@@ -1,6 +1,5 @@
 """
 Google Sheets integration for writing analysis data
-Enhanced version with support for reading arbitrary sheets and handling time lag data
 """
 
 import logging
@@ -153,8 +152,10 @@ class SheetsWriter:
     
     def write_raw_data(self, raw_data: List[Dict[str, Any]]):
         """
-        Write raw indicator data to Raw Data sheet
-        This method now writes to time-lag specific sheets (Raw Data_T-1, Raw Data_T-3, etc.)
+        Write raw indicator data to Raw Data sheets (one per time lag)
+        
+        Format: Each row = one stock event, columns = indicators at different time lags
+        Example row: Symbol, Event_Date, Event_Type, T-1_RSI, T-1_Williams, T-3_RSI, T-3_Williams, ...
         
         Args:
             raw_data: List of raw data dictionaries
@@ -164,43 +165,49 @@ class SheetsWriter:
             return
         
         # Convert to DataFrame
-        sanitized_data = []
-        for data_row in raw_data:
-            sanitized = {k: self._sanitize_value(v) for k, v in data_row.items()}
-            sanitized_data.append(sanitized)
-        
-        df = pd.DataFrame(sanitized_data)
+        df = pd.DataFrame(raw_data)
         df = self._sanitize_dataframe(df)
         
-        # Group by time lag and write to separate sheets
-        # Extract time lag columns (T-1, T-3, T-5, etc.)
-        time_lag_columns = [col for col in df.columns if col.startswith('T-')]
+        # Get time lag columns (T-1, T-3, T-5, etc.)
+        time_lag_cols = [col for col in df.columns if col.startswith('T-')]
         
-        if time_lag_columns:
-            # Write separate sheet for each time lag
-            for lag_col in time_lag_columns:
-                # Create a sheet for this time lag
-                lag_name = lag_col  # e.g., "T-1"
-                sheet_name = f"{self.sheet_names['raw_data']}_{lag_name}"
-                
-                # Select relevant columns
-                metadata_cols = ['Symbol', 'Event_Date', 'Event_Type', 'Exchange', 'Indicator_Name']
-                available_metadata = [col for col in metadata_cols if col in df.columns]
-                
-                # Create time-lag specific DataFrame
-                lag_df = df[available_metadata + [lag_col]].copy()
-                lag_df = lag_df.rename(columns={lag_col: 'Value'})
-                
-                # Remove rows where Value is None
-                lag_df = lag_df.dropna(subset=['Value'])
-                
-                if not lag_df.empty:
-                    self._write_dataframe(lag_df, sheet_name)
-                    self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
-        else:
-            # Fallback: write all data to single Raw Data sheet
+        if not time_lag_cols:
+            # No time lag columns, write to single sheet
             self._write_dataframe(df, self.sheet_names["raw_data"])
             self.logger.info(f"Wrote {len(raw_data)} raw data rows to sheet")
+            return
+        
+        # Extract unique time lags
+        time_lags = sorted(set(col.split('_')[0] for col in time_lag_cols))
+        
+        # For each time lag, create a separate sheet with just that time lag's data
+        for time_lag in time_lags:
+            # Get columns for this time lag
+            lag_cols = [col for col in time_lag_cols if col.startswith(f"{time_lag}_")]
+            
+            # Metadata columns
+            metadata_cols = ['Symbol', 'Event_Date', 'Event_Type', 'Exchange']
+            available_metadata = [col for col in metadata_cols if col in df.columns]
+            
+            # Create time-lag specific DataFrame (wide format - one row per symbol)
+            lag_df = df[available_metadata + lag_cols].copy()
+            
+            # Rename columns to remove time lag prefix (T-1_RSI -> RSI)
+            rename_dict = {col: col.replace(f"{time_lag}_", "") for col in lag_cols}
+            lag_df = lag_df.rename(columns=rename_dict)
+            
+            # Remove duplicate rows (same symbol/event with multiple indicator rows)
+            # Group by metadata and take first occurrence
+            lag_df = lag_df.groupby(available_metadata, as_index=False).first()
+            
+            # Remove rows with all None indicator values
+            indicator_cols = [col for col in lag_df.columns if col not in available_metadata]
+            lag_df = lag_df.dropna(how='all', subset=indicator_cols)
+            
+            if not lag_df.empty:
+                sheet_name = f"{self.sheet_names['raw_data']}_{time_lag}"
+                self._write_dataframe(lag_df, sheet_name)
+                self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
     
     def write_analysis(self, analysis: Dict[str, Any]):
         """
@@ -306,7 +313,6 @@ class SheetsWriter:
         worksheet.clear()
         
         # Convert DataFrame to list of lists with sanitized values
-        # Handle the conversion manually to ensure proper sanitization
         data = []
         
         # Add headers
