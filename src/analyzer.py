@@ -9,7 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-from sheets_writer import SheetsWriter
+from src.sheets_writer import SheetsWriter
 
 
 class Analyzer:
