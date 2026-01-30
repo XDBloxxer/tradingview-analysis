@@ -1,9 +1,10 @@
 """
 Google Sheets integration for writing analysis data
+Enhanced version with support for reading arbitrary sheets and handling time lag data
 """
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
@@ -13,7 +14,7 @@ import numpy as np
 
 class SheetsWriter:
     """
-    Handler for writing data to Google Sheets
+    Handler for writing and reading data to/from Google Sheets
     """
     
     SCOPES = [
@@ -153,6 +154,7 @@ class SheetsWriter:
     def write_raw_data(self, raw_data: List[Dict[str, Any]]):
         """
         Write raw indicator data to Raw Data sheet
+        This method now writes to time-lag specific sheets (Raw Data_T-1, Raw Data_T-3, etc.)
         
         Args:
             raw_data: List of raw data dictionaries
@@ -161,7 +163,7 @@ class SheetsWriter:
             self.logger.warning("No raw data to write")
             return
         
-        # Sanitize data before creating DataFrame
+        # Convert to DataFrame
         sanitized_data = []
         for data_row in raw_data:
             sanitized = {k: self._sanitize_value(v) for k, v in data_row.items()}
@@ -170,20 +172,50 @@ class SheetsWriter:
         df = pd.DataFrame(sanitized_data)
         df = self._sanitize_dataframe(df)
         
-        self._write_dataframe(df, self.sheet_names["raw_data"])
+        # Group by time lag and write to separate sheets
+        # Extract time lag columns (T-1, T-3, T-5, etc.)
+        time_lag_columns = [col for col in df.columns if col.startswith('T-')]
         
-        self.logger.info(f"Wrote {len(raw_data)} raw data rows to sheet")
+        if time_lag_columns:
+            # Write separate sheet for each time lag
+            for lag_col in time_lag_columns:
+                # Create a sheet for this time lag
+                lag_name = lag_col  # e.g., "T-1"
+                sheet_name = f"{self.sheet_names['raw_data']}_{lag_name}"
+                
+                # Select relevant columns
+                metadata_cols = ['Symbol', 'Event_Date', 'Event_Type', 'Exchange', 'Indicator_Name']
+                available_metadata = [col for col in metadata_cols if col in df.columns]
+                
+                # Create time-lag specific DataFrame
+                lag_df = df[available_metadata + [lag_col]].copy()
+                lag_df = lag_df.rename(columns={lag_col: 'Value'})
+                
+                # Remove rows where Value is None
+                lag_df = lag_df.dropna(subset=['Value'])
+                
+                if not lag_df.empty:
+                    self._write_dataframe(lag_df, sheet_name)
+                    self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
+        else:
+            # Fallback: write all data to single Raw Data sheet
+            self._write_dataframe(df, self.sheet_names["raw_data"])
+            self.logger.info(f"Wrote {len(raw_data)} raw data rows to sheet")
     
     def write_analysis(self, analysis: Dict[str, Any]):
         """
         Write analysis results to Analysis sheet
         
         Args:
-            analysis: Analysis results dictionary
+            analysis: Analysis results dictionary with 'summary', 'spikers', 'grinders'
         """
         # Write summary table (like SUMMARY_PRE_MOVE)
         if "summary" in analysis:
-            df_summary = pd.DataFrame(analysis["summary"])
+            if isinstance(analysis["summary"], pd.DataFrame):
+                df_summary = analysis["summary"]
+            else:
+                df_summary = pd.DataFrame(analysis["summary"])
+            
             df_summary = self._sanitize_dataframe(df_summary)
             self._write_dataframe(df_summary, self.sheet_names["analysis"])
             self.logger.info("Wrote analysis summary to sheet")
@@ -191,8 +223,15 @@ class SheetsWriter:
         # Write detailed results if present
         if "spikers" in analysis and "grinders" in analysis:
             # Append spikers and grinders as separate sections
-            df_spikers = pd.DataFrame(analysis["spikers"])
-            df_grinders = pd.DataFrame(analysis["grinders"])
+            if isinstance(analysis["spikers"], pd.DataFrame):
+                df_spikers = analysis["spikers"]
+            else:
+                df_spikers = pd.DataFrame(analysis["spikers"])
+            
+            if isinstance(analysis["grinders"], pd.DataFrame):
+                df_grinders = analysis["grinders"]
+            else:
+                df_grinders = pd.DataFrame(analysis["grinders"])
             
             df_spikers = self._sanitize_dataframe(df_spikers)
             df_grinders = self._sanitize_dataframe(df_grinders)
@@ -328,13 +367,7 @@ class SheetsWriter:
         Returns:
             DataFrame of candidates
         """
-        worksheet = self.spreadsheet.worksheet(self.sheet_names["candidates"])
-        data = worksheet.get_all_records()
-        
-        if not data:
-            return pd.DataFrame()
-        
-        return pd.DataFrame(data)
+        return self.read_sheet(self.sheet_names["candidates"])
     
     def read_raw_data(self) -> pd.DataFrame:
         """
@@ -343,10 +376,45 @@ class SheetsWriter:
         Returns:
             DataFrame of raw data
         """
-        worksheet = self.spreadsheet.worksheet(self.sheet_names["raw_data"])
-        data = worksheet.get_all_records()
+        return self.read_sheet(self.sheet_names["raw_data"])
+    
+    def read_sheet(self, sheet_name: str) -> Optional[pd.DataFrame]:
+        """
+        Read any sheet by name from Google Sheets
         
-        if not data:
-            return pd.DataFrame()
+        Args:
+            sheet_name: Name of sheet to read
+            
+        Returns:
+            DataFrame of sheet data, or None if sheet not found
+        """
+        try:
+            worksheet = self.spreadsheet.worksheet(sheet_name)
+            data = worksheet.get_all_records()
+            
+            if not data:
+                self.logger.warning(f"No data found in sheet: {sheet_name}")
+                return pd.DataFrame()
+            
+            return pd.DataFrame(data)
+            
+        except gspread.exceptions.WorksheetNotFound:
+            self.logger.warning(f"Sheet not found: {sheet_name}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error reading sheet {sheet_name}: {str(e)}")
+            return None
+    
+    def list_sheets(self) -> List[str]:
+        """
+        List all sheet names in the spreadsheet
         
-        return pd.DataFrame(data)
+        Returns:
+            List of sheet names
+        """
+        try:
+            worksheets = self.spreadsheet.worksheets()
+            return [ws.title for ws in worksheets]
+        except Exception as e:
+            self.logger.error(f"Error listing sheets: {str(e)}")
+            return []
