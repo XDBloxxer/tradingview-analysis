@@ -134,7 +134,7 @@ class EventDetector:
                     # Also filter for stocks with some movement
                     {'left': 'change_abs', 'operation': 'nempty'}
                 ],
-                limit=500,  # Increased from 1000 to get more stocks
+                limit=5000,  # Increased from 1000 to get more stocks, Stock limit
                 sort_by='change_abs',  # Sort by absolute change to catch movers
                 sort_order='desc'
             )
