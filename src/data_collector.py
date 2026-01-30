@@ -98,7 +98,7 @@ class DataCollector:
         Uses parallel processing for speed
         
         Returns:
-            List of raw data dictionaries
+            List of raw data dictionaries (one per symbol-lag combination)
         """
         self.logger.info("Starting parallel historical indicator collection...")
         
@@ -159,7 +159,7 @@ class DataCollector:
             candidate: Candidate dictionary with Symbol, Date, Event_Type, Exchange
             
         Returns:
-            List of indicator data rows
+            List of data rows (one row per time lag with all indicators in wide format)
         """
         symbol = candidate['Symbol']
         event_date = pd.to_datetime(candidate['Date']).date()
@@ -182,66 +182,63 @@ class DataCollector:
                 self.stats['failed'] += 1
                 return []
         
-        # Build data rows for each indicator with proper time lags
+        # Build data rows - ONE ROW PER TIME LAG with ALL indicators in columns (wide format)
         raw_data = []
+        
+        # Convert index to date-only for comparison
+        indicators_df_copy = indicators_df.copy()
+        indicators_df_copy.index = pd.to_datetime(indicators_df_copy.index).date
         
         # Get all available indicators from the dataframe
         available_indicators = [col for col in indicators_df.columns if col not in ['Open', 'High', 'Low', 'Close', 'Volume']]
         
-        # Convert index to date-only for comparison (remove timezone and time)
-        # This fixes the timezone comparison error
-        indicators_df_copy = indicators_df.copy()
-        indicators_df_copy.index = pd.to_datetime(indicators_df_copy.index).date
-        
-        for indicator_name in available_indicators:
-            try:
-                # Create row with metadata
-                data_row = {
-                    'Symbol': symbol,
-                    'Event_Date': event_date.isoformat(),
-                    'Event_Type': event_type,
-                    'Exchange': exchange,
-                    'Indicator_Name': indicator_name,
-                }
+        # Create one row per time lag
+        for lag in self.time_lags:
+            lag_date = event_date - timedelta(days=lag)
+            
+            # Create row with metadata
+            data_row = {
+                'Symbol': symbol,
+                'Event_Date': event_date.isoformat(),
+                'Event_Type': event_type,
+                'Exchange': exchange,
+                'Time_Lag': f"T-{lag}"
+            }
+            
+            # Find the closest available date for this lag
+            if lag_date in indicators_df_copy.index:
+                lag_data = indicators_df_copy.loc[lag_date]
+            else:
+                # Get closest prior date
+                prior_dates = [d for d in indicators_df_copy.index if d <= lag_date]
+                if len(prior_dates) > 0:
+                    lag_data = indicators_df_copy.loc[prior_dates[-1]]
+                else:
+                    # No data available for this lag
+                    continue
+            
+            # Add all indicators as columns in this row
+            valid_values = False
+            for indicator_name in available_indicators:
+                value = lag_data.get(indicator_name)
                 
-                # Add time lag columns with ACTUAL historical values
-                for lag in self.time_lags:
-                    lag_date = event_date - timedelta(days=lag)
-                    
-                    # Find the closest available date
-                    if lag_date in indicators_df_copy.index:
-                        value = indicators_df_copy.loc[lag_date, indicator_name]
-                    else:
-                        # Get closest prior date
-                        prior_dates = [d for d in indicators_df_copy.index if d <= lag_date]
-                        if len(prior_dates) > 0:
-                            value = indicators_df_copy.loc[prior_dates[-1], indicator_name]
+                # Validate the value
+                if pd.notna(value):
+                    try:
+                        float_value = float(value)
+                        if np.isfinite(float_value):
+                            data_row[indicator_name] = float_value
+                            valid_values = True
                         else:
-                            value = np.nan
-                    
-                    # Validate the value - must be finite and not NaN
-                    # This prevents inf, -inf, and NaN from being added
-                    if pd.notna(value):
-                        try:
-                            float_value = float(value)
-                            if np.isfinite(float_value):
-                                data_row[f"T-{lag}"] = float_value
-                            else:
-                                # Value is inf or -inf, set to None
-                                data_row[f"T-{lag}"] = None
-                        except (ValueError, TypeError):
-                            # Can't convert to float, set to None
-                            data_row[f"T-{lag}"] = None
-                    else:
-                        data_row[f"T-{lag}"] = None
-                
-                # Only add row if we have at least one valid (non-None) lag value
-                if any(data_row.get(f"T-{lag}") is not None for lag in self.time_lags):
-                    raw_data.append(data_row)
-                    
-            except Exception as e:
-                self.logger.debug(f"Error processing indicator {indicator_name} for {symbol}: {e}")
-                continue
+                            data_row[indicator_name] = None
+                    except (ValueError, TypeError):
+                        data_row[indicator_name] = None
+                else:
+                    data_row[indicator_name] = None
+            
+            # Only add row if we have at least one valid indicator value
+            if valid_values:
+                raw_data.append(data_row)
         
         return raw_data
     
