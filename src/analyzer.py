@@ -93,7 +93,6 @@ class Analyzer:
             summary_tables.extend(lag_summary)
         
         # Generate overall statistics using first available time lag data
-        # (avoid concatenation issues)
         first_lag_df = list(all_data.values())[0] if all_data else pd.DataFrame()
         if not first_lag_df.empty:
             spikers_all = first_lag_df[first_lag_df['Event_Type'] == 'Spiker']
@@ -212,9 +211,7 @@ class Analyzer:
                 'AVG_Spikers': spiker_mean,
                 'AVG_Grinders': grinder_mean,
                 'Difference': difference,
-                'Ratio': ratio,
-                'Spiker_Count': spikers_df[col].count() if col in spikers_df.columns else 0,
-                'Grinder_Count': grinders_df[col].count() if col in grinders_df.columns else 0
+                'Ratio': ratio
             })
         
         self.logger.info(f"  ✓ Generated summary for {len(summary_table)} indicators at {time_lag}")
@@ -246,7 +243,7 @@ class Analyzer:
             'grinder_ratio': len(grinders_df) / (len(spikers_df) + len(grinders_df)) if (len(spikers_df) + len(grinders_df)) > 0 else 0,
         }
         
-        # Find numeric columns for statistics (avoid the Exchange concatenation issue)
+        # Find numeric columns for statistics
         numeric_cols = spikers_df.select_dtypes(include=[np.number]).columns.tolist()
         
         # Try to find change percentage columns
