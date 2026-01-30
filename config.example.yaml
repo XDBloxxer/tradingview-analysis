@@ -1,0 +1,114 @@
+# TradingView Analysis Configuration
+
+# Google Sheets Settings
+google_sheets:
+  spreadsheet_id: "1rgJQiGk6eKc1Eks9cyn0X9ukkA3C6nk44QDMamPGwC0"
+  credentials_path: "credentials/google_sheets_credentials.json"
+  
+  # Sheet names
+  sheets:
+    candidates: "Candidates"
+    raw_data: "Raw Data"
+    analysis: "Analysis"
+    summary: "Summary Stats"
+
+# Event Detection Settings
+detection:
+  # Spiker: Single-day move > threshold
+  spiker_threshold: 15.0  # percent
+  
+  # Grinder: Consecutive days > threshold
+  grinder_days: 3
+  grinder_threshold: 0.5  # percent per day
+  
+  # Stock universe
+  exchanges:
+    - "NASDAQ"
+    - "NYSE"
+    - "AMEX"
+  
+  # Minimum requirements
+  min_price: 0.50  # Exclude penny stocks below this
+  min_volume: 100000  # Minimum daily volume
+  
+  # Lookback period for detection
+  lookback_days: 7  # How many days to scan
+
+# Technical Indicators to Track
+indicators:
+  # Exact names as they appear in TradingView
+  - name: "Stochastic RSI (3,3,14,14)"
+    column: "Stoch.RSI.K"
+  - name: "Williams Percent Range (14)"
+    column: "W.R"
+  - name: "Relative Volume"
+    column: "relative_volume_10d_calc"
+  - name: "Pre-market Gap %"
+    column: "premarket_gap"
+  - name: "Average True Range % (14)"
+    column: "ATR"
+  - name: "Exponential Moving Average (50)"
+    column: "EMA50"
+  - name: "Volume"
+    column: "volume"
+  - name: "Price"
+    column: "close"
+  - name: "Change %"
+    column: "change"
+
+# Time Lags to Collect (days before event)
+time_lags:
+  - 1   # T-1 (previous day)
+  - 3   # T-3
+  - 5   # T-5
+  - 10  # T-10
+  - 30  # T-30
+
+# Rate Limiting Settings
+rate_limiting:
+  # Requests per minute to TradingView
+  requests_per_minute: 30
+  
+  # Delay between individual symbol requests (seconds)
+  delay_between_symbols: 2.0
+  
+  # Batch size for bulk operations
+  batch_size: 10
+  
+  # Retry settings
+  max_retries: 3
+  retry_delay: 5  # seconds
+  exponential_backoff: true
+
+# Logging Settings
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/analysis.log"
+  console: true
+
+# Analysis Settings
+analysis:
+  # Minimum samples for statistical validity
+  min_samples: 10
+  
+  # Confidence level for statistical tests
+  confidence_level: 0.95
+  
+  # Include correlation analysis
+  compute_correlations: true
+  
+  # Generate visualizations (for future dashboard)
+  generate_charts: false
+
+# Data Persistence
+persistence:
+  # Cache directory for intermediate results
+  cache_dir: "data/cache"
+  
+  # Export raw data to CSV backup
+  export_csv: true
+  export_dir: "data/exports"
+  
+  # Retention period (days)
+  retention_days: 90
