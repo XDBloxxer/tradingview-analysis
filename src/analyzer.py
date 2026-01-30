@@ -1,4 +1,3 @@
-
 """
 Analyzer for comparing Spikers vs Grinders across multiple time lags
 Reads from Raw Data sheets (T-1, T-3, T-5, T-10, T-30) and generates comparative analysis
@@ -10,7 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-from .sheets_writer import SheetsWriter
+from sheets_writer import SheetsWriter
 
 
 class Analyzer:
