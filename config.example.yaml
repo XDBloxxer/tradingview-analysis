@@ -8,7 +8,7 @@ google_sheets:
   # Sheet names
   sheets:
     candidates: "Candidates"
-    raw_data: "Raw Data"
+    raw_data: "Raw Data"  # Base name - will create Raw Data_T-1, Raw Data_T-3, etc.
     analysis: "Analysis"
     summary: "Summary Stats"
 
@@ -107,7 +107,7 @@ persistence:
   cache_dir: "data/cache"
   
   # Export raw data to CSV backup
-  export_csv: true
+  export_csv: false
   export_dir: "data/exports"
   
   # Retention period (days)
