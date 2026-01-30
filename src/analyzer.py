@@ -92,11 +92,15 @@ class Analyzer:
             lag_summary = self._generate_summary_comparison(spikers_df, grinders_df, time_lag)
             summary_tables.extend(lag_summary)
         
-        # Generate overall statistics
-        combined_df = pd.concat(all_data.values(), ignore_index=True)
-        spikers_all = combined_df[combined_df['Event_Type'] == 'Spiker']
-        grinders_all = combined_df[combined_df['Event_Type'] == 'Grinder']
-        stats = self._generate_statistics(spikers_all, grinders_all)
+        # Generate overall statistics using first available time lag data
+        # (avoid concatenation issues)
+        first_lag_df = list(all_data.values())[0] if all_data else pd.DataFrame()
+        if not first_lag_df.empty:
+            spikers_all = first_lag_df[first_lag_df['Event_Type'] == 'Spiker']
+            grinders_all = first_lag_df[first_lag_df['Event_Type'] == 'Grinder']
+            stats = self._generate_statistics(spikers_all, grinders_all)
+        else:
+            stats = {}
         
         results = {
             'summary': summary_tables,
@@ -242,35 +246,38 @@ class Analyzer:
             'grinder_ratio': len(grinders_df) / (len(spikers_df) + len(grinders_df)) if (len(spikers_df) + len(grinders_df)) > 0 else 0,
         }
         
+        # Find numeric columns for statistics (avoid the Exchange concatenation issue)
+        numeric_cols = spikers_df.select_dtypes(include=[np.number]).columns.tolist()
+        
         # Try to find change percentage columns
-        change_cols = [col for col in spikers_df.columns if 'change' in col.lower() or 'cambio' in col.lower()]
+        change_cols = [col for col in numeric_cols if 'change' in col.lower() or 'cambio' in col.lower()]
         
         if change_cols and len(change_cols) > 0:
             change_col = change_cols[0]
             if change_col in spikers_df.columns:
-                stats['avg_spiker_change_pct'] = spikers_df[change_col].mean()
+                stats['avg_spiker_change_pct'] = float(spikers_df[change_col].mean())
             if change_col in grinders_df.columns:
-                stats['avg_grinder_change_pct'] = grinders_df[change_col].mean()
+                stats['avg_grinder_change_pct'] = float(grinders_df[change_col].mean())
         
         # Price statistics
-        price_cols = [col for col in spikers_df.columns if col.lower() in ['price', 'close']]
+        price_cols = [col for col in numeric_cols if col.lower() in ['price', 'close']]
         if price_cols and len(price_cols) > 0:
             price_col = price_cols[0]
             if price_col in spikers_df.columns:
-                stats['avg_spiker_price'] = spikers_df[price_col].mean()
-                stats['median_spiker_price'] = spikers_df[price_col].median()
+                stats['avg_spiker_price'] = float(spikers_df[price_col].mean())
+                stats['median_spiker_price'] = float(spikers_df[price_col].median())
             if price_col in grinders_df.columns:
-                stats['avg_grinder_price'] = grinders_df[price_col].mean()
-                stats['median_grinder_price'] = grinders_df[price_col].median()
+                stats['avg_grinder_price'] = float(grinders_df[price_col].mean())
+                stats['median_grinder_price'] = float(grinders_df[price_col].median())
         
         # Volume statistics
-        volume_cols = [col for col in spikers_df.columns if col.lower() == 'volume']
+        volume_cols = [col for col in numeric_cols if col.lower() == 'volume']
         if volume_cols and len(volume_cols) > 0:
             volume_col = volume_cols[0]
             if volume_col in spikers_df.columns:
-                stats['avg_spiker_volume'] = spikers_df[volume_col].mean()
+                stats['avg_spiker_volume'] = float(spikers_df[volume_col].mean())
             if volume_col in grinders_df.columns:
-                stats['avg_grinder_volume'] = grinders_df[volume_col].mean()
+                stats['avg_grinder_volume'] = float(grinders_df[volume_col].mean())
         
         self.logger.info(f"✓ Generated {len(stats)} statistics")
         
