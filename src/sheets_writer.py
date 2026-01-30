@@ -154,11 +154,11 @@ class SheetsWriter:
         """
         Write raw indicator data to Raw Data sheets (one per time lag)
         
-        Format: Each row = one stock event, columns = indicators at different time lags
-        Example row: Symbol, Event_Date, Event_Type, T-1_RSI, T-1_Williams, T-3_RSI, T-3_Williams, ...
+        Format: WIDE FORMAT - Each row = one stock symbol, columns = all indicators
+        Example row: Symbol, Event_Date, Event_Type, Exchange, RSI, Williams, MACD, ...
         
         Args:
-            raw_data: List of raw data dictionaries
+            raw_data: List of raw data dictionaries (one per symbol-lag combination)
         """
         if not raw_data:
             self.logger.warning("No raw data to write")
@@ -168,55 +168,37 @@ class SheetsWriter:
         df = pd.DataFrame(raw_data)
         df = self._sanitize_dataframe(df)
         
-        # Get time lag columns (T-1, T-3, T-5, etc.)
-        time_lag_cols = [col for col in df.columns if col.startswith('T-')]
-        
-        if not time_lag_cols:
-            # No time lag columns, write to single sheet
+        # Check if we have Time_Lag column
+        if 'Time_Lag' not in df.columns:
+            # No time lag info, write to single sheet
             self._write_dataframe(df, self.sheet_names["raw_data"])
             self.logger.info(f"Wrote {len(raw_data)} raw data rows to sheet")
             return
         
-        # Extract unique time lags
-        time_lags = sorted(set(col.split('_')[0] for col in time_lag_cols))
+        # Group by time lag
+        time_lags = df['Time_Lag'].unique()
         
-        # For each time lag, create a separate sheet with just that time lag's data
-        for time_lag in time_lags:
-            # Get columns for this time lag
-            lag_cols = [col for col in time_lag_cols if col.startswith(f"{time_lag}_")]
+        for time_lag in sorted(time_lags):
+            # Filter data for this time lag
+            lag_df = df[df['Time_Lag'] == time_lag].copy()
             
-            # Metadata columns
-            metadata_cols = ['Symbol', 'Event_Date', 'Event_Type', 'Exchange']
-            available_metadata = [col for col in metadata_cols if col in df.columns]
+            # Drop the Time_Lag column since it's in the sheet name
+            lag_df = lag_df.drop(columns=['Time_Lag'])
             
-            # Create time-lag specific DataFrame (wide format - one row per symbol)
-            lag_df = df[available_metadata + lag_cols].copy()
-            
-            # Rename columns to remove time lag prefix (T-1_RSI -> RSI)
-            rename_dict = {col: col.replace(f"{time_lag}_", "") for col in lag_cols}
-            lag_df = lag_df.rename(columns=rename_dict)
-            
-            # Remove duplicate rows (same symbol/event with multiple indicator rows)
-            # Group by metadata and take first occurrence
-            lag_df = lag_df.groupby(available_metadata, as_index=False).first()
-            
-            # Remove rows with all None indicator values
-            indicator_cols = [col for col in lag_df.columns if col not in available_metadata]
-            lag_df = lag_df.dropna(how='all', subset=indicator_cols)
-            
-            if not lag_df.empty:
-                sheet_name = f"{self.sheet_names['raw_data']}_{time_lag}"
-                self._write_dataframe(lag_df, sheet_name)
-                self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
+            # Write to sheet
+            sheet_name = f"{self.sheet_names['raw_data']}_{time_lag}"
+            self._write_dataframe(lag_df, sheet_name)
+            self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
     
     def write_analysis(self, analysis: Dict[str, Any]):
         """
         Write analysis results to Analysis sheet
+        ONLY writes the summary comparison (averages of spikers vs grinders)
         
         Args:
-            analysis: Analysis results dictionary with 'summary', 'spikers', 'grinders'
+            analysis: Analysis results dictionary with 'summary'
         """
-        # Write summary table (like SUMMARY_PRE_MOVE)
+        # Write ONLY the summary table (averages comparison)
         if "summary" in analysis:
             if isinstance(analysis["summary"], pd.DataFrame):
                 df_summary = analysis["summary"]
@@ -225,46 +207,7 @@ class SheetsWriter:
             
             df_summary = self._sanitize_dataframe(df_summary)
             self._write_dataframe(df_summary, self.sheet_names["analysis"])
-            self.logger.info("Wrote analysis summary to sheet")
-        
-        # Write detailed results if present
-        if "spikers" in analysis and "grinders" in analysis:
-            # Append spikers and grinders as separate sections
-            if isinstance(analysis["spikers"], pd.DataFrame):
-                df_spikers = analysis["spikers"]
-            else:
-                df_spikers = pd.DataFrame(analysis["spikers"])
-            
-            if isinstance(analysis["grinders"], pd.DataFrame):
-                df_grinders = analysis["grinders"]
-            else:
-                df_grinders = pd.DataFrame(analysis["grinders"])
-            
-            df_spikers = self._sanitize_dataframe(df_spikers)
-            df_grinders = self._sanitize_dataframe(df_grinders)
-            
-            # Get current data to append below summary
-            worksheet = self.spreadsheet.worksheet(self.sheet_names["analysis"])
-            current_rows = len(worksheet.get_all_values())
-            
-            # Write spikers
-            if not df_spikers.empty:
-                self._append_dataframe(
-                    df_spikers,
-                    self.sheet_names["analysis"],
-                    start_row=current_rows + 3,
-                    header="SPIKERS DETAIL"
-                )
-            
-            # Write grinders
-            if not df_grinders.empty:
-                current_rows = len(worksheet.get_all_values())
-                self._append_dataframe(
-                    df_grinders,
-                    self.sheet_names["analysis"],
-                    start_row=current_rows + 3,
-                    header="GRINDERS DETAIL"
-                )
+            self.logger.info(f"✓ Wrote {len(df_summary)} summary rows to Analysis sheet")
     
     def write_summary_stats(self, stats: Dict[str, Any]):
         """
