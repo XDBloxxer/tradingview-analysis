@@ -9,7 +9,7 @@ google_sheets:
   sheets:
     candidates: "Candidates"
     raw_data: "Raw Data"  # Base name - will create Raw Data_T-1, Raw Data_T-3, etc.
-    analysis: "Analysis"
+    analysis: "Analysis_Raw"
     summary: "Summary Stats"
 
 # Event Detection Settings
