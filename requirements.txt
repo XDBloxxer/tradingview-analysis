@@ -31,3 +31,6 @@ colorlog>=6.8.0
 
 # Progress tracking
 tqdm>=4.66.1
+
+#Supabase
+supabase>=1.26.01
