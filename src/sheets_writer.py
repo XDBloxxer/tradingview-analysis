@@ -2,9 +2,10 @@
 Google Sheets integration for writing analysis data
 """
 
+import json
 import logging
+import os
 from typing import List, Dict, Any, Optional
-from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
 import pandas as pd
@@ -33,19 +34,12 @@ class SheetsWriter:
         
         sheets_config = config.get("google_sheets", {})
         self.spreadsheet_id = sheets_config.get("spreadsheet_id")
-        credentials_path = sheets_config.get("credentials_path")
         
         if not self.spreadsheet_id:
             raise ValueError("spreadsheet_id not configured in config.yaml")
         
-        if not Path(credentials_path).exists():
-            raise FileNotFoundError(
-                f"Google Sheets credentials not found: {credentials_path}\n"
-                f"Please download service account JSON and place it there."
-            )
-        
-        # Initialize Google Sheets client
-        self.client = self._authenticate(credentials_path)
+        # Initialize Google Sheets client from env var
+        self.client = self._authenticate()
         self.spreadsheet = self.client.open_by_key(self.spreadsheet_id)
         
         # Get sheet names from config
@@ -59,18 +53,31 @@ class SheetsWriter:
         
         self.logger.info(f"Connected to Google Sheets: {self.spreadsheet_id}")
     
-    def _authenticate(self, credentials_path: str) -> gspread.Client:
+    def _authenticate(self) -> gspread.Client:
         """
-        Authenticate with Google Sheets API
+        Authenticate with Google Sheets API using the GOOGLE_CREDENTIALS_JSON
+        environment variable. The variable should contain the full service
+        account JSON as a string.
         
-        Args:
-            credentials_path: Path to service account JSON
-            
         Returns:
             Authenticated gspread client
+            
+        Raises:
+            EnvironmentError: If GOOGLE_CREDENTIALS_JSON is not set
+            json.JSONDecodeError: If the value is not valid JSON
         """
-        credentials = Credentials.from_service_account_file(
-            credentials_path,
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        
+        if not creds_json:
+            raise EnvironmentError(
+                "GOOGLE_CREDENTIALS_JSON environment variable is not set. "
+                "Set it in your GitHub Actions workflow or local shell."
+            )
+        
+        creds_dict = json.loads(creds_json)
+        
+        credentials = Credentials.from_service_account_info(
+            creds_dict,
             scopes=self.SCOPES
         )
         return gspread.authorize(credentials)
