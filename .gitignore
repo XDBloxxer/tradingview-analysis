@@ -34,18 +34,19 @@ ENV/
 *~
 
 # Project specific - CRITICAL: Never commit these!
-credentials/
 config.yaml
 data/cache/
 data/exports/
 logs/
 *.log
 
-# Credential files - Extra protection
+# Credential files - Extra protection (should never exist locally, but just in case)
 *_credentials.json
 *_service_account.json
 *.pem
 *.key
+.env
+.env.local
 
 # OS
 .DS_Store
@@ -59,10 +60,6 @@ htmlcov/
 
 # Jupyter
 .ipynb_checkpoints
-
-# Environment variables
-.env
-.env.local
 
 # Backup files
 *.bak
