@@ -1,5 +1,6 @@
 """
 Google Sheets integration for writing analysis data
+UPDATED: Writes all time lags to single "Raw Data" sheet
 """
 
 import json
@@ -46,7 +47,7 @@ class SheetsWriter:
         sheet_names = sheets_config.get("sheets", {})
         self.sheet_names = {
             "candidates": sheet_names.get("candidates", "Candidates"),
-            "raw_data": sheet_names.get("raw_data", "Raw Data"),
+            "raw_data": sheet_names.get("raw_data", "Raw Data"),  # Single sheet for all lags
             "analysis": sheet_names.get("analysis", "Analysis"),
             "summary": sheet_names.get("summary", "Summary Stats")
         }
@@ -159,13 +160,11 @@ class SheetsWriter:
     
     def write_raw_data(self, raw_data: List[Dict[str, Any]]):
         """
-        Write raw indicator data to Raw Data sheets (one per time lag)
-        
-        Format: WIDE FORMAT - Each row = one stock symbol, columns = all indicators
-        Example row: Symbol, Event_Date, Event_Type, Exchange, RSI, Williams, MACD, ...
+        Write raw indicator data to SINGLE "Raw Data" sheet
+        All time lags are in one sheet with a time_lag column
         
         Args:
-            raw_data: List of raw data dictionaries (one per symbol-lag combination)
+            raw_data: List of raw data dictionaries
         """
         if not raw_data:
             self.logger.warning("No raw data to write")
@@ -175,27 +174,9 @@ class SheetsWriter:
         df = pd.DataFrame(raw_data)
         df = self._sanitize_dataframe(df)
         
-        # Check if we have Time_Lag column
-        if 'Time_Lag' not in df.columns:
-            # No time lag info, write to single sheet
-            self._write_dataframe(df, self.sheet_names["raw_data"])
-            self.logger.info(f"Wrote {len(raw_data)} raw data rows to sheet")
-            return
-        
-        # Group by time lag
-        time_lags = df['Time_Lag'].unique()
-        
-        for time_lag in sorted(time_lags):
-            # Filter data for this time lag
-            lag_df = df[df['Time_Lag'] == time_lag].copy()
-            
-            # Drop the Time_Lag column since it's in the sheet name
-            lag_df = lag_df.drop(columns=['Time_Lag'])
-            
-            # Write to sheet
-            sheet_name = f"{self.sheet_names['raw_data']}_{time_lag}"
-            self._write_dataframe(lag_df, sheet_name)
-            self.logger.info(f"Wrote {len(lag_df)} rows to {sheet_name}")
+        # Write to single sheet (includes time_lag column)
+        self._write_dataframe(df, self.sheet_names["raw_data"])
+        self.logger.info(f"Wrote {len(raw_data)} raw data rows to single 'Raw Data' sheet")
     
     def write_analysis(self, analysis: Dict[str, Any]):
         """
@@ -281,40 +262,6 @@ class SheetsWriter:
             "backgroundColor": {"red": 0.2, "green": 0.2, "blue": 0.2},
             "textFormat": {"bold": True, "foregroundColor": {"red": 1, "green": 1, "blue": 1}}
         })
-    
-    def _append_dataframe(
-        self,
-        df: pd.DataFrame,
-        sheet_name: str,
-        start_row: int,
-        header: str = None
-    ):
-        """
-        Append DataFrame to sheet at specific row
-        
-        Args:
-            df: DataFrame to append
-            sheet_name: Name of sheet
-            start_row: Row to start appending (1-indexed)
-            header: Optional header text to add before data
-        """
-        worksheet = self.spreadsheet.worksheet(sheet_name)
-        
-        # Add header if provided
-        if header:
-            worksheet.update(f'A{start_row}', [[header]], value_input_option='RAW')
-            start_row += 1
-        
-        # Convert DataFrame to list of lists with sanitized values
-        data = []
-        data.append(df.columns.tolist())
-        
-        for _, row in df.iterrows():
-            sanitized_row = [self._sanitize_value(v) for v in row.values]
-            data.append(sanitized_row)
-        
-        # Append data
-        worksheet.update(f'A{start_row}', data, value_input_option='RAW')
     
     def read_candidates(self) -> pd.DataFrame:
         """
