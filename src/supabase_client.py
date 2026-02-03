@@ -25,16 +25,28 @@ class SupabaseClient:
         self.config = config
         
         # Get credentials from environment
+        # In GitHub Actions: set as secrets
+        # Locally: set in .env or export manually
         supabase_url = os.environ.get("SUPABASE_URL")
         supabase_key = os.environ.get("SUPABASE_KEY")
         
         if not supabase_url or not supabase_key:
+            self.logger.error(
+                "SUPABASE_URL and SUPABASE_KEY environment variables must be set.\n"
+                "For GitHub Actions: Add as repository secrets\n"
+                "Locally: export SUPABASE_URL=... and export SUPABASE_KEY=..."
+            )
             raise ValueError(
-                "SUPABASE_URL and SUPABASE_KEY environment variables must be set"
+                "Missing Supabase credentials. Set SUPABASE_URL and SUPABASE_KEY environment variables."
             )
         
-        # Initialize Supabase client
-        self.client: Client = create_client(supabase_url, supabase_key)
+        try:
+            # Initialize Supabase client
+            self.client: Client = create_client(supabase_url, supabase_key)
+            self.logger.info(f"✓ Connected to Supabase: {supabase_url[:30]}...")
+        except Exception as e:
+            self.logger.error(f"Failed to connect to Supabase: {str(e)}")
+            raise
         
         # Table names
         supabase_config = config.get("supabase", {})
@@ -45,7 +57,7 @@ class SupabaseClient:
             "summary": supabase_config.get("summary_table", "summary_stats")
         }
         
-        self.logger.info(f"Connected to Supabase")
+        self.logger.info(f"Using tables: {', '.join(self.tables.values())}")
     
     def write_candidates(self, candidates: List[Dict[str, Any]]) -> int:
         """
