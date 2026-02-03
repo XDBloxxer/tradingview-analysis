@@ -3,7 +3,8 @@
 # Google Sheets Settings
 google_sheets:
   spreadsheet_id: "1rgJQiGk6eKc1Eks9cyn0X9ukkA3C6nk44QDMamPGwC0"
-  credentials_path: "credentials/google_sheets_credentials.json"
+  # Credentials are read from the GOOGLE_CREDENTIALS_JSON environment variable.
+  # Do NOT put secrets in this file.
   
   # Sheet names
   sheets:
