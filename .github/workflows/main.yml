@@ -48,7 +48,11 @@ jobs:
       
       - name: Run analysis pipeline
         env:
+          # Google Sheets (for validation sample)
           GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          # Supabase (primary data store)
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           if [ "${{ github.event.inputs.run_detect }}" != "false" ] && \
              [ "${{ github.event.inputs.run_collect }}" != "false" ] && \
@@ -86,4 +90,5 @@ jobs:
         if: failure()
         run: |
           echo "Analysis pipeline failed. Check logs for details."
+          echo "Data is in Supabase even if workflow fails - check Supabase dashboard"
           # Add notification logic here (Slack, email, etc.)
