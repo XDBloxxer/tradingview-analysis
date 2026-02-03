@@ -1,6 +1,7 @@
 """
 Analyzer for comparing Spikers vs Grinders across multiple time lags
 Reads from Supabase and writes results to both Supabase and Google Sheets (sample only)
+UPDATED: Analyzes only the sheets_sample symbols for Google Sheets
 """
 
 import logging
@@ -45,7 +46,7 @@ class Analyzer:
         
         # Sample size for Google Sheets
         supabase_config = config.get("supabase", {})
-        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 20)
+        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 50)
         
         self.logger.info(
             f"Analyzer initialized: "
@@ -59,10 +60,13 @@ class Analyzer:
         Main analysis function that processes all time lags and generates
         comparative statistics for Spikers vs Grinders
         
+        Analyzes ALL data from Supabase
+        
         Returns:
             Dictionary containing:
             - summary: Summary comparison table (average differences)
             - stats: Overall statistics
+            - sheets_summary: Summary for sample symbols only (for Google Sheets)
         """
         self.logger.info("=" * 60)
         self.logger.info("STARTING ANALYSIS (Reading from Supabase)")
@@ -75,11 +79,21 @@ class Analyzer:
             self.logger.error("No raw data found in Supabase. Cannot proceed with analysis.")
             return {
                 'summary': [],
-                'stats': {}
+                'stats': {},
+                'sheets_summary': []
             }
         
-        # Generate summary comparison for each time lag
+        # Read candidates to get sample symbols
+        candidates_df = self.supabase.read_candidates()
+        if not candidates_df.empty and len(candidates_df) > self.sheets_sample_size:
+            sample_symbols = set(candidates_df.head(self.sheets_sample_size)['symbol'].tolist())
+            self.logger.info(f"Will generate separate analysis for {len(sample_symbols)} sample symbols")
+        else:
+            sample_symbols = None
+        
+        # Generate summary comparison for each time lag (ALL DATA)
         summary_tables = []
+        sheets_summary_tables = []
         
         for time_lag, lag_df in all_data.items():
             if lag_df.empty:
@@ -87,15 +101,30 @@ class Analyzer:
             
             self.logger.info(f"Analyzing {time_lag}: {len(lag_df)} rows")
             
-            # Separate Spikers and Grinders
+            # Separate Spikers and Grinders (ALL DATA)
             spikers_df = lag_df[lag_df['event_type'] == 'Spiker'].copy()
             grinders_df = lag_df[lag_df['event_type'] == 'Grinder'].copy()
             
             self.logger.info(f"  {time_lag} - Spikers: {len(spikers_df)}, Grinders: {len(grinders_df)}")
             
-            # Generate summary comparison for this time lag
+            # Generate summary comparison for ALL data
             lag_summary = self._generate_summary_comparison(spikers_df, grinders_df, time_lag)
             summary_tables.extend(lag_summary)
+            
+            # Generate summary for SAMPLE data (for Google Sheets)
+            if sample_symbols:
+                sample_spikers = spikers_df[spikers_df['symbol'].isin(sample_symbols)].copy()
+                sample_grinders = grinders_df[grinders_df['symbol'].isin(sample_symbols)].copy()
+                
+                if not sample_spikers.empty or not sample_grinders.empty:
+                    self.logger.info(
+                        f"  {time_lag} SAMPLE - Spikers: {len(sample_spikers)}, "
+                        f"Grinders: {len(sample_grinders)}"
+                    )
+                    lag_sheets_summary = self._generate_summary_comparison(
+                        sample_spikers, sample_grinders, time_lag
+                    )
+                    sheets_summary_tables.extend(lag_sheets_summary)
         
         # Generate overall statistics using first available time lag data
         first_lag_df = list(all_data.values())[0] if all_data else pd.DataFrame()
@@ -107,11 +136,15 @@ class Analyzer:
             stats = {}
         
         results = {
-            'summary': summary_tables,
-            'stats': stats
+            'summary': summary_tables,  # ALL data
+            'stats': stats,  # ALL data
+            'sheets_summary': sheets_summary_tables if sample_symbols else summary_tables  # SAMPLE data
         }
         
         self.logger.info("✓ Analysis completed successfully")
+        self.logger.info(f"  - Full analysis: {len(summary_tables)} metrics")
+        if sample_symbols:
+            self.logger.info(f"  - Sheets sample: {len(sheets_summary_tables)} metrics")
         
         return results
     
@@ -185,8 +218,6 @@ class Analyzer:
                 'ratio': ratio
             })
         
-        self.logger.info(f"  ✓ Generated summary for {len(summary_table)} indicators at {time_lag}")
-        
         return summary_table
     
     def _generate_statistics(
@@ -253,15 +284,15 @@ class Analyzer:
     
     def write_to_supabase(self, analysis_results: Dict[str, Any]):
         """
-        Write analysis results to Supabase (all data)
+        Write ALL analysis results to Supabase
         
         Args:
             analysis_results: Analysis results dictionary
         """
-        self.logger.info("Writing analysis results to Supabase...")
+        self.logger.info("Writing ALL analysis results to Supabase...")
         
         try:
-            # Write summary to analysis table
+            # Write summary to analysis table (ALL DATA)
             if analysis_results.get('summary'):
                 count = self.supabase.write_analysis(analysis_results['summary'])
                 self.logger.info(f"✓ Wrote {count} analysis rows to Supabase")
@@ -280,26 +311,20 @@ class Analyzer:
     def write_to_sheets(self, analysis_results: Dict[str, Any]):
         """
         Write SAMPLE analysis results to Google Sheets for validation
+        Uses the sheets_summary (sample symbols only)
         
         Args:
             analysis_results: Analysis results dictionary
         """
-        self.logger.info(f"Writing sample ({self.sheets_sample_size} rows) to Google Sheets for validation...")
+        self.logger.info(f"Writing SAMPLE analysis to Google Sheets...")
         
         try:
             # Write sample summary to Analysis sheet
-            if analysis_results.get('summary'):
-                summary_df = pd.DataFrame(analysis_results['summary'])
+            if analysis_results.get('sheets_summary'):
+                summary_df = pd.DataFrame(analysis_results['sheets_summary'])
                 
-                # Take sample
-                if len(summary_df) > self.sheets_sample_size:
-                    sample_df = summary_df.head(self.sheets_sample_size).copy()
-                    self.logger.info(f"  Sampling {len(sample_df)} of {len(summary_df)} rows")
-                else:
-                    sample_df = summary_df
-                
-                self.sheets_writer.write_analysis({'summary': sample_df})
-                self.logger.info(f"✓ Wrote {len(sample_df)} sample rows to Google Sheets")
+                self.sheets_writer.write_analysis({'summary': summary_df})
+                self.logger.info(f"✓ Wrote {len(summary_df)} sample analysis rows to Google Sheets")
             
             # Write all statistics (it's small)
             if analysis_results.get('stats'):
