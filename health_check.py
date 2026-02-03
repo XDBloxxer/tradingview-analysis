@@ -4,6 +4,8 @@ Health check script to verify system setup
 """
 
 import sys
+import os
+import json
 from pathlib import Path
 import yaml
 
@@ -80,49 +82,38 @@ def check_config():
         return False
 
 def check_credentials():
-    """Check Google Sheets credentials"""
+    """Check that GOOGLE_CREDENTIALS_JSON env var is set and valid"""
     print("Checking credentials...", end=" ")
     
-    try:
-        with open('config.yaml') as f:
-            config = yaml.safe_load(f)
-        
-        creds_path = config.get('google_sheets', {}).get('credentials_path')
-        
-        if not creds_path:
-            print("✗ credentials_path not set in config.yaml")
-            return False
-        
-        if not Path(creds_path).exists():
-            print(f"✗ {creds_path} not found")
-            print("  Download from Google Cloud Console")
-            return False
-        
-        # Try to load the JSON
-        import json
-        with open(creds_path) as f:
-            creds = json.load(f)
-        
-        required_keys = [
-            'type',
-            'project_id',
-            'private_key',
-            'client_email'
-        ]
-        
-        missing = [k for k in required_keys if k not in creds]
-        
-        if missing:
-            print(f"✗ Invalid credentials (missing: {', '.join(missing)})")
-            return False
-        
-        print(f"✓ Found")
-        print(f"  Service account: {creds['client_email']}")
-        return True
-        
-    except Exception as e:
-        print(f"✗ Error: {str(e)}")
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    
+    if not creds_json:
+        print("✗ GOOGLE_CREDENTIALS_JSON environment variable is not set")
+        print("  Set it in your shell or in your GitHub Actions workflow secrets")
         return False
+    
+    try:
+        creds = json.loads(creds_json)
+    except json.JSONDecodeError:
+        print("✗ GOOGLE_CREDENTIALS_JSON is not valid JSON")
+        return False
+    
+    required_keys = [
+        'type',
+        'project_id',
+        'private_key',
+        'client_email'
+    ]
+    
+    missing = [k for k in required_keys if k not in creds]
+    
+    if missing:
+        print(f"✗ Invalid credentials (missing: {', '.join(missing)})")
+        return False
+    
+    print(f"✓ Valid")
+    print(f"  Service account: {creds['client_email']}")
+    return True
 
 def check_directories():
     """Check required directories"""
@@ -131,7 +122,6 @@ def check_directories():
     required_dirs = [
         'src',
         'tests',
-        'credentials',
         'data',
         'logs'
     ]
@@ -256,7 +246,7 @@ def main():
         print("Common fixes:")
         print("  - Install dependencies: pip install -r requirements.txt")
         print("  - Copy config: cp config.example.yaml config.yaml")
-        print("  - Download credentials from Google Cloud Console")
+        print("  - Set GOOGLE_CREDENTIALS_JSON env var (paste your service account JSON)")
         print("  - Share Google Sheet with service account email")
         return 1
 
