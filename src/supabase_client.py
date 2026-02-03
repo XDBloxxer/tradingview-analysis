@@ -6,6 +6,7 @@ import logging
 import os
 from typing import List, Dict, Any, Optional
 import pandas as pd
+import numpy as np
 from supabase import create_client, Client
 
 
@@ -59,6 +60,60 @@ class SupabaseClient:
         
         self.logger.info(f"Using tables: {', '.join(self.tables.values())}")
     
+    def _sanitize_value(self, value: Any) -> Any:
+        """
+        Sanitize a value for Supabase/PostgreSQL
+        - Converts numpy types to Python types
+        - Handles NaN, inf, -inf
+        - Ensures proper type conversion for integers
+        
+        Args:
+            value: Value to sanitize
+            
+        Returns:
+            Sanitized value
+        """
+        if value is None:
+            return None
+        
+        # Handle pandas NA types
+        if pd.isna(value):
+            return None
+        
+        # Handle numpy types
+        if isinstance(value, np.integer):
+            return int(value)
+        
+        if isinstance(value, np.floating):
+            # Check for inf or nan
+            if np.isinf(value) or np.isnan(value):
+                return None
+            return float(value)
+        
+        # Handle numpy bool
+        if isinstance(value, np.bool_):
+            return bool(value)
+        
+        # Handle regular floats
+        if isinstance(value, float):
+            if np.isinf(value) or np.isnan(value):
+                return None
+            return value
+        
+        return value
+    
+    def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sanitize all values in a dictionary
+        
+        Args:
+            data: Dictionary to sanitize
+            
+        Returns:
+            Sanitized dictionary
+        """
+        return {k: self._sanitize_value(v) for k, v in data.items()}
+    
     def write_candidates(self, candidates: List[Dict[str, Any]]) -> int:
         """
         Write candidate events to Supabase
@@ -74,9 +129,12 @@ class SupabaseClient:
             return 0
         
         try:
+            # Sanitize all data
+            sanitized_candidates = [self._sanitize_dict(c) for c in candidates]
+            
             # Upsert data (insert or update if exists)
             response = self.client.table(self.tables["candidates"]).upsert(
-                candidates,
+                sanitized_candidates,
                 on_conflict="symbol,date"  # Composite unique key
             ).execute()
             
@@ -103,12 +161,18 @@ class SupabaseClient:
             return 0
         
         try:
+            # Sanitize all data
+            sanitized_data = []
+            for row in raw_data:
+                sanitized_row = self._sanitize_dict(row)
+                sanitized_data.append(sanitized_row)
+            
             # Process in batches to avoid timeouts
             batch_size = 1000
             total_written = 0
             
-            for i in range(0, len(raw_data), batch_size):
-                batch = raw_data[i:i + batch_size]
+            for i in range(0, len(sanitized_data), batch_size):
+                batch = sanitized_data[i:i + batch_size]
                 
                 response = self.client.table(self.tables["raw_data"]).upsert(
                     batch,
@@ -124,6 +188,9 @@ class SupabaseClient:
             
         except Exception as e:
             self.logger.error(f"Error writing raw data: {str(e)}", exc_info=True)
+            # Log a sample row for debugging
+            if raw_data:
+                self.logger.error(f"Sample row: {raw_data[0]}")
             raise
     
     def write_analysis(self, analysis_data: List[Dict[str, Any]]) -> int:
@@ -141,8 +208,11 @@ class SupabaseClient:
             return 0
         
         try:
+            # Sanitize all data
+            sanitized_data = [self._sanitize_dict(d) for d in analysis_data]
+            
             response = self.client.table(self.tables["analysis"]).upsert(
-                analysis_data,
+                sanitized_data,
                 on_conflict="indicator,time_lag"
             ).execute()
             
@@ -171,7 +241,7 @@ class SupabaseClient:
         try:
             # Convert to list of dicts for table format
             stats_list = [
-                {"metric": k, "value": v}
+                {"metric": k, "value": self._sanitize_value(v)}
                 for k, v in stats.items()
             ]
             
