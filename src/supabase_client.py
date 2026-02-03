@@ -25,8 +25,8 @@ class SupabaseClient:
         self.config = config
         
         # Get credentials from environment
-        supabase_url = secrets.SUPABASE_URL
-        supabase_key = secrets.SUPABASE_KEY
+        supabase_url = ${{ secrets.SUPABASE_URL }}
+        supabase_key = ${{ secrets.SUPABASE_KEY }}
         
         if not supabase_url or not supabase_key:
             raise ValueError(
