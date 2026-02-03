@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Main entry point for TradingView Stock Event Analysis System
+Writes to Supabase (primary) and Google Sheets (sample for validation)
 """
 
 import argparse
@@ -50,6 +51,11 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--skip-sheets",
+        action="store_true",
+        help="Skip Google Sheets sample writes (Supabase only)"
+    )
     
     args = parser.parse_args()
     
@@ -80,11 +86,19 @@ def main():
             events = detector.detect_events()
             
             logger.info(f"✓ Detected {len(events)} events")
-            logger.info(f"  - Spikers: {len([e for e in events if e['Event_Type'] == 'Spiker'])}")
-            logger.info(f"  - Grinders: {len([e for e in events if e['Event_Type'] == 'Grinder'])}")
+            logger.info(f"  - Spikers: {len([e for e in events if e['event_type'] == 'Spiker'])}")
+            logger.info(f"  - Grinders: {len([e for e in events if e['event_type'] == 'Grinder'])}")
             
-            detector.write_to_sheets(events)
-            logger.info("✓ Written to Google Sheets (Candidates)")
+            # Write to Supabase (all data)
+            from src.supabase_client import SupabaseClient
+            supabase = SupabaseClient(config)
+            count = supabase.write_candidates(events)
+            logger.info(f"✓ Written {count} events to Supabase")
+            
+            # Write sample to Google Sheets for validation
+            if not args.skip_sheets:
+                detector.write_to_sheets(events)
+                logger.info("✓ Written sample to Google Sheets (Candidates)")
         
         # Step 2: Data Collection
         if run_collect:
@@ -98,8 +112,14 @@ def main():
             
             logger.info(f"✓ Collected data for {len(raw_data)} symbol-indicator combinations")
             
-            collector.write_to_sheets(raw_data)
-            logger.info("✓ Written to Google Sheets (Raw Data)")
+            # Write to Supabase (all data)
+            collector.write_to_supabase(raw_data)
+            logger.info("✓ Written all data to Supabase (Raw Data)")
+            
+            # Write sample to Google Sheets for validation
+            if not args.skip_sheets:
+                collector.write_to_sheets(raw_data)
+                logger.info("✓ Written sample to Google Sheets (Raw Data)")
         
         # Step 3: Analysis
         if run_analyze:
@@ -113,13 +133,24 @@ def main():
             
             logger.info(f"✓ Generated analysis with {len(analysis_results['summary'])} metrics")
             
-            analyzer.write_to_sheets(analysis_results)
-            logger.info("✓ Written to Google Sheets (Analysis & Summary Stats)")
+            # Write to Supabase (all data)
+            analyzer.write_to_supabase(analysis_results)
+            logger.info("✓ Written all analysis to Supabase")
+            
+            # Write sample to Google Sheets for validation
+            if not args.skip_sheets:
+                analyzer.write_to_sheets(analysis_results)
+                logger.info("✓ Written sample to Google Sheets (Analysis & Summary Stats)")
         
         logger.info("")
         logger.info("=" * 60)
         logger.info("✓ PIPELINE COMPLETED SUCCESSFULLY")
         logger.info("=" * 60)
+        logger.info("")
+        logger.info("Data Storage:")
+        logger.info("  • Primary: Supabase (all data)")
+        if not args.skip_sheets:
+            logger.info("  • Validation: Google Sheets (sample data)")
         
         return 0
         
