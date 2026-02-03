@@ -236,13 +236,13 @@ class EventDetector:
                 # Check for Spiker (single-day move > threshold)
                 if change_pct >= self.spiker_threshold:
                     events.append({
-                        'Date': today.isoformat(),
-                        'Symbol': symbol,
-                        'Exchange': exchange,
-                        'Event_Type': 'Spiker',
-                        'Price': price,
-                        'Change_%': change_pct,
-                        'Volume': volume
+                        'date': today.isoformat(),
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'event_type': 'Spiker',
+                        'price': price,
+                        'change_pct': change_pct,
+                        'volume': volume
                     })
                 
                 # Check for Grinder
@@ -260,13 +260,13 @@ class EventDetector:
                     # Note: Proper grinder detection requires 3 consecutive days
                     # This is a simplified version using current data only
                     events.append({
-                        'Date': today.isoformat(),
-                        'Symbol': symbol,
-                        'Exchange': exchange,
-                        'Event_Type': 'Grinder',
-                        'Price': price,
-                        'Change_%': change_pct,
-                        'Volume': volume
+                        'date': today.isoformat(),
+                        'symbol': symbol,
+                        'exchange': exchange,
+                        'event_type': 'Grinder',
+                        'price': price,
+                        'change_pct': change_pct,
+                        'volume': volume
                     })
                 
             except Exception as e:
