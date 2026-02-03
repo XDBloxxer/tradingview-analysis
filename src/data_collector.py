@@ -1,7 +1,7 @@
 """
 Data collector for fetching technical indicators with PROPER TIME LAGS
-Uses yfinance for historical data (proven approach from enhanced_explosive_analyzer.py)
-Falls back to TradingView for real-time/current data when needed
+Uses yfinance for historical data
+Writes to Supabase (primary) and Google Sheets (sample only)
 """
 
 import logging
@@ -30,6 +30,7 @@ except ImportError:
 
 from .rate_limiter import RateLimiter
 from .sheets_writer import SheetsWriter
+from .supabase_client import SupabaseClient
 from .utils import get_indicator_mapping
 
 
@@ -40,7 +41,7 @@ class DataCollector:
     Primary method: yfinance (historical OHLCV data)
     Fallback method: TradingView (current values only)
     
-    This fixes the issue where all time lags (T-1, T-3, T-5, etc.) were identical
+    Writes to Supabase (all data) and Google Sheets (sample for validation)
     """
     
     # Parallel processing settings
@@ -68,9 +69,14 @@ class DataCollector:
         # Initialize components
         self.rate_limiter = RateLimiter(config)
         self.sheets_writer = SheetsWriter(config)
+        self.supabase = SupabaseClient(config)
         
         # Indicator mapping
         self.indicator_mapping = get_indicator_mapping(config)
+        
+        # Sample size for Google Sheets
+        supabase_config = config.get("supabase", {})
+        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 20)
         
         # Statistics
         self.stats = {
@@ -89,7 +95,8 @@ class DataCollector:
             f"Data collector initialized: "
             f"{len(self.indicator_mapping)} indicators, "
             f"{self.MAX_WORKERS} parallel workers, "
-            f"time lags: {self.time_lags}"
+            f"time lags: {self.time_lags}, "
+            f"sheets_sample: {self.sheets_sample_size}"
         )
     
     def collect_indicator_data(self) -> List[Dict[str, Any]]:
@@ -102,11 +109,11 @@ class DataCollector:
         """
         self.logger.info("Starting parallel historical indicator collection...")
         
-        # Read candidates from Google Sheets
-        candidates_df = self.sheets_writer.read_candidates()
+        # Read candidates from Supabase
+        candidates_df = self.supabase.read_candidates()
         
         if candidates_df.empty:
-            self.logger.warning("No candidates found in Google Sheets")
+            self.logger.warning("No candidates found in Supabase")
             return []
         
         self.logger.info(f"Found {len(candidates_df)} candidates to process")
@@ -137,7 +144,7 @@ class DataCollector:
                         all_raw_data.extend(result)
                 except Exception as e:
                     candidate = future_to_candidate[future]
-                    self.logger.debug(f"Error processing {candidate.get('Symbol', 'unknown')}: {str(e)}")
+                    self.logger.debug(f"Error processing {candidate.get('symbol', 'unknown')}: {str(e)}")
                     self.stats['failed'] += 1
         
         self.logger.info(f"✓ Collected {len(all_raw_data)} raw data rows")
@@ -156,15 +163,15 @@ class DataCollector:
         Process a single candidate and collect indicators with proper time lags
         
         Args:
-            candidate: Candidate dictionary with Symbol, Date, Event_Type, Exchange
+            candidate: Candidate dictionary with symbol, date, event_type, exchange
             
         Returns:
             List of data rows (one row per time lag with all indicators in wide format)
         """
-        symbol = candidate['Symbol']
-        event_date = pd.to_datetime(candidate['Date']).date()
-        event_type = candidate['Event_Type']
-        exchange = candidate.get('Exchange', 'NASDAQ')
+        symbol = candidate.get('symbol')
+        event_date = pd.to_datetime(candidate.get('date')).date()
+        event_type = candidate.get('event_type')
+        exchange = candidate.get('exchange', 'NASDAQ')
         
         # Check cache
         cache_key = f"{symbol}:{event_date}"
@@ -196,13 +203,13 @@ class DataCollector:
         for lag in self.time_lags:
             lag_date = event_date - timedelta(days=lag)
             
-            # Create row with metadata
+            # Create row with metadata (use lowercase for Supabase consistency)
             data_row = {
-                'Symbol': symbol,
-                'Event_Date': event_date.isoformat(),
-                'Event_Type': event_type,
-                'Exchange': exchange,
-                'Time_Lag': f"T-{lag}"
+                'symbol': symbol,
+                'event_date': event_date.isoformat(),
+                'event_type': event_type,
+                'exchange': exchange,
+                'time_lag': f"T-{lag}"
             }
             
             # Find the closest available date for this lag
@@ -217,7 +224,7 @@ class DataCollector:
                     # No data available for this lag
                     continue
             
-            # Add all indicators as columns in this row
+            # Add all indicators as columns in this row (lowercase keys for Supabase)
             valid_values = False
             for indicator_name in available_indicators:
                 value = lag_data.get(indicator_name)
@@ -227,14 +234,15 @@ class DataCollector:
                     try:
                         float_value = float(value)
                         if np.isfinite(float_value):
-                            data_row[indicator_name] = float_value
+                            # Convert to lowercase for Supabase column names
+                            data_row[indicator_name.lower()] = float_value
                             valid_values = True
                         else:
-                            data_row[indicator_name] = None
+                            data_row[indicator_name.lower()] = None
                     except (ValueError, TypeError):
-                        data_row[indicator_name] = None
+                        data_row[indicator_name.lower()] = None
                 else:
-                    data_row[indicator_name] = None
+                    data_row[indicator_name.lower()] = None
             
             # Only add row if we have at least one valid indicator value
             if valid_values:
@@ -281,7 +289,6 @@ class DataCollector:
     def _calculate_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Calculate comprehensive technical indicators from OHLCV data
-        Based on the proven approach from enhanced_explosive_analyzer.py
         
         Args:
             df: DataFrame with OHLCV data
@@ -455,47 +462,31 @@ class DataCollector:
         
         return result
     
-    def _fetch_tradingview_current(self, exchange: str, symbol: str) -> Dict[str, Any]:
+    def write_to_supabase(self, raw_data: List[Dict[str, Any]]):
         """
-        Fetch CURRENT indicators from TradingView (fallback method)
-        Only returns current values, not historical
-        
-        Args:
-            exchange: Exchange name
-            symbol: Stock symbol
-            
-        Returns:
-            Dictionary of current indicator values
-        """
-        if not TRADINGVIEW_AVAILABLE:
-            return {}
-        
-        try:
-            time.sleep(0.1)  # Rate limiting
-            
-            scanner = Indicators()
-            results = scanner.scrape(
-                exchange=exchange,
-                symbol=symbol,
-                timeframe='1d',
-                allIndicators=True
-            )
-            
-            if results and results.get('status') == 'success':
-                self.stats['tradingview'] += 1
-                return results.get('data', {})
-            
-            return {}
-            
-        except Exception as e:
-            self.logger.debug(f"Error fetching TradingView data for {symbol}: {str(e)}")
-            return {}
-    
-    def write_to_sheets(self, raw_data: List[Dict[str, Any]]):
-        """
-        Write raw data to Google Sheets
+        Write raw data to Supabase (all data)
         
         Args:
             raw_data: List of raw data dictionaries
         """
-        self.sheets_writer.write_raw_data(raw_data)
+        self.supabase.write_raw_data(raw_data)
+    
+    def write_to_sheets(self, raw_data: List[Dict[str, Any]]):
+        """
+        Write SAMPLE raw data to Google Sheets for validation
+        
+        Args:
+            raw_data: List of raw data dictionaries
+        """
+        if not raw_data:
+            return
+        
+        # Take sample
+        if len(raw_data) > self.sheets_sample_size:
+            sample_data = raw_data[:self.sheets_sample_size]
+            self.logger.info(f"Writing sample ({len(sample_data)} of {len(raw_data)} rows) to Google Sheets")
+        else:
+            sample_data = raw_data
+            self.logger.info(f"Writing all {len(sample_data)} rows to Google Sheets")
+        
+        self.sheets_writer.write_raw_data(sample_data)
