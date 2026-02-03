@@ -1,5 +1,6 @@
 """
 Event detection for identifying Spikers and Grinders
+Writes ALL events to Supabase, only SAMPLE to Google Sheets
 """
 
 import logging
@@ -52,10 +53,15 @@ class EventDetector:
         # Initialize Screener
         self.screener = Screener()
         
+        # Sample size for Google Sheets
+        supabase_config = config.get("supabase", {})
+        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 50)
+        
         self.logger.info(
             f"Event detector initialized: "
             f"Spiker≥{self.spiker_threshold}%, "
-            f"Grinder≥{self.grinder_threshold}% for {self.grinder_days} days"
+            f"Grinder≥{self.grinder_threshold}% for {self.grinder_days} days, "
+            f"sheets_sample={self.sheets_sample_size}"
         )
     
     def detect_events(self) -> List[Dict[str, Any]]:
@@ -134,7 +140,7 @@ class EventDetector:
                     # Also filter for stocks with some movement
                     {'left': 'change_abs', 'operation': 'nempty'}
                 ],
-                limit=100,  # Increased from 1000 to get more stocks, Stock limit
+                limit=1000,  # Increased from 1000 to get more stocks, Stock limit
                 sort_by='change_abs',  # Sort by absolute change to catch movers
                 sort_order='desc'
             )
@@ -277,9 +283,24 @@ class EventDetector:
     
     def write_to_sheets(self, events: List[Dict[str, Any]]):
         """
-        Write detected events to Google Sheets
+        Write SAMPLE of detected events to Google Sheets
         
         Args:
-            events: List of event dictionaries
+            events: List of ALL event dictionaries
         """
-        self.sheets_writer.write_candidates(events)
+        if not events:
+            self.logger.warning("No events to write to sheets")
+            return
+        
+        # Take only a sample for Google Sheets
+        if len(events) > self.sheets_sample_size:
+            sample_events = events[:self.sheets_sample_size]
+            self.logger.info(
+                f"Writing sample of {len(sample_events)} events to Google Sheets "
+                f"(out of {len(events)} total)"
+            )
+        else:
+            sample_events = events
+            self.logger.info(f"Writing all {len(sample_events)} events to Google Sheets")
+        
+        self.sheets_writer.write_candidates(sample_events)
