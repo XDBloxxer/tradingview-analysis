@@ -241,7 +241,7 @@ class EventDetector:
                         'Exchange': exchange,
                         'Event_Type': 'Spiker',
                         'Price': price,
-                        'change_pct': change_pct,
+                        'Change_%': change_pct,
                         'Volume': volume
                     })
                 
