@@ -76,7 +76,7 @@ class DataCollector:
         
         # Sample size for Google Sheets
         supabase_config = config.get("supabase", {})
-        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 20)
+        self.sheets_sample_size = supabase_config.get("sheets_sample_size", 50)
         
         # Statistics
         self.stats = {
@@ -116,7 +116,22 @@ class DataCollector:
             self.logger.warning("No candidates found in Supabase")
             return []
         
-        self.logger.info(f"Found {len(candidates_df)} candidates to process")
+        self.logger.info(f"Found {len(candidates_df)} candidates in Supabase")
+        
+        # Take sample for Google Sheets analysis
+        if len(candidates_df) > self.sheets_sample_size:
+            sheets_candidates_df = candidates_df.head(self.sheets_sample_size).copy()
+            self.logger.info(
+                f"Processing ALL {len(candidates_df)} for Supabase, "
+                f"but only {len(sheets_candidates_df)} for Google Sheets sample"
+            )
+        else:
+            sheets_candidates_df = candidates_df.copy()
+            self.logger.info(f"Processing all {len(candidates_df)} candidates")
+        
+        # Store sample symbols for later filtering
+        self.sheets_sample_symbols = set(sheets_candidates_df['symbol'].tolist())
+        
         self.stats['total'] = len(candidates_df)
         
         # Convert to list of dicts for processing
@@ -464,29 +479,38 @@ class DataCollector:
     
     def write_to_supabase(self, raw_data: List[Dict[str, Any]]):
         """
-        Write raw data to Supabase (all data)
+        Write ALL raw data to Supabase
         
         Args:
-            raw_data: List of raw data dictionaries
+            raw_data: List of ALL raw data dictionaries
         """
+        self.logger.info(f"Writing ALL {len(raw_data)} rows to Supabase...")
         self.supabase.write_raw_data(raw_data)
     
     def write_to_sheets(self, raw_data: List[Dict[str, Any]]):
         """
         Write SAMPLE raw data to Google Sheets for validation
+        Only includes data for the sampled symbols
         
         Args:
-            raw_data: List of raw data dictionaries
+            raw_data: List of ALL raw data dictionaries
         """
         if not raw_data:
             return
         
-        # Take sample
-        if len(raw_data) > self.sheets_sample_size:
-            sample_data = raw_data[:self.sheets_sample_size]
-            self.logger.info(f"Writing sample ({len(sample_data)} of {len(raw_data)} rows) to Google Sheets")
-        else:
-            sample_data = raw_data
-            self.logger.info(f"Writing all {len(sample_data)} rows to Google Sheets")
+        # Filter to only include sample symbols
+        sample_data = [
+            row for row in raw_data 
+            if row.get('symbol') in self.sheets_sample_symbols
+        ]
+        
+        if not sample_data:
+            self.logger.warning("No data found for sheets sample symbols")
+            return
+        
+        self.logger.info(
+            f"Writing sample ({len(sample_data)} of {len(raw_data)} rows) "
+            f"to Google Sheets for {len(self.sheets_sample_symbols)} symbols"
+        )
         
         self.sheets_writer.write_raw_data(sample_data)
