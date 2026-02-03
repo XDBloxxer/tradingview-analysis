@@ -86,8 +86,8 @@ def main():
             events = detector.detect_events()
             
             logger.info(f"✓ Detected {len(events)} events")
-            logger.info(f"  - Spikers: {len([e for e in events if e['Event_Type'] == 'Spiker'])}")
-            logger.info(f"  - Grinders: {len([e for e in events if e['Event_Type'] == 'Grinder'])}")
+            logger.info(f"  - Spikers: {len([e for e in events if e['event_type'] == 'Spiker'])}")
+            logger.info(f"  - Grinders: {len([e for e in events if e['event_type'] == 'Grinder'])}")
             
             # Write to Supabase (all data)
             from src.supabase_client import SupabaseClient
