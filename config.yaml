@@ -1,6 +1,20 @@
 # TradingView Analysis Configuration
 
-# Google Sheets Settings
+# Supabase Settings (Primary Data Store)
+supabase:
+  # URL and Key are read from SUPABASE_URL and SUPABASE_KEY environment variables
+  # Do NOT put secrets in this file.
+  
+  # Table names
+  candidates_table: "candidates"
+  raw_data_table: "raw_data"
+  analysis_table: "analysis"
+  summary_table: "summary_stats"
+  
+  # Sample size for Google Sheets validation
+  sheets_sample_size: 20  # Write only 20 rows to sheets for validation
+
+# Google Sheets Settings (Sample Data for Validation Only)
 google_sheets:
   spreadsheet_id: "1rgJQiGk6eKc1Eks9cyn0X9ukkA3C6nk44QDMamPGwC0"
   # Credentials are read from the GOOGLE_CREDENTIALS_JSON environment variable.
