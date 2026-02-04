@@ -95,7 +95,7 @@ class DailyWinnersSupabaseClient:
     def write_winners(self, winners: List[Dict[str, Any]]) -> int:
         """
         Write daily winners to Supabase
-        Appends new data (does not overwrite)
+        Uses upsert to handle duplicates gracefully
         
         Args:
             winners: List of winner dictionaries
@@ -111,9 +111,10 @@ class DailyWinnersSupabaseClient:
             # Sanitize all data
             sanitized_winners = [self._sanitize_dict(w) for w in winners]
             
-            # Insert data (append, don't overwrite)
-            response = self.client.table(self.tables["winners"]).insert(
-                sanitized_winners
+            # Upsert data (insert or update if exists)
+            response = self.client.table(self.tables["winners"]).upsert(
+                sanitized_winners,
+                on_conflict="symbol,detection_date"
             ).execute()
             
             count = len(response.data) if response.data else 0
@@ -127,7 +128,7 @@ class DailyWinnersSupabaseClient:
     def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
         """
         Write intraday indicator data to Supabase
-        Appends new data (does not overwrite)
+        Uses upsert to handle duplicates gracefully
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
@@ -153,9 +154,10 @@ class DailyWinnersSupabaseClient:
                 # Sanitize all data
                 sanitized_data = [self._sanitize_dict(d) for d in data]
                 
-                # Insert data (append, don't overwrite)
-                response = self.client.table(self.tables[table_key]).insert(
-                    sanitized_data
+                # Upsert data (insert or update if exists)
+                response = self.client.table(self.tables[table_key]).upsert(
+                    sanitized_data,
+                    on_conflict="symbol,detection_date,snapshot_type"
                 ).execute()
                 
                 count = len(response.data) if response.data else 0
