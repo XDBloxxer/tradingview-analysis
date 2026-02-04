@@ -127,3 +127,23 @@ persistence:
   
   # Retention period (days)
   retention_days: 90
+
+
+
+# Daily Winners Tracker Configuration
+# Add this to your existing config.yaml
+
+# Daily Winners Settings (Separate from spike/grinder analysis)
+daily_winners:
+  # Supabase table names for daily winners data
+  winners_table: "daily_winners"
+  market_open_table: "winners_market_open"
+  market_close_table: "winners_market_close"
+  day_prior_table: "winners_day_prior"
+  
+  # Number of top winners to track daily
+  top_n: 10
+  
+  # Market times (NYC timezone)
+  market_open_time: "09:30:00"
+  market_close_time: "16:00:00"
