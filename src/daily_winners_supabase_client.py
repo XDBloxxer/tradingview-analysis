@@ -91,17 +91,20 @@ class DailyWinnersSupabaseClient:
         
         # Handle strings that might be numbers
         if isinstance(value, str):
-            # Try to parse as number if it looks numeric
+            value = value.strip()
+            if not value:
+                return None
+            # Try to parse as number
             try:
-                # Check if it's an integer-like string
-                if '.' not in value and 'e' not in value.lower():
-                    return int(value)
-                else:
-                    float_val = float(value)
-                    if np.isinf(float_val) or np.isnan(float_val):
-                        return None
-                    return float_val
-            except (ValueError, TypeError):
+                # First try as float
+                float_val = float(value)
+                if np.isinf(float_val) or np.isnan(float_val):
+                    return None
+                # Check if it's actually an integer value
+                if float_val.is_integer():
+                    return int(float_val)
+                return float_val
+            except (ValueError, TypeError, AttributeError):
                 # Not a number, return as string
                 return value
         
@@ -109,9 +112,30 @@ class DailyWinnersSupabaseClient:
     
     def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Sanitize all values in a dictionary
+        Sanitize all values in a dictionary, with special handling for known integer columns
         """
-        return {k: self._sanitize_value(v) for k, v in data.items()}
+        integer_columns = {
+            'ema20_above_ema50', 'ema50_above_ema200', 
+            'price_above_ema20', 'ema10_above_ema20',
+            'gap_up', 'gap_down', 'volume'
+        }
+        
+        sanitized = {}
+        for k, v in data.items():
+            sanitized_val = self._sanitize_value(v)
+            
+            # Force specific columns to integer if they're not None
+            if k in integer_columns and sanitized_val is not None:
+                try:
+                    if isinstance(sanitized_val, str):
+                        sanitized_val = float(sanitized_val)
+                    sanitized_val = int(sanitized_val)
+                except (ValueError, TypeError):
+                    sanitized_val = None
+            
+            sanitized[k] = sanitized_val
+        
+        return sanitized
     
     def write_winners(self, winners: List[Dict[str, Any]]) -> int:
         """
@@ -174,6 +198,13 @@ class DailyWinnersSupabaseClient:
             try:
                 # Sanitize all data
                 sanitized_data = [self._sanitize_dict(d) for d in data]
+                
+                # Debug: Log first record to see what we're sending
+                if sanitized_data:
+                    self.logger.debug(f"Sample {data_type} record being sent:")
+                    sample = sanitized_data[0]
+                    for key, val in list(sample.items())[:5]:  # Show first 5 fields
+                        self.logger.debug(f"  {key}: {val} (type: {type(val).__name__})")
                 
                 # Get detection_date from first record
                 detection_date = sanitized_data[0].get('detection_date')
