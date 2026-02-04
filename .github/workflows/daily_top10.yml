@@ -15,7 +15,7 @@ on:
       top_n:
         description: 'Number of top winners to track'
         required: false
-        default: '10'
+        default: '15'
 
 jobs:
   track-winners:
