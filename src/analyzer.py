@@ -1,7 +1,7 @@
 """
 Analyzer for comparing Spikers vs Grinders across multiple time lags
 Reads from Supabase and writes results to both Supabase and Google Sheets (sample only)
-UPDATED: Analyzes only the sheets_sample symbols for Google Sheets
+FIXED: Statistics now pulled from candidates table (actual event data)
 """
 
 import logging
@@ -65,7 +65,7 @@ class Analyzer:
         Returns:
             Dictionary containing:
             - summary: Summary comparison table (average differences)
-            - stats: Overall statistics
+            - stats: Overall statistics FROM CANDIDATES TABLE (actual event data)
             - sheets_summary: Summary for sample symbols only (for Google Sheets)
         """
         self.logger.info("=" * 60)
@@ -83,9 +83,19 @@ class Analyzer:
                 'sheets_summary': []
             }
         
-        # Read candidates to get sample symbols
+        # Read candidates to get actual event statistics and sample symbols
         candidates_df = self.supabase.read_candidates()
-        if not candidates_df.empty and len(candidates_df) > self.sheets_sample_size:
+        
+        if candidates_df.empty:
+            self.logger.error("No candidates found in Supabase.")
+            return {
+                'summary': [],
+                'stats': {},
+                'sheets_summary': []
+            }
+        
+        # Determine sample symbols for sheets
+        if len(candidates_df) > self.sheets_sample_size:
             sample_symbols = set(candidates_df.head(self.sheets_sample_size)['symbol'].tolist())
             self.logger.info(f"Will generate separate analysis for {len(sample_symbols)} sample symbols")
         else:
@@ -126,18 +136,13 @@ class Analyzer:
                     )
                     sheets_summary_tables.extend(lag_sheets_summary)
         
-        # Generate overall statistics using first available time lag data
-        first_lag_df = list(all_data.values())[0] if all_data else pd.DataFrame()
-        if not first_lag_df.empty:
-            spikers_all = first_lag_df[first_lag_df['event_type'] == 'Spiker']
-            grinders_all = first_lag_df[first_lag_df['event_type'] == 'Grinder']
-            stats = self._generate_statistics(spikers_all, grinders_all)
-        else:
-            stats = {}
+        # Generate overall statistics from CANDIDATES table (actual event data)
+        self.logger.info("Generating statistics from CANDIDATES table (actual event data)...")
+        stats = self._generate_statistics_from_candidates(candidates_df)
         
         results = {
             'summary': summary_tables,  # ALL data
-            'stats': stats,  # ALL data
+            'stats': stats,  # FROM CANDIDATES (actual event metrics)
             'sheets_summary': sheets_summary_tables if sample_symbols else summary_tables  # SAMPLE data
         }
         
@@ -220,65 +225,83 @@ class Analyzer:
         
         return summary_table
     
-    def _generate_statistics(
+    def _generate_statistics_from_candidates(
         self,
-        spikers_df: pd.DataFrame,
-        grinders_df: pd.DataFrame
+        candidates_df: pd.DataFrame
     ) -> Dict[str, Any]:
         """
-        Generate overall statistics
+        Generate overall statistics from CANDIDATES table
+        This contains the actual event day data (price, change_pct, volume)
         
         Args:
-            spikers_df: Spiker events DataFrame
-            grinders_df: Grinder events DataFrame
+            candidates_df: Candidates DataFrame from Supabase
             
         Returns:
             Dictionary of statistics
         """
-        self.logger.info("Generating statistics...")
+        self.logger.info("Generating statistics from candidates table...")
+        
+        # Separate by event type
+        spikers_df = candidates_df[candidates_df['event_type'] == 'Spiker']
+        grinders_df = candidates_df[candidates_df['event_type'] == 'Grinder']
         
         stats = {
-            'total_events': len(spikers_df) + len(grinders_df),
+            'total_events': len(candidates_df),
             'total_spikers': len(spikers_df),
             'total_grinders': len(grinders_df),
-            'spiker_ratio': len(spikers_df) / (len(spikers_df) + len(grinders_df)) if (len(spikers_df) + len(grinders_df)) > 0 else 0,
-            'grinder_ratio': len(grinders_df) / (len(spikers_df) + len(grinders_df)) if (len(spikers_df) + len(grinders_df)) > 0 else 0,
+            'spiker_ratio': len(spikers_df) / len(candidates_df) if len(candidates_df) > 0 else 0,
+            'grinder_ratio': len(grinders_df) / len(candidates_df) if len(candidates_df) > 0 else 0,
         }
         
-        # Find numeric columns for statistics
-        numeric_cols = spikers_df.select_dtypes(include=[np.number]).columns.tolist()
+        # CHANGE PERCENTAGE (from event day)
+        if 'change_pct' in candidates_df.columns:
+            if len(spikers_df) > 0:
+                stats['avg_spiker_change_pct'] = float(spikers_df['change_pct'].mean())
+                stats['median_spiker_change_pct'] = float(spikers_df['change_pct'].median())
+                stats['min_spiker_change_pct'] = float(spikers_df['change_pct'].min())
+                stats['max_spiker_change_pct'] = float(spikers_df['change_pct'].max())
+            
+            if len(grinders_df) > 0:
+                stats['avg_grinder_change_pct'] = float(grinders_df['change_pct'].mean())
+                stats['median_grinder_change_pct'] = float(grinders_df['change_pct'].median())
+                stats['min_grinder_change_pct'] = float(grinders_df['change_pct'].min())
+                stats['max_grinder_change_pct'] = float(grinders_df['change_pct'].max())
         
-        # Try to find change percentage columns
-        change_cols = [col for col in numeric_cols if 'change' in col.lower() or 'cambio' in col.lower()]
+        # PRICE (from event day)
+        if 'price' in candidates_df.columns:
+            if len(spikers_df) > 0:
+                stats['avg_spiker_price'] = float(spikers_df['price'].mean())
+                stats['median_spiker_price'] = float(spikers_df['price'].median())
+            
+            if len(grinders_df) > 0:
+                stats['avg_grinder_price'] = float(grinders_df['price'].mean())
+                stats['median_grinder_price'] = float(grinders_df['price'].median())
         
-        if change_cols and len(change_cols) > 0:
-            change_col = change_cols[0]
-            if change_col in spikers_df.columns:
-                stats['avg_spiker_change_pct'] = float(spikers_df[change_col].mean())
-            if change_col in grinders_df.columns:
-                stats['avg_grinder_change_pct'] = float(grinders_df[change_col].mean())
+        # VOLUME (from event day)
+        if 'volume' in candidates_df.columns:
+            if len(spikers_df) > 0:
+                stats['avg_spiker_volume'] = float(spikers_df['volume'].mean())
+                stats['median_spiker_volume'] = float(spikers_df['volume'].median())
+            
+            if len(grinders_df) > 0:
+                stats['avg_grinder_volume'] = float(grinders_df['volume'].mean())
+                stats['median_grinder_volume'] = float(grinders_df['volume'].median())
         
-        # Price statistics
-        price_cols = [col for col in numeric_cols if col.lower() in ['price', 'close']]
-        if price_cols and len(price_cols) > 0:
-            price_col = price_cols[0]
-            if price_col in spikers_df.columns:
-                stats['avg_spiker_price'] = float(spikers_df[price_col].mean())
-                stats['median_spiker_price'] = float(spikers_df[price_col].median())
-            if price_col in grinders_df.columns:
-                stats['avg_grinder_price'] = float(grinders_df[price_col].mean())
-                stats['median_grinder_price'] = float(grinders_df[price_col].median())
+        # EXCHANGE BREAKDOWN
+        if 'exchange' in candidates_df.columns:
+            exchange_counts = candidates_df['exchange'].value_counts().to_dict()
+            for exchange, count in exchange_counts.items():
+                stats[f'count_{exchange}'] = int(count)
+            
+            # By event type and exchange
+            for event_type in ['Spiker', 'Grinder']:
+                event_df = candidates_df[candidates_df['event_type'] == event_type]
+                if not event_df.empty and 'exchange' in event_df.columns:
+                    exchange_counts = event_df['exchange'].value_counts().to_dict()
+                    for exchange, count in exchange_counts.items():
+                        stats[f'count_{event_type.lower()}_{exchange}'] = int(count)
         
-        # Volume statistics
-        volume_cols = [col for col in numeric_cols if col.lower() == 'volume']
-        if volume_cols and len(volume_cols) > 0:
-            volume_col = volume_cols[0]
-            if volume_col in spikers_df.columns:
-                stats['avg_spiker_volume'] = float(spikers_df[volume_col].mean())
-            if volume_col in grinders_df.columns:
-                stats['avg_grinder_volume'] = float(grinders_df[volume_col].mean())
-        
-        self.logger.info(f"✓ Generated {len(stats)} statistics")
+        self.logger.info(f"✓ Generated {len(stats)} statistics from candidates")
         
         return stats
     
