@@ -61,6 +61,7 @@ class DailyWinnersSupabaseClient:
     def _sanitize_value(self, value: Any) -> Any:
         """
         Sanitize a value for Supabase/PostgreSQL
+        Handles type conversions and invalid values
         """
         if value is None:
             return None
@@ -68,21 +69,41 @@ class DailyWinnersSupabaseClient:
         if pd.isna(value):
             return None
         
+        # Handle numpy integer types
         if isinstance(value, np.integer):
             return int(value)
         
+        # Handle numpy floating types
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
             return float(value)
         
+        # Handle numpy bool
         if isinstance(value, np.bool_):
             return bool(value)
         
+        # Handle regular Python floats
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
             return value
+        
+        # Handle strings that might be numbers
+        if isinstance(value, str):
+            # Try to parse as number if it looks numeric
+            try:
+                # Check if it's an integer-like string
+                if '.' not in value and 'e' not in value.lower():
+                    return int(value)
+                else:
+                    float_val = float(value)
+                    if np.isinf(float_val) or np.isnan(float_val):
+                        return None
+                    return float_val
+            except (ValueError, TypeError):
+                # Not a number, return as string
+                return value
         
         return value
     
