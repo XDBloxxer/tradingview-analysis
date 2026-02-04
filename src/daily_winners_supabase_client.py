@@ -128,7 +128,7 @@ class DailyWinnersSupabaseClient:
     def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
         """
         Write intraday indicator data to Supabase
-        Uses upsert to handle duplicates gracefully
+        Deletes existing data for the date first, then inserts new data
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
@@ -154,10 +154,22 @@ class DailyWinnersSupabaseClient:
                 # Sanitize all data
                 sanitized_data = [self._sanitize_dict(d) for d in data]
                 
-                # Upsert data (insert or update if exists)
-                response = self.client.table(self.tables[table_key]).upsert(
-                    sanitized_data,
-                    on_conflict="symbol,detection_date,snapshot_type"
+                # Get detection_date from first record
+                detection_date = sanitized_data[0].get('detection_date')
+                
+                if detection_date:
+                    # Delete existing data for this date
+                    try:
+                        self.client.table(self.tables[table_key]).delete().eq(
+                            'detection_date', detection_date
+                        ).execute()
+                        self.logger.debug(f"Deleted existing {data_type} data for {detection_date}")
+                    except Exception as delete_error:
+                        self.logger.debug(f"No existing data to delete for {data_type}: {delete_error}")
+                
+                # Insert new data
+                response = self.client.table(self.tables[table_key]).insert(
+                    sanitized_data
                 ).execute()
                 
                 count = len(response.data) if response.data else 0
