@@ -61,7 +61,6 @@ class DailyWinnersSupabaseClient:
     def _sanitize_value(self, value: Any) -> Any:
         """
         Sanitize a value for Supabase/PostgreSQL
-        Handles conversion of float-like integers (e.g., 1.0) to actual integers
         """
         if value is None:
             return None
@@ -75,11 +74,7 @@ class DailyWinnersSupabaseClient:
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
-            # Check if it's actually an integer value (e.g., 1.0)
-            float_val = float(value)
-            if float_val.is_integer():
-                return int(float_val)
-            return float_val
+            return float(value)
         
         if isinstance(value, np.bool_):
             return bool(value)
@@ -87,9 +82,6 @@ class DailyWinnersSupabaseClient:
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
-            # Check if it's actually an integer value (e.g., 1.0)
-            if value.is_integer():
-                return int(value)
             return value
         
         return value
