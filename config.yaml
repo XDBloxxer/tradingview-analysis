@@ -12,7 +12,7 @@ supabase:
   summary_table: "summary_stats"
   
   # Sample size for Google Sheets validation
-  sheets_sample_size: 20  # Write only 20 rows to sheets for validation
+  sheets_sample_size: 0 # currently set to 0, google sheets is used as a fallback
 
 # Google Sheets Settings (Sample Data for Validation Only)
 google_sheets:
