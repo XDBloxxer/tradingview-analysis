@@ -147,3 +147,60 @@ daily_winners:
   # Market times (NYC timezone)
   market_open_time: "09:30:00"
   market_close_time: "16:00:00"
+
+
+  # Add this section to your existing config.yaml file
+
+# ============================================================================
+# BACKTESTING CONFIGURATION
+# ============================================================================
+backtesting:
+  # Supabase table names for backtesting
+  strategies_table: "backtest_strategies"
+  results_table: "backtest_results"
+  trades_table: "backtest_trades"
+  
+  # Default parameters
+  defaults:
+    target_min_gain_pct: 5.0
+    target_days: 1
+    min_price: 0.50
+    min_volume: 100000
+    exchanges:
+      - "NASDAQ"
+      - "NYSE"
+      - "AMEX"
+  
+  # Performance settings
+  max_workers: 5  # Parallel processing threads
+  lookback_days: 120  # Historical data to fetch
+  cache_enabled: true  # Cache historical data
+  
+  # Available indicators for strategy criteria
+  # These are the indicators users can select in the UI
+  available_indicators:
+    - rsi
+    - macd
+    - macd_signal
+    - stoch_k
+    - stoch_d
+    - adx
+    - volume
+    - volume_ratio
+    - volume_sma_20
+    - close
+    - open
+    - high
+    - low
+    - ema_10
+    - ema_20
+    - ema_50
+    - ema_200
+    - sma_10
+    - sma_20
+    - sma_50
+    - sma_200
+    - bb_upper
+    - bb_lower
+    - bb_middle
+    - atr
