@@ -30,49 +30,28 @@ from ta.volatility import BollingerBands, AverageTrueRange
 
 
 class StrategyBacktester:
-    """
-    Backtests trading strategies using actual historical market data
-    """
-
     # ===== USER-ADJUSTABLE VARIABLES =====
-    TOP_WINNERS_PER_DAY = 20          # adjustable
-    MAX_CRITERIA_MATCHES = 50         # adjustable
-    UNIVERSE_SIZE = 3000              # adjustable scan size
+    TOP_WINNERS_PER_DAY = 20
+    MAX_CRITERIA_MATCHES = 50
+    UNIVERSE_SIZE = 3000
     LOOKBACK_DAYS = 120
     MIN_PRICE = 0.50
     MIN_VOLUME = 50000
-    MAX_WORKERS = 10
     # ======================================
 
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
         self.config = config
-
         self.price_cache = {}
         self.indicator_cache = {}
+        self.universe = []
 
-        # dynamic universe container
-        self.universe: List[str] = []
-
-        self.logger.info("Strategy Backtester initialized (dynamic universe)")
-
-    # ============================================================
-    # BACKTEST DRIVER
-    # ============================================================
-
-    def run_backtest(
-        self,
-        strategy_config: Dict[str, Any],
-        progress_callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
+    def run_backtest(self, strategy_config: Dict[str, Any], progress_callback=None):
 
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
 
-        self.logger.info("Building dynamic universe...")
         self._build_dynamic_universe()
-
-        self.logger.info("Downloading historical data...")
         self._preload_historical_data(start_date, end_date)
 
         trading_days = self._get_trading_days(start_date, end_date)
@@ -81,7 +60,6 @@ class StrategyBacktester:
         daily_results = []
 
         for idx, test_date in enumerate(trading_days):
-
             if progress_callback:
                 progress_callback(idx + 1, len(trading_days), test_date)
 
@@ -111,16 +89,16 @@ class StrategyBacktester:
 
             all_trades.extend(day_trades)
 
-            daily_result = self._aggregate_daily_results(
-                test_date,
-                day_trades,
-                len(winners),
-                len(criteria_matches)
+            daily_results.append(
+                self._aggregate_daily_results(
+                    test_date,
+                    day_trades,
+                    total_scanned=len(self.universe),
+                    criteria_matches=len(criteria_matches)
+                )
             )
 
-            daily_results.append(daily_result)
-
-        overall_stats = self._calculate_overall_stats(all_trades, daily_results)
+        overall_stats = self._calculate_overall_stats(all_trades)
 
         return {
             'trades': all_trades,
@@ -478,32 +456,52 @@ class StrategyBacktester:
     # STATS
     # ============================================================
 
-    def _aggregate_daily_results(self, date, trades, winners, matches):
+    def _aggregate_daily_results(self, date, trades, total_scanned, criteria_matches):
+
+        gains = [t['actual_gain_pct'] for t in trades if t.get('actual_gain_pct') is not None]
+        match_gains = [
+            t['actual_gain_pct'] for t in trades
+            if t['matched_criteria'] and t.get('actual_gain_pct') is not None
+        ]
+        miss_gains = [
+            t['actual_gain_pct'] for t in trades
+            if not t['matched_criteria'] and t.get('actual_gain_pct') is not None
+        ]
+
         tp = len([t for t in trades if t['trade_type'] == 'true_positive'])
         fp = len([t for t in trades if t['trade_type'] == 'false_positive'])
         fn = len([t for t in trades if t['trade_type'] == 'false_negative'])
 
         return {
             'test_date': date.isoformat(),
-            'criteria_matches': matches,
+            'total_scanned': total_scanned,
+            'criteria_matches': criteria_matches,
             'true_positives': tp,
             'false_positives': fp,
-            'missed_opportunities': fn
+            'missed_opportunities': fn,
+            'avg_match_gain_pct': sum(match_gains) / len(match_gains) if match_gains else None,
+            'avg_miss_gain_pct': sum(miss_gains) / len(miss_gains) if miss_gains else None,
+            'max_gain_pct': max(gains) if gains else None,
+            'min_gain_pct': min(gains) if gains else None
         }
 
-    def _calculate_overall_stats(self, trades, daily_results):
+    def _calculate_overall_stats(self, trades):
 
         tp = len([t for t in trades if t['trade_type'] == 'true_positive'])
         fp = len([t for t in trades if t['trade_type'] == 'false_positive'])
         fn = len([t for t in trades if t['trade_type'] == 'false_negative'])
 
-        matches = tp + fp
-        accuracy = (tp / matches * 100) if matches else 0
+        total_matches = tp + fp
+        accuracy = (tp / total_matches * 100) if total_matches else 0
+
+        gains = [t['actual_gain_pct'] for t in trades if t.get('actual_gain_pct') is not None]
 
         return {
             'total_trades': len(trades),
+            'total_matches': total_matches,
             'true_positives': tp,
             'false_positives': fp,
             'missed_opportunities': fn,
-            'accuracy_pct': round(accuracy, 2)
+            'accuracy_pct': round(accuracy, 2),
+            'avg_gain_pct': sum(gains) / len(gains) if gains else None
         }
