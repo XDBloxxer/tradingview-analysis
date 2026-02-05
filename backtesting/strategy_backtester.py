@@ -11,11 +11,8 @@ from ta.momentum import RSIIndicator
 
 
 class StrategyBacktester:
-    """
-    Strategy backtester that produces Supabase-compatible results
-    without artificial universe or date constraints.
-    """
 
+    INDICATOR_WARMUP_DAYS = 30   # ← REQUIRED, internal only
     MIN_PRICE = 0.50
     MIN_VOLUME = 50_000
     MAX_CRITERIA_MATCHES = 50
@@ -28,14 +25,10 @@ class StrategyBacktester:
         self.universe: List[str] = []
 
     # ============================================================
-    # MAIN ENTRY
+    # MAIN
     # ============================================================
 
-    def run_backtest(
-        self,
-        strategy_config: Dict[str, Any],
-        progress_callback: Optional[callable] = None
-    ) -> Dict[str, Any]:
+    def run_backtest(self, strategy_config: Dict[str, Any], progress_callback=None):
 
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
@@ -45,14 +38,14 @@ class StrategyBacktester:
 
         trading_days = self._get_trading_days(start_date, end_date)
 
-        all_trades: List[Dict[str, Any]] = []
-        daily_results: List[Dict[str, Any]] = []
+        all_trades = []
+        daily_results = []
 
         for idx, day in enumerate(trading_days):
             if progress_callback:
                 progress_callback(idx + 1, len(trading_days), day)
 
-            criteria_matches = self._get_criteria_matches_previous_day(
+            matches = self._get_criteria_matches_previous_day(
                 day,
                 strategy_config['indicator_criteria'],
                 strategy_config.get('min_price', self.MIN_PRICE),
@@ -62,7 +55,7 @@ class StrategyBacktester:
 
             trades = self._evaluate_matches(
                 day,
-                criteria_matches,
+                matches,
                 strategy_config['target_min_gain_pct'],
                 strategy_config['target_days']
             )
@@ -73,8 +66,8 @@ class StrategyBacktester:
                 self._aggregate_daily_results(
                     day,
                     trades,
-                    total_scanned=len(self.price_cache),
-                    criteria_matches=len(criteria_matches)
+                    total_scanned=len(self.indicator_cache),
+                    criteria_matches=len(matches)
                 )
             )
 
@@ -85,7 +78,7 @@ class StrategyBacktester:
         }
 
     # ============================================================
-    # UNIVERSE (NO LIMITS)
+    # UNIVERSE
     # ============================================================
 
     def _build_dynamic_universe(self):
@@ -99,10 +92,7 @@ class StrategyBacktester:
             try:
                 df = pd.read_csv(src, sep="|")
                 col = "Symbol" if "Symbol" in df.columns else df.columns[0]
-                symbols |= {
-                    s for s in df[col].astype(str)
-                    if s.isalpha()
-                }
+                symbols |= {s for s in df[col].astype(str) if s.isalpha()}
             except Exception:
                 continue
 
@@ -110,11 +100,12 @@ class StrategyBacktester:
         self.logger.info(f"Universe size: {len(self.universe)}")
 
     # ============================================================
-    # DATA DOWNLOAD (STRICT TO STRATEGY DATES)
+    # DATA (WITH INDICATOR WARMUP)
     # ============================================================
 
     def _download_price_data(self, start, end):
-        fetch_start = start - timedelta(days=5)
+
+        fetch_start = start - timedelta(days=self.INDICATOR_WARMUP_DAYS)
         fetch_end = end + timedelta(days=5)
 
         for i in range(0, len(self.universe), 50):
@@ -126,14 +117,14 @@ class StrategyBacktester:
                     start=fetch_start,
                     end=fetch_end,
                     group_by="ticker",
-                    progress=False,
-                    threads=True
+                    threads=True,
+                    progress=False
                 )
 
                 for symbol in batch:
                     try:
                         df = data if len(batch) == 1 else data[symbol]
-                        if isinstance(df, pd.DataFrame) and len(df) >= 10:
+                        if isinstance(df, pd.DataFrame) and len(df) > 20:
                             self.price_cache[symbol] = df
                             self.indicator_cache[symbol] = self._calculate_indicators(df)
                     except Exception:
@@ -144,28 +135,23 @@ class StrategyBacktester:
                 continue
 
     # ============================================================
-    # CRITERIA MATCHING
+    # CRITERIA
     # ============================================================
 
     def _get_criteria_matches_previous_day(
-        self,
-        date,
-        criteria,
-        min_price,
-        max_price,
-        min_volume
+        self, date, criteria, min_price, max_price, min_volume
     ):
         matches = []
 
         for symbol, df in self.indicator_cache.items():
-            if date not in df.index:
+            past = [d for d in df.index if d < date]
+            if not past:
                 continue
 
-            prev_day = df.index[df.index < date]
-            if len(prev_day) == 0:
-                continue
+            row = df.loc[past[-1]]
 
-            row = df.loc[prev_day[-1]]
+            if pd.isna(row["rsi"]):
+                continue
 
             if row["close"] < min_price or row["volume"] < min_volume:
                 continue
@@ -175,7 +161,7 @@ class StrategyBacktester:
             if self._check_criteria(row, criteria):
                 matches.append({
                     "symbol": symbol,
-                    "signal_date": prev_day[-1],
+                    "signal_date": past[-1],
                     "entry_price": float(row["close"]),
                     "volume": int(row["volume"]),
                 })
@@ -186,7 +172,7 @@ class StrategyBacktester:
         return matches
 
     # ============================================================
-    # TRADE EVALUATION
+    # TRADES
     # ============================================================
 
     def _evaluate_matches(self, date, matches, target_pct, target_days):
@@ -194,10 +180,7 @@ class StrategyBacktester:
 
         for m in matches:
             peak, exit_price, gain = self._calculate_outcome(
-                m["symbol"],
-                date,
-                m["entry_price"],
-                target_days
+                m["symbol"], date, m["entry_price"], target_days
             )
 
             hit = peak is not None and peak >= target_pct
@@ -213,7 +196,7 @@ class StrategyBacktester:
                 "hit_target": hit,
                 "actual_gain_pct": gain,
                 "exit_price": exit_price,
-                "trade_type": "true_positive" if hit else "false_positive"
+                "trade_type": "true_positive" if hit else "false_positive",
             })
 
         return trades
@@ -266,7 +249,7 @@ class StrategyBacktester:
         out = pd.DataFrame(index=pd.to_datetime(df.index).date)
         out["close"] = df["Close"]
         out["volume"] = df["Volume"]
-        out["rsi"] = RSIIndicator(df["Close"]).rsi()
+        out["rsi"] = RSIIndicator(df["Close"], window=14).rsi()
         return out
 
     def _check_criteria(self, row, criteria):
