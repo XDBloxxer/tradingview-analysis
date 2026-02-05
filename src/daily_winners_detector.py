@@ -1,6 +1,6 @@
 """
 Daily Winners Detector - Uses TradingView MarketMovers for ACTUAL daily gainers
-Gets ACTUAL top daily gainers based on today's performance
+Gets ACTUAL top daily gainers from major exchanges (NASDAQ, NYSE, AMEX)
 """
 
 import logging
@@ -16,6 +16,7 @@ from .rate_limiter import RateLimiter
 class DailyWinnersDetector:
     """
     Detects top daily winners using TradingView MarketMovers
+    Filters to major exchanges only (NASDAQ, NYSE, AMEX)
     """
     
     def __init__(self, config: dict):
@@ -33,7 +34,6 @@ class DailyWinnersDetector:
         # Stock universe filters
         self.min_price = detection_config.get("min_price", 0.50)
         self.min_volume = detection_config.get("min_volume", 100000)
-        self.exchanges = detection_config.get("exchanges", ["NASDAQ", "NYSE", "AMEX"])
         
         # Initialize components
         self.rate_limiter = RateLimiter(config)
@@ -65,77 +65,87 @@ class DailyWinnersDetector:
         
         all_candidates = []
         
-        try:
-            self.rate_limiter.wait()
-            
-            # Get actual day gainers from TradingView
-            gainers_result = self.market_movers.scrape(
-                market='stocks-usa',
-                category='gainers',
-                limit=100  # Get more to filter
-            )
-            
-            if gainers_result and gainers_result.get('status') == 'success':
-                gainers = gainers_result.get('data', [])
-                
-                self.logger.info(f"Got {len(gainers)} gainers from TradingView MarketMovers")
-                
-                # Debug: log first few items to see structure
-                if gainers:
-                    self.logger.info(f"Sample gainer data: {gainers[0]}")
-                
-                for item in gainers:
-                    try:
-                        # Extract symbol and exchange
-                        symbol_full = item.get('symbol', '')
-                        if ':' in symbol_full:
-                            item_exchange, symbol = symbol_full.split(':', 1)
-                        else:
-                            symbol = symbol_full
-                            item_exchange = 'NASDAQ'
-                        
-                        # Map TradingView exchange names to our format
-                        exchange_map = {
-                            'NASDAQ': 'NASDAQ',
-                            'NYSE': 'NYSE',
-                            'AMEX': 'AMEX',
-                            'NYSEAmerican': 'AMEX',
-                            'US': 'NASDAQ',  # Generic US stocks default to NASDAQ
-                        }
-                        
-                        exchange = exchange_map.get(item_exchange, item_exchange.upper())
-                        
-                        # Accept any US exchange if not in our specific list
-                        # This is more permissive - we'll take US stocks regardless
-                        if exchange not in self.exchanges and item_exchange not in ['NASDAQ', 'NYSE', 'AMEX', 'NYSEAmerican', 'US']:
-                            self.logger.debug(f"Skipping {symbol} - exchange {item_exchange} not in target list")
-                            continue
-                        
-                        price = item.get('close', 0)
-                        change_pct = item.get('change', 0)
-                        volume = item.get('volume', 0)
-                        
-                        # Apply filters
-                        if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
-                            all_candidates.append({
-                                'symbol': symbol,
-                                'exchange': exchange,
-                                'price': float(price),
-                                'change_pct': float(change_pct),
-                                'volume': int(volume)
-                            })
-                            self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
-                    except Exception as e:
-                        self.logger.debug(f"Error processing gainer: {e}")
-                        continue
-            else:
-                self.logger.warning(f"MarketMovers failed: {gainers_result.get('status', 'unknown')}")
+        # Try multiple markets to get major exchange stocks
+        # These are the specific market parameters that return NASDAQ/NYSE/AMEX stocks
+        markets_to_try = [
+            'stocks-usa',  # General US stocks
+            'nasdaq',      # NASDAQ specific
+            'nyse',        # NYSE specific
+        ]
         
-        except Exception as e:
-            self.logger.error(f"Error fetching from MarketMovers: {e}")
+        for market in markets_to_try:
+            try:
+                self.rate_limiter.wait()
+                
+                self.logger.info(f"Fetching gainers from market: {market}")
+                
+                # Get actual day gainers from TradingView
+                gainers_result = self.market_movers.scrape(
+                    market=market,
+                    category='gainers',
+                    limit=50  # Get 50 per market
+                )
+                
+                if gainers_result and gainers_result.get('status') == 'success':
+                    gainers = gainers_result.get('data', [])
+                    
+                    self.logger.info(f"Got {len(gainers)} gainers from {market}")
+                    
+                    # Debug: log first item to see structure (only once)
+                    if gainers and not all_candidates:
+                        self.logger.debug(f"Sample gainer: {gainers[0]}")
+                    
+                    for item in gainers:
+                        try:
+                            # Extract symbol and exchange
+                            symbol_full = item.get('symbol', '')
+                            if ':' in symbol_full:
+                                item_exchange, symbol = symbol_full.split(':', 1)
+                            else:
+                                symbol = symbol_full
+                                item_exchange = 'NASDAQ'
+                            
+                            # Skip OTC stocks entirely
+                            if item_exchange == 'OTC':
+                                continue
+                            
+                            # Map to standard exchange names
+                            exchange_map = {
+                                'NASDAQ': 'NASDAQ',
+                                'NYSE': 'NYSE',
+                                'AMEX': 'AMEX',
+                                'NYSEAmerican': 'AMEX',
+                            }
+                            exchange = exchange_map.get(item_exchange, item_exchange)
+                            
+                            price = item.get('close', 0)
+                            change_pct = item.get('change', 0)
+                            volume = item.get('volume', 0)
+                            
+                            # Apply filters
+                            if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
+                                # Check if we already have this symbol (deduplicate)
+                                if not any(c['symbol'] == symbol for c in all_candidates):
+                                    all_candidates.append({
+                                        'symbol': symbol,
+                                        'exchange': exchange,
+                                        'price': float(price),
+                                        'change_pct': float(change_pct),
+                                        'volume': int(volume)
+                                    })
+                                    self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
+                        except Exception as e:
+                            self.logger.debug(f"Error processing gainer: {e}")
+                            continue
+                else:
+                    self.logger.warning(f"MarketMovers failed for {market}: {gainers_result.get('status', 'unknown')}")
+            
+            except Exception as e:
+                self.logger.error(f"Error fetching from MarketMovers ({market}): {e}")
+                continue
         
         if not all_candidates:
-            self.logger.warning("No winners found")
+            self.logger.warning("No winners found after checking all markets")
             return []
         
         # Convert to DataFrame and sort
