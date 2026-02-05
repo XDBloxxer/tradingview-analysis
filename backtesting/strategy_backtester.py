@@ -38,6 +38,10 @@ class StrategyBacktester:
     4. Tracking true positives, false positives, and missed opportunities
     """
     
+    # HARDCODED LIMITS - Change these values to adjust analysis scope
+    TOP_WINNERS_PER_DAY = 10  # How many top daily winners to track
+    MAX_CRITERIA_MATCHES = 50  # Max stocks to analyze that match criteria
+    
     # Parallel processing
     MAX_WORKERS = 5
     
@@ -87,8 +91,6 @@ class StrategyBacktester:
                 - target_days: Days to hold (1 = same day, 2 = next day, etc.)
                 - min_price, max_price, min_volume: Stock filters
                 - exchanges: List of exchanges to scan
-                - top_winners_count: How many top winners to track per day (default 10)
-                - max_criteria_matches: Max stocks to analyze that match criteria (default 50)
             progress_callback: Optional callback for progress updates
             
         Returns:
@@ -102,15 +104,11 @@ class StrategyBacktester:
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
         
-        # Get limits
-        top_winners_count = strategy_config.get('top_winners_count', 10)
-        max_criteria_matches = strategy_config.get('max_criteria_matches', 50)
-        
         self.logger.info(f"Period: {start_date} to {end_date}")
         self.logger.info(f"Target gain: {strategy_config['target_min_gain_pct']}% in {strategy_config['target_days']} day(s)")
         self.logger.info(f"Indicator criteria: {len(strategy_config['indicator_criteria'])} conditions")
-        self.logger.info(f"Top winners to track: {top_winners_count}")
-        self.logger.info(f"Max criteria matches to analyze: {max_criteria_matches}")
+        self.logger.info(f"Top winners to track: {self.TOP_WINNERS_PER_DAY} (hardcoded)")
+        self.logger.info(f"Max criteria matches to analyze: {self.MAX_CRITERIA_MATCHES} (hardcoded)")
         
         # Generate list of trading days
         trading_days = self._get_trading_days(start_date, end_date)
@@ -130,7 +128,7 @@ class StrategyBacktester:
             # Step 1: Get top winners for this day
             winners = self._get_top_winners(
                 test_date,
-                top_winners_count,
+                self.TOP_WINNERS_PER_DAY,
                 strategy_config.get('exchanges', ['NASDAQ', 'NYSE', 'AMEX']),
                 strategy_config.get('min_price', 0.50),
                 strategy_config.get('min_volume', 100000)
@@ -142,7 +140,7 @@ class StrategyBacktester:
             criteria_matches = self._get_criteria_matches(
                 test_date,
                 strategy_config['indicator_criteria'],
-                max_criteria_matches,
+                self.MAX_CRITERIA_MATCHES,
                 strategy_config.get('exchanges', ['NASDAQ', 'NYSE', 'AMEX']),
                 strategy_config.get('min_price', 0.50),
                 strategy_config.get('max_price'),
