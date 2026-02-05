@@ -1,6 +1,7 @@
 """
 Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
+Can fetch data for current day or historical dates
 """
 
 import logging
@@ -131,8 +132,13 @@ class IntradayDataCollector:
         exchange = winner.get('exchange', 'NASDAQ')
         
         try:
+            # Check if target date is today - affects data availability
+            is_today = target_date.date() == datetime.now().date()
+            
             # Fetch INTRADAY data for market open/close
-            intraday_df = self._fetch_intraday_data(symbol, target_date.date())
+            # For today: we can get current intraday bars
+            # For historical: yfinance limits to last 60 days
+            intraday_df = self._fetch_intraday_data(symbol, target_date.date(), is_today)
             
             # Fetch DAILY data for day prior
             daily_df = self._fetch_daily_data(symbol, target_date.date())
@@ -171,10 +177,16 @@ class IntradayDataCollector:
     def _fetch_intraday_data(
         self,
         symbol: str,
-        target_date: datetime.date
+        target_date: datetime.date,
+        is_today: bool = False
     ) -> Optional[pd.DataFrame]:
         """
         Fetch 5-minute intraday data for target date
+        
+        Args:
+            symbol: Stock symbol
+            target_date: Target date
+            is_today: Whether target date is today (affects data fetching strategy)
         """
         cache_key = f"{symbol}:intraday:{target_date}"
         if cache_key in self.cache:
@@ -183,19 +195,29 @@ class IntradayDataCollector:
         try:
             ticker = yf.Ticker(symbol)
             
-            # yfinance intraday: last 60 days only
-            # Create datetime range for target date
-            start_dt = datetime.combine(target_date, time(9, 0))  # 9am
-            end_dt = datetime.combine(target_date, time(16, 30))  # 4:30pm
+            if is_today:
+                # For today, fetch last available intraday data
+                df = ticker.history(period='1d', interval='5m')
+            else:
+                # For historical dates - yfinance only keeps 60 days of intraday
+                # Create datetime range for target date
+                start_dt = datetime.combine(target_date, time(9, 0))  # 9am
+                end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0))  # Next day midnight
+                
+                # Check if date is within 60-day window
+                days_ago = (datetime.now().date() - target_date).days
+                if days_ago > 60:
+                    self.logger.debug(f"Date {target_date} is beyond 60-day intraday limit for {symbol}")
+                    return None
+                
+                # Fetch 5-minute data
+                df = ticker.history(
+                    start=start_dt,
+                    end=end_dt,
+                    interval='5m'
+                )
             
-            # Fetch 5-minute data
-            df = ticker.history(
-                start=start_dt,
-                end=end_dt,
-                interval='5m'
-            )
-            
-            if df.empty or len(df) < 10:
+            if df.empty or len(df) < 5:
                 self.logger.debug(f"Insufficient intraday data for {symbol}")
                 return None
             
@@ -227,7 +249,7 @@ class IntradayDataCollector:
             
             df = ticker.history(start=start_date, end=end_date, interval='1d')
             
-            if df.empty or len(df) < 50:
+            if df.empty or len(df) < 20:
                 return None
             
             indicators_df = self._calculate_all_indicators(df)
@@ -247,19 +269,19 @@ class IntradayDataCollector:
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market open (9:30-9:40am)"""
+        """Extract indicators at market open (9:30-9:45am)"""
         try:
             # Find bars around 9:30am
-            target_time = time(9, 30)
-            
-            # Filter to morning bars
             morning_bars = intraday_df[
                 (intraday_df.index.time >= time(9, 30)) &
                 (intraday_df.index.time <= time(9, 45))
             ]
             
             if morning_bars.empty:
-                return None
+                # Try to get first bar of the day
+                morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
+                if morning_bars.empty:
+                    return None
             
             # Use first available bar
             open_data = morning_bars.iloc[0]
@@ -293,16 +315,19 @@ class IntradayDataCollector:
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market close (3:50-4pm)"""
+        """Extract indicators at market close (3:55-4:00pm)"""
         try:
             # Find bars around 4pm
             close_bars = intraday_df[
-                (intraday_df.index.time >= time(15, 50)) &
+                (intraday_df.index.time >= time(15, 55)) &
                 (intraday_df.index.time <= time(16, 0))
             ]
             
             if close_bars.empty:
-                return None
+                # Try to get last bar of the day
+                close_bars = intraday_df[intraday_df.index.time <= time(16, 0)]
+                if close_bars.empty:
+                    return None
             
             # Use last available bar
             close_data = close_bars.iloc[-1]
@@ -340,7 +365,7 @@ class IntradayDataCollector:
         try:
             prior_date = target_date.date() - timedelta(days=1)
             
-            # Find closest prior date
+            # Find closest prior date (handles weekends/holidays)
             available_dates = [d for d in daily_df.index if d <= prior_date]
             
             if not available_dates:
@@ -402,12 +427,17 @@ class IntradayDataCollector:
         except:
             pass
         
+        # EMAs
+        for period in [10, 20, 50]:
+            try:
+                result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
+            except:
+                pass
+        
         return result
     
     def _calculate_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calculate full indicators on daily data"""
-        # Use the same comprehensive calculation from document 20
-        # (Copy the full method from the original file)
         result = pd.DataFrame(index=df.index)
         
         result['close'] = df['Close']
@@ -416,19 +446,71 @@ class IntradayDataCollector:
         result['low'] = df['Low']
         result['volume'] = df['Volume']
         
+        # RSI
         try:
             rsi = RSIIndicator(close=df['Close'], window=14)
-            result['RSI'] = rsi.rsi()
+            result['rsi'] = rsi.rsi()
         except:
             pass
         
+        # MACD
         try:
             macd = MACD(close=df['Close'])
-            result['MACD.macd'] = macd.macd()
-            result['MACD.signal'] = macd.macd_signal()
+            result['macd.macd'] = macd.macd()
+            result['macd.signal'] = macd.macd_signal()
         except:
             pass
         
-        # Add more indicators as needed...
+        # Stochastic
+        try:
+            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'])
+            result['stoch.k'] = stoch.stoch()
+            result['stoch.d'] = stoch.stoch_signal()
+        except:
+            pass
+        
+        # ADX
+        try:
+            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'])
+            result['adx'] = adx.adx()
+        except:
+            pass
+        
+        # Bollinger Bands
+        try:
+            bb = BollingerBands(close=df['Close'])
+            result['bb.upper'] = bb.bollinger_hband()
+            result['bb.lower'] = bb.bollinger_lband()
+            result['bb.middle'] = bb.bollinger_mavg()
+        except:
+            pass
+        
+        # ATR
+        try:
+            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'])
+            result['atr'] = atr.average_true_range()
+        except:
+            pass
+        
+        # EMAs
+        for period in [10, 20, 50, 200]:
+            try:
+                result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
+            except:
+                pass
+        
+        # SMAs
+        for period in [10, 20, 50, 200]:
+            try:
+                result[f'sma{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
+            except:
+                pass
+        
+        # Volume indicators
+        try:
+            result['volume_sma_20'] = df['Volume'].rolling(window=20).mean()
+            result['volume_ratio'] = df['Volume'] / result['volume_sma_20']
+        except:
+            pass
         
         return result
