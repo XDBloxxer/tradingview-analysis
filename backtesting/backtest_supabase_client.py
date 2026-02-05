@@ -50,26 +50,45 @@ class BacktestSupabaseClient:
     
     def _sanitize_value(self, value: Any) -> Any:
         """Sanitize value for Supabase"""
+    
         if value is None:
             return None
+    
+        # Handle pandas / numpy arrays or Series
+        if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
+            # Convert numpy arrays / Series to Python lists
+            if isinstance(value, (np.ndarray, pd.Series)):
+                value = value.tolist()
+    
+            # If list is empty, store NULL
+            if len(value) == 0:
+                return None
+    
+            return value
+    
+        # Handle pandas scalar NA (must be AFTER array handling)
         if pd.isna(value):
             return None
+    
+        # NumPy scalars
         if isinstance(value, np.integer):
             return int(value)
+    
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
             return float(value)
+    
         if isinstance(value, np.bool_):
             return bool(value)
+    
+        # Native floats
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
-        return value
     
-    def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Sanitize dictionary"""
-        return {k: self._sanitize_value(v) for k, v in data.items()}
+        return value
+
     
     # ========================================================================
     # STRATEGIES
