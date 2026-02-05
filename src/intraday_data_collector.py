@@ -12,6 +12,8 @@ import pandas as pd
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from zoneinfo import ZoneInfo
+
 
 # Data sources
 import yfinance as yf
@@ -135,7 +137,16 @@ class IntradayDataCollector:
         
         try:
             # Check if target date is today - affects data availability
-            is_today = target_date.date() == datetime.now().date()
+            market_tz = ZoneInfo("America/New_York")
+            now_et = datetime.now(market_tz)
+            
+            market_closed = now_et.time() >= time(16, 5)
+            
+            is_today = (
+                target_date.date() == now_et.date()
+                and not market_closed
+            )
+
             
             # Fetch INTRADAY data for market open/close
             intraday_df = self._fetch_intraday_data(symbol, target_date.date(), is_today)
