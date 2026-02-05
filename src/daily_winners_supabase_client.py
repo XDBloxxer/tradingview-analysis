@@ -154,18 +154,49 @@ class DailyWinnersSupabaseClient:
             return 0
         
         try:
-            # Sanitize all data
-            sanitized_winners = [self._sanitize_dict(w) for w in winners]
+            # Check which symbols already exist for this date
+            detection_date = winners[0].get('detection_date')
+            existing_symbols = set()
             
-            # Upsert data (insert or update if exists based on unique constraint)
-            # This will update existing records or insert new ones
-            response = self.client.table(self.tables["winners"]).upsert(
-                sanitized_winners,
-                on_conflict="symbol,detection_date"
+            try:
+                response = self.client.table(self.tables["winners"]) \
+                    .select("symbol") \
+                    .eq("detection_date", detection_date) \
+                    .execute()
+                
+                if response.data:
+                    existing_symbols = {row['symbol'] for row in response.data}
+                    self.logger.info(f"Found {len(existing_symbols)} existing winners for {detection_date}")
+            except Exception as e:
+                self.logger.debug(f"Could not check existing winners: {e}")
+            
+            # Filter out symbols that already exist (don't overwrite old data)
+            new_winners = []
+            skipped_count = 0
+            
+            for winner in winners:
+                if winner.get('symbol') not in existing_symbols:
+                    new_winners.append(winner)
+                else:
+                    skipped_count += 1
+            
+            if skipped_count > 0:
+                self.logger.info(f"Skipping {skipped_count} winners that already exist in database")
+            
+            if not new_winners:
+                self.logger.info("No new winners to write (all already exist)")
+                return 0
+            
+            # Sanitize all data
+            sanitized_winners = [self._sanitize_dict(w) for w in new_winners]
+            
+            # Insert new data only
+            response = self.client.table(self.tables["winners"]).insert(
+                sanitized_winners
             ).execute()
             
             count = len(response.data) if response.data else 0
-            self.logger.info(f"Wrote {count} winners to Supabase")
+            self.logger.info(f"Wrote {count} NEW winners to Supabase")
             return count
             
         except Exception as e:
@@ -175,8 +206,7 @@ class DailyWinnersSupabaseClient:
     def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
         """
         Write intraday indicator data to Supabase
-        Uses upsert to handle duplicates - will update if record exists
-        NO LONGER DELETES EXISTING DATA
+        Only writes NEW data - skips stocks that already exist for this date
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
@@ -199,8 +229,42 @@ class DailyWinnersSupabaseClient:
                 continue
             
             try:
+                # Check which symbols already exist for this date
+                detection_date = data[0].get('detection_date')
+                existing_symbols = set()
+                
+                try:
+                    response = self.client.table(self.tables[table_key]) \
+                        .select("symbol") \
+                        .eq("detection_date", detection_date) \
+                        .execute()
+                    
+                    if response.data:
+                        existing_symbols = {row['symbol'] for row in response.data}
+                        self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
+                except Exception as e:
+                    self.logger.debug(f"Could not check existing {data_type}: {e}")
+                
+                # Filter out symbols that already exist
+                new_data = []
+                skipped_count = 0
+                
+                for record in data:
+                    if record.get('symbol') not in existing_symbols:
+                        new_data.append(record)
+                    else:
+                        skipped_count += 1
+                
+                if skipped_count > 0:
+                    self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
+                
+                if not new_data:
+                    self.logger.info(f"No new {data_type} data to write (all already exist)")
+                    counts[data_type] = 0
+                    continue
+                
                 # Sanitize all data
-                sanitized_data = [self._sanitize_dict(d) for d in data]
+                sanitized_data = [self._sanitize_dict(d) for d in new_data]
                 
                 # Debug: Log first record to see what we're sending
                 if sanitized_data:
@@ -209,16 +273,14 @@ class DailyWinnersSupabaseClient:
                     for key, val in list(sample.items())[:5]:  # Show first 5 fields
                         self.logger.debug(f"  {key}: {val} (type: {type(val).__name__})")
                 
-                # Upsert data (no deletion - just insert or update)
-                # Unique constraint is on (symbol, detection_date, snapshot_type)
-                response = self.client.table(self.tables[table_key]).upsert(
-                    sanitized_data,
-                    on_conflict="symbol,detection_date"
+                # Insert new data only
+                response = self.client.table(self.tables[table_key]).insert(
+                    sanitized_data
                 ).execute()
                 
                 count = len(response.data) if response.data else 0
                 counts[data_type] = count
-                self.logger.info(f"Wrote {count} rows to {self.tables[table_key]}")
+                self.logger.info(f"Wrote {count} NEW rows to {self.tables[table_key]}")
                 
             except Exception as e:
                 self.logger.error(f"Error writing {data_type} data: {str(e)}", exc_info=True)
