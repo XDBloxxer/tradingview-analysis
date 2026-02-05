@@ -1,5 +1,5 @@
 """
-Daily Winners Detector - Uses yfinance day_gainers screener
+Daily Winners Detector - Scrapes Yahoo Finance day gainers page
 Gets ACTUAL top daily gainers dynamically from market
 """
 
@@ -7,14 +7,15 @@ import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import pandas as pd
-import yfinance as yf
+import requests
+from bs4 import BeautifulSoup
 
 from .rate_limiter import RateLimiter
 
 
 class DailyWinnersDetector:
     """
-    Detects top daily winners using yfinance day_gainers screener
+    Detects top daily winners by scraping Yahoo Finance day gainers
     """
     
     def __init__(self, config: dict):
@@ -37,13 +38,13 @@ class DailyWinnersDetector:
         self.rate_limiter = RateLimiter(config)
         
         self.logger.info(
-            f"Daily Winners detector initialized (using yfinance day_gainers): "
+            f"Daily Winners detector initialized (scraping Yahoo Finance): "
             f"min_price={self.min_price}, min_volume={self.min_volume}"
         )
     
     def detect_top_winners(self, top_n: int = 10, target_date: datetime = None) -> List[Dict[str, Any]]:
         """
-        Detect top N daily winners using yfinance day_gainers screener
+        Detect top N daily winners by scraping Yahoo Finance day gainers
         
         Args:
             top_n: Number of top winners to return
@@ -57,63 +58,70 @@ class DailyWinnersDetector:
         
         target_date_str = target_date.date().isoformat()
         
-        # Note: yfinance screeners only work for current day
+        # Note: Yahoo Finance screeners only work for current day
         is_today = target_date.date() == datetime.now().date()
         
         if not is_today:
             self.logger.warning(
-                f"yfinance day_gainers only works for current day. "
+                f"Yahoo Finance day gainers only shows current day. "
                 f"Requested date {target_date_str} is not today. "
-                f"Will attempt to get current day's gainers instead."
+                f"Will fetch current day's gainers instead."
             )
         
-        self.logger.info(f"Fetching ACTUAL day gainers from yfinance screener...")
+        self.logger.info(f"Fetching ACTUAL day gainers from Yahoo Finance...")
         
         try:
-            # Get day gainers screener
-            screener = yf.Screener()
+            # Scrape Yahoo Finance day gainers page
+            url = "https://finance.yahoo.com/screener/predefined/day_gainers"
             
-            # Fetch day gainers (this is the actual screener that gets real-time top gainers)
-            result = screener.get_screeners(['day_gainers'], count=100)
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
-            if not result or 'day_gainers' not in result:
-                self.logger.error("Failed to get day_gainers from yfinance")
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            
+            # Parse HTML
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            # Find the table with gainers data
+            # Yahoo Finance uses different structure, try to find the data
+            table = soup.find('table')
+            
+            if not table:
+                self.logger.error("Could not find data table on Yahoo Finance page")
                 return []
             
-            quotes = result['day_gainers'].get('quotes', [])
+            # Parse table into DataFrame
+            df = pd.read_html(str(table))[0]
             
-            if not quotes:
-                self.logger.warning("No quotes returned from day_gainers screener")
-                return []
-            
-            self.logger.info(f"Got {len(quotes)} stocks from day_gainers screener")
+            self.logger.info(f"Found {len(df)} stocks from Yahoo Finance day gainers")
             
             # Process and filter results
             all_candidates = []
             
-            for quote in quotes:
+            for idx, row in df.iterrows():
                 try:
-                    symbol = quote.get('symbol', '')
+                    # Extract data from row
+                    # Column names vary, try different possibilities
+                    symbol = row.get('Symbol', row.get('Ticker', ''))
                     
-                    # Get exchange
-                    exchange = quote.get('exchange', 'NASDAQ')
-                    
-                    # Map yfinance exchanges to our format
-                    if exchange in ['NMS', 'NGM', 'NCM']:
-                        exchange = 'NASDAQ'
-                    elif exchange == 'NYQ':
-                        exchange = 'NYSE'
-                    elif exchange in ['NYE', 'ASE']:
-                        exchange = 'AMEX'
-                    
-                    # Skip OTC and foreign exchanges
-                    if exchange not in ['NASDAQ', 'NYSE', 'AMEX']:
-                        self.logger.debug(f"Skipping {symbol} - exchange {exchange} not supported")
+                    if not symbol:
                         continue
                     
-                    price = quote.get('regularMarketPrice', 0)
-                    change_pct = quote.get('regularMarketChangePercent', 0)
-                    volume = quote.get('regularMarketVolume', 0)
+                    # Get price and change
+                    price = row.get('Price (Intraday)', row.get('Price', 0))
+                    change_str = row.get('% Change', row.get('Change %', '0'))
+                    volume = row.get('Volume', row.get('Avg Vol (3 month)', 0))
+                    
+                    # Clean up change percentage (remove % sign)
+                    if isinstance(change_str, str):
+                        change_pct = float(change_str.replace('%', '').replace('+', ''))
+                    else:
+                        change_pct = float(change_str)
+                    
+                    # Determine exchange (assume NASDAQ by default for US stocks)
+                    exchange = 'NASDAQ'
                     
                     # Apply filters
                     if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
@@ -124,10 +132,10 @@ class DailyWinnersDetector:
                             'change_pct': float(change_pct),
                             'volume': int(volume)
                         })
-                        self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
+                        self.logger.debug(f"Added {symbol}: +{change_pct:.2f}%")
                     
                 except Exception as e:
-                    self.logger.debug(f"Error processing quote: {e}")
+                    self.logger.debug(f"Error processing row: {e}")
                     continue
             
             if not all_candidates:
@@ -135,18 +143,18 @@ class DailyWinnersDetector:
                 return []
             
             # Convert to DataFrame and sort
-            df = pd.DataFrame(all_candidates)
-            df = df.sort_values('change_pct', ascending=False)
+            df_results = pd.DataFrame(all_candidates)
+            df_results = df_results.sort_values('change_pct', ascending=False)
             
             # Take top N
-            top_winners = df.head(top_n).to_dict('records')
+            top_winners = df_results.head(top_n).to_dict('records')
             
             # Add detection date and time
             for winner in top_winners:
                 winner['detection_date'] = target_date_str
                 winner['detection_time'] = '16:00:00'
             
-            self.logger.info(f"✓ Found top {len(top_winners)} ACTUAL daily winners for {target_date_str}:")
+            self.logger.info(f"✓ Found top {len(top_winners)} ACTUAL daily winners:")
             if top_winners:
                 for i, winner in enumerate(top_winners[:5], 1):
                     self.logger.info(f"  #{i}: {winner['symbol']} (+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}")
