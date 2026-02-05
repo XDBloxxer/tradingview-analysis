@@ -1,6 +1,7 @@
 """
 Strategy Backtester - Processes each date individually
 Finds actual daily gainers and criteria-matching stocks for each trading day
+FIXED: Uses TradingView screener to dynamically scan the market on each date
 """
 
 import logging
@@ -12,6 +13,7 @@ import yfinance as yf
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 import time
+from tradingview_scraper.symbols.screener import Screener
 
 
 class StrategyBacktester:
@@ -20,6 +22,8 @@ class StrategyBacktester:
     1. Top daily gainers (actual market winners)
     2. Stocks matching strategy criteria
     3. Overlap analysis and missed opportunities
+    
+    Uses TradingView Screener to dynamically scan the market on each date
     """
     
     def __init__(self, config: dict):
@@ -31,7 +35,7 @@ class StrategyBacktester:
         self.max_workers = 10
         self.request_delay = 0.5  # Delay between requests
         
-        self.logger.info("Strategy backtester initialized")
+        self.logger.info("Strategy backtester initialized (dynamic market scanning)")
     
     def run_backtest(
         self,
@@ -130,14 +134,14 @@ class StrategyBacktester:
     ) -> List[Dict[str, Any]]:
         """
         Process a single date:
-        1. Find top 20 daily gainers
-        2. Find 20 stocks matching criteria
+        1. Scan market for top 20 daily gainers
+        2. Scan market for 20 stocks matching criteria
         3. Check which ones hit target
         4. Classify all stocks
         """
         self.logger.debug(f"Processing {test_date}")
         
-        # Get top gainers for this date
+        # Get top gainers for this date (dynamic market scan)
         gainers = self._get_daily_gainers(test_date, top_n=20)
         
         if not gainers:
@@ -146,7 +150,7 @@ class StrategyBacktester:
         
         self.logger.debug(f"Found {len(gainers)} gainers")
         
-        # Get stocks matching criteria
+        # Get stocks matching criteria (dynamic market scan)
         criteria_matches = self._get_criteria_matches(
             test_date,
             criteria,
@@ -229,34 +233,48 @@ class StrategyBacktester:
     
     def _get_daily_gainers(self, date: datetime.date, top_n: int = 20) -> List[str]:
         """
-        Get top daily gainers for a specific date using yfinance
-        Scans a broad universe and finds actual gainers
+        Get top daily gainers for a specific date by:
+        1. Screening the entire market using TradingView
+        2. Getting historical performance for each stock on that date
+        3. Finding the actual top gainers
         """
-        # Use a broad universe of liquid stocks
-        # Get from major indices
-        indices = ['SPY', 'QQQ', 'IWM', 'DIA']
-        symbols = set()
+        self.logger.info(f"Scanning market for top gainers on {date}")
         
-        for index in indices:
-            try:
-                ticker = yf.Ticker(index)
-                # Get constituents would be ideal, but yfinance doesn't provide this
-                # Instead, we'll use a different approach
-                pass
-            except:
-                pass
+        # Use TradingView screener to get all tradable stocks
+        screener = Screener()
         
-        # Use a curated list of the most active stocks across exchanges
-        # This is a practical approach for backtesting
-        active_stocks = self._get_active_stocks_universe()
+        # Get all stocks with basic filters
+        results = screener.screen(
+            market='america',
+            filters=[
+                {'left': 'close', 'operation': 'greater', 'right': 0.5},
+                {'left': 'volume', 'operation': 'greater', 'right': 100000}
+            ],
+            limit=10000,  # Get as many as possible
+            sort_by='volume',
+            sort_order='desc'
+        )
         
-        # Get performance for all stocks on this date
+        if not results or results.get('status') != 'success':
+            self.logger.error("Screener failed")
+            return []
+        
+        symbols = []
+        for item in results.get('data', []):
+            symbol_full = item.get('symbol', '')
+            if ':' in symbol_full:
+                _, symbol = symbol_full.split(':', 1)
+                symbols.append(symbol)
+        
+        self.logger.info(f"Screener returned {len(symbols)} symbols")
+        
+        # Get performance for each symbol on the target date
         gainers = []
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_symbol = {
                 executor.submit(self._get_daily_performance, symbol, date): symbol
-                for symbol in active_stocks
+                for symbol in symbols
             }
             
             for future in as_completed(future_to_symbol):
@@ -267,48 +285,10 @@ class StrategyBacktester:
         # Sort by change_pct descending
         gainers.sort(key=lambda x: x['change_pct'], reverse=True)
         
+        self.logger.info(f"Found {len(gainers)} gainers, returning top {top_n}")
+        
         # Return top N symbols
         return [g['symbol'] for g in gainers[:top_n]]
-    
-    def _get_active_stocks_universe(self) -> List[str]:
-        """
-        Get a universe of active stocks to scan
-        Uses the most liquid stocks across NASDAQ, NYSE, AMEX
-        """
-        # This is a practical list of ~200 most active stocks
-        # In production, you could expand this or use a data provider
-        
-        # Top NASDAQ stocks
-        nasdaq = [
-            'AAPL', 'MSFT', 'GOOGL', 'GOOG', 'AMZN', 'NVDA', 'META', 'TSLA',
-            'AVGO', 'COST', 'NFLX', 'AMD', 'PEP', 'ADBE', 'CSCO', 'CMCSA',
-            'INTC', 'TMUS', 'INTU', 'TXN', 'QCOM', 'AMGN', 'HON', 'AMAT',
-            'SBUX', 'ISRG', 'ADI', 'BKNG', 'VRTX', 'GILD', 'REGN', 'LRCX',
-            'MU', 'PANW', 'MDLZ', 'PYPL', 'ADP', 'KLAC', 'SNPS', 'CDNS',
-            'MRVL', 'ABNB', 'ASML', 'MELI', 'FTNT', 'CRWD', 'WDAY', 'ADSK',
-            'TEAM', 'DASH', 'DDOG', 'ZS', 'SNOW', 'NET', 'DXCM', 'MRNA'
-        ]
-        
-        # Top NYSE stocks
-        nyse = [
-            'BRK-B', 'JPM', 'V', 'JNJ', 'WMT', 'PG', 'XOM', 'MA', 'UNH', 'HD',
-            'CVX', 'MRK', 'ABBV', 'LLY', 'PFE', 'KO', 'BAC', 'DIS', 'CRM',
-            'NKE', 'ORCL', 'TMO', 'ACN', 'ABT', 'MCD', 'VZ', 'DHR', 'ADBE',
-            'WFC', 'CMCSA', 'NEE', 'BMY', 'TXN', 'UPS', 'PM', 'RTX', 'SCHW',
-            'MS', 'LOW', 'HON', 'AMGN', 'GS', 'SPGI', 'BLK', 'CAT', 'AXP',
-            'DE', 'AMD', 'GE', 'MMM', 'BA', 'IBM', 'NOW', 'ISRG', 'GILD'
-        ]
-        
-        # Popular small/mid caps and volatile stocks
-        others = [
-            'GME', 'AMC', 'PLTR', 'RIVN', 'LCID', 'SOFI', 'NIO', 'COIN',
-            'HOOD', 'RBLX', 'U', 'OPEN', 'WISH', 'CLOV', 'BB', 'NOK',
-            'PLUG', 'FCEL', 'SPCE', 'SKLZ', 'DKNG', 'PENN', 'MARA', 'RIOT',
-            'SQ', 'ZM', 'DOCU', 'ROKU', 'TDOC', 'PTON', 'BYND', 'SPWR',
-            'ENPH', 'SEDG', 'BLNK', 'CHPT', 'QS', 'FSR', 'NKLA', 'WKHS'
-        ]
-        
-        return list(set(nasdaq + nyse + others))
     
     def _get_daily_performance(self, symbol: str, date: datetime.date) -> Optional[Dict]:
         """Get a stock's performance on a specific date"""
@@ -369,15 +349,46 @@ class StrategyBacktester:
         top_n: int = 20
     ) -> List[str]:
         """
-        Find stocks matching criteria on a specific date
-        Scans the active universe
+        Find stocks matching criteria on a specific date by:
+        1. Screening the entire market using TradingView
+        2. Checking each stock's indicators on that date
+        3. Finding matches
         """
         min_price = strategy_config.get('min_price', 0.50)
         max_price = strategy_config.get('max_price')
         min_volume = strategy_config.get('min_volume', 100000)
         
-        active_stocks = self._get_active_stocks_universe()
+        self.logger.info(f"Scanning market for criteria matches on {date}")
         
+        # Use TradingView screener to get all tradable stocks
+        screener = Screener()
+        
+        # Get all stocks with basic filters
+        results = screener.screen(
+            market='america',
+            filters=[
+                {'left': 'close', 'operation': 'greater', 'right': min_price},
+                {'left': 'volume', 'operation': 'greater', 'right': min_volume}
+            ],
+            limit=10000,
+            sort_by='volume',
+            sort_order='desc'
+        )
+        
+        if not results or results.get('status') != 'success':
+            self.logger.error("Screener failed")
+            return []
+        
+        symbols = []
+        for item in results.get('data', []):
+            symbol_full = item.get('symbol', '')
+            if ':' in symbol_full:
+                _, symbol = symbol_full.split(':', 1)
+                symbols.append(symbol)
+        
+        self.logger.info(f"Screener returned {len(symbols)} symbols, checking criteria")
+        
+        # Check criteria for each symbol
         matches = []
         
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -391,12 +402,14 @@ class StrategyBacktester:
                     max_price,
                     min_volume
                 ): symbol
-                for symbol in active_stocks
+                for symbol in symbols
             }
             
             for future in as_completed(future_to_symbol):
                 if future.result():
                     matches.append(future.result())
+        
+        self.logger.info(f"Found {len(matches)} criteria matches")
         
         return matches[:top_n]
     
