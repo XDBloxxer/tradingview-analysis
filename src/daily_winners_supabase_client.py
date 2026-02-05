@@ -1,7 +1,7 @@
 """
 Supabase client for Daily Winners tracking
 Completely separate tables from the spike/grinder analysis
-FIXED: No longer deletes existing data - appends new records
+ONLY writes NEW symbols that don't already exist for the date
 """
 
 import logging
@@ -90,58 +90,40 @@ class DailyWinnersSupabaseClient:
                 return None
             return value
         
-        # Handle strings that might be numbers
-        if isinstance(value, str):
-            value = value.strip()
-            if not value:
-                return None
-            # Try to parse as number
-            try:
-                # First try as float
-                float_val = float(value)
-                if np.isinf(float_val) or np.isnan(float_val):
-                    return None
-                # Check if it's actually an integer value
-                if float_val.is_integer():
-                    return int(float_val)
-                return float_val
-            except (ValueError, TypeError, AttributeError):
-                # Not a number, return as string
-                return value
-        
         return value
     
     def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize all values in a dictionary"""
+        return {k: self._sanitize_value(v) for k, v in data.items()}
+    
+    def _get_existing_symbols(self, table_name: str, detection_date: str) -> set:
         """
-        Sanitize all values in a dictionary, with special handling for known integer columns
+        Get set of symbols that already exist for a date in a table
+        
+        Args:
+            table_name: Name of table to check
+            detection_date: Date to check
+            
+        Returns:
+            Set of existing symbols
         """
-        integer_columns = {
-            'ema20_above_ema50', 'ema50_above_ema200', 
-            'price_above_ema20', 'ema10_above_ema20',
-            'gap_up', 'gap_down', 'volume'
-        }
-        
-        sanitized = {}
-        for k, v in data.items():
-            sanitized_val = self._sanitize_value(v)
+        try:
+            response = self.client.table(table_name) \
+                .select("symbol") \
+                .eq("detection_date", detection_date) \
+                .execute()
             
-            # Force specific columns to integer if they're not None
-            if k in integer_columns and sanitized_val is not None:
-                try:
-                    if isinstance(sanitized_val, str):
-                        sanitized_val = float(sanitized_val)
-                    sanitized_val = int(sanitized_val)
-                except (ValueError, TypeError):
-                    sanitized_val = None
-            
-            sanitized[k] = sanitized_val
-        
-        return sanitized
+            if response.data:
+                return {row['symbol'] for row in response.data}
+            return set()
+        except Exception as e:
+            self.logger.debug(f"Could not check existing symbols in {table_name}: {e}")
+            return set()
     
     def write_winners(self, winners: List[Dict[str, Any]]) -> int:
         """
         Write daily winners to Supabase
-        Uses upsert to handle duplicates gracefully (update if exists, insert if new)
+        ONLY writes NEW symbols that don't already exist for this date
         
         Args:
             winners: List of winner dictionaries
@@ -154,32 +136,18 @@ class DailyWinnersSupabaseClient:
             return 0
         
         try:
-            # Check which symbols already exist for this date
             detection_date = winners[0].get('detection_date')
-            existing_symbols = set()
             
-            try:
-                response = self.client.table(self.tables["winners"]) \
-                    .select("symbol") \
-                    .eq("detection_date", detection_date) \
-                    .execute()
-                
-                if response.data:
-                    existing_symbols = {row['symbol'] for row in response.data}
-                    self.logger.info(f"Found {len(existing_symbols)} existing winners for {detection_date}")
-            except Exception as e:
-                self.logger.debug(f"Could not check existing winners: {e}")
+            # Get existing symbols for this date
+            existing_symbols = self._get_existing_symbols(self.tables["winners"], detection_date)
             
-            # Filter out symbols that already exist (don't overwrite old data)
-            new_winners = []
-            skipped_count = 0
+            if existing_symbols:
+                self.logger.info(f"Found {len(existing_symbols)} existing winners for {detection_date}")
             
-            for winner in winners:
-                if winner.get('symbol') not in existing_symbols:
-                    new_winners.append(winner)
-                else:
-                    skipped_count += 1
+            # Filter out symbols that already exist
+            new_winners = [w for w in winners if w.get('symbol') not in existing_symbols]
             
+            skipped_count = len(winners) - len(new_winners)
             if skipped_count > 0:
                 self.logger.info(f"Skipping {skipped_count} winners that already exist in database")
             
@@ -206,7 +174,7 @@ class DailyWinnersSupabaseClient:
     def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
         """
         Write intraday indicator data to Supabase
-        Only writes NEW data - skips stocks that already exist for this date
+        ONLY writes NEW symbols that don't already exist for this date
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
@@ -229,32 +197,18 @@ class DailyWinnersSupabaseClient:
                 continue
             
             try:
-                # Check which symbols already exist for this date
                 detection_date = data[0].get('detection_date')
-                existing_symbols = set()
                 
-                try:
-                    response = self.client.table(self.tables[table_key]) \
-                        .select("symbol") \
-                        .eq("detection_date", detection_date) \
-                        .execute()
-                    
-                    if response.data:
-                        existing_symbols = {row['symbol'] for row in response.data}
-                        self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
-                except Exception as e:
-                    self.logger.debug(f"Could not check existing {data_type}: {e}")
+                # Get existing symbols for this date
+                existing_symbols = self._get_existing_symbols(self.tables[table_key], detection_date)
+                
+                if existing_symbols:
+                    self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
                 
                 # Filter out symbols that already exist
-                new_data = []
-                skipped_count = 0
+                new_data = [d for d in data if d.get('symbol') not in existing_symbols]
                 
-                for record in data:
-                    if record.get('symbol') not in existing_symbols:
-                        new_data.append(record)
-                    else:
-                        skipped_count += 1
-                
+                skipped_count = len(data) - len(new_data)
                 if skipped_count > 0:
                     self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
                 
@@ -265,13 +219,6 @@ class DailyWinnersSupabaseClient:
                 
                 # Sanitize all data
                 sanitized_data = [self._sanitize_dict(d) for d in new_data]
-                
-                # Debug: Log first record to see what we're sending
-                if sanitized_data:
-                    self.logger.debug(f"Sample {data_type} record being sent:")
-                    sample = sanitized_data[0]
-                    for key, val in list(sample.items())[:5]:  # Show first 5 fields
-                        self.logger.debug(f"  {key}: {val} (type: {type(val).__name__})")
                 
                 # Insert new data only
                 response = self.client.table(self.tables[table_key]).insert(
@@ -331,56 +278,6 @@ class DailyWinnersSupabaseClient:
             self.logger.error(f"Error reading winners: {str(e)}")
             return pd.DataFrame()
     
-    def read_intraday_data(
-        self,
-        snapshot_type: str,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-        limit: Optional[int] = None
-    ) -> pd.DataFrame:
-        """
-        Read intraday indicator data from Supabase
-        
-        Args:
-            snapshot_type: 'market_open', 'market_close', or 'day_prior'
-            start_date: Optional start date filter (ISO format)
-            end_date: Optional end date filter (ISO format)
-            limit: Optional limit on number of rows
-            
-        Returns:
-            DataFrame of intraday data
-        """
-        try:
-            table_name = self.tables.get(snapshot_type)
-            if not table_name:
-                self.logger.error(f"Invalid snapshot type: {snapshot_type}")
-                return pd.DataFrame()
-            
-            query = self.client.table(table_name).select("*")
-            
-            if start_date:
-                query = query.gte("detection_date", start_date)
-            
-            if end_date:
-                query = query.lte("detection_date", end_date)
-            
-            if limit:
-                query = query.limit(limit)
-            
-            # Order by detection date descending
-            query = query.order("detection_date", desc=True)
-            
-            response = query.execute()
-            
-            if not response.data:
-                return pd.DataFrame()
-            
-            return pd.DataFrame(response.data)
-            
-        except Exception as e:
-            self.logger.error(f"Error reading {snapshot_type} data: {str(e)}")
-            return pd.DataFrame()
-    
     def get_available_dates(self) -> List[str]:
         """
         Get list of all available detection dates
@@ -402,32 +299,6 @@ class DailyWinnersSupabaseClient:
         except Exception as e:
             self.logger.error(f"Error getting available dates: {str(e)}")
             return []
-    
-    def get_winners_for_date(self, detection_date: str) -> pd.DataFrame:
-        """
-        Get all winners for a specific date
-        
-        Args:
-            detection_date: Date in ISO format (YYYY-MM-DD)
-            
-        Returns:
-            DataFrame of winners for that date
-        """
-        try:
-            response = self.client.table(self.tables["winners"]) \
-                .select("*") \
-                .eq("detection_date", detection_date) \
-                .order("change_pct", desc=True) \
-                .execute()
-            
-            if not response.data:
-                return pd.DataFrame()
-            
-            return pd.DataFrame(response.data)
-            
-        except Exception as e:
-            self.logger.error(f"Error getting winners for {detection_date}: {str(e)}")
-            return pd.DataFrame()
     
     def check_date_exists(self, detection_date: str) -> bool:
         """
