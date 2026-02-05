@@ -103,13 +103,14 @@ class DailyWinnersDetector:
         # Take top N
         top_winners = df.head(top_n).to_dict('records')
         
-        # Add detection date
+        # Add detection date and time
         for winner in top_winners:
             winner['detection_date'] = target_date_str
             winner['detection_time'] = '16:00:00'  # 4pm NYC
         
         self.logger.info(f"Found top {len(top_winners)} winners")
-        self.logger.info(f"Top winner: {top_winners[0]['symbol']} (+{top_winners[0]['change_pct']:.2f}%)")
+        if top_winners:
+            self.logger.info(f"Top winner: {top_winners[0]['symbol']} (+{top_winners[0]['change_pct']:.2f}%)")
         
         return top_winners
     
@@ -134,15 +135,15 @@ class DailyWinnersDetector:
             
             self.logger.debug(f"Screening {market} market (exchange: {exchange})...")
             
-            # Get stocks sorted by performance
+            # Get stocks sorted by performance - focusing on actual daily gainers
             results = self.screener.screen(
                 market=market,
                 filters=[
                     {'left': 'close', 'operation': 'greater', 'right': self.min_price},
                     {'left': 'volume', 'operation': 'greater', 'right': self.min_volume},
-                    {'left': 'change', 'operation': 'greater', 'right': 0},  # Only positive movers
+                    {'left': 'change', 'operation': 'greater', 'right': 1.0},  # At least 1% gain to be a "winner"
                 ],
-                limit=500,  # Get top 500 movers
+                limit=500,  # Get top 500 to have a good pool
                 sort_by='change',  # Sort by percentage change
                 sort_order='desc'
             )
