@@ -152,3 +152,15 @@ daily_winners:
 # ============================================================================
 # BACKTESTING CONFIGURATION
 # ============================================================================
+backtesting:
+  # Number of parallel workers for backtesting
+  max_workers: 10
+  
+  # Delay between requests (seconds)
+  request_delay: 0.5
+  
+  # Number of top gainers to check per day
+  top_gainers_per_day: 20
+  
+  # Number of criteria matches to check per day
+  criteria_matches_per_day: 20
