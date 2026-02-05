@@ -539,7 +539,7 @@ class IntradayDataCollector:
         
         # Gaps (note the space in column name!)
         try:
-            result['gap_ %'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
+            result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
             result['gap_up'] = (result['gap_ %'] > 2).astype(int)
             result['gap_down'] = (result['gap_ %'] < -2).astype(int)
         except:
