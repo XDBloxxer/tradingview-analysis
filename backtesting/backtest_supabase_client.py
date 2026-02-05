@@ -1,11 +1,13 @@
 """
 Supabase client for backtesting data
 Handles reading/writing backtest strategies, results, and trades
+FIXED: Proper date serialization
 """
 
 import logging
 import os
 from typing import List, Dict, Any, Optional
+from datetime import date, datetime
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
@@ -50,45 +52,49 @@ class BacktestSupabaseClient:
     
     def _sanitize_value(self, value: Any) -> Any:
         """Sanitize value for Supabase"""
-    
         if value is None:
             return None
-    
+        
+        # Handle date/datetime objects
+        if isinstance(value, (date, datetime)):
+            if isinstance(value, datetime):
+                return value.date().isoformat()
+            return value.isoformat()
+        
         # Handle pandas / numpy arrays or Series
         if isinstance(value, (list, tuple, np.ndarray, pd.Series)):
-            # Convert numpy arrays / Series to Python lists
             if isinstance(value, (np.ndarray, pd.Series)):
                 value = value.tolist()
-    
-            # If list is empty, store NULL
             if len(value) == 0:
                 return None
-    
             return value
-    
-        # Handle pandas scalar NA (must be AFTER array handling)
+        
+        # Handle pandas scalar NA
         if pd.isna(value):
             return None
-    
+        
         # NumPy scalars
         if isinstance(value, np.integer):
             return int(value)
-    
+        
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
             return float(value)
-    
+        
         if isinstance(value, np.bool_):
             return bool(value)
-    
+        
         # Native floats
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
-    
+        
         return value
-
+    
+    def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Sanitize all values in a dictionary"""
+        return {k: self._sanitize_value(v) for k, v in data.items()}
     
     # ========================================================================
     # STRATEGIES
@@ -118,10 +124,12 @@ class BacktestSupabaseClient:
                 'max_price': strategy_config.get('max_price'),
                 'min_volume': strategy_config.get('min_volume', 100000),
                 'exchanges': strategy_config.get('exchanges', ['NASDAQ', 'NYSE', 'AMEX']),
+                'top_winners_count': strategy_config.get('top_winners_count', 10),
+                'max_criteria_matches': strategy_config.get('max_criteria_matches', 50),
                 'run_status': 'pending'
             }
             
-            data = self._sanitize_value(data)
+            data = self._sanitize_dict(data)
             
             response = self.client.table(self.tables["strategies"]).insert(data).execute()
             
@@ -154,7 +162,6 @@ class BacktestSupabaseClient:
             
             if response.data:
                 strategy = response.data[0]
-                # Parse JSON fields
                 if 'indicator_criteria' in strategy and isinstance(strategy['indicator_criteria'], str):
                     strategy['indicator_criteria'] = json.loads(strategy['indicator_criteria'])
                 return strategy
@@ -174,7 +181,6 @@ class BacktestSupabaseClient:
             
             strategies = response.data if response.data else []
             
-            # Parse JSON fields
             for strategy in strategies:
                 if 'indicator_criteria' in strategy and isinstance(strategy['indicator_criteria'], str):
                     strategy['indicator_criteria'] = json.loads(strategy['indicator_criteria'])
@@ -187,7 +193,6 @@ class BacktestSupabaseClient:
     def delete_strategy(self, strategy_id: int):
         """Delete strategy and all related data"""
         try:
-            # Cascade delete will handle results and trades
             self.client.table(self.tables["strategies"]) \
                 .delete() \
                 .eq("id", strategy_id) \
@@ -220,12 +225,20 @@ class BacktestSupabaseClient:
             return 0
         
         try:
-            # Add strategy_id to each result
+            # Add strategy_id to each result and sanitize
             data = []
             for result in daily_results:
+                # Convert test_date to ISO string
+                test_date = result['test_date']
+                if isinstance(test_date, (date, datetime)):
+                    if isinstance(test_date, datetime):
+                        test_date = test_date.date().isoformat()
+                    else:
+                        test_date = test_date.isoformat()
+                
                 row = {
                     'strategy_id': strategy_id,
-                    'test_date': result['test_date'],
+                    'test_date': test_date,
                     'total_scanned': result['total_scanned'],
                     'criteria_matches': result['criteria_matches'],
                     'true_positives': result['true_positives'],
@@ -236,7 +249,7 @@ class BacktestSupabaseClient:
                     'max_gain_pct': result['max_gain_pct'],
                     'min_gain_pct': result['min_gain_pct']
                 }
-                data.append(self._sanitize_value(row))
+                data.append(self._sanitize_dict(row))
             
             # Upsert (handles duplicates)
             response = self.client.table(self.tables["results"]).upsert(
@@ -307,11 +320,19 @@ class BacktestSupabaseClient:
                 # Add strategy_id and sanitize
                 data = []
                 for trade in batch:
+                    # Convert signal_date to string if needed
+                    signal_date = trade['signal_date']
+                    if isinstance(signal_date, (date, datetime)):
+                        if isinstance(signal_date, datetime):
+                            signal_date = signal_date.date().isoformat()
+                        else:
+                            signal_date = signal_date.isoformat()
+                    
                     row = {
                         'strategy_id': strategy_id,
                         'symbol': trade['symbol'],
                         'exchange': trade['exchange'],
-                        'signal_date': trade['signal_date'],
+                        'signal_date': signal_date,
                         'entry_price': trade['entry_price'],
                         'entry_volume': trade.get('entry_volume'),
                         'indicator_values': json.dumps(trade.get('indicator_values', {})),
@@ -321,7 +342,7 @@ class BacktestSupabaseClient:
                         'exit_price': trade.get('exit_price'),
                         'trade_type': trade['trade_type']
                     }
-                    data.append(self._sanitize_value(row))
+                    data.append(self._sanitize_dict(row))
                 
                 # Upsert batch
                 response = self.client.table(self.tables["trades"]).upsert(
@@ -378,7 +399,6 @@ class BacktestSupabaseClient:
             
             df = pd.DataFrame(response.data)
             
-            # Parse JSON fields
             if 'indicator_values' in df.columns:
                 df['indicator_values'] = df['indicator_values'].apply(
                     lambda x: json.loads(x) if isinstance(x, str) else x
@@ -418,7 +438,7 @@ class BacktestSupabaseClient:
                 'last_run_at': 'NOW()'
             }
             
-            data = self._sanitize_value(data)
+            data = self._sanitize_dict(data)
             
             self.client.table(self.tables["strategies"]) \
                 .update(data) \
