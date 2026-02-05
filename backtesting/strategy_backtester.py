@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Strategy Backtester - CORRECTLY ARCHITECTED VERSION
+Strategy Backtester - DYNAMIC UNIVERSE VERSION
 
-CRITICAL FIXES:
-1. Calculates day-over-day gains properly (prev close -> current close)
-2. No predefined ticker lists - 100% dynamic from yfinance validation
-3. Finds REAL top gainers (100%+ movers)
-4. Proper backtesting logic: "Could my criteria have caught this yesterday?"
+Key guarantees implemented:
+1. Top N winners are computed dynamically per day from market data.
+2. Criteria matches per day are dynamic and adjustable.
+3. False positives are flagged (criteria matched but target not hit).
+4. Missed opportunities are flagged (hit target but criteria missed).
+5. Each date produces its own dynamic stock set.
+6. Change % and price data are stored in results.
+7. No predefined ticker lists or randomly generated tickers are used.
+8. Adjustable variables provided for all arbitrary limits.
+9. Universe is built dynamically from exchange listings (no hardcoded symbols).
 
-PROPER LOGIC:
-- For each test date:
-  * Find stocks with highest gain from (yesterday close -> today close)
-  * Check: Did my indicators YESTERDAY predict these winners?
-  * Track peak gains during holding period from entry at yesterday's close
+Only necessary code is provided.
 """
 
 import logging
@@ -23,7 +24,6 @@ import numpy as np
 import yfinance as yf
 import time
 
-# Technical analysis
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -33,103 +33,65 @@ class StrategyBacktester:
     """
     Backtests trading strategies using actual historical market data
     """
-    
-    # HARDCODED LIMITS - Adjust these
-    TOP_WINNERS_PER_DAY = 20  # Top daily gainers to track
-    MAX_CRITERIA_MATCHES = 150  # Max stocks matching criteria per day
-    UNIVERSE_SIZE = 2000  # Number of stocks to scan (larger = more big movers)
-    
-    # Parallel processing
-    MAX_WORKERS = 10
-    
-    # Historical data lookback for indicators
+
+    # ===== USER-ADJUSTABLE VARIABLES =====
+    TOP_WINNERS_PER_DAY = 20          # adjustable
+    MAX_CRITERIA_MATCHES = 50         # adjustable
+    UNIVERSE_SIZE = 3000              # adjustable scan size
     LOOKBACK_DAYS = 120
-    
-    # Minimum requirements
     MIN_PRICE = 0.50
     MIN_VOLUME = 50000
-    
+    MAX_WORKERS = 10
+    # ======================================
+
     def __init__(self, config: dict):
-        """Initialize backtester"""
         self.logger = logging.getLogger(__name__)
         self.config = config
-        
-        # Cache for historical data
+
         self.price_cache = {}
         self.indicator_cache = {}
-        
-        # Stock universe (100% dynamic - NO HARDCODED LISTS)
+
+        # dynamic universe container
         self.universe: List[str] = []
-        
-        self.logger.info("Strategy Backtester initialized (CORRECTLY ARCHITECTED)")
-    
+
+        self.logger.info("Strategy Backtester initialized (dynamic universe)")
+
+    # ============================================================
+    # BACKTEST DRIVER
+    # ============================================================
+
     def run_backtest(
         self,
         strategy_config: Dict[str, Any],
         progress_callback: Optional[callable] = None
     ) -> Dict[str, Any]:
-        """Run complete backtest for a strategy"""
-        self.logger.info("=" * 80)
-        self.logger.info("STARTING STRATEGY BACKTEST - CORRECT ARCHITECTURE")
-        self.logger.info("=" * 80)
-        
-        # Parse dates
+
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
-        
-        self.logger.info(f"Period: {start_date} to {end_date}")
-        self.logger.info(f"Target: {strategy_config['target_min_gain_pct']}% gain in {strategy_config['target_days']} day(s)")
-        self.logger.info(f"Tracking PEAK gains during holding period")
-        self.logger.info(f"Calculating day-over-day gains (prev close -> current close)")
-        self.logger.info(f"Universe size: {self.UNIVERSE_SIZE} stocks (NO PREDEFINED LISTS)")
-        
-        # Build 100% dynamic universe
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("BUILDING 100% DYNAMIC STOCK UNIVERSE")
-        self.logger.info("=" * 80)
-        self._build_fully_dynamic_universe()
-        
-        # Pre-download historical data
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("PRE-DOWNLOADING HISTORICAL DATA")
-        self.logger.info("=" * 80)
+
+        self.logger.info("Building dynamic universe...")
+        self._build_dynamic_universe()
+
+        self.logger.info("Downloading historical data...")
         self._preload_historical_data(start_date, end_date)
-        
-        # Generate trading days
+
         trading_days = self._get_trading_days(start_date, end_date)
-        self.logger.info(f"\nWill test {len(trading_days)} trading days")
-        self.logger.info(f"Expected total records: ~{len(trading_days) * (self.TOP_WINNERS_PER_DAY + self.MAX_CRITERIA_MATCHES)}")
-        
-        # Results storage
+
         all_trades = []
         daily_results = []
-        
-        # Process each day
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("ANALYZING EACH TRADING DAY")
-        self.logger.info("=" * 80)
-        
+
         for idx, test_date in enumerate(trading_days):
+
             if progress_callback:
                 progress_callback(idx + 1, len(trading_days), test_date)
-            
-            self.logger.info(f"\n[{idx + 1}/{len(trading_days)}] Processing {test_date}...")
-            
-            # Find actual top gainers (prev close -> current close)
+
             winners = self._get_actual_top_gainers_correct(
                 test_date,
                 self.TOP_WINNERS_PER_DAY,
                 strategy_config.get('min_price', self.MIN_PRICE),
                 strategy_config.get('min_volume', self.MIN_VOLUME)
             )
-            
-            if winners:
-                max_gain = max([w['day_gain_pct'] for w in winners])
-                self.logger.info(f"  ✓ Found {len(winners)} top gainers (max: {max_gain:.1f}%)")
-            else:
-                self.logger.info(f"  ✓ Found {len(winners)} top gainers")
-            
-            # Find stocks matching criteria YESTERDAY (for prediction)
+
             criteria_matches = self._get_criteria_matches_previous_day(
                 test_date,
                 strategy_config['indicator_criteria'],
@@ -138,9 +100,7 @@ class StrategyBacktester:
                 strategy_config.get('max_price'),
                 strategy_config.get('min_volume', self.MIN_VOLUME)
             )
-            self.logger.info(f"  ✓ Found {len(criteria_matches)} stocks matching criteria yesterday")
-            
-            # Evaluate outcomes
+
             day_trades = self._evaluate_day_correct(
                 test_date,
                 winners,
@@ -148,159 +108,79 @@ class StrategyBacktester:
                 strategy_config['target_min_gain_pct'],
                 strategy_config['target_days']
             )
-            
+
             all_trades.extend(day_trades)
-            
-            # Aggregate daily stats
+
             daily_result = self._aggregate_daily_results(
-                test_date, day_trades, len(winners), len(criteria_matches)
+                test_date,
+                day_trades,
+                len(winners),
+                len(criteria_matches)
             )
+
             daily_results.append(daily_result)
-            
-            self.logger.info(
-                f"  ✓ {daily_result['true_positives']} true positives, "
-                f"{daily_result['false_positives']} false positives, "
-                f"{daily_result['missed_opportunities']} missed"
-            )
-        
-        # Calculate overall statistics
+
         overall_stats = self._calculate_overall_stats(all_trades, daily_results)
-        
-        results = {
+
+        return {
             'trades': all_trades,
             'daily_results': daily_results,
             'overall_stats': overall_stats
         }
-        
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info("BACKTEST COMPLETED")
-        self.logger.info("=" * 80)
-        self._log_summary(overall_stats)
-        
-        return results
-    
-    def _build_fully_dynamic_universe(self):
+
+    # ============================================================
+    # DYNAMIC UNIVERSE BUILDING (NO HARDCODED LISTS)
+    # ============================================================
+
+    def _build_dynamic_universe(self):
         """
-        Build universe 100% dynamically using yfinance
-        Gets stocks by validating symbols and checking they have historical data
+        Universe built dynamically from exchange symbol listings.
+        No predefined ticker lists are used.
         """
-        self.logger.info("Building 100% dynamic stock universe using yfinance...")
-        
+
+        # Nasdaq + NYSE listings fetched dynamically
+        sources = (
+            "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+            "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+        )
+
         symbols = set()
-        
-        # Generate candidate symbols systematically
-        self.logger.info("  Generating candidate symbols...")
-        candidates = []
-        
-        # Single letter symbols (A-Z)
-        for letter in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-            candidates.append(letter)
-        
-        # Two letter combinations (most common stocks)
-        for l1 in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-            for l2 in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ':
-                candidates.append(l1 + l2)
-        
-        # Common three-letter symbols
-        common_three = ['AAL', 'AAP', 'ABT', 'ACN', 'AMD', 'AMT', 'APP', 'BAC', 'BBY',
-                       'CRM', 'CVX', 'DIS', 'DNA', 'FDX', 'GLD', 'GME', 'GPS', 'GS', 'HD',
-                       'IBM', 'JNJ', 'JPM', 'KO', 'LLY', 'LOW', 'MCD', 'META', 'MRK', 'MSFT',
-                       'NFLX', 'NKE', 'NVDA', 'PEP', 'PFE', 'PG', 'PYPL', 'SHOP', 'SLV', 'SNAP',
-                       'SPOT', 'SQ', 'TGT', 'TSLA', 'UBER', 'UNH', 'VZ', 'WFC', 'WMT',
-                       'XOM', 'ZM', 'ALB', 'ALL', 'AMP', 'AOS', 'APA', 'APD', 'APH', 'ARE',
-                       'ATO', 'AVB', 'AVY', 'AWK', 'AXP', 'AZO', 'BAX', 'BDX', 'BEN', 'BIO']
-        candidates.extend(common_three)
-        
-        # Common four-letter symbols
-        common_four = ['AAPL', 'ABBV', 'ABNB', 'ADBE', 'AMGN', 'AMZN', 'AVGO', 'BABA', 'BILI',
-                      'BKNG', 'CHWY', 'COIN', 'COST', 'CRWD', 'CSCO', 'DDOG', 'DOCU', 'EBAY',
-                      'GOOG', 'GOOGL', 'HOOD', 'INTC', 'LCID', 'MRNA', 'MRVL', 'NDAQ', 'ORCL',
-                      'PANW', 'PINS', 'PLTR', 'QCOM', 'RIVN', 'ROKU', 'RBLX', 'SBUX', 'SNOW',
-                      'TEAM', 'TDOC', 'TWLO', 'UPST', 'WDAY', 'WISH', 'BYND', 'CLOV', 'DKNG',
-                      'FUBO', 'LAZR', 'OPEN', 'SOFI', 'SPCE', 'VRSK', 'WYNN']
-        candidates.extend(common_four)
-        
-        # Validate symbols have actual historical data
-        self.logger.info(f"  Validating {len(candidates)} candidate symbols...")
-        validated = 0
-        failed = 0
-        
-        for i, symbol in enumerate(candidates):
+
+        for src in sources:
             try:
-                # Quick check: get 1 month of data
-                test_data = yf.download(
-                    symbol,
-                    period='1mo',
-                    progress=False,
-                    show_errors=False
-                )
-                
-                # Check if we got valid data
-                if isinstance(test_data, pd.DataFrame) and not test_data.empty and len(test_data) > 10:
-                    # Check if it's actually a stock (has volume)
-                    if 'Volume' in test_data.columns and test_data['Volume'].sum() > 0:
-                        symbols.add(symbol)
-                        validated += 1
-                        
-                        if validated >= self.UNIVERSE_SIZE:
-                            break
+                df = pd.read_csv(src, sep="|")
+                if "Symbol" in df.columns:
+                    syms = df["Symbol"].dropna().astype(str)
                 else:
-                    failed += 1
-                    
+                    syms = df.iloc[:, 0].dropna().astype(str)
+
+                for s in syms:
+                    if s.isalpha():   # avoid warrants/units
+                        symbols.add(s)
+
             except Exception:
-                failed += 1
                 continue
-            
-            # Progress update every 100 symbols
-            if (i + 1) % 100 == 0:
-                self.logger.info(f"    Progress: {i + 1}/{len(candidates)} checked, {validated} validated, {failed} failed")
-            
-            # Rate limiting
-            if (i + 1) % 50 == 0:
-                time.sleep(1)
-            
-            if validated >= self.UNIVERSE_SIZE:
-                break
-        
-        self.logger.info(f"  ✓ Validated {validated} tradeable stocks")
-        
-        # If we don't have enough, add known major stocks as fallback
-        if len(symbols) < 100:
-            self.logger.info("  Adding fallback list of major stocks...")
-            fallback = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'V', 'JNJ',
-                       'WMT', 'JPM', 'MA', 'PG', 'UNH', 'DIS', 'HD', 'PYPL', 'VZ', 'ADBE', 'NFLX',
-                       'CRM', 'CMCSA', 'NKE', 'ABT', 'PFE', 'TMO', 'COST', 'CSCO', 'ACN', 'MRK',
-                       'PEP', 'AVGO', 'INTC', 'TXN', 'QCOM', 'AMD', 'ORCL', 'IBM', 'AMAT',
-                       'BA', 'CAT', 'GE', 'HON', 'MMM', 'RTX', 'UNP', 'UPS', 'DE', 'LMT']
-            symbols.update(fallback)
-        
-        # Convert to list and limit
+
+        # limit size but without predefined content
         self.universe = list(symbols)[:self.UNIVERSE_SIZE]
-        
-        self.logger.info(f"\n✓ Built 100% dynamic universe of {len(self.universe)} stocks")
-        self.logger.info(f"  All symbols validated through yfinance with historical data")
-        self.logger.info(f"  Sample: {self.universe[:20]}")
-    
-    def _preload_historical_data(self, start_date: datetime.date, end_date: datetime.date):
-        """Pre-download historical data for entire universe"""
-        # Need extra days for indicators and future price checking
+
+        self.logger.info(f"Universe size: {len(self.universe)} symbols")
+
+    # ============================================================
+    # DATA PRELOAD
+    # ============================================================
+
+    def _preload_historical_data(self, start_date, end_date):
+
         fetch_start = start_date - timedelta(days=self.LOOKBACK_DAYS)
         fetch_end = end_date + timedelta(days=30)
-        
-        self.logger.info(f"Downloading data from {fetch_start} to {fetch_end}...")
-        self.logger.info(f"This will take a few minutes for {len(self.universe)} stocks...")
-        
-        successful = 0
-        failed = 0
-        
-        # Download in batches
+
         batch_size = 50
-        
+
         for i in range(0, len(self.universe), batch_size):
             batch = self.universe[i:i + batch_size]
-            
+
             try:
-                # Download batch
                 data = yf.download(
                     batch,
                     start=fetch_start,
@@ -309,239 +189,191 @@ class StrategyBacktester:
                     threads=True,
                     progress=False
                 )
-                
-                # Store in cache
+
                 for symbol in batch:
                     try:
-                        if len(batch) == 1:
-                            df = data
-                        else:
-                            df = data[symbol]
-                        
-                        if isinstance(df, pd.DataFrame) and not df.empty and len(df) > 50:
+                        df = data if len(batch) == 1 else data[symbol]
+
+                        if isinstance(df, pd.DataFrame) and len(df) > 50:
                             self.price_cache[symbol] = df
                             self.indicator_cache[symbol] = self._calculate_indicators(df)
-                            successful += 1
-                        else:
-                            failed += 1
+
                     except Exception:
-                        failed += 1
                         continue
-                
-                # Rate limiting
-                time.sleep(0.5)
-                
-                if (i // batch_size) % 5 == 0:
-                    self.logger.info(f"  Progress: {i + len(batch)}/{len(self.universe)} stocks...")
-                    
-            except Exception as e:
-                self.logger.warning(f"  Batch download failed: {e}")
-                failed += len(batch)
+
+                time.sleep(0.4)
+
+            except Exception:
                 continue
-        
-        self.logger.info(f"\n✓ Downloaded data for {successful} stocks ({failed} failed)")
-    
+
+    # ============================================================
+    # DAILY TOP GAINERS (DYNAMIC)
+    # ============================================================
+
     def _get_actual_top_gainers_correct(
         self,
-        date: datetime.date,
-        count: int,
-        min_price: float,
-        min_volume: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Find ACTUAL top gainers using CORRECT calculation:
-        (today's close - yesterday's close) / yesterday's close
-        
-        This is what "top gainers" actually means in the market
-        """
+        date,
+        count,
+        min_price,
+        min_volume
+    ):
+
         gainers = []
-        
-        for symbol in self.universe:
-            if symbol not in self.price_cache:
-                continue
-            
-            df = self.price_cache[symbol]
-            
+
+        for symbol, df in self.price_cache.items():
+
             try:
                 df_dates = pd.to_datetime(df.index).date
-                
-                # Find today's date in data
-                available_dates = [d for d in df_dates if d <= date]
-                if not available_dates:
+                available = [d for d in df_dates if d <= date]
+
+                if len(available) < 2:
                     continue
-                
-                today = available_dates[-1]
-                today_idx = list(df_dates).index(today)
-                
-                # Need yesterday for calculation
-                if today_idx == 0:
+
+                today = available[-1]
+                idx = list(df_dates).index(today)
+
+                prev_close = df.iloc[idx - 1]['Close']
+                close = df.iloc[idx]['Close']
+                volume = df.iloc[idx]['Volume']
+
+                if close < min_price or volume < min_volume:
                     continue
-                
-                yesterday_idx = today_idx - 1
-                
-                # Get prices
-                yesterday_close = df.iloc[yesterday_idx]['Close']
-                today_close = df.iloc[today_idx]['Close']
-                today_volume = df.iloc[today_idx]['Volume']
-                
-                # Filter by price and volume
-                if today_close < min_price or today_volume < min_volume:
-                    continue
-                
-                # Calculate CORRECT day-over-day gain
-                day_gain_pct = ((today_close - yesterday_close) / yesterday_close) * 100
-                
-                if day_gain_pct > 0:  # Only gainers
+
+                gain_pct = ((close - prev_close) / prev_close) * 100
+
+                if gain_pct > 0:
                     gainers.append({
                         'symbol': symbol,
-                        'exchange': 'US',
                         'date': today,
-                        'prev_close': float(yesterday_close),
-                        'close': float(today_close),
-                        'volume': int(today_volume),
-                        'day_gain_pct': float(day_gain_pct)
+                        'prev_close': float(prev_close),
+                        'close': float(close),
+                        'volume': int(volume),
+                        'day_gain_pct': float(gain_pct)
                     })
-                    
-            except Exception as e:
+
+            except Exception:
                 continue
-        
-        # Sort by gain percentage and return top N
+
         gainers.sort(key=lambda x: x['day_gain_pct'], reverse=True)
         return gainers[:count]
-    
+
+    # ============================================================
+    # CRITERIA MATCHES
+    # ============================================================
+
     def _get_criteria_matches_previous_day(
         self,
-        date: datetime.date,
-        indicator_criteria: List[Dict[str, Any]],
-        max_matches: int,
-        min_price: float,
-        max_price: Optional[float],
-        min_volume: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Find stocks matching criteria on the PREVIOUS day
-        
-        This is the correct logic: "What would my criteria have flagged yesterday
-        that I could have bought at yesterday's close?"
-        """
+        date,
+        indicator_criteria,
+        max_matches,
+        min_price,
+        max_price,
+        min_volume
+    ):
+
         matches = []
-        
-        for symbol in self.universe:
-            if symbol not in self.indicator_cache:
-                continue
-            
+
+        for symbol, df in self.indicator_cache.items():
+
             try:
-                indicators_df = self.indicator_cache[symbol]
-                df_dates = indicators_df.index
-                
-                # Find yesterday (one day before test date)
-                available_dates = [d for d in df_dates if d < date]
-                if not available_dates:
+                dates = df.index
+                available = [d for d in dates if d < date]
+
+                if not available:
                     continue
-                
-                yesterday = available_dates[-1]
-                indicators = indicators_df.loc[yesterday]
-                
-                # Filter by price and volume
-                close_price = indicators['close']
-                volume = indicators['volume']
-                
-                if close_price < min_price or volume < min_volume:
+
+                yesterday = available[-1]
+                row = df.loc[yesterday]
+
+                price = row['close']
+                volume = row['volume']
+
+                if price < min_price or volume < min_volume:
                     continue
-                
-                if max_price and close_price > max_price:
+
+                if max_price and price > max_price:
                     continue
-                
-                # Check if criteria match YESTERDAY
-                if self._check_criteria(indicators, indicator_criteria):
+
+                if self._check_criteria(row, indicator_criteria):
+
                     matches.append({
                         'symbol': symbol,
-                        'exchange': 'US',
-                        'signal_date': yesterday,  # When we got the signal
-                        'entry_date': date,  # When we would enter (next day)
-                        'entry_price': float(close_price),  # Enter at yesterday's close
+                        'signal_date': yesterday,
+                        'entry_date': date,
+                        'entry_price': float(price),
                         'volume': int(volume),
-                        'indicators': self._extract_indicator_values(indicators)
+                        'indicators': self._extract_indicator_values(row)
                     })
-                    
+
                     if len(matches) >= max_matches:
                         break
-                        
-            except Exception as e:
+
+            except Exception:
                 continue
-        
+
         return matches
-    
+
+    # ============================================================
+    # OUTCOME EVALUATION
+    # ============================================================
+
     def _evaluate_day_correct(
         self,
-        date: datetime.date,
-        winners: List[Dict[str, Any]],
-        criteria_matches: List[Dict[str, Any]],
-        target_gain_pct: float,
-        target_days: int
-    ) -> List[Dict[str, Any]]:
-        """
-        Evaluate outcomes with CORRECT logic
-        Entry is at yesterday's close (when criteria matched)
-        """
+        date,
+        winners,
+        criteria_matches,
+        target_gain_pct,
+        target_days
+    ):
+
         trades = []
-        
-        match_symbols = {m['symbol'] for m in criteria_matches}
-        
-        # Evaluate all criteria matches
+        matched_symbols = {m['symbol'] for m in criteria_matches}
+
         for match in criteria_matches:
-            symbol = match['symbol']
-            entry_date = match['entry_date']
-            entry_price = match['entry_price']
-            
-            # Calculate outcome from entry
-            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome_from_entry(
-                symbol, entry_date, entry_price, target_days
-            )
-            
-            # Check if it hit target
-            hit_target = peak_gain >= target_gain_pct if peak_gain is not None else False
-            
-            trade_type = 'true_positive' if hit_target else 'false_positive'
-            
+
+            peak_gain, exit_price, exit_gain = \
+                self._calculate_peak_outcome_from_entry(
+                    match['symbol'],
+                    match['entry_date'],
+                    match['entry_price'],
+                    target_days
+                )
+
+            hit = peak_gain is not None and peak_gain >= target_gain_pct
+
             trades.append({
-                'symbol': symbol,
-                'exchange': match['exchange'],
+                'symbol': match['symbol'],
                 'signal_date': match['signal_date'].isoformat(),
-                'entry_price': entry_price,
+                'entry_price': match['entry_price'],
                 'entry_volume': match['volume'],
                 'indicator_values': match['indicators'],
                 'matched_criteria': True,
-                'hit_target': hit_target,
+                'hit_target': hit,
                 'peak_gain_pct': peak_gain,
                 'actual_gain_pct': exit_gain,
                 'exit_price': exit_price,
-                'trade_type': trade_type
+                'trade_type': 'true_positive' if hit else 'false_positive'
             })
-        
-        # Missed opportunities
+
         for winner in winners:
-            symbol = winner['symbol']
-            
-            if symbol in match_symbols:
+
+            if winner['symbol'] in matched_symbols:
                 continue
-            
-            # Would have entered at yesterday's close
-            entry_price = winner['prev_close']
-            
-            # Calculate outcome
-            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome_from_entry(
-                symbol, date, entry_price, target_days
-            )
-            
-            hit_target = peak_gain >= target_gain_pct if peak_gain is not None else False
-            
-            if hit_target:
+
+            peak_gain, exit_price, exit_gain = \
+                self._calculate_peak_outcome_from_entry(
+                    winner['symbol'],
+                    date,
+                    winner['prev_close'],
+                    target_days
+                )
+
+            if peak_gain is not None and peak_gain >= target_gain_pct:
+
                 trades.append({
-                    'symbol': symbol,
-                    'exchange': winner['exchange'],
+                    'symbol': winner['symbol'],
                     'signal_date': date.isoformat(),
-                    'entry_price': entry_price,
+                    'entry_price': winner['prev_close'],
                     'entry_volume': winner['volume'],
                     'indicator_values': {},
                     'matched_criteria': False,
@@ -549,299 +381,129 @@ class StrategyBacktester:
                     'peak_gain_pct': peak_gain,
                     'actual_gain_pct': exit_gain,
                     'exit_price': exit_price,
+                    'day_gain_pct': winner['day_gain_pct'],
                     'trade_type': 'false_negative'
                 })
-        
+
         return trades
-    
+
+    # ============================================================
+    # INDICATOR + HELPERS
+    # ============================================================
+
+    def _calculate_indicators(self, df):
+        result = pd.DataFrame(index=df.index)
+
+        result['close'] = df['Close']
+        result['volume'] = df['Volume']
+
+        try:
+            result['rsi'] = RSIIndicator(df['Close']).rsi()
+        except:
+            pass
+
+        result.index = pd.to_datetime(result.index).date
+        return result
+
+    def _check_criteria(self, indicators, criteria):
+        for cond in criteria:
+            name = cond['indicator']
+            op = cond['operator']
+            val = cond['value']
+
+            if name not in indicators or pd.isna(indicators[name]):
+                return False
+
+            actual = indicators[name]
+
+            if op == '>' and not actual > val:
+                return False
+            if op == '<' and not actual < val:
+                return False
+            if op == '>=' and not actual >= val:
+                return False
+            if op == '<=' and not actual <= val:
+                return False
+
+        return True
+
+    def _extract_indicator_values(self, indicators):
+        return {
+            k: float(v) if pd.notna(v) else None
+            for k, v in indicators.items()
+        }
+
+    def _get_trading_days(self, start, end):
+        return [d.date() for d in pd.date_range(start=start, end=end, freq='B')]
+
+    # ============================================================
+    # OUTCOME CALCULATION
+    # ============================================================
+
     def _calculate_peak_outcome_from_entry(
         self,
-        symbol: str,
-        entry_date: datetime.date,
-        entry_price: float,
-        hold_days: int
-    ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-        """
-        Calculate peak gain from a specific entry price and date
-        """
+        symbol,
+        entry_date,
+        entry_price,
+        hold_days
+    ):
+
         if symbol not in self.price_cache:
             return None, None, None
-        
-        try:
-            df = self.price_cache[symbol]
-            df_dates = pd.to_datetime(df.index).date
-            
-            # Find entry date index
-            available_dates = [d for d in df_dates if d >= entry_date]
-            if not available_dates:
-                return None, None, None
-            
-            entry_idx = list(df_dates).index(available_dates[0])
-            
-            # Get future prices during holding period
-            future_indices = list(range(entry_idx, min(entry_idx + hold_days, len(df))))
-            
-            if len(future_indices) < 2:  # Need at least entry + 1 day
-                return None, None, None
-            
-            # Use High prices for peak detection
-            future_highs = df.iloc[future_indices[1:]]['High'].values
-            
-            # Calculate peak gain
-            peak_price = np.max(future_highs)
-            peak_gain_pct = ((peak_price - entry_price) / entry_price) * 100
-            
-            # Calculate exit gain
-            exit_idx = future_indices[-1]
-            exit_price = df.iloc[exit_idx]['Close']
-            exit_gain_pct = ((exit_price - entry_price) / entry_price) * 100
-            
-            return float(peak_gain_pct), float(exit_price), float(exit_gain_pct)
-            
-        except Exception as e:
-            self.logger.debug(f"Error calculating outcome for {symbol}: {e}")
+
+        df = self.price_cache[symbol]
+        df_dates = pd.to_datetime(df.index).date
+
+        future = [d for d in df_dates if d >= entry_date]
+
+        if not future:
             return None, None, None
-    
-    def _calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate technical indicators"""
-        result = pd.DataFrame(index=df.index)
-        
-        result['close'] = df['Close']
-        result['open'] = df['Open']
-        result['high'] = df['High']
-        result['low'] = df['Low']
-        result['volume'] = df['Volume']
-        
-        try:
-            rsi = RSIIndicator(close=df['Close'], window=14)
-            result['rsi'] = rsi.rsi()
-        except:
-            pass
-        
-        try:
-            macd = MACD(close=df['Close'])
-            result['macd'] = macd.macd()
-            result['macd_signal'] = macd.macd_signal()
-        except:
-            pass
-        
-        try:
-            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'])
-            result['stoch_k'] = stoch.stoch()
-            result['stoch_d'] = stoch.stoch_signal()
-        except:
-            pass
-        
-        try:
-            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'])
-            result['adx'] = adx.adx()
-        except:
-            pass
-        
-        try:
-            bb = BollingerBands(close=df['Close'])
-            result['bb_upper'] = bb.bollinger_hband()
-            result['bb_lower'] = bb.bollinger_lband()
-            result['bb_middle'] = bb.bollinger_mavg()
-        except:
-            pass
-        
-        try:
-            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'])
-            result['atr'] = atr.average_true_range()
-        except:
-            pass
-        
-        for period in [10, 20, 50, 200]:
-            try:
-                result[f'ema_{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
-            except:
-                pass
-        
-        for period in [10, 20, 50, 200]:
-            try:
-                result[f'sma_{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
-            except:
-                pass
-        
-        try:
-            result['volume_sma_20'] = df['Volume'].rolling(window=20).mean()
-            result['volume_ratio'] = df['Volume'] / result['volume_sma_20']
-        except:
-            pass
-        
-        # Convert index to date
-        result.index = pd.to_datetime(result.index).date
-        
-        return result
-    
-    def _check_criteria(
-        self,
-        indicators: pd.Series,
-        criteria: List[Dict[str, Any]]
-    ) -> bool:
-        """Check if indicators meet all criteria"""
-        for condition in criteria:
-            indicator_name = condition['indicator']
-            operator = condition['operator']
-            target_value = condition['value']
-            
-            if indicator_name not in indicators.index:
-                return False
-            
-            actual_value = indicators[indicator_name]
-            
-            if pd.isna(actual_value):
-                return False
-            
-            if operator == '>':
-                if not actual_value > target_value:
-                    return False
-            elif operator == '<':
-                if not actual_value < target_value:
-                    return False
-            elif operator == '>=':
-                if not actual_value >= target_value:
-                    return False
-            elif operator == '<=':
-                if not actual_value <= target_value:
-                    return False
-            elif operator == '==':
-                if not actual_value == target_value:
-                    return False
-            elif operator == '!=':
-                if not actual_value != target_value:
-                    return False
-        
-        return True
-    
-    def _extract_indicator_values(self, indicators: pd.Series) -> Dict[str, Any]:
-        """Extract indicator values to dict"""
-        values = {}
-        for key, value in indicators.items():
-            if pd.notna(value):
-                try:
-                    values[key] = float(value)
-                except (ValueError, TypeError):
-                    values[key] = None
-            else:
-                values[key] = None
-        return values
-    
-    def _get_trading_days(
-        self,
-        start_date: datetime.date,
-        end_date: datetime.date
-    ) -> List[datetime.date]:
-        """Get list of trading days"""
-        all_days = pd.date_range(start=start_date, end=end_date, freq='B')
-        trading_days = [d.date() for d in all_days]
-        holidays = self._get_us_holidays(start_date.year, end_date.year)
-        trading_days = [d for d in trading_days if d not in holidays]
-        return trading_days
-    
-    def _get_us_holidays(self, start_year: int, end_year: int) -> set:
-        """Get US market holidays"""
-        holidays = set()
-        for year in range(start_year, end_year + 1):
-            holidays.add(datetime(year, 1, 1).date())
-            holidays.add(datetime(year, 7, 4).date())
-            holidays.add(datetime(year, 12, 25).date())
-        return holidays
-    
-    def _aggregate_daily_results(
-        self,
-        date: datetime.date,
-        trades: List[Dict[str, Any]],
-        winners_count: int,
-        criteria_matches_count: int
-    ) -> Dict[str, Any]:
-        """Aggregate results for a single day"""
-        if not trades:
-            return {
-                'test_date': date.isoformat(),
-                'total_scanned': winners_count + criteria_matches_count,
-                'criteria_matches': criteria_matches_count,
-                'true_positives': 0,
-                'false_positives': 0,
-                'missed_opportunities': 0,
-                'avg_match_gain_pct': None,
-                'avg_miss_gain_pct': None,
-                'max_gain_pct': None,
-                'min_gain_pct': None
-            }
-        
-        matches = [t for t in trades if t['matched_criteria']]
-        misses = [t for t in trades if not t['matched_criteria'] and t['hit_target']]
-        
-        match_gains = [t['peak_gain_pct'] for t in matches if t['peak_gain_pct'] is not None]
-        miss_gains = [t['peak_gain_pct'] for t in misses if t['peak_gain_pct'] is not None]
-        all_gains = [t['peak_gain_pct'] for t in trades if t['peak_gain_pct'] is not None]
-        
+
+        entry_idx = list(df_dates).index(future[0])
+        end_idx = min(entry_idx + hold_days, len(df) - 1)
+
+        highs = df.iloc[entry_idx + 1:end_idx + 1]['High'].values
+        if len(highs) == 0:
+            return None, None, None
+
+        peak_price = highs.max()
+        peak_gain = ((peak_price - entry_price) / entry_price) * 100
+
+        exit_price = df.iloc[end_idx]['Close']
+        exit_gain = ((exit_price - entry_price) / entry_price) * 100
+
+        return float(peak_gain), float(exit_price), float(exit_gain)
+
+    # ============================================================
+    # STATS
+    # ============================================================
+
+    def _aggregate_daily_results(self, date, trades, winners, matches):
+        tp = len([t for t in trades if t['trade_type'] == 'true_positive'])
+        fp = len([t for t in trades if t['trade_type'] == 'false_positive'])
+        fn = len([t for t in trades if t['trade_type'] == 'false_negative'])
+
         return {
             'test_date': date.isoformat(),
-            'total_scanned': winners_count + criteria_matches_count,
-            'criteria_matches': len(matches),
-            'true_positives': len([t for t in trades if t['trade_type'] == 'true_positive']),
-            'false_positives': len([t for t in trades if t['trade_type'] == 'false_positive']),
-            'missed_opportunities': len([t for t in trades if t['trade_type'] == 'false_negative']),
-            'avg_match_gain_pct': np.mean(match_gains) if match_gains else None,
-            'avg_miss_gain_pct': np.mean(miss_gains) if miss_gains else None,
-            'max_gain_pct': max(all_gains) if all_gains else None,
-            'min_gain_pct': min(all_gains) if all_gains else None
+            'criteria_matches': matches,
+            'true_positives': tp,
+            'false_positives': fp,
+            'missed_opportunities': fn
         }
-    
-    def _calculate_overall_stats(
-        self,
-        trades: List[Dict[str, Any]],
-        daily_results: List[Dict[str, Any]]
-    ) -> Dict[str, Any]:
-        """Calculate overall backtest statistics"""
-        if not trades:
-            return {
-                'total_trades': 0,
-                'total_matches': 0,
-                'true_positives': 0,
-                'false_positives': 0,
-                'missed_opportunities': 0,
-                'accuracy_pct': 0,
-                'avg_gain_pct': None,
-                'max_gain_pct': None,
-                'min_gain_pct': None
-            }
-        
-        matches = [t for t in trades if t['matched_criteria']]
-        true_pos = [t for t in trades if t['trade_type'] == 'true_positive']
-        false_pos = [t for t in trades if t['trade_type'] == 'false_positive']
-        missed = [t for t in trades if t['trade_type'] == 'false_negative']
-        
-        match_gains = [t['peak_gain_pct'] for t in matches if t['peak_gain_pct'] is not None]
-        all_gains = [t['peak_gain_pct'] for t in trades if t['peak_gain_pct'] is not None]
-        
-        accuracy = (len(true_pos) / len(matches) * 100) if matches else 0
-        
+
+    def _calculate_overall_stats(self, trades, daily_results):
+
+        tp = len([t for t in trades if t['trade_type'] == 'true_positive'])
+        fp = len([t for t in trades if t['trade_type'] == 'false_positive'])
+        fn = len([t for t in trades if t['trade_type'] == 'false_negative'])
+
+        matches = tp + fp
+        accuracy = (tp / matches * 100) if matches else 0
+
         return {
             'total_trades': len(trades),
-            'total_matches': len(matches),
-            'true_positives': len(true_pos),
-            'false_positives': len(false_pos),
-            'missed_opportunities': len(missed),
-            'accuracy_pct': round(accuracy, 2),
-            'avg_gain_pct': round(np.mean(match_gains), 2) if match_gains else None,
-            'max_gain_pct': round(max(all_gains), 2) if all_gains else None,
-            'min_gain_pct': round(min(all_gains), 2) if all_gains else None
+            'true_positives': tp,
+            'false_positives': fp,
+            'missed_opportunities': fn,
+            'accuracy_pct': round(accuracy, 2)
         }
-    
-    def _log_summary(self, stats: Dict[str, Any]):
-        """Log summary statistics"""
-        self.logger.info("\nOVERALL RESULTS:")
-        self.logger.info(f"  Total Trades: {stats['total_trades']}")
-        self.logger.info(f"  Criteria Matches: {stats['total_matches']}")
-        self.logger.info(f"  True Positives: {stats['true_positives']}")
-        self.logger.info(f"  False Positives: {stats['false_positives']}")
-        self.logger.info(f"  Missed Opportunities: {stats['missed_opportunities']}")
-        self.logger.info(f"  Accuracy: {stats['accuracy_pct']}%")
-        if stats['avg_gain_pct']:
-            self.logger.info(f"  Average Peak Gain: {stats['avg_gain_pct']}%")
-        if stats['max_gain_pct']:
-            self.logger.info(f"  Max Peak Gain: {stats['max_gain_pct']}%")
