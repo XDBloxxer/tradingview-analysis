@@ -2,6 +2,7 @@
 Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
 Only includes indicators that exist in database schema
+FIXED: Preserves metadata fields (symbol, exchange, etc.) when adding indicators
 """
 
 import logging
@@ -301,13 +302,21 @@ class IntradayDataCollector:
                 'snapshot_time': '09:30:00'
             }
             
-            # Add indicators (only basic OHLCV)
+            # Reserved metadata fields that should not be overwritten
+            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
+            
+            # Add indicators (only basic OHLCV) - don't overwrite metadata
             for key, value in open_data.items():
+                key_lower = key.lower()
+                # Skip if this would overwrite a reserved metadata field
+                if key_lower in reserved_fields:
+                    continue
+                    
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = self._serialize_value(value)
+                        snapshot[key_lower] = self._serialize_value(value)
                     except:
-                        snapshot[key.lower()] = None
+                        snapshot[key_lower] = None
             
             self.logger.debug(f"Extracted market_open for {symbol}: {list(snapshot.keys())}")
             return snapshot
@@ -348,13 +357,21 @@ class IntradayDataCollector:
                 'snapshot_time': '16:00:00'
             }
             
-            # Add indicators (only basic OHLCV)
+            # Reserved metadata fields that should not be overwritten
+            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
+            
+            # Add indicators (only basic OHLCV) - don't overwrite metadata
             for key, value in close_data.items():
+                key_lower = key.lower()
+                # Skip if this would overwrite a reserved metadata field
+                if key_lower in reserved_fields:
+                    continue
+                    
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = self._serialize_value(value)
+                        snapshot[key_lower] = self._serialize_value(value)
                     except:
-                        snapshot[key.lower()] = None
+                        snapshot[key_lower] = None
             
             self.logger.debug(f"Extracted market_close for {symbol}: {list(snapshot.keys())}")
             return snapshot
@@ -393,13 +410,22 @@ class IntradayDataCollector:
                 'snapshot_date': actual_date.isoformat()
             }
             
-            # Add indicators (only basic OHLCV)
+            # Reserved metadata fields that should not be overwritten
+            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
+                              'snapshot_time', 'snapshot_date'}
+            
+            # Add indicators (only basic OHLCV) - don't overwrite metadata
             for key, value in prior_data.items():
+                key_lower = key.lower()
+                # Skip if this would overwrite a reserved metadata field
+                if key_lower in reserved_fields:
+                    continue
+                    
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = self._serialize_value(value)
+                        snapshot[key_lower] = self._serialize_value(value)
                     except:
-                        snapshot[key.lower()] = None
+                        snapshot[key_lower] = None
             
             self.logger.debug(f"Extracted day_prior for {symbol}: {list(snapshot.keys())}")
             return snapshot
