@@ -434,8 +434,8 @@ class IntradayDataCollector:
         try:
             adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
             result['adx'] = adx.adx()
-            result['adx + di'] = adx.adx_pos()  # Note the space!
-            result['adx - di'] = adx.adx_neg()  # Note the space!
+            result['adx+di'] = adx.adx_pos()  # Note the space!
+            result['adx-di'] = adx.adx_neg()  # Note the space!
         except:
             pass
         
