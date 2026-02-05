@@ -242,6 +242,27 @@ class IntradayDataCollector:
         except Exception as e:
             self.logger.debug(f"Error fetching daily for {symbol}: {e}")
             return None
+            
+    def _serialize_value(self, v):
+        """
+        Convert pandas/numpy values to Python types
+        while preserving integers for DB insertion.
+        Only fixes integer/float casting issue.
+        """
+        if pd.isna(v) or np.isinf(v):
+            return None
+    
+        # Preserve integer types
+        if isinstance(v, (np.integer, int)):
+            return int(v)
+    
+        # Preserve float types
+        if isinstance(v, (np.floating, float)):
+            return float(v)
+    
+        return v
+
+    
     
     def _extract_market_open(
         self,
@@ -279,7 +300,7 @@ class IntradayDataCollector:
             for key, value in open_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = float(value)
+                        snapshot[key.lower()] = self._serialize_value(value)
                     except:
                         snapshot[key.lower()] = None
             
@@ -326,7 +347,7 @@ class IntradayDataCollector:
             for key, value in close_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = float(value)
+                        snapshot[key.lower()] = self._serialize_value(value)
                     except:
                         snapshot[key.lower()] = None
             
@@ -371,7 +392,7 @@ class IntradayDataCollector:
             for key, value in prior_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
-                        snapshot[key.lower()] = float(value)
+                        snapshot[key.lower()] = self._serialize_value(value)
                     except:
                         snapshot[key.lower()] = None
             
