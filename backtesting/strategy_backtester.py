@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Strategy Backtester - Core backtesting engine (PROPERLY FIXED)
-Evaluates trading strategies against ACTUAL historical data
+Strategy Backtester - CORRECTLY ARCHITECTED VERSION
 
 CRITICAL FIXES:
-1. Dynamically builds universe using yfinance (no predefined lists)
-2. Finds ACTUAL top gainers for each historical date from price data
-3. Checks PEAK gains during holding period (accounts for consolidation)
-4. Properly evaluates indicator criteria using historical values
+1. Calculates day-over-day gains properly (prev close -> current close)
+2. No predefined ticker lists - 100% dynamic from public sources
+3. Finds REAL top gainers (100%+ movers)
+4. Proper backtesting logic: "Could my criteria have caught this yesterday?"
 
-LOGIC:
-- Fetch list of active tickers dynamically
+PROPER LOGIC:
 - For each test date:
-  * Get historical data for all tickers
-  * Calculate which stocks had highest gains THAT DAY
-  * Find stocks matching indicator criteria from historical data
-  * Check if they hit target at ANY point during holding period (peak gain)
+  * Find stocks with highest gain from (yesterday close -> today close)
+  * Check: Did my indicators YESTERDAY predict these winners?
+  * Track peak gains during holding period from entry at yesterday's close
 """
 
 import logging
@@ -23,7 +20,6 @@ from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime, timedelta
 import pandas as pd
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import yfinance as yf
 import time
 
@@ -38,10 +34,10 @@ class StrategyBacktester:
     Backtests trading strategies using actual historical market data
     """
     
-    # HARDCODED LIMITS - Adjust these to balance accuracy vs speed
-    TOP_WINNERS_PER_DAY = 15  # Top daily gainers to track
-    MAX_CRITERIA_MATCHES = 100  # Max stocks matching criteria per day
-    UNIVERSE_SIZE = 1500  # Number of stocks to scan (higher = better coverage)
+    # HARDCODED LIMITS - Adjust these
+    TOP_WINNERS_PER_DAY = 20  # Top daily gainers to track
+    MAX_CRITERIA_MATCHES = 150  # Max stocks matching criteria per day
+    UNIVERSE_SIZE = 2000  # Number of stocks to scan (larger = more big movers)
     
     # Parallel processing
     MAX_WORKERS = 10
@@ -49,7 +45,7 @@ class StrategyBacktester:
     # Historical data lookback for indicators
     LOOKBACK_DAYS = 120
     
-    # Minimum requirements for stock inclusion
+    # Minimum requirements
     MIN_PRICE = 0.50
     MIN_VOLUME = 50000
     
@@ -58,14 +54,14 @@ class StrategyBacktester:
         self.logger = logging.getLogger(__name__)
         self.config = config
         
-        # Cache for historical data (reduces API calls)
+        # Cache for historical data
         self.price_cache = {}
         self.indicator_cache = {}
         
-        # Stock universe (built dynamically)
+        # Stock universe (100% dynamic - NO HARDCODED LISTS)
         self.universe: List[str] = []
         
-        self.logger.info("Strategy Backtester initialized (PROPERLY FIXED)")
+        self.logger.info("Strategy Backtester initialized (CORRECTLY ARCHITECTED)")
     
     def run_backtest(
         self,
@@ -74,7 +70,7 @@ class StrategyBacktester:
     ) -> Dict[str, Any]:
         """Run complete backtest for a strategy"""
         self.logger.info("=" * 80)
-        self.logger.info("STARTING STRATEGY BACKTEST")
+        self.logger.info("STARTING STRATEGY BACKTEST - CORRECT ARCHITECTURE")
         self.logger.info("=" * 80)
         
         # Parse dates
@@ -83,18 +79,17 @@ class StrategyBacktester:
         
         self.logger.info(f"Period: {start_date} to {end_date}")
         self.logger.info(f"Target: {strategy_config['target_min_gain_pct']}% gain in {strategy_config['target_days']} day(s)")
-        self.logger.info(f"Checking PEAK gains (accounts for consolidation after spike)")
-        self.logger.info(f"Universe size: {self.UNIVERSE_SIZE} stocks")
-        self.logger.info(f"Top winners per day: {self.TOP_WINNERS_PER_DAY}")
-        self.logger.info(f"Max criteria matches per day: {self.MAX_CRITERIA_MATCHES}")
+        self.logger.info(f"Tracking PEAK gains during holding period")
+        self.logger.info(f"Calculating day-over-day gains (prev close -> current close)")
+        self.logger.info(f"Universe size: {self.UNIVERSE_SIZE} stocks (NO PREDEFINED LISTS)")
         
-        # Build dynamic stock universe
+        # Build 100% dynamic universe
         self.logger.info("\n" + "=" * 80)
-        self.logger.info("BUILDING DYNAMIC STOCK UNIVERSE")
+        self.logger.info("BUILDING 100% DYNAMIC STOCK UNIVERSE")
         self.logger.info("=" * 80)
-        self._build_dynamic_universe(start_date, end_date)
+        self._build_fully_dynamic_universe()
         
-        # Pre-download historical data for entire universe
+        # Pre-download historical data
         self.logger.info("\n" + "=" * 80)
         self.logger.info("PRE-DOWNLOADING HISTORICAL DATA")
         self.logger.info("=" * 80)
@@ -103,6 +98,7 @@ class StrategyBacktester:
         # Generate trading days
         trading_days = self._get_trading_days(start_date, end_date)
         self.logger.info(f"\nWill test {len(trading_days)} trading days")
+        self.logger.info(f"Expected total records: ~{len(trading_days) * (self.TOP_WINNERS_PER_DAY + self.MAX_CRITERIA_MATCHES)}")
         
         # Results storage
         all_trades = []
@@ -119,17 +115,22 @@ class StrategyBacktester:
             
             self.logger.info(f"\n[{idx + 1}/{len(trading_days)}] Processing {test_date}...")
             
-            # Find actual top gainers for this date
-            winners = self._get_actual_top_gainers(
+            # Find actual top gainers (prev close -> current close)
+            winners = self._get_actual_top_gainers_correct(
                 test_date,
                 self.TOP_WINNERS_PER_DAY,
                 strategy_config.get('min_price', self.MIN_PRICE),
                 strategy_config.get('min_volume', self.MIN_VOLUME)
             )
-            self.logger.info(f"  ✓ Found {len(winners)} top gainers (up to {max([w['day_gain_pct'] for w in winners]) if winners else 0:.1f}%)")
             
-            # Find stocks matching criteria
-            criteria_matches = self._get_criteria_matches(
+            if winners:
+                max_gain = max([w['day_gain_pct'] for w in winners])
+                self.logger.info(f"  ✓ Found {len(winners)} top gainers (max: {max_gain:.1f}%)")
+            else:
+                self.logger.info(f"  ✓ Found {len(winners)} top gainers")
+            
+            # Find stocks matching criteria YESTERDAY (for prediction)
+            criteria_matches = self._get_criteria_matches_previous_day(
                 test_date,
                 strategy_config['indicator_criteria'],
                 self.MAX_CRITERIA_MATCHES,
@@ -137,10 +138,10 @@ class StrategyBacktester:
                 strategy_config.get('max_price'),
                 strategy_config.get('min_volume', self.MIN_VOLUME)
             )
-            self.logger.info(f"  ✓ Found {len(criteria_matches)} stocks matching criteria")
+            self.logger.info(f"  ✓ Found {len(criteria_matches)} stocks matching criteria yesterday")
             
-            # Evaluate outcomes (with peak gain detection)
-            day_trades = self._evaluate_day(
+            # Evaluate outcomes
+            day_trades = self._evaluate_day_correct(
                 test_date,
                 winners,
                 criteria_matches,
@@ -157,9 +158,9 @@ class StrategyBacktester:
             daily_results.append(daily_result)
             
             self.logger.info(
-                f"  ✓ Results: {daily_result['true_positives']} true positives, "
+                f"  ✓ {daily_result['true_positives']} true positives, "
                 f"{daily_result['false_positives']} false positives, "
-                f"{daily_result['missed_opportunities']} missed opportunities"
+                f"{daily_result['missed_opportunities']} missed"
             )
         
         # Calculate overall statistics
@@ -178,87 +179,95 @@ class StrategyBacktester:
         
         return results
     
-    def _build_dynamic_universe(self, start_date: datetime.date, end_date: datetime.date):
+    def _build_fully_dynamic_universe(self):
         """
-        Build universe dynamically using yfinance
-        Gets most actively traded stocks from major exchanges
+        Build universe 100% dynamically - NO PREDEFINED LISTS
+        Fetches ticker lists from public sources only
         """
-        self.logger.info("Building dynamic stock universe using yfinance...")
-        
-        # Strategy: Download lists of stocks from major indices and ETFs
-        # Then filter for actively traded ones
+        self.logger.info("Building 100% dynamic stock universe...")
         
         symbols = set()
         
-        # Get S&P 500 components
+        # Get S&P 500 (dynamic from Wikipedia)
         try:
             self.logger.info("  Fetching S&P 500 components...")
-            sp500 = pd.read_html('https://en.wikipedia.org/wiki/List_of_S%26P_500_companies')[0]
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
+            tables = pd.read_html(url)
+            sp500 = tables[0]
             sp500_symbols = sp500['Symbol'].str.replace('.', '-').tolist()
-            symbols.update(sp500_symbols[:500])  # Limit to 500
-            self.logger.info(f"  ✓ Added {len(sp500_symbols[:500])} S&P 500 stocks")
+            symbols.update(sp500_symbols)
+            self.logger.info(f"  ✓ Added {len(sp500_symbols)} S&P 500 stocks")
         except Exception as e:
-            self.logger.warning(f"  Could not fetch S&P 500: {e}")
+            self.logger.warning(f"  Failed to fetch S&P 500: {e}")
         
-        # Get NASDAQ 100 components
+        # Get NASDAQ 100 (dynamic from Wikipedia)
         try:
             self.logger.info("  Fetching NASDAQ 100 components...")
-            nasdaq100 = pd.read_html('https://en.wikipedia.org/wiki/NASDAQ-100')[4]
+            url = 'https://en.wikipedia.org/wiki/NASDAQ-100'
+            tables = pd.read_html(url)
+            nasdaq100 = tables[4]  # The holdings table
             nasdaq_symbols = nasdaq100['Ticker'].tolist()
-            symbols.update(nasdaq_symbols[:100])
-            self.logger.info(f"  ✓ Added {len(nasdaq_symbols[:100])} NASDAQ 100 stocks")
+            symbols.update(nasdaq_symbols)
+            self.logger.info(f"  ✓ Added {len(nasdaq_symbols)} NASDAQ 100 stocks")
         except Exception as e:
-            self.logger.warning(f"  Could not fetch NASDAQ 100: {e}")
+            self.logger.warning(f"  Failed to fetch NASDAQ 100: {e}")
         
-        # Get Russell 2000 small caps (where the big movers often are)
+        # Get Dow Jones Industrial Average (dynamic)
         try:
-            self.logger.info("  Fetching Russell 2000 components...")
-            # Use a sample of Russell 2000 from iShares IWM ETF holdings
-            iwm = yf.Ticker("IWM")
-            # We can't get holdings directly, so we'll add known volatile small caps
-            # This is a limitation - in production you'd want a data provider
+            self.logger.info("  Fetching Dow Jones components...")
+            url = 'https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average'
+            tables = pd.read_html(url)
+            dow = tables[1]
+            dow_symbols = dow['Symbol'].tolist()
+            symbols.update(dow_symbols)
+            self.logger.info(f"  ✓ Added {len(dow_symbols)} Dow Jones stocks")
         except Exception as e:
-            self.logger.warning(f"  Could not fetch Russell 2000: {e}")
+            self.logger.warning(f"  Failed to fetch Dow Jones: {e}")
         
-        # Add some known volatile/popular tickers that often have big moves
-        popular_tickers = [
-            # Meme stocks / high volatility
-            'GME', 'AMC', 'BBBY', 'KOSS', 'EXPR', 'NAKD', 'SNDL', 'TLRY',
-            # Penny stocks that move
-            'MULN', 'WULF', 'GREE', 'SPRT', 'IRNT', 'OPAD', 'BGFV',
-            # Biotech (often big movers)
-            'MRNA', 'BNTX', 'NVAX', 'GILD', 'REGN', 'VRTX', 'BIIB',
-            # EV / Tech high volatility  
-            'TSLA', 'RIVN', 'LCID', 'NIO', 'XPEV', 'LI',
-            # Crypto related
-            'MARA', 'RIOT', 'COIN', 'MSTR', 'SI', 'HUT',
-            # SPACs and recent IPOs often have big moves
-            'HOOD', 'DKNG', 'OPEN', 'SOFI', 'UPST', 'AFRM'
-        ]
-        symbols.update(popular_tickers)
+        # Get S&P 400 MidCap
+        try:
+            self.logger.info("  Fetching S&P 400 MidCap components...")
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_400_companies'
+            tables = pd.read_html(url)
+            sp400 = tables[0]
+            sp400_symbols = sp400['Symbol'].str.replace('.', '-').tolist()
+            symbols.update(sp400_symbols)
+            self.logger.info(f"  ✓ Added {len(sp400_symbols)} S&P 400 stocks")
+        except Exception as e:
+            self.logger.warning(f"  Failed to fetch S&P 400: {e}")
+        
+        # Get S&P 600 SmallCap (more big movers here)
+        try:
+            self.logger.info("  Fetching S&P 600 SmallCap components...")
+            url = 'https://en.wikipedia.org/wiki/List_of_S%26P_600_companies'
+            tables = pd.read_html(url)
+            sp600 = tables[0]
+            sp600_symbols = sp600['Symbol'].str.replace('.', '-').tolist()
+            symbols.update(sp600_symbols)
+            self.logger.info(f"  ✓ Added {len(sp600_symbols)} S&P 600 stocks")
+        except Exception as e:
+            self.logger.warning(f"  Failed to fetch S&P 600: {e}")
         
         # Convert to list and limit
         self.universe = list(symbols)[:self.UNIVERSE_SIZE]
         
-        self.logger.info(f"\n✓ Built universe of {len(self.universe)} stocks")
+        self.logger.info(f"\n✓ Built 100% dynamic universe of {len(self.universe)} stocks")
+        self.logger.info(f"  NO PREDEFINED LISTS - All fetched dynamically")
         self.logger.info(f"  Sample: {self.universe[:10]}")
     
     def _preload_historical_data(self, start_date: datetime.date, end_date: datetime.date):
-        """
-        Pre-download historical data for entire universe
-        This is much faster than fetching on-demand
-        """
+        """Pre-download historical data for entire universe"""
         # Need extra days for indicators and future price checking
         fetch_start = start_date - timedelta(days=self.LOOKBACK_DAYS)
         fetch_end = end_date + timedelta(days=30)
         
         self.logger.info(f"Downloading data from {fetch_start} to {fetch_end}...")
-        self.logger.info(f"This may take a few minutes for {len(self.universe)} stocks...")
+        self.logger.info(f"This will take a few minutes for {len(self.universe)} stocks...")
         
         successful = 0
         failed = 0
         
-        # Download in batches to avoid overwhelming the API
+        # Download in batches
         batch_size = 50
         
         for i in range(0, len(self.universe), batch_size):
@@ -284,10 +293,7 @@ class StrategyBacktester:
                             df = data[symbol]
                         
                         if isinstance(df, pd.DataFrame) and not df.empty and len(df) > 50:
-                            # Store price data
                             self.price_cache[symbol] = df
-                            
-                            # Calculate and store indicators
                             self.indicator_cache[symbol] = self._calculate_indicators(df)
                             successful += 1
                         else:
@@ -309,7 +315,7 @@ class StrategyBacktester:
         
         self.logger.info(f"\n✓ Downloaded data for {successful} stocks ({failed} failed)")
     
-    def _get_actual_top_gainers(
+    def _get_actual_top_gainers_correct(
         self,
         date: datetime.date,
         count: int,
@@ -317,8 +323,10 @@ class StrategyBacktester:
         min_volume: int
     ) -> List[Dict[str, Any]]:
         """
-        Find the ACTUAL top gainers for a specific historical date
-        by analyzing price data
+        Find ACTUAL top gainers using CORRECT calculation:
+        (today's close - yesterday's close) / yesterday's close
+        
+        This is what "top gainers" actually means in the market
         """
         gainers = []
         
@@ -328,42 +336,43 @@ class StrategyBacktester:
             
             df = self.price_cache[symbol]
             
-            # Check if we have data for this date
             try:
-                # Get closest date
                 df_dates = pd.to_datetime(df.index).date
-                available_dates = [d for d in df_dates if d <= date]
                 
+                # Find today's date in data
+                available_dates = [d for d in df_dates if d <= date]
                 if not available_dates:
                     continue
                 
-                actual_date = available_dates[-1]
+                today = available_dates[-1]
+                today_idx = list(df_dates).index(today)
                 
-                if actual_date not in df_dates:
+                # Need yesterday for calculation
+                if today_idx == 0:
                     continue
                 
-                idx = list(df_dates).index(actual_date)
-                row = df.iloc[idx]
+                yesterday_idx = today_idx - 1
+                
+                # Get prices
+                yesterday_close = df.iloc[yesterday_idx]['Close']
+                today_close = df.iloc[today_idx]['Close']
+                today_volume = df.iloc[today_idx]['Volume']
                 
                 # Filter by price and volume
-                close_price = row['Close']
-                volume = row['Volume']
-                
-                if close_price < min_price or volume < min_volume:
+                if today_close < min_price or today_volume < min_volume:
                     continue
                 
-                # Calculate day's gain
-                open_price = row['Open']
-                day_gain_pct = ((close_price - open_price) / open_price) * 100
+                # Calculate CORRECT day-over-day gain
+                day_gain_pct = ((today_close - yesterday_close) / yesterday_close) * 100
                 
                 if day_gain_pct > 0:  # Only gainers
                     gainers.append({
                         'symbol': symbol,
-                        'exchange': 'US',  # yfinance doesn't specify
-                        'date': actual_date,
-                        'open': float(open_price),
-                        'close': float(close_price),
-                        'volume': int(volume),
+                        'exchange': 'US',
+                        'date': today,
+                        'prev_close': float(yesterday_close),
+                        'close': float(today_close),
+                        'volume': int(today_volume),
                         'day_gain_pct': float(day_gain_pct)
                     })
                     
@@ -374,7 +383,7 @@ class StrategyBacktester:
         gainers.sort(key=lambda x: x['day_gain_pct'], reverse=True)
         return gainers[:count]
     
-    def _get_criteria_matches(
+    def _get_criteria_matches_previous_day(
         self,
         date: datetime.date,
         indicator_criteria: List[Dict[str, Any]],
@@ -384,7 +393,10 @@ class StrategyBacktester:
         min_volume: int
     ) -> List[Dict[str, Any]]:
         """
-        Find stocks matching indicator criteria for this date
+        Find stocks matching criteria on the PREVIOUS day
+        
+        This is the correct logic: "What would my criteria have flagged yesterday
+        that I could have bought at yesterday's close?"
         """
         matches = []
         
@@ -392,18 +404,17 @@ class StrategyBacktester:
             if symbol not in self.indicator_cache:
                 continue
             
-            # Check if we have data for this date
             try:
                 indicators_df = self.indicator_cache[symbol]
                 df_dates = indicators_df.index
                 
-                # Find closest date
-                available_dates = [d for d in df_dates if d <= date]
+                # Find yesterday (one day before test date)
+                available_dates = [d for d in df_dates if d < date]
                 if not available_dates:
                     continue
                 
-                actual_date = available_dates[-1]
-                indicators = indicators_df.loc[actual_date]
+                yesterday = available_dates[-1]
+                indicators = indicators_df.loc[yesterday]
                 
                 # Filter by price and volume
                 close_price = indicators['close']
@@ -415,13 +426,14 @@ class StrategyBacktester:
                 if max_price and close_price > max_price:
                     continue
                 
-                # Check if criteria match
+                # Check if criteria match YESTERDAY
                 if self._check_criteria(indicators, indicator_criteria):
                     matches.append({
                         'symbol': symbol,
                         'exchange': 'US',
-                        'date': actual_date,
-                        'entry_price': float(close_price),
+                        'signal_date': yesterday,  # When we got the signal
+                        'entry_date': date,  # When we would enter (next day)
+                        'entry_price': float(close_price),  # Enter at yesterday's close
                         'volume': int(volume),
                         'indicators': self._extract_indicator_values(indicators)
                     })
@@ -434,7 +446,7 @@ class StrategyBacktester:
         
         return matches
     
-    def _evaluate_day(
+    def _evaluate_day_correct(
         self,
         date: datetime.date,
         winners: List[Dict[str, Any]],
@@ -443,8 +455,8 @@ class StrategyBacktester:
         target_days: int
     ) -> List[Dict[str, Any]]:
         """
-        Evaluate outcomes for the day
-        CRITICAL: Uses PEAK gain during holding period (not just exit price)
+        Evaluate outcomes with CORRECT logic
+        Entry is at yesterday's close (when criteria matched)
         """
         trades = []
         
@@ -453,13 +465,15 @@ class StrategyBacktester:
         # Evaluate all criteria matches
         for match in criteria_matches:
             symbol = match['symbol']
+            entry_date = match['entry_date']
+            entry_price = match['entry_price']
             
-            # Calculate outcome (with peak gain detection)
-            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome(
-                symbol, date, target_days
+            # Calculate outcome from entry
+            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome_from_entry(
+                symbol, entry_date, entry_price, target_days
             )
             
-            # Check if it hit target at ANY point during holding period
+            # Check if it hit target
             hit_target = peak_gain >= target_gain_pct if peak_gain is not None else False
             
             trade_type = 'true_positive' if hit_target else 'false_positive'
@@ -467,28 +481,31 @@ class StrategyBacktester:
             trades.append({
                 'symbol': symbol,
                 'exchange': match['exchange'],
-                'signal_date': date.isoformat(),
-                'entry_price': match['entry_price'],
+                'signal_date': match['signal_date'].isoformat(),
+                'entry_price': entry_price,
                 'entry_volume': match['volume'],
                 'indicator_values': match['indicators'],
                 'matched_criteria': True,
                 'hit_target': hit_target,
-                'peak_gain_pct': peak_gain,  # NEW: Track peak gain
-                'actual_gain_pct': exit_gain,  # Exit gain for reference
+                'peak_gain_pct': peak_gain,
+                'actual_gain_pct': exit_gain,
                 'exit_price': exit_price,
                 'trade_type': trade_type
             })
         
-        # Missed opportunities (winners not in criteria)
+        # Missed opportunities
         for winner in winners:
             symbol = winner['symbol']
             
             if symbol in match_symbols:
                 continue
             
+            # Would have entered at yesterday's close
+            entry_price = winner['prev_close']
+            
             # Calculate outcome
-            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome(
-                symbol, date, target_days
+            peak_gain, exit_price, exit_gain = self._calculate_peak_outcome_from_entry(
+                symbol, date, entry_price, target_days
             )
             
             hit_target = peak_gain >= target_gain_pct if peak_gain is not None else False
@@ -498,7 +515,7 @@ class StrategyBacktester:
                     'symbol': symbol,
                     'exchange': winner['exchange'],
                     'signal_date': date.isoformat(),
-                    'entry_price': winner['close'],
+                    'entry_price': entry_price,
                     'entry_volume': winner['volume'],
                     'indicator_values': {},
                     'matched_criteria': False,
@@ -511,17 +528,15 @@ class StrategyBacktester:
         
         return trades
     
-    def _calculate_peak_outcome(
+    def _calculate_peak_outcome_from_entry(
         self,
         symbol: str,
         entry_date: datetime.date,
+        entry_price: float,
         hold_days: int
     ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """
-        Calculate PEAK gain during holding period
-        
-        Returns:
-            (peak_gain_pct, exit_price, exit_gain_pct)
+        Calculate peak gain from a specific entry price and date
         """
         if symbol not in self.price_cache:
             return None, None, None
@@ -530,27 +545,27 @@ class StrategyBacktester:
             df = self.price_cache[symbol]
             df_dates = pd.to_datetime(df.index).date
             
-            # Find entry index
+            # Find entry date index
             available_dates = [d for d in df_dates if d >= entry_date]
             if not available_dates:
                 return None, None, None
             
             entry_idx = list(df_dates).index(available_dates[0])
-            entry_price = df.iloc[entry_idx]['Close']
             
             # Get future prices during holding period
-            future_indices = list(range(entry_idx + 1, min(entry_idx + 1 + hold_days, len(df))))
+            future_indices = list(range(entry_idx, min(entry_idx + hold_days, len(df))))
             
-            if not future_indices:
+            if len(future_indices) < 2:  # Need at least entry + 1 day
                 return None, None, None
             
-            future_prices = df.iloc[future_indices]['High'].values  # Use High for peak
+            # Use High prices for peak detection
+            future_highs = df.iloc[future_indices[1:]]['High'].values
             
             # Calculate peak gain
-            peak_price = np.max(future_prices)
+            peak_price = np.max(future_highs)
             peak_gain_pct = ((peak_price - entry_price) / entry_price) * 100
             
-            # Calculate exit gain (at end of holding period)
+            # Calculate exit gain
             exit_idx = future_indices[-1]
             exit_price = df.iloc[exit_idx]['Close']
             exit_gain_pct = ((exit_price - entry_price) / entry_price) * 100
