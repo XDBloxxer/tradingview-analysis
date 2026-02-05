@@ -80,6 +80,10 @@ class DailyWinnersDetector:
                 
                 self.logger.info(f"Got {len(gainers)} gainers from TradingView MarketMovers")
                 
+                # Debug: log first few items to see structure
+                if gainers:
+                    self.logger.info(f"Sample gainer data: {gainers[0]}")
+                
                 for item in gainers:
                     try:
                         # Extract symbol and exchange
@@ -90,9 +94,21 @@ class DailyWinnersDetector:
                             symbol = symbol_full
                             item_exchange = 'NASDAQ'
                         
-                        # Map exchange names
-                        exchange = item_exchange.upper()
-                        if exchange not in self.exchanges:
+                        # Map TradingView exchange names to our format
+                        exchange_map = {
+                            'NASDAQ': 'NASDAQ',
+                            'NYSE': 'NYSE',
+                            'AMEX': 'AMEX',
+                            'NYSEAmerican': 'AMEX',
+                            'US': 'NASDAQ',  # Generic US stocks default to NASDAQ
+                        }
+                        
+                        exchange = exchange_map.get(item_exchange, item_exchange.upper())
+                        
+                        # Accept any US exchange if not in our specific list
+                        # This is more permissive - we'll take US stocks regardless
+                        if exchange not in self.exchanges and item_exchange not in ['NASDAQ', 'NYSE', 'AMEX', 'NYSEAmerican', 'US']:
+                            self.logger.debug(f"Skipping {symbol} - exchange {item_exchange} not in target list")
                             continue
                         
                         price = item.get('close', 0)
@@ -108,6 +124,7 @@ class DailyWinnersDetector:
                                 'change_pct': float(change_pct),
                                 'volume': int(volume)
                             })
+                            self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
                     except Exception as e:
                         self.logger.debug(f"Error processing gainer: {e}")
                         continue
