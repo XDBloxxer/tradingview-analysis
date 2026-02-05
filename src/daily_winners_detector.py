@@ -1,21 +1,21 @@
 """
-Daily Winners Detector - FIXED VERSION using yfinance for reliable data
+Daily Winners Detector - Uses TradingView MarketMovers for ACTUAL daily gainers
 Gets ACTUAL top daily gainers based on today's performance
 """
 
 import logging
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 import pandas as pd
-import yfinance as yf
-from tqdm import tqdm
+
+from tradingview_scraper.symbols.market_movers import MarketMovers
 
 from .rate_limiter import RateLimiter
 
 
 class DailyWinnersDetector:
     """
-    Detects top 10 daily winners using yfinance for reliable data
+    Detects top daily winners using TradingView MarketMovers
     """
     
     def __init__(self, config: dict):
@@ -37,15 +37,16 @@ class DailyWinnersDetector:
         
         # Initialize components
         self.rate_limiter = RateLimiter(config)
+        self.market_movers = MarketMovers()
         
         self.logger.info(
-            f"Daily Winners detector initialized (using yfinance): "
+            f"Daily Winners detector initialized (using TradingView MarketMovers): "
             f"min_price={self.min_price}, min_volume={self.min_volume}"
         )
     
     def detect_top_winners(self, top_n: int = 10, target_date: datetime = None) -> List[Dict[str, Any]]:
         """
-        Detect top N daily winners using yfinance screener
+        Detect top N daily winners using TradingView MarketMovers
         
         Args:
             top_n: Number of top winners to return
@@ -60,46 +61,43 @@ class DailyWinnersDetector:
         target_date_str = target_date.date().isoformat()
         
         self.logger.info(f"Detecting top {top_n} ACTUAL daily winners for {target_date_str}...")
-        self.logger.info("Using yfinance to get reliable daily gainers")
+        self.logger.info("Using TradingView MarketMovers gainers screener")
         
         all_candidates = []
         
-        # Get most active stocks using yfinance screener
         try:
-            # Get day gainers from yfinance
-            self.logger.info("Fetching day gainers from yfinance...")
-            gainers = yf.Screener()
+            self.rate_limiter.wait()
             
-            # Get day gainers screener
-            # This returns actual stocks with highest % change today
-            gainers_data = gainers.get_screeners(['day_gainers'], count=100)
+            # Get actual day gainers from TradingView
+            gainers_result = self.market_movers.scrape(
+                market='stocks-usa',
+                category='gainers',
+                limit=100  # Get more to filter
+            )
             
-            if gainers_data and 'day_gainers' in gainers_data:
-                quotes = gainers_data['day_gainers'].get('quotes', [])
+            if gainers_result and gainers_result.get('status') == 'success':
+                gainers = gainers_result.get('data', [])
                 
-                self.logger.info(f"Got {len(quotes)} gainers from yfinance")
+                self.logger.info(f"Got {len(gainers)} gainers from TradingView MarketMovers")
                 
-                for quote in quotes:
+                for item in gainers:
                     try:
-                        symbol = quote.get('symbol', '')
+                        # Extract symbol and exchange
+                        symbol_full = item.get('symbol', '')
+                        if ':' in symbol_full:
+                            item_exchange, symbol = symbol_full.split(':', 1)
+                        else:
+                            symbol = symbol_full
+                            item_exchange = 'NASDAQ'
                         
-                        # Get exchange - yfinance uses different format
-                        exchange = quote.get('exchange', 'NASDAQ')
-                        # Map yfinance exchanges to our format
-                        if exchange in ['NMS', 'NGM', 'NCM']:
-                            exchange = 'NASDAQ'
-                        elif exchange == 'NYQ':
-                            exchange = 'NYSE'
-                        elif exchange == 'NYE':
-                            exchange = 'AMEX'
-                        
-                        # Skip if not in our target exchanges
+                        # Map exchange names
+                        exchange = item_exchange.upper()
                         if exchange not in self.exchanges:
                             continue
                         
-                        price = quote.get('regularMarketPrice', 0)
-                        change_pct = quote.get('regularMarketChangePercent', 0)
-                        volume = quote.get('regularMarketVolume', 0)
+                        price = item.get('close', 0)
+                        change_pct = item.get('change', 0)
+                        volume = item.get('volume', 0)
                         
                         # Apply filters
                         if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
@@ -111,13 +109,13 @@ class DailyWinnersDetector:
                                 'volume': int(volume)
                             })
                     except Exception as e:
-                        self.logger.debug(f"Error processing quote: {e}")
+                        self.logger.debug(f"Error processing gainer: {e}")
                         continue
+            else:
+                self.logger.warning(f"MarketMovers failed: {gainers_result.get('status', 'unknown')}")
         
         except Exception as e:
-            self.logger.error(f"Error fetching from yfinance screener: {e}")
-            self.logger.info("Falling back to manual stock list scan...")
-            all_candidates = self._fallback_scan(target_date)
+            self.logger.error(f"Error fetching from MarketMovers: {e}")
         
         if not all_candidates:
             self.logger.warning("No winners found")
@@ -143,78 +141,3 @@ class DailyWinnersDetector:
                 self.logger.info(f"  ... and {len(top_winners) - 5} more")
         
         return top_winners
-    
-    def _fallback_scan(self, target_date: datetime) -> List[Dict[str, Any]]:
-        """
-        Fallback method: scan a predefined list of active stocks
-        This is used if yfinance screener fails
-        """
-        self.logger.info("Using fallback method - scanning active stocks...")
-        
-        # List of highly traded stocks to scan
-        # These are common stocks that frequently appear in daily movers
-        scan_symbols = [
-            # Tech
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC', 'NFLX',
-            # Finance
-            'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'V', 'MA',
-            # Healthcare
-            'JNJ', 'PFE', 'ABBV', 'MRK', 'TMO', 'UNH',
-            # Energy
-            'XOM', 'CVX', 'COP', 'SLB',
-            # Consumer
-            'WMT', 'HD', 'DIS', 'NKE', 'SBUX', 'MCD',
-            # Volatile/Penny stocks that often move
-            'SOXL', 'TQQQ', 'SPXL', 'UVXY', 'SQQQ',
-        ]
-        
-        # Add more volatile small caps
-        # These are stocks under $50 that tend to have big moves
-        volatile_small_caps = [
-            'AMC', 'GME', 'BBBY', 'PLUG', 'RIOT', 'MARA', 'LCID', 'RIVN',
-            'NIO', 'PLTR', 'SOFI', 'CLOV', 'WISH', 'BB', 'NOK', 'SNDL'
-        ]
-        
-        scan_symbols.extend(volatile_small_caps)
-        
-        candidates = []
-        
-        for symbol in tqdm(scan_symbols, desc="Scanning stocks"):
-            try:
-                ticker = yf.Ticker(symbol)
-                
-                # Get today's data
-                hist = ticker.history(period='2d')
-                
-                if len(hist) < 2:
-                    continue
-                
-                today = hist.iloc[-1]
-                yesterday = hist.iloc[-2]
-                
-                price = today['Close']
-                change_pct = ((price - yesterday['Close']) / yesterday['Close']) * 100
-                volume = today['Volume']
-                
-                # Determine exchange (approximate)
-                info = ticker.info
-                exchange = info.get('exchange', 'NASDAQ')
-                if exchange in ['NMS', 'NGM', 'NCM']:
-                    exchange = 'NASDAQ'
-                elif exchange == 'NYQ':
-                    exchange = 'NYSE'
-                
-                if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
-                    candidates.append({
-                        'symbol': symbol,
-                        'exchange': exchange,
-                        'price': float(price),
-                        'change_pct': float(change_pct),
-                        'volume': int(volume)
-                    })
-                
-            except Exception as e:
-                self.logger.debug(f"Error scanning {symbol}: {e}")
-                continue
-        
-        return candidates
