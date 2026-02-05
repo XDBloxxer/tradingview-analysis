@@ -33,8 +33,8 @@ class StrategyBacktester:
     # ===== USER-ADJUSTABLE VARIABLES =====
     TOP_WINNERS_PER_DAY = 20
     MAX_CRITERIA_MATCHES = 50
-    UNIVERSE_SIZE = 3000
-    LOOKBACK_DAYS = 120
+    UNIVERSE_SIZE = 1000
+    LOOKBACK_DAYS = 60
     MIN_PRICE = 0.50
     MIN_VOLUME = 50000
     # ======================================
