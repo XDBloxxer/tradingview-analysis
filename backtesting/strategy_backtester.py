@@ -5,10 +5,10 @@ Evaluates trading strategies against historical data
 
 FIXED VERSION:
 1. Gets top N winners for each day
-2. Finds stocks matching strategy criteria (configurable limit)
+2. Finds stocks matching strategy criteria (configurable limit per day)
 3. Identifies:
-   - True positives (criteria match + winner)
-   - False positives (criteria match but not winner)
+   - True positives (criteria match + hit target)
+   - False positives (criteria match but didn't hit target)
    - Missed opportunities (winner but no criteria match)
 """
 
@@ -33,14 +33,14 @@ class StrategyBacktester:
     """
     Backtests trading strategies by:
     1. Finding top N daily winners
-    2. Finding stocks matching indicator criteria (with limit)
+    2. Finding stocks matching indicator criteria (with limit PER DAY)
     3. Checking if matches hit target gains
     4. Tracking true positives, false positives, and missed opportunities
     """
     
     # HARDCODED LIMITS - Change these values to adjust analysis scope
     TOP_WINNERS_PER_DAY = 10  # How many top daily winners to track
-    MAX_CRITERIA_MATCHES = 50  # Max stocks to analyze that match criteria
+    MAX_CRITERIA_MATCHES = 50  # Max stocks to analyze that match criteria PER DAY
     
     # Parallel processing
     MAX_WORKERS = 5
@@ -107,8 +107,8 @@ class StrategyBacktester:
         self.logger.info(f"Period: {start_date} to {end_date}")
         self.logger.info(f"Target gain: {strategy_config['target_min_gain_pct']}% in {strategy_config['target_days']} day(s)")
         self.logger.info(f"Indicator criteria: {len(strategy_config['indicator_criteria'])} conditions")
-        self.logger.info(f"Top winners to track: {self.TOP_WINNERS_PER_DAY} (hardcoded)")
-        self.logger.info(f"Max criteria matches to analyze: {self.MAX_CRITERIA_MATCHES} (hardcoded)")
+        self.logger.info(f"Top winners to track: {self.TOP_WINNERS_PER_DAY} per day (hardcoded)")
+        self.logger.info(f"Max criteria matches to analyze: {self.MAX_CRITERIA_MATCHES} per day (hardcoded)")
         
         # Generate list of trading days
         trading_days = self._get_trading_days(start_date, end_date)
@@ -269,12 +269,12 @@ class StrategyBacktester:
         min_volume: int
     ) -> List[Dict[str, Any]]:
         """
-        Get stocks that match the indicator criteria
+        Get stocks that match the indicator criteria FOR THIS DAY
         
         Args:
             date: Date to evaluate
             indicator_criteria: List of indicator conditions
-            max_matches: Maximum number of matches to return
+            max_matches: Maximum number of matches to return FOR THIS DAY
             exchanges: List of exchanges
             min_price: Minimum stock price
             max_price: Maximum stock price (optional)
@@ -283,7 +283,7 @@ class StrategyBacktester:
         Returns:
             List of stock dictionaries that match criteria
         """
-        # Get a broader universe of stocks to evaluate
+        # Get a broader universe of stocks to evaluate FOR THIS DAY
         universe = []
         
         for exchange in exchanges:
@@ -301,7 +301,7 @@ class StrategyBacktester:
                 results = self.screener.screen(
                     market=market,
                     filters=filters,
-                    limit=max_matches * 3  # Get more than needed for filtering
+                    limit=200  # Get reasonable universe per day
                 )
                 
                 if results and results.get('status') == 'success':
@@ -332,7 +332,7 @@ class StrategyBacktester:
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             futures = {
                 executor.submit(self._check_stock_criteria, stock, date, indicator_criteria): stock
-                for stock in universe[:max_matches * 2]  # Limit how many we check
+                for stock in universe  # Check all stocks in universe
             }
             
             for future in as_completed(futures):
@@ -341,6 +341,9 @@ class StrategyBacktester:
                     if result:
                         matches.append(result)
                         if len(matches) >= max_matches:
+                            # Cancel remaining futures to save time
+                            for f in futures:
+                                f.cancel()
                             break
                 except Exception as e:
                     continue
@@ -387,6 +390,7 @@ class StrategyBacktester:
         if self._check_criteria(indicators, indicator_criteria):
             stock['indicators'] = self._extract_indicator_values(indicators)
             stock['entry_price'] = float(indicators['close'])
+            stock['hist_data'] = hist_data  # Pass historical data for outcome calculation
             return stock
         
         return None
@@ -402,6 +406,8 @@ class StrategyBacktester:
         """
         Evaluate the day's results
         
+        FIXED: Properly evaluate if criteria matches hit target
+        
         Args:
             date: Test date
             winners: List of top winners
@@ -416,33 +422,24 @@ class StrategyBacktester:
         
         # Create sets for easy lookup
         winner_symbols = {w['symbol'] for w in winners}
-        match_symbols = {m['symbol'] for m in criteria_matches}
         
-        # Process winners to check outcomes
-        winner_outcomes = {}
-        for winner in winners:
-            hist_data = self._fetch_historical_data(winner['symbol'], date)
-            if hist_data is not None:
-                entry_price = winner['price']
-                exit_price, actual_gain = self._calculate_outcome(hist_data, date, target_days)
-                
-                hit_target = actual_gain >= target_gain_pct if actual_gain is not None else False
-                
-                winner_outcomes[winner['symbol']] = {
-                    'entry_price': entry_price,
-                    'exit_price': exit_price,
-                    'actual_gain_pct': actual_gain,
-                    'hit_target': hit_target
-                }
-        
-        # TRUE POSITIVES: In criteria matches AND is a winner that hit target
+        # Process ALL criteria matches and check if they hit target
         for match in criteria_matches:
             symbol = match['symbol']
             
-            if symbol in winner_symbols and symbol in winner_outcomes:
-                outcome = winner_outcomes[symbol]
+            # Get outcome for this stock
+            hist_data = match.get('hist_data')
+            if hist_data is None:
+                hist_data = self._fetch_historical_data(symbol, date)
+            
+            if hist_data is not None:
+                exit_price, actual_gain = self._calculate_outcome(hist_data, date, target_days)
                 
-                if outcome['hit_target']:
+                # Check if it hit the target (actual_gain >= target_gain_pct)
+                hit_target = actual_gain >= target_gain_pct if actual_gain is not None else False
+                
+                if hit_target:
+                    # TRUE POSITIVE: Criteria match AND hit target
                     trades.append({
                         'symbol': symbol,
                         'exchange': match['exchange'],
@@ -452,17 +449,12 @@ class StrategyBacktester:
                         'indicator_values': match.get('indicators', {}),
                         'matched_criteria': True,
                         'hit_target': True,
-                        'actual_gain_pct': outcome['actual_gain_pct'],
-                        'exit_price': outcome['exit_price'],
+                        'actual_gain_pct': actual_gain,
+                        'exit_price': exit_price,
                         'trade_type': 'true_positive'
                     })
-            else:
-                # FALSE POSITIVE: In criteria but not a winner (or didn't hit target)
-                # Get outcome for this stock
-                hist_data = self._fetch_historical_data(symbol, date)
-                if hist_data is not None:
-                    exit_price, actual_gain = self._calculate_outcome(hist_data, date, target_days)
-                    
+                else:
+                    # FALSE POSITIVE: Criteria match but didn't hit target
                     trades.append({
                         'symbol': symbol,
                         'exchange': match['exchange'],
@@ -477,14 +469,25 @@ class StrategyBacktester:
                         'trade_type': 'false_positive'
                     })
         
-        # MISSED OPPORTUNITIES: Winners that hit target but not in criteria
+        # MISSED OPPORTUNITIES: Winners that hit target but not in criteria matches
+        match_symbols = {m['symbol'] for m in criteria_matches}
+        
         for winner in winners:
             symbol = winner['symbol']
             
-            if symbol not in match_symbols and symbol in winner_outcomes:
-                outcome = winner_outcomes[symbol]
+            # Skip if already in criteria matches
+            if symbol in match_symbols:
+                continue
+            
+            # Get outcome for this winner
+            hist_data = self._fetch_historical_data(symbol, date)
+            if hist_data is not None:
+                exit_price, actual_gain = self._calculate_outcome(hist_data, date, target_days)
                 
-                if outcome['hit_target']:
+                # Check if it hit target
+                hit_target = actual_gain >= target_gain_pct if actual_gain is not None else False
+                
+                if hit_target:
                     trades.append({
                         'symbol': symbol,
                         'exchange': winner['exchange'],
@@ -494,8 +497,8 @@ class StrategyBacktester:
                         'indicator_values': {},
                         'matched_criteria': False,
                         'hit_target': True,
-                        'actual_gain_pct': outcome['actual_gain_pct'],
-                        'exit_price': outcome['exit_price'],
+                        'actual_gain_pct': actual_gain,
+                        'exit_price': exit_price,
                         'trade_type': 'false_negative'
                     })
         
