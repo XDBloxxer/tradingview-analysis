@@ -1,6 +1,6 @@
 """
 Daily Winners Detector - Uses TradingView MarketMovers for ACTUAL daily gainers
-Gets ACTUAL top daily gainers from major exchanges (NASDAQ, NYSE, AMEX)
+Gets top daily gainers from stocks-usa market and filters out OTC stocks
 """
 
 import logging
@@ -16,7 +16,7 @@ from .rate_limiter import RateLimiter
 class DailyWinnersDetector:
     """
     Detects top daily winners using TradingView MarketMovers
-    Filters to major exchanges only (NASDAQ, NYSE, AMEX)
+    Filters to major exchanges only (NASDAQ, NYSE, AMEX) - excludes OTC
     """
     
     def __init__(self, config: dict):
@@ -65,87 +65,81 @@ class DailyWinnersDetector:
         
         all_candidates = []
         
-        # Try multiple markets to get major exchange stocks
-        # These are the specific market parameters that return NASDAQ/NYSE/AMEX stocks
-        markets_to_try = [
-            'stocks-usa',  # General US stocks
-            'nasdaq',      # NASDAQ specific
-            'nyse',        # NYSE specific
-        ]
-        
-        for market in markets_to_try:
-            try:
-                self.rate_limiter.wait()
-                
-                self.logger.info(f"Fetching gainers from market: {market}")
-                
-                # Get actual day gainers from TradingView
-                gainers_result = self.market_movers.scrape(
-                    market=market,
-                    category='gainers',
-                    limit=50  # Get 50 per market
-                )
-                
-                if gainers_result and gainers_result.get('status') == 'success':
-                    gainers = gainers_result.get('data', [])
-                    
-                    self.logger.info(f"Got {len(gainers)} gainers from {market}")
-                    
-                    # Debug: log first item to see structure (only once)
-                    if gainers and not all_candidates:
-                        self.logger.debug(f"Sample gainer: {gainers[0]}")
-                    
-                    for item in gainers:
-                        try:
-                            # Extract symbol and exchange
-                            symbol_full = item.get('symbol', '')
-                            if ':' in symbol_full:
-                                item_exchange, symbol = symbol_full.split(':', 1)
-                            else:
-                                symbol = symbol_full
-                                item_exchange = 'NASDAQ'
-                            
-                            # Skip OTC stocks entirely
-                            if item_exchange == 'OTC':
-                                continue
-                            
-                            # Map to standard exchange names
-                            exchange_map = {
-                                'NASDAQ': 'NASDAQ',
-                                'NYSE': 'NYSE',
-                                'AMEX': 'AMEX',
-                                'NYSEAmerican': 'AMEX',
-                            }
-                            exchange = exchange_map.get(item_exchange, item_exchange)
-                            
-                            price = item.get('close', 0)
-                            change_pct = item.get('change', 0)
-                            volume = item.get('volume', 0)
-                            
-                            # Apply filters
-                            if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
-                                # Check if we already have this symbol (deduplicate)
-                                if not any(c['symbol'] == symbol for c in all_candidates):
-                                    all_candidates.append({
-                                        'symbol': symbol,
-                                        'exchange': exchange,
-                                        'price': float(price),
-                                        'change_pct': float(change_pct),
-                                        'volume': int(volume)
-                                    })
-                                    self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
-                        except Exception as e:
-                            self.logger.debug(f"Error processing gainer: {e}")
-                            continue
-                else:
-                    self.logger.warning(f"MarketMovers failed for {market}: {gainers_result.get('status', 'unknown')}")
+        try:
+            self.rate_limiter.wait()
             
-            except Exception as e:
-                self.logger.error(f"Error fetching from MarketMovers ({market}): {e}")
-                continue
+            # Get day gainers from TradingView - fetch MORE to compensate for OTC filtering
+            gainers_result = self.market_movers.scrape(
+                market='stocks-usa',
+                category='gainers',
+                limit=200  # Get 200 to ensure we have enough after filtering OTC
+            )
+            
+            if gainers_result and gainers_result.get('status') == 'success':
+                gainers = gainers_result.get('data', [])
+                
+                self.logger.info(f"Got {len(gainers)} gainers from stocks-usa market")
+                
+                # Debug: log first item
+                if gainers:
+                    self.logger.debug(f"Sample gainer: {gainers[0]}")
+                
+                otc_count = 0
+                filtered_count = 0
+                
+                for item in gainers:
+                    try:
+                        # Extract symbol and exchange
+                        symbol_full = item.get('symbol', '')
+                        if ':' in symbol_full:
+                            item_exchange, symbol = symbol_full.split(':', 1)
+                        else:
+                            symbol = symbol_full
+                            item_exchange = 'NASDAQ'
+                        
+                        # Skip OTC stocks entirely
+                        if item_exchange == 'OTC':
+                            otc_count += 1
+                            continue
+                        
+                        # Map to standard exchange names
+                        exchange_map = {
+                            'NASDAQ': 'NASDAQ',
+                            'NYSE': 'NYSE',
+                            'AMEX': 'AMEX',
+                            'NYSEAmerican': 'AMEX',
+                        }
+                        exchange = exchange_map.get(item_exchange, item_exchange)
+                        
+                        price = item.get('close', 0)
+                        change_pct = item.get('change', 0)
+                        volume = item.get('volume', 0)
+                        
+                        # Apply filters
+                        if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
+                            all_candidates.append({
+                                'symbol': symbol,
+                                'exchange': exchange,
+                                'price': float(price),
+                                'change_pct': float(change_pct),
+                                'volume': int(volume)
+                            })
+                            self.logger.debug(f"Added {symbol} ({exchange}): +{change_pct:.2f}%")
+                        else:
+                            filtered_count += 1
+                    except Exception as e:
+                        self.logger.debug(f"Error processing gainer: {e}")
+                        continue
+                
+                self.logger.info(f"Filtered out {otc_count} OTC stocks and {filtered_count} stocks not meeting criteria")
+            else:
+                self.logger.warning(f"MarketMovers failed: {gainers_result.get('status', 'unknown')}")
+        
+        except Exception as e:
+            self.logger.error(f"Error fetching from MarketMovers: {e}")
         
         if not all_candidates:
-            self.logger.warning("No winners found after checking all markets")
+            self.logger.warning("No winners found after filtering")
             return []
         
         # Convert to DataFrame and sort
