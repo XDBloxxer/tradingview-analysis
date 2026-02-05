@@ -105,7 +105,21 @@ class DailyWinnersDetector:
                 try:
                     # Extract data from row
                     # Column names vary, try different possibilities
-                    symbol = row.get('Symbol', row.get('Ticker', ''))
+                    symbol_raw = row.get('Symbol', row.get('Ticker', ''))
+                    
+                    if not symbol_raw:
+                        continue
+                    
+                    # Clean up symbol - sometimes it has extra characters or spaces
+                    # If it's like "S SLAB", take the part after the space
+                    if isinstance(symbol_raw, str):
+                        symbol = symbol_raw.strip()
+                        # If there's a space, take the second part (the actual symbol)
+                        if ' ' in symbol:
+                            parts = symbol.split()
+                            symbol = parts[-1]  # Take the last part which is the actual symbol
+                    else:
+                        symbol = str(symbol_raw).strip()
                     
                     if not symbol:
                         continue
