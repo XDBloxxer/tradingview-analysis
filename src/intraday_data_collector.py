@@ -227,6 +227,11 @@ class IntradayDataCollector:
         except Exception as e:
             self.logger.debug(f"Error fetching intraday for {symbol}: {e}")
             return None
+            
+        self.logger.debug(
+            f"{symbol} intraday fetch | is_today={is_today} | now_et={now_et}"
+        )
+
     
     def _fetch_daily_data(
         self,
