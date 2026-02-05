@@ -261,6 +261,7 @@ class IntradayDataCollector:
             if morning_bars.empty:
                 morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
                 if morning_bars.empty:
+                    self.logger.debug(f"No morning bars found for {symbol}")
                     return None
             
             # Use first available bar
@@ -274,7 +275,7 @@ class IntradayDataCollector:
                 'snapshot_time': '09:30:00'
             }
             
-            # Add indicators
+            # Add indicators (only basic OHLCV)
             for key, value in open_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
@@ -282,10 +283,11 @@ class IntradayDataCollector:
                     except:
                         snapshot[key.lower()] = None
             
+            self.logger.debug(f"Extracted market_open for {symbol}: {list(snapshot.keys())}")
             return snapshot
             
         except Exception as e:
-            self.logger.debug(f"Error extracting market open: {e}")
+            self.logger.debug(f"Error extracting market open for {symbol}: {e}")
             return None
     
     def _extract_market_close(
@@ -306,6 +308,7 @@ class IntradayDataCollector:
             if close_bars.empty:
                 close_bars = intraday_df[intraday_df.index.time <= time(16, 0)]
                 if close_bars.empty:
+                    self.logger.debug(f"No close bars found for {symbol}")
                     return None
             
             # Use last available bar
@@ -319,7 +322,7 @@ class IntradayDataCollector:
                 'snapshot_time': '16:00:00'
             }
             
-            # Add indicators
+            # Add indicators (only basic OHLCV)
             for key, value in close_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
@@ -327,10 +330,11 @@ class IntradayDataCollector:
                     except:
                         snapshot[key.lower()] = None
             
+            self.logger.debug(f"Extracted market_close for {symbol}: {list(snapshot.keys())}")
             return snapshot
             
         except Exception as e:
-            self.logger.debug(f"Error extracting market close: {e}")
+            self.logger.debug(f"Error extracting market close for {symbol}: {e}")
             return None
     
     def _extract_day_prior(
@@ -348,6 +352,7 @@ class IntradayDataCollector:
             available_dates = [d for d in daily_df.index if d <= prior_date]
             
             if not available_dates:
+                self.logger.debug(f"No prior dates found for {symbol}")
                 return None
             
             actual_date = available_dates[-1]
@@ -362,7 +367,7 @@ class IntradayDataCollector:
                 'snapshot_date': actual_date.isoformat()
             }
             
-            # Add indicators
+            # Add indicators (only basic OHLCV)
             for key, value in prior_data.items():
                 if pd.notna(value) and not np.isinf(value):
                     try:
@@ -370,20 +375,21 @@ class IntradayDataCollector:
                     except:
                         snapshot[key.lower()] = None
             
+            self.logger.debug(f"Extracted day_prior for {symbol}: {list(snapshot.keys())}")
             return snapshot
             
         except Exception as e:
-            self.logger.debug(f"Error extracting day prior: {e}")
+            self.logger.debug(f"Error extracting day prior for {symbol}: {e}")
             return None
     
     def _calculate_minimal_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Calculate ONLY indicators that exist in database schema
-        Based on common columns across all three tables
+        Calculate indicators matching the EXACT database schema
+        Column names must match exactly including dots, brackets, spaces
         """
         result = pd.DataFrame(index=df.index)
         
-        # Basic OHLCV (always present)
+        # Basic OHLCV
         result['close'] = df['Close']
         result['open'] = df['Open']
         result['high'] = df['High']
@@ -392,62 +398,160 @@ class IntradayDataCollector:
         
         # RSI
         try:
-            rsi = RSIIndicator(close=df['Close'], window=14)
-            result['rsi'] = rsi.rsi()
+            rsi_ind = RSIIndicator(close=df['Close'], window=14)
+            result['rsi'] = rsi_ind.rsi()
+            result['rsi[1]'] = result['rsi'].shift(1)
         except:
             pass
         
-        # MACD
+        # Momentum
         try:
-            macd = MACD(close=df['Close'])
-            result['macd_macd'] = macd.macd()
-            result['macd_signal'] = macd.macd_signal()
+            result['mom'] = df['Close'].diff(10)
+            result['mom[1]'] = result['mom'].shift(1)
         except:
             pass
         
-        # Stochastic
+        # MACD (use dots not underscores)
         try:
-            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'])
-            result['stoch_k'] = stoch.stoch()
-            result['stoch_d'] = stoch.stoch_signal()
+            macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
+            result['macd.macd'] = macd.macd()
+            result['macd.signal'] = macd.macd_signal()
+            result['macd_diff'] = macd.macd_diff()
         except:
             pass
         
-        # ADX
+        # Stochastic (use dots)
         try:
-            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'])
+            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
+            result['stoch.k'] = stoch.stoch()
+            result['stoch.d'] = stoch.stoch_signal()
+            result['stoch.k[1]'] = result['stoch.k'].shift(1)
+            result['stoch.d[1]'] = result['stoch.d'].shift(1)
+        except:
+            pass
+        
+        # ADX (with spaces in column names!)
+        try:
+            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
             result['adx'] = adx.adx()
+            result['adx + di'] = adx.adx_pos()  # Note the space!
+            result['adx - di'] = adx.adx_neg()  # Note the space!
         except:
             pass
         
-        # Bollinger Bands
+        # Bollinger Bands (use dots)
         try:
-            bb = BollingerBands(close=df['Close'])
-            result['bb_upper'] = bb.bollinger_hband()
-            result['bb_lower'] = bb.bollinger_lband()
-            result['bb_middle'] = bb.bollinger_mavg()
+            bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
+            result['bb.upper'] = bb.bollinger_hband()
+            result['bb.lower'] = bb.bollinger_lband()
+            result['bb.middle'] = bb.bollinger_mavg()
+            result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
+            result['bbpower'] = (df['Close'] - result['bb.lower']) / (result['bb.upper'] - result['bb.lower'])
         except:
             pass
         
         # ATR
         try:
-            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'])
+            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=14)
             result['atr'] = atr.average_true_range()
         except:
             pass
         
-        # EMAs (only common periods)
-        for period in [10, 20, 50]:
+        # Williams %R
+        try:
+            wr = WilliamsRIndicator(high=df['High'], low=df['Low'], close=df['Close'], lbp=14)
+            result['w.r'] = wr.williams_r()
+        except:
+            pass
+        
+        # CCI
+        try:
+            cci = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20)
+            result['cci20'] = cci.cci()
+        except:
+            pass
+        
+        # Awesome Oscillator
+        try:
+            ao = AwesomeOscillatorIndicator(high=df['High'], low=df['Low'], window1=5, window2=34)
+            result['ao'] = ao.awesome_oscillator()
+        except:
+            pass
+        
+        # Ultimate Oscillator
+        try:
+            uo = UltimateOscillator(high=df['High'], low=df['Low'], close=df['Close'], 
+                                   window1=7, window2=14, window3=28)
+            result['uo'] = uo.ultimate_oscillator()
+        except:
+            pass
+        
+        # EMAs
+        for period in [5, 10, 20, 50, 100, 200]:
             try:
                 result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
             except:
                 pass
         
-        # SMAs (only common periods)
-        for period in [10, 20, 50]:
+        # SMAs
+        for period in [5, 10, 20, 50, 100, 200]:
             try:
                 result[f'sma{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
             except:
                 pass
+        
+        # Volume indicators
+        try:
+            result['volume_sma5'] = result['volume'].rolling(window=5).mean()
+            result['volume_sma20'] = result['volume'].rolling(window=20).mean()
+            result['volume_ratio'] = result['volume'] / result['volume_sma20']
+        except:
+            pass
+        
+        # Price changes
+        for days in [1, 3, 5, 10, 20]:
+            try:
+                result[f'price_change_{days}d'] = df['Close'].pct_change(days) * 100
+            except:
+                pass
+        
+        # Volatility
+        try:
+            result['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100 * np.sqrt(252)
+        except:
+            pass
+        
+        # VWAP
+        try:
+            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+            result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+        except:
+            pass
+        
+        # 52-week high/low
+        try:
+            result['high_52w'] = df['High'].rolling(window=252, min_periods=1).max()
+            result['low_52w'] = df['Low'].rolling(window=252, min_periods=1).min()
+            result['price_vs_high_52w'] = (df['Close'] / result['high_52w'] - 1) * 100
+            result['price_vs_low_52w'] = (df['Close'] / result['low_52w'] - 1) * 100
+        except:
+            pass
+        
+        # Gaps (note the space in column name!)
+        try:
+            result['gap_ %'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
+            result['gap_up'] = (result['gap_ %'] > 2).astype(int)
+            result['gap_down'] = (result['gap_ %'] < -2).astype(int)
+        except:
+            pass
+        
+        # Trend indicators (boolean as integers)
+        try:
+            result['ema20_above_ema50'] = (result['ema20'] > result['ema50']).astype(int)
+            result['ema50_above_ema200'] = (result['ema50'] > result['ema200']).astype(int)
+            result['price_above_ema20'] = (df['Close'] > result['ema20']).astype(int)
+            result['ema10_above_ema20'] = (result['ema10'] > result['ema20']).astype(int)
+        except:
+            pass
         
         return result
