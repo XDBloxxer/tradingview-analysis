@@ -1,7 +1,7 @@
 """
 Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
-Can fetch data for current day or historical dates
+Only includes indicators that exist in database schema
 """
 
 import logging
@@ -16,11 +16,10 @@ from tqdm import tqdm
 import yfinance as yf
 
 from .rate_limiter import RateLimiter
-from .utils import get_indicator_mapping
 
 # Technical analysis library
-from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, UltimateOscillator, AwesomeOscillatorIndicator
-from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator, CCIIndicator
+from ta.momentum import RSIIndicator, StochasticOscillator
+from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 
 
@@ -30,6 +29,8 @@ class IntradayDataCollector:
     - Market open (9:30am NYC) - from 5-minute bars
     - Market close (4pm NYC) - from 5-minute bars
     - Previous day (T-1) - from daily bars
+    
+    Only includes indicators that exist in database schema
     """
     
     # Parallel processing settings
@@ -46,22 +47,17 @@ class IntradayDataCollector:
         # Initialize components
         self.rate_limiter = RateLimiter(config)
         
-        # Indicator mapping
-        self.indicator_mapping = get_indicator_mapping(config)
-        
         # Statistics
         self.stats = {
             'total': 0,
             'success': 0,
-            'failed': 0,
-            'cached': 0,
-            'yfinance': 0
+            'failed': 0
         }
         
         # Cache for already-fetched data
         self.cache = {}
         
-        self.logger.info("Intraday data collector initialized (using 5-min bars for market open/close)")
+        self.logger.info("Intraday data collector initialized (minimal indicators for database schema)")
     
     def collect_intraday_data(
         self,
@@ -136,8 +132,6 @@ class IntradayDataCollector:
             is_today = target_date.date() == datetime.now().date()
             
             # Fetch INTRADAY data for market open/close
-            # For today: we can get current intraday bars
-            # For historical: yfinance limits to last 60 days
             intraday_df = self._fetch_intraday_data(symbol, target_date.date(), is_today)
             
             # Fetch DAILY data for day prior
@@ -182,11 +176,6 @@ class IntradayDataCollector:
     ) -> Optional[pd.DataFrame]:
         """
         Fetch 5-minute intraday data for target date
-        
-        Args:
-            symbol: Stock symbol
-            target_date: Target date
-            is_today: Whether target date is today (affects data fetching strategy)
         """
         cache_key = f"{symbol}:intraday:{target_date}"
         if cache_key in self.cache:
@@ -196,33 +185,24 @@ class IntradayDataCollector:
             ticker = yf.Ticker(symbol)
             
             if is_today:
-                # For today, fetch last available intraday data
                 df = ticker.history(period='1d', interval='5m')
             else:
-                # For historical dates - yfinance only keeps 60 days of intraday
-                # Create datetime range for target date
-                start_dt = datetime.combine(target_date, time(9, 0))  # 9am
-                end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0))  # Next day midnight
+                start_dt = datetime.combine(target_date, time(9, 0))
+                end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0))
                 
-                # Check if date is within 60-day window
                 days_ago = (datetime.now().date() - target_date).days
                 if days_ago > 60:
                     self.logger.debug(f"Date {target_date} is beyond 60-day intraday limit for {symbol}")
                     return None
                 
-                # Fetch 5-minute data
-                df = ticker.history(
-                    start=start_dt,
-                    end=end_dt,
-                    interval='5m'
-                )
+                df = ticker.history(start=start_dt, end=end_dt, interval='5m')
             
             if df.empty or len(df) < 5:
                 self.logger.debug(f"Insufficient intraday data for {symbol}")
                 return None
             
-            # Calculate indicators on 5-min data
-            indicators_df = self._calculate_indicators_lightweight(df)
+            # Calculate MINIMAL indicators
+            indicators_df = self._calculate_minimal_indicators(df)
             
             self.cache[cache_key] = indicators_df
             return indicators_df
@@ -252,7 +232,8 @@ class IntradayDataCollector:
             if df.empty or len(df) < 20:
                 return None
             
-            indicators_df = self._calculate_all_indicators(df)
+            # Calculate MINIMAL indicators
+            indicators_df = self._calculate_minimal_indicators(df)
             indicators_df.index = pd.to_datetime(indicators_df.index).date
             
             self.cache[cache_key] = indicators_df
@@ -278,7 +259,6 @@ class IntradayDataCollector:
             ]
             
             if morning_bars.empty:
-                # Try to get first bar of the day
                 morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
                 if morning_bars.empty:
                     return None
@@ -296,7 +276,7 @@ class IntradayDataCollector:
             
             # Add indicators
             for key, value in open_data.items():
-                if pd.notna(value):
+                if pd.notna(value) and not np.isinf(value):
                     try:
                         snapshot[key.lower()] = float(value)
                     except:
@@ -324,7 +304,6 @@ class IntradayDataCollector:
             ]
             
             if close_bars.empty:
-                # Try to get last bar of the day
                 close_bars = intraday_df[intraday_df.index.time <= time(16, 0)]
                 if close_bars.empty:
                     return None
@@ -342,7 +321,7 @@ class IntradayDataCollector:
             
             # Add indicators
             for key, value in close_data.items():
-                if pd.notna(value):
+                if pd.notna(value) and not np.isinf(value):
                     try:
                         snapshot[key.lower()] = float(value)
                     except:
@@ -385,7 +364,7 @@ class IntradayDataCollector:
             
             # Add indicators
             for key, value in prior_data.items():
-                if pd.notna(value):
+                if pd.notna(value) and not np.isinf(value):
                     try:
                         snapshot[key.lower()] = float(value)
                     except:
@@ -397,46 +376,14 @@ class IntradayDataCollector:
             self.logger.debug(f"Error extracting day prior: {e}")
             return None
     
-    def _calculate_indicators_lightweight(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate MINIMAL indicators on intraday data - only what exists in database schema"""
+    def _calculate_minimal_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate ONLY indicators that exist in database schema
+        Based on common columns across all three tables
+        """
         result = pd.DataFrame(index=df.index)
         
-        # Basic OHLCV
-        result['close'] = df['Close']
-        result['open'] = df['Open']
-        result['high'] = df['High']
-        result['low'] = df['Low']
-        result['volume'] = df['Volume']
-        
-        # RSI (common indicator)
-        try:
-            rsi = RSIIndicator(close=df['Close'], window=14)
-            result['rsi'] = rsi.rsi()
-        except:
-            pass
-        
-        # MACD
-        try:
-            macd = MACD(close=df['Close'])
-            result['macd_macd'] = macd.macd()
-            result['macd_signal'] = macd.macd_signal()
-        except:
-            pass
-        
-        # Simple EMAs (common)
-        for period in [10, 20, 50]:
-            try:
-                result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
-            except:
-                pass
-        
-        return result
-    
-    def _calculate_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate MINIMAL indicators on daily data - only what exists in database schema"""
-        result = pd.DataFrame(index=df.index)
-        
-        # Basic OHLCV
+        # Basic OHLCV (always present)
         result['close'] = df['Close']
         result['open'] = df['Open']
         result['high'] = df['High']
@@ -489,15 +436,15 @@ class IntradayDataCollector:
         except:
             pass
         
-        # EMAs (common periods only)
-        for period in [10, 20, 50, 200]:
+        # EMAs (only common periods)
+        for period in [10, 20, 50]:
             try:
                 result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
             except:
                 pass
         
-        # SMAs (common periods only)
-        for period in [10, 20, 50, 200]:
+        # SMAs (only common periods)
+        for period in [10, 20, 50]:
             try:
                 result[f'sma{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
             except:
