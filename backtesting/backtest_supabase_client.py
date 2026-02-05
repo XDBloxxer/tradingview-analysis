@@ -309,11 +309,30 @@ class BacktestSupabaseClient:
             return 0
         
         try:
+            # Deduplicate trades by (strategy_id, symbol, signal_date) before writing
+            seen = set()
+            unique_trades = []
+            for trade in trades:
+                signal_date = trade['signal_date']
+                if isinstance(signal_date, (date, datetime)):
+                    if isinstance(signal_date, datetime):
+                        signal_date = signal_date.date().isoformat()
+                    else:
+                        signal_date = signal_date.isoformat()
+                
+                key = (strategy_id, trade['symbol'], signal_date)
+                if key not in seen:
+                    seen.add(key)
+                    unique_trades.append(trade)
+            
+            if len(trades) != len(unique_trades):
+                self.logger.info(f"Removed {len(trades) - len(unique_trades)} duplicate trades")
+            
             total_written = 0
             
             # Process in batches
-            for i in range(0, len(trades), batch_size):
-                batch = trades[i:i + batch_size]
+            for i in range(0, len(unique_trades), batch_size):
+                batch = unique_trades[i:i + batch_size]
                 
                 # Add strategy_id and sanitize
                 data = []
