@@ -121,7 +121,7 @@ class BacktestSupabaseClient:
                 'run_status': 'pending'
             }
             
-            data = self._sanitize_dict(data)
+            data = self._sanitize_value(data)
             
             response = self.client.table(self.tables["strategies"]).insert(data).execute()
             
@@ -236,7 +236,7 @@ class BacktestSupabaseClient:
                     'max_gain_pct': result['max_gain_pct'],
                     'min_gain_pct': result['min_gain_pct']
                 }
-                data.append(self._sanitize_dict(row))
+                data.append(self._sanitize_value(row))
             
             # Upsert (handles duplicates)
             response = self.client.table(self.tables["results"]).upsert(
@@ -321,7 +321,7 @@ class BacktestSupabaseClient:
                         'exit_price': trade.get('exit_price'),
                         'trade_type': trade['trade_type']
                     }
-                    data.append(self._sanitize_dict(row))
+                    data.append(self._sanitize_value(row))
                 
                 # Upsert batch
                 response = self.client.table(self.tables["trades"]).upsert(
@@ -418,7 +418,7 @@ class BacktestSupabaseClient:
                 'last_run_at': 'NOW()'
             }
             
-            data = self._sanitize_dict(data)
+            data = self._sanitize_value(data)
             
             self.client.table(self.tables["strategies"]) \
                 .update(data) \
