@@ -2,6 +2,7 @@
 Supabase client for Daily Winners tracking
 Completely separate tables from the spike/grinder analysis
 ONLY writes NEW symbols that don't already exist for the date
+FIXED: Removes auto-generated fields before insertion
 """
 
 import logging
@@ -94,11 +95,24 @@ class DailyWinnersSupabaseClient:
                 return int(value)
         
             return value
-
+        
+        return value
     
     def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Sanitize all values in a dictionary"""
-        return {k: self._sanitize_value(v) for k, v in data.items()}
+        """
+        Sanitize all values in a dictionary AND remove auto-generated fields
+        """
+        # Remove fields that PostgreSQL auto-generates
+        auto_fields = {'id', 'created_at', 'updated_at'}
+        
+        sanitized = {}
+        for k, v in data.items():
+            # Skip auto-generated fields
+            if k in auto_fields:
+                continue
+            sanitized[k] = self._sanitize_value(v)
+        
+        return sanitized
     
     def _get_existing_symbols(self, table_name: str, detection_date: str) -> set:
         """
@@ -221,8 +235,16 @@ class DailyWinnersSupabaseClient:
                     counts[data_type] = 0
                     continue
                 
-                # Sanitize all data
+                # Sanitize all data (this now removes 'id' and other auto-fields)
                 sanitized_data = [self._sanitize_dict(d) for d in new_data]
+                
+                # DEBUG: Log first record to verify structure
+                if sanitized_data:
+                    first_record = sanitized_data[0]
+                    self.logger.info(f"DEBUG {data_type} - First record keys: {list(first_record.keys())[:10]}")
+                    self.logger.info(f"DEBUG {data_type} - symbol: {first_record.get('symbol')}")
+                    self.logger.info(f"DEBUG {data_type} - exchange: {first_record.get('exchange')}")
+                    self.logger.info(f"DEBUG {data_type} - detection_date: {first_record.get('detection_date')}")
                 
                 # Insert new data only
                 response = self.client.table(self.tables[table_key]).insert(
