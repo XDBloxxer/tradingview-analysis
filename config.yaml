@@ -149,8 +149,6 @@ daily_winners:
   market_close_time: "16:00:00"
 
 
-  # Add this section to your existing config.yaml file
-
 # ============================================================================
 # BACKTESTING CONFIGURATION
 # ============================================================================
@@ -170,6 +168,9 @@ backtesting:
       - "NASDAQ"
       - "NYSE"
       - "AMEX"
+    # NEW: Control how many stocks to analyze
+    top_winners_count: 10  # How many top winners to track per day
+    max_criteria_matches: 50  # Max stocks to analyze that match criteria
   
   # Performance settings
   max_workers: 5  # Parallel processing threads
