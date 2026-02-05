@@ -32,3 +32,6 @@ tqdm>=4.66.1
 
 # Supabase
 supabase>=1.26.01
+
+#lxml
+lxml>=6.0.0
