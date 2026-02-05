@@ -92,8 +92,9 @@ class DailyWinnersDetector:
                 self.logger.error("Could not find data table on Yahoo Finance page")
                 return []
             
-            # Parse table into DataFrame
-            df = pd.read_html(str(table))[0]
+            # Parse table into DataFrame using StringIO to avoid warning
+            from io import StringIO
+            df = pd.read_html(StringIO(str(table)))[0]
             
             self.logger.info(f"Found {len(df)} stocks from Yahoo Finance day gainers")
             
@@ -110,15 +111,35 @@ class DailyWinnersDetector:
                         continue
                     
                     # Get price and change
-                    price = row.get('Price (Intraday)', row.get('Price', 0))
+                    price_str = row.get('Price (Intraday)', row.get('Price', '0'))
                     change_str = row.get('% Change', row.get('Change %', '0'))
-                    volume = row.get('Volume', row.get('Avg Vol (3 month)', 0))
+                    volume_str = row.get('Volume', row.get('Avg Vol (3 month)', '0'))
+                    
+                    # Clean up and convert price (remove commas, dollar signs)
+                    if isinstance(price_str, str):
+                        price = float(price_str.replace('$', '').replace(',', ''))
+                    else:
+                        price = float(price_str)
                     
                     # Clean up change percentage (remove % sign)
                     if isinstance(change_str, str):
                         change_pct = float(change_str.replace('%', '').replace('+', ''))
                     else:
                         change_pct = float(change_str)
+                    
+                    # Clean up volume (remove commas, handle M/B suffixes)
+                    if isinstance(volume_str, str):
+                        volume_str = volume_str.replace(',', '')
+                        if 'M' in volume_str:
+                            volume = float(volume_str.replace('M', '')) * 1000000
+                        elif 'B' in volume_str:
+                            volume = float(volume_str.replace('B', '')) * 1000000000
+                        elif 'K' in volume_str:
+                            volume = float(volume_str.replace('K', '')) * 1000
+                        else:
+                            volume = float(volume_str)
+                    else:
+                        volume = float(volume_str)
                     
                     # Determine exchange (assume NASDAQ by default for US stocks)
                     exchange = 'NASDAQ'
