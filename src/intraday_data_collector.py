@@ -126,6 +126,11 @@ class IntradayDataCollector:
         """Process a single winner and collect indicators at three time points"""
         symbol = winner.get('symbol')
         exchange = winner.get('exchange', 'NASDAQ')
+
+        # Skip invalid winners
+        if not symbol:
+            self.logger.debug(f"Skipping invalid winner (missing symbol): {winner}")
+            return None
         
         try:
             # Check if target date is today - affects data availability
