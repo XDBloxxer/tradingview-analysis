@@ -12,9 +12,9 @@ from ta.momentum import RSIIndicator
 
 class StrategyBacktester:
 
-    INDICATOR_WARMUP_DAYS = 30   # ← REQUIRED, internal only
+    INDICATOR_WARMUP_DAYS = 120   # ← REQUIRED, internal only
     MIN_PRICE = 0.50
-    MIN_VOLUME = 50_000
+    MIN_VOLUME = 50000
     MAX_CRITERIA_MATCHES = 50
 
     def __init__(self, config: dict):
