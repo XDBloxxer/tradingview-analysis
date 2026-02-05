@@ -108,15 +108,19 @@ class DailyWinnersDetector:
             winner['detection_date'] = target_date_str
             winner['detection_time'] = '16:00:00'  # 4pm NYC
         
-        self.logger.info(f"Found top {len(top_winners)} winners")
+        self.logger.info(f"✓ Found top {len(top_winners)} winners for {target_date_str}:")
         if top_winners:
-            self.logger.info(f"Top winner: {top_winners[0]['symbol']} (+{top_winners[0]['change_pct']:.2f}%)")
+            for i, winner in enumerate(top_winners[:5], 1):  # Show top 5
+                self.logger.info(f"  #{i}: {winner['symbol']} (+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}")
+            if len(top_winners) > 5:
+                self.logger.info(f"  ... and {len(top_winners) - 5} more")
         
         return top_winners
     
     def _get_symbols_for_exchange(self, exchange: str) -> List[Dict]:
         """
         Get symbols with current data for an exchange using TradingView Screener
+        SPECIFICALLY targeting top daily gainers (highest % change today)
         
         Args:
             exchange: Exchange name (NASDAQ, NYSE, AMEX)
@@ -133,19 +137,20 @@ class DailyWinnersDetector:
             else:
                 market = exchange.lower()
             
-            self.logger.debug(f"Screening {market} market (exchange: {exchange})...")
+            self.logger.info(f"Screening {market} market for TOP DAILY GAINERS (exchange: {exchange})...")
             
-            # Get stocks sorted by performance - focusing on actual daily gainers
+            # Get ONLY top daily gainers - sorted by today's percentage change
+            # No minimum gain filter - we want the TOP performers even if market is down
             results = self.screener.screen(
                 market=market,
                 filters=[
                     {'left': 'close', 'operation': 'greater', 'right': self.min_price},
                     {'left': 'volume', 'operation': 'greater', 'right': self.min_volume},
-                    {'left': 'change', 'operation': 'greater', 'right': 1.0},  # At least 1% gain to be a "winner"
+                    # Removed minimum % change filter - we want top performers regardless
                 ],
-                limit=500,  # Get top 500 to have a good pool
-                sort_by='change',  # Sort by percentage change
-                sort_order='desc'
+                limit=200,  # Get top 200 by % change
+                sort_by='change',  # Sort by TODAY'S percentage change
+                sort_order='desc'  # Descending = highest gains first
             )
             
             # Check status
