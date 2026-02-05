@@ -111,7 +111,7 @@ class BacktestSupabaseClient:
             Strategy ID
         """
         try:
-            # Prepare data
+            # Prepare data (exclude hardcoded limits - those don't go in DB)
             data = {
                 'name': strategy_config['name'],
                 'description': strategy_config.get('description', ''),
@@ -124,8 +124,6 @@ class BacktestSupabaseClient:
                 'max_price': strategy_config.get('max_price'),
                 'min_volume': strategy_config.get('min_volume', 100000),
                 'exchanges': strategy_config.get('exchanges', ['NASDAQ', 'NYSE', 'AMEX']),
-                'top_winners_count': strategy_config.get('top_winners_count', 10),
-                'max_criteria_matches': strategy_config.get('max_criteria_matches', 50),
                 'run_status': 'pending'
             }
             
