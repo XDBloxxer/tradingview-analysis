@@ -52,7 +52,7 @@ class BacktestSupabaseClient:
         """Sanitize value for Supabase"""
         if value is None:
             return None
-        if pd.all(value):
+        if pd.isna(value):
             return None
         if isinstance(value, np.integer):
             return int(value)
