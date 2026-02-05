@@ -398,36 +398,32 @@ class IntradayDataCollector:
             return None
     
     def _calculate_indicators_lightweight(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators on intraday data (lighter weight)"""
+        """Calculate MINIMAL indicators on intraday data - only what exists in database schema"""
         result = pd.DataFrame(index=df.index)
         
+        # Basic OHLCV
         result['close'] = df['Close']
         result['open'] = df['Open']
         result['high'] = df['High']
         result['low'] = df['Low']
         result['volume'] = df['Volume']
         
-        # Only calculate fast indicators for intraday
+        # RSI (common indicator)
         try:
             rsi = RSIIndicator(close=df['Close'], window=14)
             result['rsi'] = rsi.rsi()
         except:
             pass
         
+        # MACD
         try:
             macd = MACD(close=df['Close'])
-            result['macd.macd'] = macd.macd()
-            result['macd.signal'] = macd.macd_signal()
+            result['macd_macd'] = macd.macd()
+            result['macd_signal'] = macd.macd_signal()
         except:
             pass
         
-        try:
-            result['volume_sma_20'] = df['Volume'].rolling(window=20).mean()
-            result['volume_ratio'] = df['Volume'] / result['volume_sma_20']
-        except:
-            pass
-        
-        # EMAs
+        # Simple EMAs (common)
         for period in [10, 20, 50]:
             try:
                 result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
@@ -437,9 +433,10 @@ class IntradayDataCollector:
         return result
     
     def _calculate_all_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate full indicators on daily data"""
+        """Calculate MINIMAL indicators on daily data - only what exists in database schema"""
         result = pd.DataFrame(index=df.index)
         
+        # Basic OHLCV
         result['close'] = df['Close']
         result['open'] = df['Open']
         result['high'] = df['High']
@@ -456,16 +453,16 @@ class IntradayDataCollector:
         # MACD
         try:
             macd = MACD(close=df['Close'])
-            result['macd.macd'] = macd.macd()
-            result['macd.signal'] = macd.macd_signal()
+            result['macd_macd'] = macd.macd()
+            result['macd_signal'] = macd.macd_signal()
         except:
             pass
         
         # Stochastic
         try:
             stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'])
-            result['stoch.k'] = stoch.stoch()
-            result['stoch.d'] = stoch.stoch_signal()
+            result['stoch_k'] = stoch.stoch()
+            result['stoch_d'] = stoch.stoch_signal()
         except:
             pass
         
@@ -479,9 +476,9 @@ class IntradayDataCollector:
         # Bollinger Bands
         try:
             bb = BollingerBands(close=df['Close'])
-            result['bb.upper'] = bb.bollinger_hband()
-            result['bb.lower'] = bb.bollinger_lband()
-            result['bb.middle'] = bb.bollinger_mavg()
+            result['bb_upper'] = bb.bollinger_hband()
+            result['bb_lower'] = bb.bollinger_lband()
+            result['bb_middle'] = bb.bollinger_mavg()
         except:
             pass
         
@@ -492,25 +489,18 @@ class IntradayDataCollector:
         except:
             pass
         
-        # EMAs
+        # EMAs (common periods only)
         for period in [10, 20, 50, 200]:
             try:
                 result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
             except:
                 pass
         
-        # SMAs
+        # SMAs (common periods only)
         for period in [10, 20, 50, 200]:
             try:
                 result[f'sma{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
             except:
                 pass
-        
-        # Volume indicators
-        try:
-            result['volume_sma_20'] = df['Volume'].rolling(window=20).mean()
-            result['volume_ratio'] = df['Volume'] / result['volume_sma_20']
-        except:
-            pass
         
         return result
