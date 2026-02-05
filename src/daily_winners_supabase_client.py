@@ -83,14 +83,18 @@ class DailyWinnersSupabaseClient:
         # Handle numpy bool
         if isinstance(value, np.bool_):
             return bool(value)
-        
+    
         # Handle regular Python floats
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
-            return value
         
-        return value
+            # FIX: convert float integers (0.0, 1.0) to int
+            if value.is_integer():
+                return int(value)
+        
+            return value
+
     
     def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Sanitize all values in a dictionary"""
