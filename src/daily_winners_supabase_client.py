@@ -1,6 +1,7 @@
 """
 Supabase client for Daily Winners tracking
 Completely separate tables from the spike/grinder analysis
+FIXED: No longer deletes existing data - appends new records
 """
 
 import logging
@@ -140,7 +141,7 @@ class DailyWinnersSupabaseClient:
     def write_winners(self, winners: List[Dict[str, Any]]) -> int:
         """
         Write daily winners to Supabase
-        Uses upsert to handle duplicates gracefully
+        Uses upsert to handle duplicates gracefully (update if exists, insert if new)
         
         Args:
             winners: List of winner dictionaries
@@ -156,7 +157,8 @@ class DailyWinnersSupabaseClient:
             # Sanitize all data
             sanitized_winners = [self._sanitize_dict(w) for w in winners]
             
-            # Upsert data (insert or update if exists)
+            # Upsert data (insert or update if exists based on unique constraint)
+            # This will update existing records or insert new ones
             response = self.client.table(self.tables["winners"]).upsert(
                 sanitized_winners,
                 on_conflict="symbol,detection_date"
@@ -173,7 +175,8 @@ class DailyWinnersSupabaseClient:
     def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
         """
         Write intraday indicator data to Supabase
-        Deletes existing data for the date first, then inserts new data
+        Uses upsert to handle duplicates - will update if record exists
+        NO LONGER DELETES EXISTING DATA
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
@@ -206,22 +209,11 @@ class DailyWinnersSupabaseClient:
                     for key, val in list(sample.items())[:5]:  # Show first 5 fields
                         self.logger.debug(f"  {key}: {val} (type: {type(val).__name__})")
                 
-                # Get detection_date from first record
-                detection_date = sanitized_data[0].get('detection_date')
-                
-                if detection_date:
-                    # Delete existing data for this date
-                    try:
-                        self.client.table(self.tables[table_key]).delete().eq(
-                            'detection_date', detection_date
-                        ).execute()
-                        self.logger.debug(f"Deleted existing {data_type} data for {detection_date}")
-                    except Exception as delete_error:
-                        self.logger.debug(f"No existing data to delete for {data_type}: {delete_error}")
-                
-                # Insert new data
-                response = self.client.table(self.tables[table_key]).insert(
-                    sanitized_data
+                # Upsert data (no deletion - just insert or update)
+                # Unique constraint is on (symbol, detection_date, snapshot_type)
+                response = self.client.table(self.tables[table_key]).upsert(
+                    sanitized_data,
+                    on_conflict="symbol,detection_date"
                 ).execute()
                 
                 count = len(response.data) if response.data else 0
@@ -374,3 +366,26 @@ class DailyWinnersSupabaseClient:
         except Exception as e:
             self.logger.error(f"Error getting winners for {detection_date}: {str(e)}")
             return pd.DataFrame()
+    
+    def check_date_exists(self, detection_date: str) -> bool:
+        """
+        Check if data already exists for a given date
+        
+        Args:
+            detection_date: Date in ISO format (YYYY-MM-DD)
+            
+        Returns:
+            True if data exists, False otherwise
+        """
+        try:
+            response = self.client.table(self.tables["winners"]) \
+                .select("detection_date") \
+                .eq("detection_date", detection_date) \
+                .limit(1) \
+                .execute()
+            
+            return len(response.data) > 0
+            
+        except Exception as e:
+            self.logger.error(f"Error checking date exists: {str(e)}")
+            return False
