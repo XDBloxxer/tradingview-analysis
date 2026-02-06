@@ -3,6 +3,7 @@ Supabase client for Daily Winners tracking
 Completely separate tables from the spike/grinder analysis
 ONLY writes NEW symbols that don't already exist for the date
 FIXED: Removes auto-generated fields before insertion
+ENHANCED: Supports day_prior_open table
 """
 
 import logging
@@ -55,7 +56,8 @@ class DailyWinnersSupabaseClient:
             "winners": daily_winners_config.get("winners_table", "daily_winners"),
             "market_open": daily_winners_config.get("market_open_table", "winners_market_open"),
             "market_close": daily_winners_config.get("market_close_table", "winners_market_close"),
-            "day_prior": daily_winners_config.get("day_prior_table", "winners_day_prior")
+            "day_prior_open": daily_winners_config.get("day_prior_open_table", "winners_day_prior_open"),
+            "day_prior_close": daily_winners_config.get("day_prior_close_table", "winners_day_prior_close")
         }
         
         self.logger.info(f"Using daily winners tables: {', '.join(self.tables.values())}")
@@ -195,7 +197,7 @@ class DailyWinnersSupabaseClient:
         ONLY writes NEW symbols that don't already exist for this date
         
         Args:
-            intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior' keys
+            intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior_open', 'day_prior_close' keys
             
         Returns:
             Dictionary with counts for each table
@@ -205,7 +207,8 @@ class DailyWinnersSupabaseClient:
         for data_type, table_key in [
             ('market_open', 'market_open'),
             ('market_close', 'market_close'),
-            ('day_prior', 'day_prior')
+            ('day_prior_open', 'day_prior_open'),
+            ('day_prior_close', 'day_prior_close')
         ]:
             data = intraday_data.get(data_type, [])
             
