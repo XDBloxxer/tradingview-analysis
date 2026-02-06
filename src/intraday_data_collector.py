@@ -3,6 +3,7 @@ Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
 Only includes indicators that exist in database schema
 FIXED: Preserves metadata fields (symbol, exchange, etc.) when adding indicators
+FIXED: Corrected market open data fetching logic
 """
 
 import logging
@@ -136,20 +137,8 @@ class IntradayDataCollector:
             return None
         
         try:
-            # Check if target date is today - affects data availability
-            market_tz = ZoneInfo("America/New_York")
-            now_et = datetime.now(market_tz)
-            
-            market_closed = now_et.time() >= time(16, 5)
-            
-            is_today = (
-                target_date.date() == now_et.date()
-                and not market_closed
-            )
-
-            
             # Fetch INTRADAY data for market open/close
-            intraday_df = self._fetch_intraday_data(symbol, target_date.date(), is_today)
+            intraday_df = self._fetch_intraday_data(symbol, target_date)
             
             # Fetch DAILY data for day prior
             daily_df = self._fetch_daily_data(symbol, target_date.date())
@@ -188,35 +177,63 @@ class IntradayDataCollector:
     def _fetch_intraday_data(
         self,
         symbol: str,
-        target_date: datetime.date,
-        is_today: bool = False
+        target_date: datetime
     ) -> Optional[pd.DataFrame]:
         """
         Fetch 5-minute intraday data for target date
         """
-        cache_key = f"{symbol}:intraday:{target_date}"
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        cache_key = f"{symbol}:intraday:{target_date_obj}"
+        
         if cache_key in self.cache:
             return self.cache[cache_key]
         
         try:
+            # Check if target date is today
+            market_tz = ZoneInfo("America/New_York")
+            now_et = datetime.now(market_tz)
+            is_today = target_date_obj == now_et.date()
+            
             ticker = yf.Ticker(symbol)
             
             if is_today:
+                # For today, use period-based fetch
+                self.logger.debug(f"Fetching today's intraday data for {symbol}")
                 df = ticker.history(period='1d', interval='5m')
             else:
-                start_dt = datetime.combine(target_date, time(9, 0))
-                end_dt = datetime.combine(target_date + timedelta(days=1), time(0, 0))
-                
-                days_ago = (datetime.now().date() - target_date).days
+                # For historical dates, check if within 60-day limit
+                days_ago = (datetime.now().date() - target_date_obj).days
                 if days_ago > 60:
-                    self.logger.debug(f"Date {target_date} is beyond 60-day intraday limit for {symbol}")
+                    self.logger.debug(f"Date {target_date_obj} is beyond 60-day intraday limit for {symbol}")
                     return None
                 
+                # Use date range for historical data
+                # Set start to 9am and end to 5pm next day to capture full trading day
+                start_dt = datetime.combine(target_date_obj, time(9, 0))
+                end_dt = datetime.combine(target_date_obj + timedelta(days=1), time(17, 0))
+                
+                self.logger.debug(f"Fetching historical intraday data for {symbol} on {target_date_obj}")
                 df = ticker.history(start=start_dt, end=end_dt, interval='5m')
             
-            if df.empty or len(df) < 5:
-                self.logger.debug(f"Insufficient intraday data for {symbol}")
+            if df.empty:
+                self.logger.debug(f"No intraday data returned for {symbol} on {target_date_obj}")
                 return None
+            
+            # Filter to only include data from the target date
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('America/New_York')
+            else:
+                df.index = df.index.tz_convert('America/New_York')
+            
+            # Keep only bars from target date
+            df = df[df.index.date == target_date_obj]
+            
+            if df.empty or len(df) < 5:
+                self.logger.debug(f"Insufficient intraday data for {symbol} on {target_date_obj} (got {len(df)} bars)")
+                return None
+            
+            self.logger.debug(f"Successfully fetched {len(df)} intraday bars for {symbol} on {target_date_obj}")
             
             # Calculate MINIMAL indicators
             indicators_df = self._calculate_minimal_indicators(df)
@@ -227,11 +244,6 @@ class IntradayDataCollector:
         except Exception as e:
             self.logger.debug(f"Error fetching intraday for {symbol}: {e}")
             return None
-            
-        self.logger.debug(
-            f"{symbol} intraday fetch | is_today={is_today} | now_et={now_et}"
-        )
-
     
     def _fetch_daily_data(
         self,
@@ -608,8 +620,8 @@ class IntradayDataCollector:
         # Gaps (note the space in column name!)
         try:
             result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
-            result['gap_up'] = (result['gap_ %'] > 2).astype(int)
-            result['gap_down'] = (result['gap_ %'] < -2).astype(int)
+            result['gap_up'] = (result['gap_%'] > 2).astype(int)
+            result['gap_down'] = (result['gap_%'] < -2).astype(int)
         except:
             pass
         
