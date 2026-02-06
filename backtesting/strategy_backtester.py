@@ -229,7 +229,6 @@ class StrategyBacktester:
                     'hit_target': hit_target,
                     'actual_gain_pct': float(actual_gain_pct),
                     'exit_price': float(exit_price),
-                    'exit_date': test_date.isoformat(),  # When we measured results
                     'trade_type': trade_type,
                     # Exit analysis fields
                     'exit_high': float(exit_high),
