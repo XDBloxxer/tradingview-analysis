@@ -139,7 +139,8 @@ daily_winners:
   winners_table: "daily_winners"
   market_open_table: "winners_market_open"
   market_close_table: "winners_market_close"
-  day_prior_table: "winners_day_prior"
+  day_prior_open_table: "winners_day_prior_open"
+  day_prior_close_table: "winners_day_prior_close"
   
   # Number of top winners to track daily
   top_n: 10
