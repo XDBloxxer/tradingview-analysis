@@ -1,6 +1,7 @@
 """
 Supabase client for backtesting data
 UPDATED: Includes methods to query historical_market_data table
+FIXED: Better date range queries with distinct dates
 """
 
 import logging
@@ -46,12 +47,13 @@ class BacktestSupabaseClient:
         }
     
     # ========================================================================
-    # HISTORICAL DATA QUERY METHODS (NEW)
+    # HISTORICAL DATA QUERY METHODS (FIXED)
     # ========================================================================
     
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
         """
         Get list of available trading dates in database within range
+        FIXED: Uses proper query to get distinct dates
         
         Args:
             start_date: Start date
@@ -61,20 +63,26 @@ class BacktestSupabaseClient:
             List of dates
         """
         try:
+            # Query with large limit to get all dates, then dedupe in Python
             response = self.client.table(self.tables["historical"]) \
                 .select("date") \
                 .gte("date", start_date.isoformat()) \
                 .lte("date", end_date.isoformat()) \
+                .order("date") \
+                .limit(100000) \
                 .execute()
             
             if not response.data:
+                self.logger.warning(f"No data found for date range {start_date} to {end_date}")
                 return []
             
-            # Get unique dates
+            # Get unique dates and sort
             dates = sorted(list(set(
                 datetime.fromisoformat(row['date']).date() 
                 for row in response.data
             )))
+            
+            self.logger.info(f"Found {len(dates)} unique dates between {start_date} and {end_date}")
             
             return dates
             
@@ -119,6 +127,7 @@ class BacktestSupabaseClient:
     ) -> List[str]:
         """
         Get all stocks trading on a date that meet filters
+        FIXED: Increased limit to get more stocks
         
         Args:
             target_date: Date to query
@@ -134,7 +143,8 @@ class BacktestSupabaseClient:
                 .select("symbol") \
                 .eq("date", target_date.isoformat()) \
                 .gte("close", min_price) \
-                .gte("volume", min_volume)
+                .gte("volume", min_volume) \
+                .limit(10000)  # Increased limit to get all stocks
             
             if max_price:
                 query = query.lte("close", max_price)
@@ -144,7 +154,10 @@ class BacktestSupabaseClient:
             if not response.data:
                 return []
             
-            return [row['symbol'] for row in response.data]
+            symbols = [row['symbol'] for row in response.data]
+            self.logger.debug(f"Found {len(symbols)} stocks on {target_date} matching filters")
+            
+            return symbols
             
         except Exception as e:
             self.logger.error(f"Error getting stocks for date: {e}")
@@ -170,10 +183,12 @@ class BacktestSupabaseClient:
                 .execute()
             
             if not response.data:
-                # Try closest prior date
+                # Try closest prior date within 7 days
+                prior_date = target_date - timedelta(days=7)
                 response = self.client.table(self.tables["historical"]) \
                     .select("*") \
                     .eq("symbol", symbol) \
+                    .gte("date", prior_date.isoformat()) \
                     .lte("date", target_date.isoformat()) \
                     .order("date", desc=True) \
                     .limit(1) \
@@ -185,7 +200,7 @@ class BacktestSupabaseClient:
             return response.data[0]
             
         except Exception as e:
-            self.logger.error(f"Error getting stock data: {e}")
+            self.logger.debug(f"Error getting stock data for {symbol}: {e}")
             return None
     
     def get_stock_history(
@@ -213,6 +228,7 @@ class BacktestSupabaseClient:
                 .gte("date", start_date.isoformat()) \
                 .lte("date", end_date.isoformat()) \
                 .order("date") \
+                .limit(500) \
                 .execute()
             
             if not response.data:
@@ -221,7 +237,7 @@ class BacktestSupabaseClient:
             return response.data
             
         except Exception as e:
-            self.logger.error(f"Error getting stock history: {e}")
+            self.logger.debug(f"Error getting stock history for {symbol}: {e}")
             return []
     
     # ========================================================================
