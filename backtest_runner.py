@@ -120,7 +120,6 @@ def main():
         help="Strategy ID from database"
     )
     parser.add_argument(
-        "--verbose",
         "-v",
         action="store_true",
         help="Verbose logging"
