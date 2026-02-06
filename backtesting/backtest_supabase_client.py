@@ -1,6 +1,6 @@
 """
 Supabase client for backtesting data
-OPTIMIZED: Better batching, less logging, smarter queries
+ENHANCED: Handles new exit analysis fields
 """
 
 import logging
@@ -14,7 +14,7 @@ from supabase import create_client, Client
 
 
 class BacktestSupabaseClient:
-    """Handler for backtest data in Supabase - OPTIMIZED"""
+    """Handler for backtest data in Supabase - ENHANCED"""
     
     def __init__(self, config: dict):
         """Initialize Supabase client"""
@@ -313,7 +313,7 @@ class BacktestSupabaseClient:
             raise
     
     def write_trades(self, strategy_id: int, trades: List[Dict]):
-        """Write trade records - OPTIMIZED with larger batches"""
+        """Write trade records - handles new fields gracefully"""
         if not trades:
             return
         
@@ -349,7 +349,7 @@ class BacktestSupabaseClient:
             raise
     
     def update_strategy_summary(self, strategy_id: int, stats: Dict):
-        """Update strategy with overall statistics"""
+        """Update strategy with overall statistics - includes new metrics"""
         try:
             update_data = {
                 'total_matches': stats.get('total_matches', 0),
