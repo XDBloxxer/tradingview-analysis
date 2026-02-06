@@ -1,7 +1,6 @@
 """
 Supabase client for backtesting data
-UPDATED: Includes methods to query historical_market_data table
-FIXED: Better date range queries with distinct dates
+FIXED: Proper date range queries that get ALL dates
 """
 
 import logging
@@ -43,7 +42,7 @@ class BacktestSupabaseClient:
             "strategies": "backtest_strategies",
             "results": "backtest_results",
             "trades": "backtest_trades",
-            "historical": "historical_market_data"  # NEW!
+            "historical": "historical_market_data"
         }
     
     # ========================================================================
@@ -53,42 +52,63 @@ class BacktestSupabaseClient:
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
         """
         Get list of available trading dates in database within range
-        FIXED: Uses proper query to get distinct dates
+        FIXED: Efficiently gets all distinct dates with pagination
         
         Args:
             start_date: Start date
             end_date: End date
             
         Returns:
-            List of dates
+            List of dates (sorted)
         """
         try:
-            # Query with large limit to get all dates, then dedupe in Python
-            response = self.client.table(self.tables["historical"]) \
-                .select("date") \
-                .gte("date", start_date.isoformat()) \
-                .lte("date", end_date.isoformat()) \
-                .order("date") \
-                .limit(100000) \
-                .execute()
+            self.logger.info(f"Fetching available dates from {start_date} to {end_date}")
             
-            if not response.data:
+            # Fetch all dates with pagination
+            all_dates = set()
+            offset = 0
+            batch_size = 10000
+            
+            while True:
+                response = self.client.table(self.tables["historical"]) \
+                    .select("date") \
+                    .gte("date", start_date.isoformat()) \
+                    .lte("date", end_date.isoformat()) \
+                    .order("date") \
+                    .range(offset, offset + batch_size - 1) \
+                    .execute()
+                
+                if not response.data:
+                    break
+                
+                # Add unique dates
+                for row in response.data:
+                    all_dates.add(datetime.fromisoformat(row['date']).date())
+                
+                self.logger.debug(f"Fetched batch {offset}-{offset + len(response.data)}, total unique dates so far: {len(all_dates)}")
+                
+                # If we got less than batch_size, we're done
+                if len(response.data) < batch_size:
+                    break
+                
+                offset += batch_size
+            
+            # Convert to sorted list
+            available_dates = sorted(list(all_dates))
+            
+            self.logger.info(f"Found {len(available_dates)} unique trading dates between {start_date} and {end_date}")
+            
+            if not available_dates:
                 self.logger.warning(f"No data found for date range {start_date} to {end_date}")
-                return []
             
-            # Get unique dates and sort
-            dates = sorted(list(set(
-                datetime.fromisoformat(row['date']).date() 
-                for row in response.data
-            )))
-            
-            self.logger.info(f"Found {len(dates)} unique dates between {start_date} and {end_date}")
-            
-            return dates
+            return available_dates
             
         except Exception as e:
-            self.logger.error(f"Error getting available dates: {e}")
-            return []
+            self.logger.error(f"Error getting available dates: {e}", exc_info=True)
+            # Fallback: generate business days
+            self.logger.warning("Using fallback: generating business days")
+            business_days = pd.bdate_range(start=start_date, end=end_date)
+            return [d.date() for d in business_days]
     
     def get_top_gainers(self, target_date: date, top_n: int = 20) -> List[str]:
         """
@@ -127,7 +147,7 @@ class BacktestSupabaseClient:
     ) -> List[str]:
         """
         Get all stocks trading on a date that meet filters
-        FIXED: Increased limit to get more stocks
+        FIXED: Increased limit and uses pagination if needed
         
         Args:
             target_date: Date to query
@@ -139,25 +159,39 @@ class BacktestSupabaseClient:
             List of symbols
         """
         try:
+            # Build query
             query = self.client.table(self.tables["historical"]) \
                 .select("symbol") \
                 .eq("date", target_date.isoformat()) \
                 .gte("close", min_price) \
-                .gte("volume", min_volume) \
-                .limit(10000)  # Increased limit to get all stocks
+                .gte("volume", min_volume)
             
             if max_price:
                 query = query.lte("close", max_price)
             
-            response = query.execute()
+            # Get all results with pagination
+            all_symbols = []
+            offset = 0
+            batch_size = 1000
             
-            if not response.data:
-                return []
+            while True:
+                response = query.range(offset, offset + batch_size - 1).execute()
+                
+                if not response.data:
+                    break
+                
+                batch_symbols = [row['symbol'] for row in response.data]
+                all_symbols.extend(batch_symbols)
+                
+                # If we got less than batch_size, we're done
+                if len(batch_symbols) < batch_size:
+                    break
+                
+                offset += batch_size
             
-            symbols = [row['symbol'] for row in response.data]
-            self.logger.debug(f"Found {len(symbols)} stocks on {target_date} matching filters")
+            self.logger.debug(f"Found {len(all_symbols)} stocks on {target_date} matching filters")
             
-            return symbols
+            return all_symbols
             
         except Exception as e:
             self.logger.error(f"Error getting stocks for date: {e}")
@@ -212,6 +246,7 @@ class BacktestSupabaseClient:
         """
         Get historical OHLCV data for a stock over a date range
         Used for indicator calculation
+        FIXED: Uses pagination to get all data
         
         Args:
             symbol: Stock symbol
@@ -222,19 +257,33 @@ class BacktestSupabaseClient:
             List of dictionaries with OHLCV data
         """
         try:
-            response = self.client.table(self.tables["historical"]) \
-                .select("*") \
-                .eq("symbol", symbol) \
-                .gte("date", start_date.isoformat()) \
-                .lte("date", end_date.isoformat()) \
-                .order("date") \
-                .limit(500) \
-                .execute()
+            # Get all results with pagination
+            all_data = []
+            offset = 0
+            batch_size = 1000
             
-            if not response.data:
-                return []
+            while True:
+                response = self.client.table(self.tables["historical"]) \
+                    .select("*") \
+                    .eq("symbol", symbol) \
+                    .gte("date", start_date.isoformat()) \
+                    .lte("date", end_date.isoformat()) \
+                    .order("date") \
+                    .range(offset, offset + batch_size - 1) \
+                    .execute()
+                
+                if not response.data:
+                    break
+                
+                all_data.extend(response.data)
+                
+                # If we got less than batch_size, we're done
+                if len(response.data) < batch_size:
+                    break
+                
+                offset += batch_size
             
-            return response.data
+            return all_data
             
         except Exception as e:
             self.logger.debug(f"Error getting stock history for {symbol}: {e}")
