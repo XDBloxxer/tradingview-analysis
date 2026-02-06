@@ -1,6 +1,6 @@
 """
-Strategy Backtester - OPTIMIZED VERSION
-Reduces database queries and memory usage by 90%+
+Strategy Backtester - ENHANCED VERSION
+Now tracks high/low for better exit analysis
 """
 
 import logging
@@ -19,7 +19,7 @@ from ta.volatility import BollingerBands, AverageTrueRange
 class StrategyBacktester:
     """
     Backtester that queries historical database and calculates indicators on-the-fly
-    OPTIMIZED: Caches data, batches queries, reduces logging
+    ENHANCED: Now tracks intraday highs/lows for better exit analysis
     """
     
     def __init__(self, config: dict):
@@ -31,7 +31,7 @@ class StrategyBacktester:
         self._stock_universe_cache = {}  # date -> list of symbols
         self._price_cache = {}  # (symbol, date) -> price data
         self._history_cache = {}  # symbol -> DataFrame
-        self._indicator_cache = {}  # (symbol, date) -> indicators dict - FIXED: Now initialized
+        self._indicator_cache = {}  # (symbol, date) -> indicators dict
         
         self.logger.info("Strategy backtester initialized")
     
@@ -43,7 +43,7 @@ class StrategyBacktester:
     ) -> Dict[str, Any]:
         """
         Run backtest for a strategy
-        OPTIMIZED: Batches writes, caches queries, minimal logging
+        ENHANCED: Now tracks high/low data for exit analysis
         """
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
@@ -64,10 +64,9 @@ class StrategyBacktester:
         # Process dates with larger batch writes
         all_trades = []
         daily_results = []
-        batch_write_interval = 20  # Write every 20 days instead of 10
+        batch_write_interval = 20
         failed_dates = []
         
-        # Track cumulative trades written to avoid re-writing
         trades_written_count = 0
         daily_written_count = 0
         
@@ -76,7 +75,6 @@ class StrategyBacktester:
                 if progress_callback:
                     progress_callback(i + 1, len(trading_days), test_date)
                 
-                # Only log every 10th day
                 if (i + 1) % 10 == 0 or (i + 1) == len(trading_days):
                     self.logger.info(f"Progress: {i+1}/{len(trading_days)}")
                 
@@ -94,9 +92,7 @@ class StrategyBacktester:
                     daily_stats = self._calculate_daily_stats(test_date, day_trades)
                     daily_results.append(daily_stats)
                 
-                # Write less frequently
                 if (i + 1) % batch_write_interval == 0 or (i + 1) == len(trading_days):
-                    # Get the new results to write (only what we haven't written yet)
                     new_daily = daily_results[daily_written_count:]
                     new_trades = all_trades[trades_written_count:]
                     
@@ -139,7 +135,7 @@ class StrategyBacktester:
         strategy_config: Dict,
         supabase_client
     ) -> List[Dict[str, Any]]:
-        """Process a single date - OPTIMIZED"""
+        """Process a single date - ENHANCED with high/low tracking"""
         
         # Get top gainers (with caching)
         if test_date not in self._stock_universe_cache:
@@ -176,12 +172,25 @@ class StrategyBacktester:
                 exit_price = exit_data['close']
                 actual_gain_pct = ((exit_price - entry_price) / entry_price) * 100
                 
+                # NEW: Track high/low for exit analysis
+                exit_high = exit_data.get('high', exit_price)
+                exit_low = exit_data.get('low', exit_price)
+                
+                # Calculate max possible gain (if sold at high)
+                max_possible_gain_pct = ((exit_high - entry_price) / entry_price) * 100
+                
+                # Calculate max drawdown (worst point)
+                max_drawdown_pct = ((exit_low - entry_price) / entry_price) * 100
+                
+                # Did the target get hit intraday?
+                target_hit_intraday = max_possible_gain_pct >= target_gain_pct
+                
                 indicator_values = self._calculate_indicators_for_stock(
                     symbol, test_date, criteria, supabase_client
                 )
                 
                 matched_criteria = symbol in criteria_matches
-                hit_target = actual_gain_pct >= target_gain_pct
+                hit_target = actual_gain_pct >= target_gain_pct  # Based on close
                 
                 if matched_criteria and hit_target:
                     trade_type = 'true_positive'
@@ -203,7 +212,13 @@ class StrategyBacktester:
                     'hit_target': hit_target,
                     'actual_gain_pct': float(actual_gain_pct),
                     'exit_price': float(exit_price),
-                    'trade_type': trade_type
+                    'trade_type': trade_type,
+                    # NEW FIELDS for exit analysis
+                    'exit_high': float(exit_high),
+                    'exit_low': float(exit_low),
+                    'max_possible_gain_pct': float(max_possible_gain_pct),
+                    'max_drawdown_pct': float(max_drawdown_pct),
+                    'target_hit_intraday': target_hit_intraday
                 })
                 
             except Exception as e:
@@ -230,15 +245,11 @@ class StrategyBacktester:
         supabase_client,
         max_stocks: int = 10
     ) -> List[str]:
-        """
-        Find stocks matching criteria - OPTIMIZED
-        Only scans a small sample instead of entire universe
-        """
+        """Find stocks matching criteria - samples from filtered universe"""
         min_price = strategy_config.get('min_price', 0.25)
         max_price = strategy_config.get('max_price')
         min_volume = strategy_config.get('min_volume', 100000)
         
-        # Get only 50 random stocks instead of ALL stocks
         client = supabase_client.client
         
         query = client.table("historical_market_data") \
@@ -250,7 +261,7 @@ class StrategyBacktester:
         if max_price:
             query = query.lte("close", max_price)
         
-        # Get random sample instead of all
+        # Sample random stocks - increase this for better coverage
         response = query.limit(50).execute()
         
         if not response.data:
@@ -258,7 +269,7 @@ class StrategyBacktester:
         
         candidate_stocks = [row['symbol'] for row in response.data]
         
-        # Check criteria on this smaller set
+        # Check criteria on this sample
         matches = []
         
         for stock_symbol in candidate_stocks:
@@ -489,7 +500,7 @@ class StrategyBacktester:
         }
     
     def _calculate_overall_stats(self, all_trades: List[Dict]) -> Dict:
-        """Calculate overall backtest statistics"""
+        """Calculate overall backtest statistics - ENHANCED with new metrics"""
         if not all_trades:
             return {
                 'total_trades': 0,
@@ -498,7 +509,13 @@ class StrategyBacktester:
                 'false_positives': 0,
                 'missed_opportunities': 0,
                 'accuracy_pct': 0,
-                'avg_gain_pct': None
+                'avg_gain_pct': None,
+                # NEW METRICS
+                'win_rate_pct': 0,
+                'avg_winner_pct': None,
+                'avg_loser_pct': None,
+                'profit_factor': None,
+                'intraday_target_hit_rate': 0
             }
         
         total_matches = sum(1 for t in all_trades if t['matched_criteria'])
@@ -511,6 +528,24 @@ class StrategyBacktester:
         matched_trades = [t for t in all_trades if t['matched_criteria']]
         avg_gain = np.mean([t['actual_gain_pct'] for t in matched_trades]) if matched_trades else None
         
+        # NEW: Win rate (% of matched trades that were profitable)
+        winners = [t for t in matched_trades if t['actual_gain_pct'] > 0]
+        losers = [t for t in matched_trades if t['actual_gain_pct'] < 0]
+        win_rate = (len(winners) / len(matched_trades) * 100) if matched_trades else 0
+        
+        # NEW: Average winner vs loser
+        avg_winner = np.mean([t['actual_gain_pct'] for t in winners]) if winners else None
+        avg_loser = np.mean([t['actual_gain_pct'] for t in losers]) if losers else None
+        
+        # NEW: Profit factor (total gains / total losses)
+        total_gains = sum(t['actual_gain_pct'] for t in winners) if winners else 0
+        total_losses = abs(sum(t['actual_gain_pct'] for t in losers)) if losers else 0
+        profit_factor = (total_gains / total_losses) if total_losses > 0 else None
+        
+        # NEW: Intraday target hit rate
+        intraday_hits = sum(1 for t in matched_trades if t.get('target_hit_intraday', False))
+        intraday_hit_rate = (intraday_hits / len(matched_trades) * 100) if matched_trades else 0
+        
         return {
             'total_trades': len(all_trades),
             'total_matches': total_matches,
@@ -518,5 +553,11 @@ class StrategyBacktester:
             'false_positives': false_positives,
             'missed_opportunities': missed_opportunities,
             'accuracy_pct': round(accuracy, 2),
-            'avg_gain_pct': round(avg_gain, 2) if avg_gain else None
+            'avg_gain_pct': round(avg_gain, 2) if avg_gain else None,
+            # NEW METRICS
+            'win_rate_pct': round(win_rate, 2),
+            'avg_winner_pct': round(avg_winner, 2) if avg_winner else None,
+            'avg_loser_pct': round(avg_loser, 2) if avg_loser else None,
+            'profit_factor': round(profit_factor, 2) if profit_factor else None,
+            'intraday_target_hit_rate': round(intraday_hit_rate, 2)
         }
