@@ -48,16 +48,15 @@ class BacktestSupabaseClient:
         try:
             self.logger.info(f"Querying dates from {start_date} to {end_date}")
             
-            # Use RPC function to get distinct dates (much faster)
-            # If RPC not available, fall back to client-side deduplication
+            # Strategy: Query in large batches and deduplicate client-side
+            # This is the most reliable approach given Supabase limitations
             
             all_dates = set()
             offset = 0
-            batch_size = 1000  # Smaller batches since we're getting distinct
+            batch_size = 10000  # Large batches to grab data quickly
+            last_processed_count = 0
             
             while True:
-                # Get one row per date by using DISTINCT-like approach
-                # Select symbol and date, then deduplicate client-side
                 response = self.client.table(self.tables["historical"]) \
                     .select("date") \
                     .gte("date", start_date.isoformat()) \
@@ -67,30 +66,35 @@ class BacktestSupabaseClient:
                     .execute()
                 
                 if not response.data:
+                    self.logger.debug(f"No data at offset {offset}, stopping")
                     break
                 
-                batch_dates = set()
+                # Add all dates from this batch
                 for row in response.data:
-                    batch_dates.add(datetime.fromisoformat(row['date']).date())
+                    all_dates.add(datetime.fromisoformat(row['date']).date())
                 
-                all_dates.update(batch_dates)
+                rows_in_batch = len(response.data)
+                self.logger.debug(f"Offset {offset}: got {rows_in_batch} rows, total unique dates: {len(all_dates)}")
                 
-                # If we got fewer than batch_size, we're done
-                if len(response.data) < batch_size:
+                # If we got fewer rows than batch_size, we've reached the end
+                if rows_in_batch < batch_size:
+                    self.logger.debug(f"Got {rows_in_batch} < {batch_size}, reached end")
                     break
                 
-                # Important: if all dates in this batch are the same as what we already have,
-                # we need to skip ahead more
-                if len(batch_dates) == 0 or (len(all_dates) > 0 and max(batch_dates) == max(all_dates)):
-                    # Jump ahead by a larger amount
-                    offset += batch_size * 10
-                else:
-                    offset += batch_size
+                # Move to next batch
+                offset += batch_size
                 
-                # Safety: don't loop forever
+                # Safety: if we've processed 1M rows and haven't found new dates in a while, stop
                 if offset > 1000000:
-                    self.logger.warning("Reached offset limit, stopping")
+                    self.logger.warning("Reached 1M row offset, stopping (safety limit)")
                     break
+                
+                # If dates haven't increased in last 100k rows, we might be stuck
+                if offset % 100000 == 0:
+                    if len(all_dates) == last_processed_count:
+                        self.logger.warning(f"No new dates found in last 100k rows, stopping")
+                        break
+                    last_processed_count = len(all_dates)
             
             available_dates = sorted(list(all_dates))
             
