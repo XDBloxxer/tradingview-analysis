@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Backtest Runner - UPDATED VERSION
-Uses database queries instead of dynamic market scanning
+Backtest Runner - FIXED VERSION
+Runs existing strategies instead of creating duplicates
 """
 
 import argparse
@@ -27,9 +27,10 @@ def run_backtest(
 ) -> Dict[str, Any]:
     """
     Run a backtest with given strategy configuration
+    DOES NOT create a new strategy - expects strategy_id in config
     
     Args:
-        strategy_config: Strategy configuration dictionary
+        strategy_config: Strategy configuration dictionary (must include 'id' or 'strategy_id')
         config: Optional system config (loads from file if not provided)
         progress_callback: Optional callback for progress updates
         
@@ -48,18 +49,22 @@ def run_backtest(
         backtester = StrategyBacktester(config)
         supabase = BacktestSupabaseClient(config)
         
-        # Create strategy record
-        logger.info("Creating strategy record...")
-        strategy_id = supabase.create_strategy(strategy_config)
+        # Get strategy_id from config
+        strategy_id = strategy_config.get('id') or strategy_config.get('strategy_id')
+        
+        if not strategy_id:
+            raise ValueError("Strategy config must include 'id' or 'strategy_id'")
+        
+        logger.info(f"Running backtest for strategy ID: {strategy_id}")
         
         # Update status to running
         supabase.update_strategy_status(strategy_id, 'running')
         
-        # Run backtest (PASS supabase client to backtester)
+        # Run backtest
         logger.info("Running backtest...")
         results = backtester.run_backtest(
             strategy_config, 
-            supabase,  # NEW: Pass client to backtester
+            supabase,
             progress_callback
         )
         
@@ -109,48 +114,10 @@ def main():
         help="Path to configuration file"
     )
     parser.add_argument(
-        "--name",
-        required=True,
-        help="Strategy name"
-    )
-    parser.add_argument(
-        "--start-date",
-        required=True,
-        help="Start date (YYYY-MM-DD)"
-    )
-    parser.add_argument(
-        "--end-date",
-        required=True,
-        help="End date (YYYY-MM-DD)"
-    )
-    parser.add_argument(
-        "--target-gain",
-        type=float,
-        default=5.0,
-        help="Target gain percentage (default: 5.0)"
-    )
-    parser.add_argument(
-        "--target-days",
+        "--strategy-id",
         type=int,
-        default=1,
-        help="Days to hold (default: 1)"
-    )
-    parser.add_argument(
-        "--criteria",
         required=True,
-        help="Indicator criteria as JSON string"
-    )
-    parser.add_argument(
-        "--min-price",
-        type=float,
-        default=0.25,
-        help="Minimum stock price"
-    )
-    parser.add_argument(
-        "--min-volume",
-        type=int,
-        default=100000,
-        help="Minimum volume"
+        help="Strategy ID from database"
     )
     parser.add_argument(
         "--verbose",
@@ -168,27 +135,20 @@ def main():
     log_level = "DEBUG" if args.verbose else "INFO"
     logger = setup_logging(log_level, config.get("logging", {}))
     
-    # Parse criteria JSON
-    import json
     try:
-        criteria = json.loads(args.criteria)
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid criteria JSON: {e}")
-        return 1
-    
-    # Build strategy config
-    strategy_config = {
-        'name': args.name,
-        'start_date': args.start_date,
-        'end_date': args.end_date,
-        'target_min_gain_pct': args.target_gain,
-        'target_days': args.target_days,
-        'indicator_criteria': criteria,
-        'min_price': args.min_price,
-        'min_volume': args.min_volume
-    }
-    
-    try:
+        # Initialize Supabase client
+        supabase = BacktestSupabaseClient(config)
+        
+        # Fetch strategy from database
+        strategy_config = supabase.get_strategy(args.strategy_id)
+        
+        if not strategy_config:
+            logger.error(f"Strategy {args.strategy_id} not found in database")
+            return 1
+        
+        logger.info(f"Loaded strategy: {strategy_config['name']}")
+        
+        # Run backtest
         result = run_backtest(strategy_config, config)
         
         logger.info("")
