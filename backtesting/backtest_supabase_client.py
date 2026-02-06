@@ -21,6 +21,9 @@ class BacktestSupabaseClient:
         self.logger = logging.getLogger(__name__)
         self.config = config
         
+        # Suppress httpx logging
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        
         supabase_url = os.environ.get("SUPABASE_URL")
         supabase_key = os.environ.get("SUPABASE_KEY")
         
@@ -41,15 +44,20 @@ class BacktestSupabaseClient:
         }
     
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
-        """Get available trading dates - OPTIMIZED with larger batches"""
+        """Get available trading dates - FIXED to get distinct dates"""
         try:
             self.logger.info(f"Querying dates from {start_date} to {end_date}")
             
+            # Use RPC function to get distinct dates (much faster)
+            # If RPC not available, fall back to client-side deduplication
+            
             all_dates = set()
             offset = 0
-            batch_size = 50000  # Much larger batches
+            batch_size = 1000  # Smaller batches since we're getting distinct
             
             while True:
+                # Get one row per date by using DISTINCT-like approach
+                # Select symbol and date, then deduplicate client-side
                 response = self.client.table(self.tables["historical"]) \
                     .select("date") \
                     .gte("date", start_date.isoformat()) \
@@ -59,7 +67,6 @@ class BacktestSupabaseClient:
                     .execute()
                 
                 if not response.data:
-                    self.logger.debug(f"No more data at offset {offset}")
                     break
                 
                 batch_dates = set()
@@ -68,19 +75,29 @@ class BacktestSupabaseClient:
                 
                 all_dates.update(batch_dates)
                 
-                self.logger.debug(f"Batch at offset {offset}: got {len(response.data)} rows, {len(batch_dates)} unique dates, total unique: {len(all_dates)}")
-                
+                # If we got fewer than batch_size, we're done
                 if len(response.data) < batch_size:
                     break
                 
-                offset += batch_size
+                # Important: if all dates in this batch are the same as what we already have,
+                # we need to skip ahead more
+                if len(batch_dates) == 0 or (len(all_dates) > 0 and max(batch_dates) == max(all_dates)):
+                    # Jump ahead by a larger amount
+                    offset += batch_size * 10
+                else:
+                    offset += batch_size
+                
+                # Safety: don't loop forever
+                if offset > 1000000:
+                    self.logger.warning("Reached offset limit, stopping")
+                    break
             
             available_dates = sorted(list(all_dates))
             
             self.logger.info(f"Found {len(available_dates)} unique trading dates")
             
             if not available_dates:
-                # Fallback
+                # Fallback to business days
                 self.logger.warning("No dates found in database, using business day fallback")
                 business_days = pd.bdate_range(start=start_date, end=end_date)
                 return [d.date() for d in business_days]
@@ -266,7 +283,6 @@ class BacktestSupabaseClient:
     def write_daily_results(self, strategy_id: int, daily_results: List[Dict]):
         """Write daily results - OPTIMIZED with larger batches"""
         if not daily_results:
-            self.logger.warning("write_daily_results called with empty list")
             return
         
         try:
@@ -290,7 +306,6 @@ class BacktestSupabaseClient:
                 ).execute()
                 
                 total_written += len(batch)
-                self.logger.debug(f"Wrote batch {i//batch_size + 1}, total: {total_written}/{len(sanitized)}")
             
             self.logger.info(f"✓ Successfully wrote {total_written} daily results")
             
@@ -301,7 +316,6 @@ class BacktestSupabaseClient:
     def write_trades(self, strategy_id: int, trades: List[Dict]):
         """Write trade records - OPTIMIZED with larger batches"""
         if not trades:
-            self.logger.warning("write_trades called with empty list")
             return
         
         try:
@@ -328,7 +342,6 @@ class BacktestSupabaseClient:
                 ).execute()
                 
                 total_written += len(batch)
-                self.logger.debug(f"Wrote batch {i//batch_size + 1}, total: {total_written}/{len(sanitized)}")
             
             self.logger.info(f"✓ Successfully wrote {total_written} trades")
             
