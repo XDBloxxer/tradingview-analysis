@@ -190,7 +190,7 @@ class StrategyBacktester:
                 )
                 
                 matched_criteria = symbol in criteria_matches
-                hit_target = actual_gain_pct >= target_gain_pct  # Based on close
+                hit_target = max_possible_gain_pct >= target_gain_pct  # Based on close
                 
                 if matched_criteria and hit_target:
                     trade_type = 'true_positive'
