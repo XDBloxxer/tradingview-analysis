@@ -169,7 +169,7 @@ class BacktestSupabaseClient:
                 # KEY CHANGE: Only select columns needed for indicators
                 # Add any other columns you need here (volume, etc.)
                 response = self.client.table(self.tables["historical"]) \
-                    .select("date,open,high,low,close,volume") \  # <-- Specific columns only!
+                    .select("date,open,high,low,close,volume") \  
                     .eq("symbol", symbol) \
                     .gte("date", start_date.isoformat()) \
                     .lte("date", end_date.isoformat()) \
