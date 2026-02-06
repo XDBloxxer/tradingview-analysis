@@ -4,6 +4,7 @@ Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intrada
 Only includes indicators that exist in database schema
 FIXED: Preserves metadata fields (symbol, exchange, etc.) when adding indicators
 FIXED: Corrected market open data fetching logic
+FIXED: More flexible time windows to handle yfinance data delays
 """
 
 import logging
@@ -305,22 +306,30 @@ class IntradayDataCollector:
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market open (9:30-9:45am)"""
+        """Extract indicators at market open (9:30-10:00am window to handle yfinance delays)"""
         try:
-            # Find bars around 9:30am
+            # Find bars around 9:30am (expand window to 10:00am to handle yfinance delays)
             morning_bars = intraday_df[
                 (intraday_df.index.time >= time(9, 30)) &
-                (intraday_df.index.time <= time(9, 45))
+                (intraday_df.index.time <= time(10, 0))
             ]
             
             if morning_bars.empty:
+                # Fallback: get earliest available bar after 9:30
                 morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
                 if morning_bars.empty:
-                    self.logger.debug(f"No morning bars found for {symbol}")
-                    return None
+                    # Last resort: use first bar of the day if no 9:30+ bars available yet
+                    if len(intraday_df) > 0:
+                        self.logger.debug(f"Using first available bar for {symbol} (no 9:30am+ data yet)")
+                        morning_bars = intraday_df.head(1)
+                    else:
+                        self.logger.debug(f"No morning bars found for {symbol}")
+                        return None
             
             # Use first available bar
             open_data = morning_bars.iloc[0]
+            actual_time = morning_bars.index[0].strftime('%H:%M:%S')
+            self.logger.debug(f"Using {actual_time} bar for market_open for {symbol}")
             
             snapshot = {
                 'symbol': symbol,
