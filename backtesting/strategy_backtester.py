@@ -245,7 +245,7 @@ class StrategyBacktester:
                 for condition in criteria:
                     indicator_name = condition['indicator'].lower()
                     operator = condition['operator']
-                    target_value = condition['value']
+                    comparison_type = condition.get('comparison_type', 'value')
                     
                     if indicator_name not in indicators:
                         all_criteria_met = False
@@ -256,6 +256,21 @@ class StrategyBacktester:
                     if actual_value is None:
                         all_criteria_met = False
                         break
+                    
+                    # Determine comparison value
+                    if comparison_type == 'indicator':
+                        # Compare to another indicator
+                        compare_to = condition.get('compare_to', '').lower()
+                        if compare_to not in indicators:
+                            all_criteria_met = False
+                            break
+                        target_value = indicators[compare_to]
+                        if target_value is None:
+                            all_criteria_met = False
+                            break
+                    else:
+                        # Compare to a fixed value
+                        target_value = condition['value']
                     
                     # Check condition
                     if operator == '>':
@@ -337,6 +352,9 @@ class StrategyBacktester:
         needed = set()
         for c in criteria:
             needed.add(c['indicator'].lower())
+            # Also add comparison indicator if comparing to another indicator
+            if c.get('comparison_type') == 'indicator':
+                needed.add(c.get('compare_to', '').lower())
         
         # Calculate each needed indicator
         try:
