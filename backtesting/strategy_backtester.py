@@ -1,6 +1,6 @@
 """
-Strategy Backtester - ENHANCED VERSION
-Now tracks high/low for better exit analysis
+Strategy Backtester - FIXED VERSION
+Now checks criteria on T-1 (before move) and measures results on T (after move)
 """
 
 import logging
@@ -18,8 +18,8 @@ from ta.volatility import BollingerBands, AverageTrueRange
 
 class StrategyBacktester:
     """
-    Backtester that queries historical database and calculates indicators on-the-fly
-    ENHANCED: Now tracks intraday highs/lows for better exit analysis
+    Backtester that checks criteria BEFORE moves happen
+    FIXED: Checks indicators on signal_date (T-1), measures gain on test_date (T)
     """
     
     def __init__(self, config: dict):
@@ -33,7 +33,7 @@ class StrategyBacktester:
         self._history_cache = {}  # symbol -> DataFrame
         self._indicator_cache = {}  # (symbol, date) -> indicators dict
         
-        self.logger.info("Strategy backtester initialized")
+        self.logger.info("Strategy backtester initialized (FIXED VERSION)")
     
     def run_backtest(
         self,
@@ -43,7 +43,7 @@ class StrategyBacktester:
     ) -> Dict[str, Any]:
         """
         Run backtest for a strategy
-        ENHANCED: Now tracks high/low data for exit analysis
+        FIXED: Checks criteria on T-1, measures gains on T
         """
         start_date = pd.to_datetime(strategy_config['start_date']).date()
         end_date = pd.to_datetime(strategy_config['end_date']).date()
@@ -53,6 +53,7 @@ class StrategyBacktester:
         strategy_id = strategy_config.get('id') or strategy_config.get('strategy_id')
         
         self.logger.info(f"Backtest: {start_date} to {end_date}, target: {target_gain_pct}% in {target_days}d")
+        self.logger.info(f"LOGIC: Check criteria on T-1, measure gain on T")
         
         # Get trading days
         trading_days = supabase_client.get_available_dates(start_date, end_date)
@@ -135,25 +136,34 @@ class StrategyBacktester:
         strategy_config: Dict,
         supabase_client
     ) -> List[Dict[str, Any]]:
-        """Process a single date - ENHANCED with high/low tracking"""
+        """
+        Process a single date
+        FIXED: test_date is when stocks MOVED, signal_date is when we CHECK criteria
+        """
         
-        # Get top gainers (with caching)
+        # KEY FIX: Calculate signal_date (when we check criteria)
+        # For target_days=1, signal_date = test_date - 1 day
+        signal_date = test_date - timedelta(days=target_days)
+        
+        self.logger.debug(f"Test date: {test_date}, Signal date: {signal_date}")
+        
+        # Get top gainers on TEST_DATE (the explosion day)
         if test_date not in self._stock_universe_cache:
             gainers = supabase_client.get_top_gainers(test_date, top_n=5)
             self._stock_universe_cache[test_date] = gainers
         else:
             gainers = self._stock_universe_cache[test_date]
         
-        # Get criteria matches
+        # Get stocks that met criteria on SIGNAL_DATE (before the move)
         criteria_matches = self._get_criteria_matches(
-            test_date,
+            signal_date,  # ✅ Check criteria BEFORE the move
             criteria,
             strategy_config,
             supabase_client,
             max_stocks=10
         )
         
-        # Combine
+        # Combine both lists
         all_symbols = set(gainers + criteria_matches)
         
         # Process trades
@@ -161,9 +171,11 @@ class StrategyBacktester:
         
         for symbol in all_symbols:
             try:
-                entry_data = self._get_cached_price(symbol, test_date, supabase_client)
-                exit_date = test_date + timedelta(days=target_days)
-                exit_data = self._get_cached_price(symbol, exit_date, supabase_client)
+                # Entry is on SIGNAL_DATE (when criteria was checked)
+                entry_data = self._get_cached_price(symbol, signal_date, supabase_client)
+                
+                # Exit is on TEST_DATE (target_days later)
+                exit_data = self._get_cached_price(symbol, test_date, supabase_client)
                 
                 if not entry_data or not exit_data:
                     continue
@@ -172,7 +184,7 @@ class StrategyBacktester:
                 exit_price = exit_data['close']
                 actual_gain_pct = ((exit_price - entry_price) / entry_price) * 100
                 
-                # NEW: Track high/low for exit analysis
+                # Track high/low for exit analysis
                 exit_high = exit_data.get('high', exit_price)
                 exit_low = exit_data.get('low', exit_price)
                 
@@ -185,13 +197,18 @@ class StrategyBacktester:
                 # Did the target get hit intraday?
                 target_hit_intraday = max_possible_gain_pct >= target_gain_pct
                 
+                # Calculate indicators on SIGNAL_DATE (before the move)
                 indicator_values = self._calculate_indicators_for_stock(
-                    symbol, test_date, criteria, supabase_client
+                    symbol, signal_date, criteria, supabase_client
                 )
                 
+                # Did this stock match criteria on signal_date?
                 matched_criteria = symbol in criteria_matches
-                hit_target = max_possible_gain_pct >= target_gain_pct  # Based on close
                 
+                # Did it hit target by test_date?
+                hit_target = actual_gain_pct >= target_gain_pct
+                
+                # Classify trade type
                 if matched_criteria and hit_target:
                     trade_type = 'true_positive'
                 elif matched_criteria and not hit_target:
@@ -204,7 +221,7 @@ class StrategyBacktester:
                 trades.append({
                     'symbol': symbol,
                     'exchange': entry_data.get('exchange', 'NASDAQ'),
-                    'signal_date': test_date.isoformat(),
+                    'signal_date': signal_date.isoformat(),  # When we found it
                     'entry_price': float(entry_price),
                     'entry_volume': int(entry_data.get('volume', 0)),
                     'indicator_values': indicator_values,
@@ -212,8 +229,9 @@ class StrategyBacktester:
                     'hit_target': hit_target,
                     'actual_gain_pct': float(actual_gain_pct),
                     'exit_price': float(exit_price),
+                    'exit_date': test_date.isoformat(),  # When we measured results
                     'trade_type': trade_type,
-                    # NEW FIELDS for exit analysis
+                    # Exit analysis fields
                     'exit_high': float(exit_high),
                     'exit_low': float(exit_low),
                     'max_possible_gain_pct': float(max_possible_gain_pct),
@@ -222,6 +240,7 @@ class StrategyBacktester:
                 })
                 
             except Exception as e:
+                self.logger.debug(f"Error processing {symbol}: {e}")
                 continue
         
         return trades
@@ -239,13 +258,16 @@ class StrategyBacktester:
     
     def _get_criteria_matches(
         self,
-        test_date: datetime.date,
+        signal_date: datetime.date,
         criteria: List[Dict],
         strategy_config: Dict,
         supabase_client,
         max_stocks: int = 10
     ) -> List[str]:
-        """Find stocks matching criteria - samples from filtered universe"""
+        """
+        Find stocks matching criteria on signal_date
+        Samples from filtered universe to minimize egress
+        """
         min_price = strategy_config.get('min_price', 0.25)
         max_price = strategy_config.get('max_price')
         min_volume = strategy_config.get('min_volume', 100000)
@@ -254,14 +276,14 @@ class StrategyBacktester:
         
         query = client.table("historical_market_data") \
             .select("symbol") \
-            .eq("date", test_date.isoformat()) \
+            .eq("date", signal_date.isoformat()) \
             .gte("close", min_price) \
             .gte("volume", min_volume)
         
         if max_price:
             query = query.lte("close", max_price)
         
-        # Sample random stocks - increase this for better coverage
+        # Sample random stocks - small sample to minimize egress
         response = query.limit(50).execute()
         
         if not response.data:
@@ -278,7 +300,7 @@ class StrategyBacktester:
             
             try:
                 indicators = self._calculate_indicators_for_stock(
-                    stock_symbol, test_date, criteria, supabase_client
+                    stock_symbol, signal_date, criteria, supabase_client
                 )
                 
                 all_criteria_met = True
@@ -331,7 +353,8 @@ class StrategyBacktester:
                 if all_criteria_met:
                     matches.append(stock_symbol)
                         
-            except:
+            except Exception as e:
+                self.logger.debug(f"Error checking criteria for {stock_symbol}: {e}")
                 continue
         
         return matches
@@ -422,6 +445,18 @@ class StrategyBacktester:
                 adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
                 indicators['adx'] = adx.adx().iloc[idx]
             
+            if 'adx+di' in needed or 'adx_pos' in needed:
+                adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+                val = adx.adx_pos().iloc[idx]
+                indicators['adx+di'] = val
+                indicators['adx_pos'] = val
+            
+            if 'adx-di' in needed or 'adx_neg' in needed:
+                adx = ADXIndicator(high=df['high'], low=df['low'], close=df['close'], window=14)
+                val = adx.adx_neg().iloc[idx]
+                indicators['adx-di'] = val
+                indicators['adx_neg'] = val
+            
             for period in [5, 10, 20, 50, 100, 200]:
                 ema_key = f'ema_{period}'
                 if ema_key in needed or f'ema{period}' in needed:
@@ -441,12 +476,17 @@ class StrategyBacktester:
                 atr = AverageTrueRange(high=df['high'], low=df['low'], close=df['close'], window=14)
                 indicators['atr'] = atr.average_true_range().iloc[idx]
             
-            if any(x in needed for x in ['bb.upper', 'bb.lower', 'bb.middle', 'bb_width']):
+            if any(x in needed for x in ['bb.upper', 'bb.lower', 'bb.middle', 'bb_width', 'bbpower']):
                 bb = BollingerBands(close=df['close'], window=20, window_dev=2)
                 indicators['bb.upper'] = bb.bollinger_hband().iloc[idx]
                 indicators['bb.lower'] = bb.bollinger_lband().iloc[idx]
                 indicators['bb.middle'] = bb.bollinger_mavg().iloc[idx]
                 indicators['bb_width'] = (indicators['bb.upper'] - indicators['bb.lower']) / indicators['bb.middle'] * 100
+                
+                # BBPower = (close - lower) / (upper - lower) * 100
+                close_price = df['close'].iloc[idx]
+                indicators['bbpower'] = ((close_price - indicators['bb.lower']) / 
+                                        (indicators['bb.upper'] - indicators['bb.lower'])) * 100
             
             if 'volume' in needed:
                 indicators['volume'] = df['volume'].iloc[idx]
@@ -459,9 +499,20 @@ class StrategyBacktester:
                 indicators['close'] = df['close'].iloc[idx]
             if 'open' in needed:
                 indicators['open'] = df['open'].iloc[idx]
+            if 'high' in needed:
+                indicators['high'] = df['high'].iloc[idx]
+            if 'low' in needed:
+                indicators['low'] = df['low'].iloc[idx]
             
-        except:
-            pass
+            # Comparison indicators (EMA crossovers, etc.)
+            if 'ema50' in indicators and 'ema200' in indicators:
+                indicators['ema50_above_ema200'] = 1.0 if indicators['ema50'] > indicators['ema200'] else 0.0
+            
+            if 'ema20' in indicators and 'ema50' in indicators:
+                indicators['ema20_above_ema50'] = 1.0 if indicators['ema20'] > indicators['ema50'] else 0.0
+            
+        except Exception as e:
+            self.logger.debug(f"Error calculating indicators for {symbol}: {e}")
         
         # Cache result
         self._indicator_cache[cache_key] = indicators
@@ -500,7 +551,7 @@ class StrategyBacktester:
         }
     
     def _calculate_overall_stats(self, all_trades: List[Dict]) -> Dict:
-        """Calculate overall backtest statistics - ENHANCED with new metrics"""
+        """Calculate overall backtest statistics"""
         if not all_trades:
             return {
                 'total_trades': 0,
@@ -510,7 +561,6 @@ class StrategyBacktester:
                 'missed_opportunities': 0,
                 'accuracy_pct': 0,
                 'avg_gain_pct': None,
-                # NEW METRICS
                 'win_rate_pct': 0,
                 'avg_winner_pct': None,
                 'avg_loser_pct': None,
@@ -528,21 +578,21 @@ class StrategyBacktester:
         matched_trades = [t for t in all_trades if t['matched_criteria']]
         avg_gain = np.mean([t['actual_gain_pct'] for t in matched_trades]) if matched_trades else None
         
-        # NEW: Win rate (% of matched trades that were profitable)
+        # Win rate (% of matched trades that were profitable)
         winners = [t for t in matched_trades if t['actual_gain_pct'] > 0]
         losers = [t for t in matched_trades if t['actual_gain_pct'] < 0]
         win_rate = (len(winners) / len(matched_trades) * 100) if matched_trades else 0
         
-        # NEW: Average winner vs loser
+        # Average winner vs loser
         avg_winner = np.mean([t['actual_gain_pct'] for t in winners]) if winners else None
         avg_loser = np.mean([t['actual_gain_pct'] for t in losers]) if losers else None
         
-        # NEW: Profit factor (total gains / total losses)
+        # Profit factor (total gains / total losses)
         total_gains = sum(t['actual_gain_pct'] for t in winners) if winners else 0
         total_losses = abs(sum(t['actual_gain_pct'] for t in losers)) if losers else 0
         profit_factor = (total_gains / total_losses) if total_losses > 0 else None
         
-        # NEW: Intraday target hit rate
+        # Intraday target hit rate
         intraday_hits = sum(1 for t in matched_trades if t.get('target_hit_intraday', False))
         intraday_hit_rate = (intraday_hits / len(matched_trades) * 100) if matched_trades else 0
         
@@ -554,7 +604,6 @@ class StrategyBacktester:
             'missed_opportunities': missed_opportunities,
             'accuracy_pct': round(accuracy, 2),
             'avg_gain_pct': round(avg_gain, 2) if avg_gain else None,
-            # NEW METRICS
             'win_rate_pct': round(win_rate, 2),
             'avg_winner_pct': round(avg_winner, 2) if avg_winner else None,
             'avg_loser_pct': round(avg_loser, 2) if avg_loser else None,
