@@ -60,10 +60,6 @@ class StrategyBacktester:
         if not trading_days:
             raise ValueError(f"No data for {start_date} to {end_date}")
         
-        # Pre-cache top gainers for all dates (single batch query)
-        self.logger.info("Pre-caching top gainers...")
-        self._precache_top_gainers(trading_days, supabase_client)
-        
         # Process dates with larger batch writes
         all_trades = []
         daily_results = []
@@ -95,15 +91,25 @@ class StrategyBacktester:
                 
                 # Write less frequently
                 if (i + 1) % batch_write_interval == 0 or (i + 1) == len(trading_days):
+                    self.logger.info(f"Writing batch: {len(daily_results)} daily results, {len(all_trades)} total trades")
+                    
                     if daily_results:
+                        self.logger.info(f"Writing {len(daily_results)} daily results...")
                         supabase_client.write_daily_results(strategy_id, daily_results)
+                    else:
+                        self.logger.warning("No daily results to write!")
+                    
                     if all_trades:
+                        self.logger.info(f"Writing {len(all_trades)} trades...")
                         supabase_client.write_trades(strategy_id, all_trades)
+                    else:
+                        self.logger.warning("No trades to write!")
                     
                     current_stats = self._calculate_overall_stats(all_trades)
+                    self.logger.info(f"Stats: {current_stats}")
                     supabase_client.update_strategy_summary(strategy_id, current_stats)
                     
-                    self.logger.info(f"Wrote {len(daily_results)} days, {len(all_trades)} trades")
+                    self.logger.info(f"✓ Batch complete")
                 
             except Exception as e:
                 self.logger.error(f"Error on {test_date}: {e}")
@@ -122,26 +128,14 @@ class StrategyBacktester:
         }
     
     def _precache_top_gainers(self, trading_days, supabase_client):
-        """Pre-cache top gainers for all dates in one batch query"""
+        """Pre-cache top gainers for all dates in batches"""
         try:
-            # Get top 5 gainers for each date in one query
-            client = supabase_client.client
+            # Don't pre-cache - it's too slow
+            # Instead, cache on-demand in _process_date
+            self.logger.info("Using on-demand caching for top gainers")
             
-            for test_date in trading_days:
-                response = client.table("historical_market_data") \
-                    .select("symbol") \
-                    .eq("date", test_date.isoformat()) \
-                    .order("change_pct", desc=True) \
-                    .limit(5) \
-                    .execute()
-                
-                if response.data:
-                    self._stock_universe_cache[test_date] = [row['symbol'] for row in response.data]
-                else:
-                    self._stock_universe_cache[test_date] = []
-                    
         except Exception as e:
-            self.logger.warning(f"Pre-cache failed: {e}")
+            self.logger.warning(f"Pre-cache setup failed: {e}")
     
     def _process_date(
         self,
@@ -154,8 +148,14 @@ class StrategyBacktester:
     ) -> List[Dict[str, Any]]:
         """Process a single date - OPTIMIZED"""
         
-        # Get cached gainers
-        gainers = self._stock_universe_cache.get(test_date, [])
+        # Get top gainers (with caching)
+        if test_date not in self._stock_universe_cache:
+            gainers = supabase_client.get_top_gainers(test_date, top_n=5)
+            self._stock_universe_cache[test_date] = gainers
+        else:
+            gainers = self._stock_universe_cache[test_date]
+        
+        self.logger.debug(f"{test_date}: {len(gainers)} gainers")
         
         # Get fewer criteria matches
         criteria_matches = self._get_criteria_matches(
@@ -166,8 +166,12 @@ class StrategyBacktester:
             max_stocks=10  # Keep at 10
         )
         
+        self.logger.debug(f"{test_date}: {len(criteria_matches)} criteria matches")
+        
         # Combine
         all_symbols = set(gainers + criteria_matches)
+        
+        self.logger.debug(f"{test_date}: {len(all_symbols)} total symbols to process")
         
         # Process trades
         trades = []
@@ -215,8 +219,11 @@ class StrategyBacktester:
                     'trade_type': trade_type
                 })
                 
-            except:
+            except Exception as e:
+                self.logger.debug(f"Error processing {symbol}: {e}")
                 continue
+        
+        self.logger.debug(f"{test_date}: Created {len(trades)} trades")
         
         return trades
     
