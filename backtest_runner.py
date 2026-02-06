@@ -105,10 +105,10 @@ def main():
         help="Strategy ID from database"
     )
     parser.add_argument(
-        "--verbose",
+        "--silent",
         "-v",
         action="store_true",
-        help="Verbose logging"
+        help="silent logging"
     )
     
     args = parser.parse_args()
@@ -117,7 +117,7 @@ def main():
     config = load_config(args.config)
     
     # Setup logging
-    log_level = "DEBUG" if args.verbose else "INFO"
+    log_level = "DEBUG" if args.silent else "INFO"
     logger = setup_logging(log_level, config.get("logging", {}))
     
     try:
