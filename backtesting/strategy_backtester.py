@@ -1,7 +1,8 @@
 """
-Strategy Backtester - Database Query Version
+Strategy Backtester - Database Query Version - FIXED
 Queries pre-downloaded historical data from Supabase
 Calculates indicators on-the-fly during backtest
+FIXED: Properly scans all dates and all stocks
 """
 
 import logging
@@ -112,27 +113,27 @@ class StrategyBacktester:
         """
         Process a single date:
         1. Get top 20 gainers from database
-        2. Get 20 stocks matching criteria (calculated on-the-fly)
+        2. Get ALL stocks matching criteria (not just 20)
         3. Check which ones hit target
         """
         self.logger.debug(f"Processing {test_date}")
         
-        # Get top gainers for this date from database
-        gainers = supabase_client.get_top_gainers(test_date, top_n=20)
+        # Get top gainers for this date from database (top 50 to get more)
+        gainers = supabase_client.get_top_gainers(test_date, top_n=50)
         
         if not gainers:
             self.logger.warning(f"No gainers found for {test_date}")
-            return []
+            gainers = []
         
         self.logger.debug(f"Found {len(gainers)} gainers")
         
-        # Get stocks matching criteria
+        # Get ALL stocks matching criteria (not limited to 20)
         criteria_matches = self._get_criteria_matches(
             test_date,
             criteria,
             strategy_config,
             supabase_client,
-            top_n=20
+            max_stocks=500  # Increased limit to scan more stocks
         )
         
         self.logger.debug(f"Found {len(criteria_matches)} criteria matches")
@@ -141,6 +142,8 @@ class StrategyBacktester:
         all_symbols = set()
         all_symbols.update(gainers)
         all_symbols.update(criteria_matches)
+        
+        self.logger.debug(f"Total unique symbols: {len(all_symbols)}")
         
         # For each symbol, check if it hit target
         trades = []
@@ -208,17 +211,18 @@ class StrategyBacktester:
         criteria: List[Dict],
         strategy_config: Dict,
         supabase_client,
-        top_n: int = 20
+        max_stocks: int = 500
     ) -> List[str]:
         """
         Find stocks matching criteria on a specific date
         Calculates indicators on-the-fly
+        FIXED: Scans more stocks, not limited to 20
         """
         min_price = strategy_config.get('min_price', 0.25)
         max_price = strategy_config.get('max_price')
         min_volume = strategy_config.get('min_volume', 100000)
         
-        # Get all stocks from database for this date (pre-filtered by price/volume)
+        # Get ALL stocks from database for this date (pre-filtered by price/volume)
         all_stocks = supabase_client.get_all_stocks_for_date(
             test_date,
             min_price=min_price,
@@ -229,10 +233,16 @@ class StrategyBacktester:
         if not all_stocks:
             return []
         
+        self.logger.debug(f"Scanning {len(all_stocks)} stocks for criteria matches")
+        
         # For each stock, calculate indicators and check criteria
         matches = []
         
         for stock_symbol in all_stocks:
+            # Stop if we have enough matches
+            if len(matches) >= max_stocks:
+                break
+            
             try:
                 # Calculate indicators for this stock
                 indicators = self._calculate_indicators_for_stock(
@@ -300,9 +310,6 @@ class StrategyBacktester:
                 
                 if all_criteria_met:
                     matches.append(stock_symbol)
-                    
-                    if len(matches) >= top_n:
-                        break
                         
             except Exception as e:
                 self.logger.debug(f"Error checking criteria for {stock_symbol}: {e}")
@@ -322,7 +329,7 @@ class StrategyBacktester:
         Fetches historical data from database and calculates on-the-fly
         """
         # Get historical data for this stock (need enough for indicator calculations)
-        lookback_days = 200  # Enough for 200-day MA
+        lookback_days = 250  # Enough for 200-day MA + buffer
         start_date = target_date - timedelta(days=lookback_days)
         
         hist_data = supabase_client.get_stock_history(symbol, start_date, target_date)
@@ -339,14 +346,15 @@ class StrategyBacktester:
         indicators = {}
         
         # Find target date index
-        if target_date not in df.index.date:
+        target_date_dt = pd.Timestamp(target_date)
+        if target_date_dt not in df.index:
             # Find closest prior date
-            prior_dates = [d for d in df.index.date if d <= target_date]
+            prior_dates = [d for d in df.index if d.date() <= target_date]
             if not prior_dates:
                 return {}
-            target_date = prior_dates[-1]
+            target_date_dt = prior_dates[-1]
         
-        idx = list(df.index.date).index(target_date)
+        idx = df.index.get_loc(target_date_dt)
         
         # Extract needed indicators from criteria
         needed = set()
@@ -394,7 +402,7 @@ class StrategyBacktester:
                 indicators['adx'] = adx.adx().iloc[idx]
             
             # Moving averages
-            for period in [10, 20, 50, 200]:
+            for period in [5, 10, 20, 50, 100, 200]:
                 ema_key = f'ema_{period}'
                 if ema_key in needed or f'ema{period}' in needed:
                     ema = EMAIndicator(close=df['close'], window=period)
