@@ -31,8 +31,9 @@ class StrategyBacktester:
         self._stock_universe_cache = {}  # date -> list of symbols
         self._price_cache = {}  # (symbol, date) -> price data
         self._history_cache = {}  # symbol -> DataFrame
+        self._indicator_cache = {}  # (symbol, date) -> indicators dict - FIXED: Now initialized
         
-        self.logger.info("Strategy backtester initialized (OPTIMIZED)")
+        self.logger.info("Strategy backtester initialized")
     
     def run_backtest(
         self,
@@ -99,30 +100,22 @@ class StrategyBacktester:
                     new_daily = daily_results[daily_written_count:]
                     new_trades = all_trades[trades_written_count:]
                     
-                    self.logger.info(f"Writing batch: {len(new_daily)} new daily results, {len(new_trades)} new trades (total: {len(daily_results)} daily, {len(all_trades)} trades)")
+                    self.logger.info(f"Writing batch: {len(new_daily)} daily results, {len(new_trades)} trades")
                     
                     if new_daily:
-                        self.logger.info(f"Writing {len(new_daily)} daily results...")
                         supabase_client.write_daily_results(strategy_id, new_daily)
                         daily_written_count = len(daily_results)
-                    else:
-                        self.logger.warning("No new daily results to write!")
                     
                     if new_trades:
-                        self.logger.info(f"Writing {len(new_trades)} trades...")
                         supabase_client.write_trades(strategy_id, new_trades)
                         trades_written_count = len(all_trades)
-                    else:
-                        self.logger.warning("No new trades to write!")
                     
                     current_stats = self._calculate_overall_stats(all_trades)
                     self.logger.info(f"Stats: matches={current_stats['total_matches']}, accuracy={current_stats['accuracy_pct']}%")
                     supabase_client.update_strategy_summary(strategy_id, current_stats)
-                    
-                    self.logger.info(f"✓ Batch complete")
                 
             except Exception as e:
-                self.logger.error(f"Error on {test_date}: {e}", exc_info=True)
+                self.logger.error(f"Error on {test_date}: {e}")
                 failed_dates.append(test_date)
                 continue
         
@@ -136,16 +129,6 @@ class StrategyBacktester:
             'overall_stats': overall_stats,
             'failed_dates': failed_dates
         }
-    
-    def _precache_top_gainers(self, trading_days, supabase_client):
-        """Pre-cache top gainers for all dates in batches"""
-        try:
-            # Don't pre-cache - it's too slow
-            # Instead, cache on-demand in _process_date
-            self.logger.info("Using on-demand caching for top gainers")
-            
-        except Exception as e:
-            self.logger.warning(f"Pre-cache setup failed: {e}")
     
     def _process_date(
         self,
@@ -165,23 +148,17 @@ class StrategyBacktester:
         else:
             gainers = self._stock_universe_cache[test_date]
         
-        self.logger.debug(f"{test_date}: {len(gainers)} gainers")
-        
-        # Get fewer criteria matches
+        # Get criteria matches
         criteria_matches = self._get_criteria_matches(
             test_date,
             criteria,
             strategy_config,
             supabase_client,
-            max_stocks=10  # Keep at 10
+            max_stocks=10
         )
-        
-        self.logger.debug(f"{test_date}: {len(criteria_matches)} criteria matches")
         
         # Combine
         all_symbols = set(gainers + criteria_matches)
-        
-        self.logger.debug(f"{test_date}: {len(all_symbols)} total symbols to process")
         
         # Process trades
         trades = []
@@ -230,10 +207,7 @@ class StrategyBacktester:
                 })
                 
             except Exception as e:
-                self.logger.debug(f"Error processing {symbol}: {e}")
                 continue
-        
-        self.logger.debug(f"{test_date}: Created {len(trades)} trades")
         
         return trades
     
@@ -265,7 +239,6 @@ class StrategyBacktester:
         min_volume = strategy_config.get('min_volume', 100000)
         
         # Get only 50 random stocks instead of ALL stocks
-        # This is the key optimization
         client = supabase_client.client
         
         query = client.table("historical_market_data") \
