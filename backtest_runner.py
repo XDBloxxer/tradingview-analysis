@@ -16,8 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.utils import setup_logging, load_config
 
 # Import NEW versions
-from strategy_backtester import StrategyBacktester
-from backtest_supabase_client import BacktestSupabaseClient
+from backtesting.strategy_backtester import StrategyBacktester
+from backtesting.backtest_supabase_client import BacktestSupabaseClient
 
 
 def run_backtest(
