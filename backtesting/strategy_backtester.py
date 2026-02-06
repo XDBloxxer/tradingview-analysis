@@ -66,6 +66,10 @@ class StrategyBacktester:
         batch_write_interval = 20  # Write every 20 days instead of 10
         failed_dates = []
         
+        # Track cumulative trades written to avoid re-writing
+        trades_written_count = 0
+        daily_written_count = 0
+        
         for i, test_date in enumerate(trading_days):
             try:
                 if progress_callback:
@@ -91,28 +95,34 @@ class StrategyBacktester:
                 
                 # Write less frequently
                 if (i + 1) % batch_write_interval == 0 or (i + 1) == len(trading_days):
-                    self.logger.info(f"Writing batch: {len(daily_results)} daily results, {len(all_trades)} total trades")
+                    # Get the new results to write (only what we haven't written yet)
+                    new_daily = daily_results[daily_written_count:]
+                    new_trades = all_trades[trades_written_count:]
                     
-                    if daily_results:
-                        self.logger.info(f"Writing {len(daily_results)} daily results...")
-                        supabase_client.write_daily_results(strategy_id, daily_results)
-                    else:
-                        self.logger.warning("No daily results to write!")
+                    self.logger.info(f"Writing batch: {len(new_daily)} new daily results, {len(new_trades)} new trades (total: {len(daily_results)} daily, {len(all_trades)} trades)")
                     
-                    if all_trades:
-                        self.logger.info(f"Writing {len(all_trades)} trades...")
-                        supabase_client.write_trades(strategy_id, all_trades)
+                    if new_daily:
+                        self.logger.info(f"Writing {len(new_daily)} daily results...")
+                        supabase_client.write_daily_results(strategy_id, new_daily)
+                        daily_written_count = len(daily_results)
                     else:
-                        self.logger.warning("No trades to write!")
+                        self.logger.warning("No new daily results to write!")
+                    
+                    if new_trades:
+                        self.logger.info(f"Writing {len(new_trades)} trades...")
+                        supabase_client.write_trades(strategy_id, new_trades)
+                        trades_written_count = len(all_trades)
+                    else:
+                        self.logger.warning("No new trades to write!")
                     
                     current_stats = self._calculate_overall_stats(all_trades)
-                    self.logger.info(f"Stats: {current_stats}")
+                    self.logger.info(f"Stats: matches={current_stats['total_matches']}, accuracy={current_stats['accuracy_pct']}%")
                     supabase_client.update_strategy_summary(strategy_id, current_stats)
                     
                     self.logger.info(f"✓ Batch complete")
                 
             except Exception as e:
-                self.logger.error(f"Error on {test_date}: {e}")
+                self.logger.error(f"Error on {test_date}: {e}", exc_info=True)
                 failed_dates.append(test_date)
                 continue
         
