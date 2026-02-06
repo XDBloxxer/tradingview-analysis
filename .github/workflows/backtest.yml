@@ -15,6 +15,7 @@ on:
         type: choice
         options:
           - 'false'
+          - 'true'
 
 jobs:
   backtest:
@@ -47,7 +48,7 @@ jobs:
           ARGS="--strategy-id ${{ github.event.inputs.strategy_id }}"
           
           if [ "${{ github.event.inputs.verbose }}" == "true" ]; then
-            ARGS="$ARGS --verbose"
+            ARGS="$ARGS --silent"
           fi
           
           echo "Running backtest with args: $ARGS"
