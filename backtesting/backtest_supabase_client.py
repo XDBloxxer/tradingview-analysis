@@ -43,6 +43,8 @@ class BacktestSupabaseClient:
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
         """Get available trading dates - OPTIMIZED with larger batches"""
         try:
+            self.logger.info(f"Querying dates from {start_date} to {end_date}")
+            
             all_dates = set()
             offset = 0
             batch_size = 50000  # Much larger batches
@@ -57,10 +59,16 @@ class BacktestSupabaseClient:
                     .execute()
                 
                 if not response.data:
+                    self.logger.debug(f"No more data at offset {offset}")
                     break
                 
+                batch_dates = set()
                 for row in response.data:
-                    all_dates.add(datetime.fromisoformat(row['date']).date())
+                    batch_dates.add(datetime.fromisoformat(row['date']).date())
+                
+                all_dates.update(batch_dates)
+                
+                self.logger.debug(f"Batch at offset {offset}: got {len(response.data)} rows, {len(batch_dates)} unique dates, total unique: {len(all_dates)}")
                 
                 if len(response.data) < batch_size:
                     break
@@ -69,15 +77,18 @@ class BacktestSupabaseClient:
             
             available_dates = sorted(list(all_dates))
             
+            self.logger.info(f"Found {len(available_dates)} unique trading dates")
+            
             if not available_dates:
                 # Fallback
+                self.logger.warning("No dates found in database, using business day fallback")
                 business_days = pd.bdate_range(start=start_date, end=end_date)
                 return [d.date() for d in business_days]
             
             return available_dates
             
         except Exception as e:
-            self.logger.error(f"Error getting dates: {e}")
+            self.logger.error(f"Error getting dates: {e}", exc_info=True)
             business_days = pd.bdate_range(start=start_date, end=end_date)
             return [d.date() for d in business_days]
     
