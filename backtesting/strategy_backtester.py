@@ -1,8 +1,6 @@
 """
 Strategy Backtester - Database Query Version - FIXED
-Queries pre-downloaded historical data from Supabase
-Calculates indicators on-the-fly during backtest
-FIXED: Properly scans all dates and all stocks
+FIXED: Better error handling, writes results incrementally, doesn't stop on single date failures
 """
 
 import logging
@@ -21,7 +19,7 @@ from ta.volatility import BollingerBands, AverageTrueRange
 class StrategyBacktester:
     """
     Backtester that queries historical database and calculates indicators on-the-fly
-    Much simpler than the old version - no market scanning needed!
+    FIXED: Writes results incrementally and handles errors gracefully
     """
     
     def __init__(self, config: dict):
@@ -39,6 +37,7 @@ class StrategyBacktester:
     ) -> Dict[str, Any]:
         """
         Run backtest for a strategy
+        FIXED: Writes results incrementally every 10 days and handles errors better
         
         Args:
             strategy_config: Strategy configuration
@@ -53,44 +52,85 @@ class StrategyBacktester:
         target_gain_pct = strategy_config['target_min_gain_pct']
         target_days = strategy_config.get('target_days', 1)
         criteria = strategy_config['indicator_criteria']
+        strategy_id = strategy_config.get('id') or strategy_config.get('strategy_id')
         
         self.logger.info(f"Running backtest from {start_date} to {end_date}")
         self.logger.info(f"Target: {target_gain_pct}% in {target_days} days")
         self.logger.info(f"Criteria: {len(criteria)} conditions")
         
         # Get all available dates in database within range
+        self.logger.info("Fetching available trading dates from database...")
         trading_days = supabase_client.get_available_dates(start_date, end_date)
         self.logger.info(f"Found {len(trading_days)} trading days in database")
         
         if not trading_days:
             raise ValueError(f"No data found in database for date range {start_date} to {end_date}")
         
-        # Process each date
+        # Process each date with incremental writes
         all_trades = []
         daily_results = []
+        batch_write_interval = 10  # Write to database every 10 days
+        failed_dates = []
         
         for i, test_date in enumerate(trading_days):
-            if progress_callback:
-                progress_callback(i + 1, len(trading_days), test_date)
-            
-            self.logger.info(f"Processing {test_date} ({i+1}/{len(trading_days)})")
-            
-            # Process this single date
-            day_trades = self._process_date(
-                test_date,
-                target_gain_pct,
-                target_days,
-                criteria,
-                strategy_config,
-                supabase_client
-            )
-            
-            if day_trades:
-                all_trades.extend(day_trades)
+            try:
+                if progress_callback:
+                    progress_callback(i + 1, len(trading_days), test_date)
                 
-                # Calculate daily stats
-                daily_stats = self._calculate_daily_stats(test_date, day_trades)
-                daily_results.append(daily_stats)
+                self.logger.info(f"Processing {test_date} ({i+1}/{len(trading_days)})")
+                
+                # Process this single date
+                day_trades = self._process_date(
+                    test_date,
+                    target_gain_pct,
+                    target_days,
+                    criteria,
+                    strategy_config,
+                    supabase_client
+                )
+                
+                if day_trades:
+                    all_trades.extend(day_trades)
+                    
+                    # Calculate daily stats
+                    daily_stats = self._calculate_daily_stats(test_date, day_trades)
+                    daily_results.append(daily_stats)
+                
+                # Write incrementally every N days
+                if (i + 1) % batch_write_interval == 0 or (i + 1) == len(trading_days):
+                    self.logger.info(f"Writing intermediate results (processed {i+1}/{len(trading_days)} days)...")
+                    
+                    try:
+                        # Write accumulated results
+                        if daily_results:
+                            supabase_client.write_daily_results(strategy_id, daily_results)
+                        
+                        if all_trades:
+                            supabase_client.write_trades(strategy_id, all_trades)
+                        
+                        # Calculate and update current stats
+                        current_stats = self._calculate_overall_stats(all_trades)
+                        supabase_client.update_strategy_summary(strategy_id, current_stats)
+                        
+                        self.logger.info(f"✓ Wrote results for {len(daily_results)} days, {len(all_trades)} trades")
+                        
+                        # Clear the lists since we've written them
+                        # (don't clear - we need them for final stats)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error writing intermediate results: {e}", exc_info=True)
+                        # Don't stop - continue processing
+                
+            except Exception as e:
+                self.logger.error(f"Error processing {test_date}: {e}", exc_info=True)
+                failed_dates.append(test_date)
+                # Don't stop - continue with next date
+                continue
+        
+        # Log summary
+        self.logger.info(f"Backtest complete: {len(trading_days)} days processed")
+        if failed_dates:
+            self.logger.warning(f"Failed to process {len(failed_dates)} dates: {failed_dates[:10]}{'...' if len(failed_dates) > 10 else ''}")
         
         # Calculate overall statistics
         overall_stats = self._calculate_overall_stats(all_trades)
@@ -98,7 +138,8 @@ class StrategyBacktester:
         return {
             'trades': all_trades,
             'daily_results': daily_results,
-            'overall_stats': overall_stats
+            'overall_stats': overall_stats,
+            'failed_dates': failed_dates
         }
     
     def _process_date(
@@ -122,7 +163,7 @@ class StrategyBacktester:
         gainers = supabase_client.get_top_gainers(test_date, top_n=50)
         
         if not gainers:
-            self.logger.warning(f"No gainers found for {test_date}")
+            self.logger.debug(f"No gainers found for {test_date}")
             gainers = []
         
         self.logger.debug(f"Found {len(gainers)} gainers")
