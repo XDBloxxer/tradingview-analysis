@@ -160,7 +160,7 @@ class StrategyBacktester:
         self.logger.debug(f"Processing {test_date}")
         
         # Get top gainers for this date from database (top 50 to get more)
-        gainers = supabase_client.get_top_gainers(test_date, top_n=50)
+        gainers = supabase_client.get_top_gainers(test_date, top_n=5)
         
         if not gainers:
             self.logger.debug(f"No gainers found for {test_date}")
@@ -174,7 +174,7 @@ class StrategyBacktester:
             criteria,
             strategy_config,
             supabase_client,
-            max_stocks=500  # Increased limit to scan more stocks
+            max_stocks=10  # Increased limit to scan more stocks
         )
         
         self.logger.debug(f"Found {len(criteria_matches)} criteria matches")
