@@ -255,9 +255,12 @@ class BacktestSupabaseClient:
     def write_daily_results(self, strategy_id: int, daily_results: List[Dict]):
         """Write daily results - OPTIMIZED with larger batches"""
         if not daily_results:
+            self.logger.warning("write_daily_results called with empty list")
             return
         
         try:
+            self.logger.info(f"Writing {len(daily_results)} daily results for strategy {strategy_id}")
+            
             for result in daily_results:
                 result['strategy_id'] = strategy_id
             
@@ -265,24 +268,34 @@ class BacktestSupabaseClient:
             
             # Larger batches
             batch_size = 500
+            total_written = 0
+            
             for i in range(0, len(sanitized), batch_size):
                 batch = sanitized[i:i + batch_size]
                 
-                self.client.table(self.tables["results"]).upsert(
+                response = self.client.table(self.tables["results"]).upsert(
                     batch,
                     on_conflict="strategy_id,test_date"
                 ).execute()
+                
+                total_written += len(batch)
+                self.logger.debug(f"Wrote batch {i//batch_size + 1}, total: {total_written}/{len(sanitized)}")
+            
+            self.logger.info(f"✓ Successfully wrote {total_written} daily results")
             
         except Exception as e:
-            self.logger.error(f"Error writing results: {e}")
+            self.logger.error(f"Error writing daily results: {e}", exc_info=True)
             raise
     
     def write_trades(self, strategy_id: int, trades: List[Dict]):
         """Write trade records - OPTIMIZED with larger batches"""
         if not trades:
+            self.logger.warning("write_trades called with empty list")
             return
         
         try:
+            self.logger.info(f"Writing {len(trades)} trades for strategy {strategy_id}")
+            
             for trade in trades:
                 trade['strategy_id'] = strategy_id
                 
@@ -293,16 +306,23 @@ class BacktestSupabaseClient:
             
             # Larger batches
             batch_size = 500
+            total_written = 0
+            
             for i in range(0, len(sanitized), batch_size):
                 batch = sanitized[i:i + batch_size]
                 
-                self.client.table(self.tables["trades"]).upsert(
+                response = self.client.table(self.tables["trades"]).upsert(
                     batch,
                     on_conflict="strategy_id,symbol,signal_date"
                 ).execute()
+                
+                total_written += len(batch)
+                self.logger.debug(f"Wrote batch {i//batch_size + 1}, total: {total_written}/{len(sanitized)}")
+            
+            self.logger.info(f"✓ Successfully wrote {total_written} trades")
             
         except Exception as e:
-            self.logger.error(f"Error writing trades: {e}")
+            self.logger.error(f"Error writing trades: {e}", exc_info=True)
             raise
     
     def update_strategy_summary(self, strategy_id: int, stats: Dict):
