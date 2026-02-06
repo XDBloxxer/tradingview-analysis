@@ -1,6 +1,6 @@
 """
 Supabase client for backtesting data
-ENHANCED: Handles new exit analysis fields
+OPTIMIZED: Minimal column selection to reduce egress costs
 """
 
 import logging
@@ -14,7 +14,7 @@ from supabase import create_client, Client
 
 
 class BacktestSupabaseClient:
-    """Handler for backtest data in Supabase - ENHANCED"""
+    """Handler for backtest data in Supabase - OPTIMIZED for minimal egress"""
     
     def __init__(self, config: dict):
         """Initialize Supabase client"""
@@ -48,8 +48,8 @@ class BacktestSupabaseClient:
         try:
             self.logger.info(f"Querying unique dates from {start_date} to {end_date}")
             
-            # KEY CHANGE: Only select the 'date' column, not all columns (*)
-            # This reduces egress by ~95% since we don't fetch OHLCV data
+            # OPTIMIZATION: Only select 'date' column, not all columns
+            # This reduces egress by ~95%
             all_dates = set()
             offset = 0
             batch_size = 1000
@@ -80,7 +80,7 @@ class BacktestSupabaseClient:
                 
                 offset += batch_size
                 
-                # Safety limit (keep this)
+                # Safety limit
                 if offset > 5000000:
                     self.logger.warning("Hit 5M row safety limit")
                     break
@@ -134,7 +134,7 @@ class BacktestSupabaseClient:
                 .execute()
             
             if not response.data:
-                # Try closest prior date
+                # Try closest prior date (within 7 days)
                 prior_date = target_date - timedelta(days=7)
                 response = self.client.table(self.tables["historical"]) \
                     .select("*") \
@@ -159,15 +159,18 @@ class BacktestSupabaseClient:
         start_date: date,
         end_date: date
     ) -> List[Dict]:
-        """Get historical data - OPTIMIZED with column selection"""
+        """
+        Get historical data - OPTIMIZED with column selection
+        Only fetches columns needed for indicator calculation
+        """
         try:
             all_data = []
             offset = 0
-            batch_size = 1000  # Reduced from 5000 for better streaming
+            batch_size = 1000
             
             while True:
-                # KEY CHANGE: Only select columns needed for indicators
-                # Add any other columns you need here (volume, etc.)
+                # OPTIMIZATION: Only select columns needed for indicators
+                # This reduces egress significantly
                 response = self.client.table(self.tables["historical"]) \
                     .select("date,open,high,low,close,volume") \
                     .eq("symbol", symbol) \
@@ -193,7 +196,7 @@ class BacktestSupabaseClient:
             return []
     
     # ========================================================================
-    # WRITE METHODS - OPTIMIZED
+    # WRITE METHODS
     # ========================================================================
     
     def _sanitize_value(self, value: Any) -> Any:
@@ -291,7 +294,7 @@ class BacktestSupabaseClient:
             
             sanitized = [self._sanitize_dict(r) for r in daily_results]
             
-            # Larger batches
+            # Larger batches to reduce number of requests
             batch_size = 500
             total_written = 0
             
@@ -312,7 +315,7 @@ class BacktestSupabaseClient:
             raise
     
     def write_trades(self, strategy_id: int, trades: List[Dict]):
-        """Write trade records - handles new fields gracefully"""
+        """Write trade records - OPTIMIZED with larger batches"""
         if not trades:
             return
         
@@ -327,7 +330,7 @@ class BacktestSupabaseClient:
             
             sanitized = [self._sanitize_dict(t) for t in trades]
             
-            # Larger batches
+            # Larger batches to reduce number of requests
             batch_size = 500
             total_written = 0
             
@@ -348,7 +351,7 @@ class BacktestSupabaseClient:
             raise
     
     def update_strategy_summary(self, strategy_id: int, stats: Dict):
-        """Update strategy with overall statistics - includes new metrics"""
+        """Update strategy with overall statistics"""
         try:
             update_data = {
                 'total_matches': stats.get('total_matches', 0),
