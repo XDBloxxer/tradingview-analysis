@@ -57,7 +57,7 @@ class BacktestSupabaseClient:
             
             while True:
                 response = self.client.table(self.tables["historical"]) \
-                    .select("date") \  # ONLY fetch date column
+                    .select("date") \
                     .gte("date", start_date.isoformat()) \
                     .lte("date", end_date.isoformat()) \
                     .order("date") \
