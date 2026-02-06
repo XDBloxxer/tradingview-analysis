@@ -1,11 +1,8 @@
 """
 Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
-Only includes indicators that exist in database schema
-FIXED: Preserves metadata fields (symbol, exchange, etc.) when adding indicators
-FIXED: Corrected market open data fetching logic
-FIXED: More flexible time windows to handle yfinance data delays
-FIXED: Properly extracts data from specific timestamp rows
+FIXED: Fetches sufficient historical data for indicator calculations
+FIXED: Handles the 60-day intraday limit by falling back to daily data for longer periods
 """
 
 import logging
@@ -63,7 +60,7 @@ class IntradayDataCollector:
         # Cache for already-fetched data
         self.cache = {}
         
-        self.logger.info("Intraday data collector initialized (minimal indicators for database schema)")
+        self.logger.info("Intraday data collector initialized")
     
     def collect_intraday_data(
         self,
@@ -139,32 +136,32 @@ class IntradayDataCollector:
             return None
         
         try:
-            # Fetch RAW intraday data (don't calculate indicators yet)
-            intraday_df = self._fetch_intraday_data_raw(symbol, target_date)
+            # Fetch historical DAILY data for indicator calculation (need 200+ days)
+            daily_df = self._fetch_daily_data_extended(symbol, target_date.date())
             
-            # Fetch DAILY data for day prior
-            daily_df = self._fetch_daily_data(symbol, target_date.date())
-            
-            if intraday_df is None and daily_df is None:
+            if daily_df is None:
                 self.stats['failed'] += 1
                 return None
             
+            # Fetch TODAY's intraday data to get specific timestamps
+            intraday_df = self._fetch_intraday_data_today(symbol, target_date)
+            
             self.stats['success'] += 1
             
-            # Extract market open snapshot (9:30am from intraday data)
+            # Extract market open snapshot
             market_open_snapshot = self._extract_market_open(
-                intraday_df, symbol, exchange, target_date
+                intraday_df, daily_df, symbol, exchange, target_date
             ) if intraday_df is not None else None
             
-            # Extract market close snapshot (4pm from intraday data)
+            # Extract market close snapshot
             market_close_snapshot = self._extract_market_close(
-                intraday_df, symbol, exchange, target_date
+                intraday_df, daily_df, symbol, exchange, target_date
             ) if intraday_df is not None else None
             
             # Extract day prior snapshot (from daily data)
             day_prior_snapshot = self._extract_day_prior(
                 daily_df, symbol, exchange, target_date
-            ) if daily_df is not None else None
+            )
             
             return {
                 'market_open': market_open_snapshot,
@@ -173,25 +170,24 @@ class IntradayDataCollector:
             }
             
         except Exception as e:
-            self.logger.debug(f"Error processing {symbol}: {e}")
+            self.logger.error(f"Error processing {symbol}: {e}", exc_info=True)
             return None
     
-    def _fetch_intraday_data_raw(
+    def _fetch_intraday_data_today(
         self,
         symbol: str,
         target_date: datetime
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch RAW 5-minute intraday data for target date (no indicators calculated yet)
+        Fetch TODAY's 5-minute intraday data just to get current price at specific times
         """
         target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
-        cache_key = f"{symbol}:intraday_raw:{target_date_obj}"
+        cache_key = f"{symbol}:intraday:{target_date_obj}"
         
         if cache_key in self.cache:
             return self.cache[cache_key]
         
         try:
-            # Check if target date is today
             market_tz = ZoneInfo("America/New_York")
             now_et = datetime.now(market_tz)
             is_today = target_date_obj == now_et.date()
@@ -199,18 +195,15 @@ class IntradayDataCollector:
             ticker = yf.Ticker(symbol)
             
             if is_today:
-                # For today, use period-based fetch
                 self.logger.debug(f"Fetching today's intraday data for {symbol}")
                 df = ticker.history(period='1d', interval='5m')
             else:
-                # For historical dates, check if within 60-day limit
+                # Historical - within 60 days
                 days_ago = (datetime.now().date() - target_date_obj).days
                 if days_ago > 60:
                     self.logger.debug(f"Date {target_date_obj} is beyond 60-day intraday limit for {symbol}")
                     return None
                 
-                # Use date range for historical data
-                # Set start to 9am and end to 5pm next day to capture full trading day
                 start_dt = datetime.combine(target_date_obj, time(9, 0))
                 end_dt = datetime.combine(target_date_obj + timedelta(days=1), time(17, 0))
                 
@@ -218,10 +211,10 @@ class IntradayDataCollector:
                 df = ticker.history(start=start_dt, end=end_dt, interval='5m')
             
             if df.empty:
-                self.logger.debug(f"No intraday data returned for {symbol} on {target_date_obj}")
+                self.logger.debug(f"No intraday data for {symbol}")
                 return None
             
-            # Filter to only include data from the target date
+            # Normalize timezone
             df.index = pd.to_datetime(df.index)
             if df.index.tz is None:
                 df.index = df.index.tz_localize('America/New_York')
@@ -231,11 +224,11 @@ class IntradayDataCollector:
             # Keep only bars from target date
             df = df[df.index.date == target_date_obj]
             
-            if df.empty or len(df) < 1:
-                self.logger.debug(f"Insufficient intraday data for {symbol} on {target_date_obj} (got {len(df)} bars)")
+            if df.empty:
+                self.logger.debug(f"No bars for target date {target_date_obj} for {symbol}")
                 return None
             
-            self.logger.debug(f"Successfully fetched {len(df)} RAW intraday bars for {symbol} on {target_date_obj}")
+            self.logger.debug(f"Fetched {len(df)} intraday bars for {symbol}")
             
             self.cache[cache_key] = df
             return df
@@ -244,125 +237,124 @@ class IntradayDataCollector:
             self.logger.debug(f"Error fetching intraday for {symbol}: {e}")
             return None
     
-    def _fetch_daily_data(
+    def _fetch_daily_data_extended(
         self,
         symbol: str,
         target_date: datetime.date
     ) -> Optional[pd.DataFrame]:
-        """Fetch daily data for day prior calculation"""
-        cache_key = f"{symbol}:daily:{target_date}"
+        """Fetch 1+ year of daily data for indicator calculation"""
+        cache_key = f"{symbol}:daily_extended:{target_date}"
         if cache_key in self.cache:
             return self.cache[cache_key]
         
         try:
             ticker = yf.Ticker(symbol)
             
+            # Fetch enough data for 200-day indicators
             end_date = target_date + timedelta(days=1)
-            start_date = target_date - timedelta(days=90)
+            start_date = target_date - timedelta(days=400)  # Extra buffer
             
             df = ticker.history(start=start_date, end=end_date, interval='1d')
             
-            if df.empty or len(df) < 20:
+            if df.empty or len(df) < 50:
+                self.logger.debug(f"Insufficient daily data for {symbol}")
                 return None
             
-            # Calculate MINIMAL indicators
+            # Calculate indicators on daily data
             indicators_df = self._calculate_minimal_indicators(df)
             indicators_df.index = pd.to_datetime(indicators_df.index).date
+            
+            self.logger.debug(f"Fetched {len(indicators_df)} days of data for {symbol}")
             
             self.cache[cache_key] = indicators_df
             return indicators_df
             
         except Exception as e:
-            self.logger.debug(f"Error fetching daily for {symbol}: {e}")
+            self.logger.debug(f"Error fetching daily extended for {symbol}: {e}")
             return None
             
     def _serialize_value(self, v):
-        """
-        Convert pandas/numpy values to Python types
-        while preserving integers for DB insertion.
-        Only fixes integer/float casting issue.
-        """
-        if pd.isna(v) or np.isinf(v):
+        """Convert pandas/numpy values to Python types"""
+        if pd.isna(v) or (isinstance(v, (float, np.floating)) and np.isinf(v)):
             return None
     
-        # Preserve integer types
         if isinstance(v, (np.integer, int)):
             return int(v)
     
-        # Preserve float types
         if isinstance(v, (np.floating, float)):
             return float(v)
     
         return v
-
-    
     
     def _extract_market_open(
         self,
-        raw_df: pd.DataFrame,
+        intraday_df: Optional[pd.DataFrame],
+        daily_df: pd.DataFrame,
         symbol: str,
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market open (9:30-10:00am window to handle yfinance delays)"""
+        """Extract indicators at market open using daily data for indicators + intraday for current price"""
         try:
-            # Find bars around 9:30am (expand window to 10:00am to handle yfinance delays)
-            morning_bars = raw_df[
-                (raw_df.index.time >= time(9, 30)) &
-                (raw_df.index.time <= time(10, 0))
-            ]
+            target_date_obj = target_date.date()
             
-            if morning_bars.empty:
-                # Fallback: get earliest available bar after 9:30
-                morning_bars = raw_df[raw_df.index.time >= time(9, 30)]
-                if morning_bars.empty:
-                    # Last resort: use first bar of the day if no 9:30+ bars available yet
-                    if len(raw_df) > 0:
-                        self.logger.debug(f"Using first available bar for {symbol} (no 9:30am+ data yet)")
-                        morning_bars = raw_df.head(1)
-                    else:
-                        self.logger.debug(f"No morning bars found for {symbol}")
-                        return None
+            # Get today's indicators from daily data (will be most recent available)
+            if target_date_obj not in daily_df.index:
+                # Use most recent date
+                available_dates = [d for d in daily_df.index if d <= target_date_obj]
+                if not available_dates:
+                    self.logger.debug(f"No daily data available for market open {symbol}")
+                    return None
+                indicator_date = available_dates[-1]
+            else:
+                indicator_date = target_date_obj
             
-            # Get the specific timestamp
-            target_timestamp = morning_bars.index[0]
-            actual_time = target_timestamp.strftime('%H:%M:%S')
-            self.logger.debug(f"Using {actual_time} bar for market_open for {symbol}")
+            # Get the indicator values
+            indicator_data = daily_df.loc[indicator_date]
             
-            # Now calculate indicators on sufficient historical data
-            # We need at least 200 bars for 200-period indicators
-            indicators_df = self._calculate_minimal_indicators(raw_df)
-            
-            # Extract the row at our target timestamp
-            if target_timestamp not in indicators_df.index:
-                self.logger.debug(f"Timestamp {target_timestamp} not found in indicators for {symbol}")
-                return None
+            # Get current OHLCV from intraday if available
+            if intraday_df is not None and len(intraday_df) > 0:
+                # Find morning bars
+                morning_bars = intraday_df[
+                    (intraday_df.index.time >= time(9, 30)) &
+                    (intraday_df.index.time <= time(10, 0))
+                ]
                 
-            open_data = indicators_df.loc[target_timestamp]
+                if morning_bars.empty:
+                    morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
+                    if morning_bars.empty:
+                        morning_bars = intraday_df.head(1)
+                
+                if not morning_bars.empty:
+                    current_bar = morning_bars.iloc[0]
+                    actual_time = morning_bars.index[0].strftime('%H:%M:%S')
+                    self.logger.debug(f"Using {actual_time} bar for market_open {symbol}")
+                    
+                    # Override OHLCV with current values
+                    indicator_data = indicator_data.copy()
+                    indicator_data['open'] = current_bar['Open']
+                    indicator_data['high'] = current_bar['High']
+                    indicator_data['low'] = current_bar['Low']
+                    indicator_data['close'] = current_bar['Close']
+                    indicator_data['volume'] = current_bar['Volume']
             
             snapshot = {
                 'symbol': symbol,
                 'exchange': exchange,
-                'detection_date': target_date.date().isoformat(),
+                'detection_date': target_date_obj.isoformat(),
                 'snapshot_type': 'market_open',
                 'snapshot_time': '09:30:00'
             }
             
-            # Reserved metadata fields that should not be overwritten
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
             
-            # Add indicators - don't overwrite metadata
-            for key, value in open_data.items():
+            # Add all indicator values
+            for key, value in indicator_data.items():
                 key_lower = key.lower()
-                # Skip if this would overwrite a reserved metadata field
                 if key_lower in reserved_fields:
                     continue
                     
-                if pd.notna(value) and not np.isinf(value):
-                    try:
-                        snapshot[key_lower] = self._serialize_value(value)
-                    except:
-                        snapshot[key_lower] = None
+                snapshot[key_lower] = self._serialize_value(value)
             
             self.logger.debug(f"Extracted market_open for {symbol} with {len(snapshot)} fields")
             return snapshot
@@ -373,62 +365,69 @@ class IntradayDataCollector:
     
     def _extract_market_close(
         self,
-        raw_df: pd.DataFrame,
+        intraday_df: Optional[pd.DataFrame],
+        daily_df: pd.DataFrame,
         symbol: str,
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market close (3:55-4:00pm) - will be null if market hasn't closed yet"""
+        """Extract indicators at market close - will be null if market hasn't closed yet"""
         try:
-            # Find bars around 4pm
-            close_bars = raw_df[
-                (raw_df.index.time >= time(15, 55)) &
-                (raw_df.index.time <= time(16, 0))
+            target_date_obj = target_date.date()
+            
+            # Check if we have close bars in intraday data
+            if intraday_df is None or intraday_df.empty:
+                self.logger.debug(f"No intraday data for market_close {symbol}")
+                return None
+            
+            close_bars = intraday_df[
+                (intraday_df.index.time >= time(15, 55)) &
+                (intraday_df.index.time <= time(16, 0))
             ]
             
             if close_bars.empty:
-                # Market hasn't closed yet - this is normal during trading hours
-                self.logger.debug(f"No close bars found for {symbol} - market may not be closed yet")
+                self.logger.debug(f"Market hasn't closed yet for {symbol}")
                 return None
             
-            # Get the specific timestamp
-            target_timestamp = close_bars.index[-1]
-            actual_time = target_timestamp.strftime('%H:%M:%S')
-            self.logger.debug(f"Using {actual_time} bar for market_close for {symbol}")
+            # Get indicator values from daily data
+            if target_date_obj not in daily_df.index:
+                available_dates = [d for d in daily_df.index if d <= target_date_obj]
+                if not available_dates:
+                    self.logger.debug(f"No daily data for market close {symbol}")
+                    return None
+                indicator_date = available_dates[-1]
+            else:
+                indicator_date = target_date_obj
             
-            # Calculate indicators on full dataset
-            indicators_df = self._calculate_minimal_indicators(raw_df)
+            indicator_data = daily_df.loc[indicator_date].copy()
             
-            # Extract the row at our target timestamp
-            if target_timestamp not in indicators_df.index:
-                self.logger.debug(f"Timestamp {target_timestamp} not found in indicators for {symbol}")
-                return None
-                
-            close_data = indicators_df.loc[target_timestamp]
+            # Use actual close values
+            current_bar = close_bars.iloc[-1]
+            actual_time = close_bars.index[-1].strftime('%H:%M:%S')
+            self.logger.debug(f"Using {actual_time} bar for market_close {symbol}")
+            
+            indicator_data['open'] = current_bar['Open']
+            indicator_data['high'] = current_bar['High']
+            indicator_data['low'] = current_bar['Low']
+            indicator_data['close'] = current_bar['Close']
+            indicator_data['volume'] = current_bar['Volume']
             
             snapshot = {
                 'symbol': symbol,
                 'exchange': exchange,
-                'detection_date': target_date.date().isoformat(),
+                'detection_date': target_date_obj.isoformat(),
                 'snapshot_type': 'market_close',
                 'snapshot_time': '16:00:00'
             }
             
-            # Reserved metadata fields that should not be overwritten
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
             
-            # Add indicators - don't overwrite metadata
-            for key, value in close_data.items():
+            for key, value in indicator_data.items():
                 key_lower = key.lower()
-                # Skip if this would overwrite a reserved metadata field
                 if key_lower in reserved_fields:
                     continue
                     
-                if pd.notna(value) and not np.isinf(value):
-                    try:
-                        snapshot[key_lower] = self._serialize_value(value)
-                    except:
-                        snapshot[key_lower] = None
+                snapshot[key_lower] = self._serialize_value(value)
             
             self.logger.debug(f"Extracted market_close for {symbol} with {len(snapshot)} fields")
             return snapshot
@@ -448,11 +447,10 @@ class IntradayDataCollector:
         try:
             prior_date = target_date.date() - timedelta(days=1)
             
-            # Find closest prior date (handles weekends/holidays)
             available_dates = [d for d in daily_df.index if d <= prior_date]
             
             if not available_dates:
-                self.logger.debug(f"No prior dates found for {symbol}")
+                self.logger.debug(f"No prior dates for {symbol}")
                 return None
             
             actual_date = available_dates[-1]
@@ -467,22 +465,15 @@ class IntradayDataCollector:
                 'snapshot_date': actual_date.isoformat()
             }
             
-            # Reserved metadata fields that should not be overwritten
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
                               'snapshot_time', 'snapshot_date'}
             
-            # Add indicators - don't overwrite metadata
             for key, value in prior_data.items():
                 key_lower = key.lower()
-                # Skip if this would overwrite a reserved metadata field
                 if key_lower in reserved_fields:
                     continue
                     
-                if pd.notna(value) and not np.isinf(value):
-                    try:
-                        snapshot[key_lower] = self._serialize_value(value)
-                    except:
-                        snapshot[key_lower] = None
+                snapshot[key_lower] = self._serialize_value(value)
             
             self.logger.debug(f"Extracted day_prior for {symbol} with {len(snapshot)} fields")
             return snapshot
@@ -492,10 +483,7 @@ class IntradayDataCollector:
             return None
     
     def _calculate_minimal_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate indicators matching the EXACT database schema
-        Column names must match exactly including dots, brackets, spaces
-        """
+        """Calculate indicators matching database schema"""
         result = pd.DataFrame(index=df.index)
         
         # Basic OHLCV
@@ -520,7 +508,7 @@ class IntradayDataCollector:
         except:
             pass
         
-        # MACD (use dots not underscores)
+        # MACD
         try:
             macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
             result['macd.macd'] = macd.macd()
@@ -529,7 +517,7 @@ class IntradayDataCollector:
         except:
             pass
         
-        # Stochastic (use dots)
+        # Stochastic
         try:
             stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
             result['stoch.k'] = stoch.stoch()
@@ -539,16 +527,16 @@ class IntradayDataCollector:
         except:
             pass
         
-        # ADX (with spaces in column names!)
+        # ADX
         try:
             adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
             result['adx'] = adx.adx()
-            result['adx+di'] = adx.adx_pos()  # Note the space!
-            result['adx-di'] = adx.adx_neg()  # Note the space!
+            result['adx+di'] = adx.adx_pos()
+            result['adx-di'] = adx.adx_neg()
         except:
             pass
         
-        # Bollinger Bands (use dots)
+        # Bollinger Bands
         try:
             bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
             result['bb.upper'] = bb.bollinger_hband()
@@ -646,7 +634,7 @@ class IntradayDataCollector:
         except:
             pass
         
-        # Gaps (note the space in column name!)
+        # Gaps
         try:
             result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
             result['gap_up'] = (result['gap_%'] > 2).astype(int)
@@ -654,7 +642,7 @@ class IntradayDataCollector:
         except:
             pass
         
-        # Trend indicators (boolean as integers)
+        # Trend indicators
         try:
             result['ema20_above_ema50'] = (result['ema20'] > result['ema50']).astype(int)
             result['ema50_above_ema200'] = (result['ema50'] > result['ema200']).astype(int)
