@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Daily Winners Tracker - Main entry point
-Tracks top 10 daily winners and captures indicators at market open, close, and T-1
+Tracks top 10 daily winners and captures indicators at market open, close, and T-1 (open & close)
 Completely separate from the spike/grinder analysis system
 """
 
@@ -68,7 +68,7 @@ def main():
     
     try:
         logger.info("=" * 60)
-        logger.info("DAILY WINNERS TRACKER")
+        logger.info("DAILY WINNERS TRACKER (ENHANCED)")
         logger.info(f"Target Date: {target_date_str}")
         logger.info(f"Top N: {args.top_n}")
         logger.info("=" * 60)
@@ -100,18 +100,33 @@ def main():
         # Step 2: Collect Intraday Indicator Data for THE SAME WINNERS
         logger.info("")
         logger.info("=" * 60)
-        logger.info("STEP 2: COLLECT INTRADAY INDICATOR DATA FOR WINNERS")
+        logger.info("STEP 2: COLLECT ENHANCED INTRADAY INDICATOR DATA FOR WINNERS")
         logger.info(f"Collecting indicators for the same {len(winners)} winning stocks")
-        logger.info("This captures indicators at: Market Open (9:30am), Market Close (4pm), Day Prior (T-1)")
+        logger.info("=" * 60)
+        logger.info("Capturing indicators at FOUR time points:")
+        logger.info("  - Market Open (9:30am) - Current Day")
+        logger.info("  - Market Close (4pm) - Current Day")
+        logger.info("  - Day Prior Open (9:30am) - Previous Day")
+        logger.info("  - Day Prior Close (4pm) - Previous Day")
+        logger.info("")
+        logger.info("Enhanced with comprehensive technical indicators:")
+        logger.info("  • Momentum: RSI, Stochastic, Williams %R, ROC, TSI, KAMA")
+        logger.info("  • Trend: MACD, ADX, CCI, Aroon, PSAR, Vortex, Mass Index")
+        logger.info("  • Volatility: Bollinger Bands, ATR, Keltner, Donchian")
+        logger.info("  • Volume: OBV, CMF, Force Index, EOM, VPT, NVI")
+        logger.info("  • Moving Averages: EMA/SMA (5,10,20,50,100,200)")
+        logger.info("  • Price Analysis: Multi-period changes, 52-week levels, gaps")
+        logger.info("  • Candlestick Patterns: Doji, Hammer, Engulfing")
         logger.info("=" * 60)
         
         collector = IntradayDataCollector(config)
         intraday_data = collector.collect_intraday_data(winners, target_date)
         
-        logger.info(f"✓ Collected indicator data for the SAME {len(winners)} winners:")
+        logger.info(f"✓ Collected enhanced indicator data for the SAME {len(winners)} winners:")
         logger.info(f"  - Market Open (9:30am): {len(intraday_data['market_open'])} symbols")
         logger.info(f"  - Market Close (4pm): {len(intraday_data['market_close'])} symbols")
-        logger.info(f"  - Day Prior (T-1): {len(intraday_data['day_prior'])} symbols")
+        logger.info(f"  - Day Prior Open (9:30am T-1): {len(intraday_data['day_prior_open'])} symbols")
+        logger.info(f"  - Day Prior Close (4pm T-1): {len(intraday_data['day_prior_close'])} symbols")
         
         # Write intraday data to Supabase
         counts = supabase.write_intraday_data(intraday_data)
@@ -126,10 +141,11 @@ def main():
         logger.info("")
         logger.info(f"Data for {target_date_str} saved to Supabase:")
         logger.info(f"  • Identified {len(winners)} top winners at market close (4pm)")
-        logger.info(f"  • Captured indicators for these SAME stocks at:")
+        logger.info(f"  • Captured comprehensive indicators for these SAME stocks at:")
         logger.info(f"    - Market Open (9:30am): {len(intraday_data['market_open'])} stocks")
         logger.info(f"    - Market Close (4pm): {len(intraday_data['market_close'])} stocks")
-        logger.info(f"    - Day Prior (T-1): {len(intraday_data['day_prior'])} stocks")
+        logger.info(f"    - Day Prior Open (9:30am T-1): {len(intraday_data['day_prior_open'])} stocks")
+        logger.info(f"    - Day Prior Close (4pm T-1): {len(intraday_data['day_prior_close'])} stocks")
         logger.info("")
         logger.info(f"  Winners: {', '.join([w['symbol'] for w in winners])}")
         
