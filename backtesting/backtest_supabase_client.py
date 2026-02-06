@@ -1,17 +1,16 @@
-
 """
 Supabase client for backtesting data
-Handles reading/writing backtest strategies and results
+UPDATED: Includes methods to query historical_market_data table
 """
 
 import logging
 import os
 import json
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta, date
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
-from datetime import datetime
 
 
 class BacktestSupabaseClient:
@@ -42,8 +41,192 @@ class BacktestSupabaseClient:
         self.tables = {
             "strategies": "backtest_strategies",
             "results": "backtest_results",
-            "trades": "backtest_trades"
+            "trades": "backtest_trades",
+            "historical": "historical_market_data"  # NEW!
         }
+    
+    # ========================================================================
+    # HISTORICAL DATA QUERY METHODS (NEW)
+    # ========================================================================
+    
+    def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
+        """
+        Get list of available trading dates in database within range
+        
+        Args:
+            start_date: Start date
+            end_date: End date
+            
+        Returns:
+            List of dates
+        """
+        try:
+            response = self.client.table(self.tables["historical"]) \
+                .select("date") \
+                .gte("date", start_date.isoformat()) \
+                .lte("date", end_date.isoformat()) \
+                .execute()
+            
+            if not response.data:
+                return []
+            
+            # Get unique dates
+            dates = sorted(list(set(
+                datetime.fromisoformat(row['date']).date() 
+                for row in response.data
+            )))
+            
+            return dates
+            
+        except Exception as e:
+            self.logger.error(f"Error getting available dates: {e}")
+            return []
+    
+    def get_top_gainers(self, target_date: date, top_n: int = 20) -> List[str]:
+        """
+        Get top N gainers for a specific date from database
+        
+        Args:
+            target_date: Date to query
+            top_n: Number of top gainers
+            
+        Returns:
+            List of symbols
+        """
+        try:
+            response = self.client.table(self.tables["historical"]) \
+                .select("symbol, change_pct") \
+                .eq("date", target_date.isoformat()) \
+                .order("change_pct", desc=True) \
+                .limit(top_n) \
+                .execute()
+            
+            if not response.data:
+                return []
+            
+            return [row['symbol'] for row in response.data]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting top gainers: {e}")
+            return []
+    
+    def get_all_stocks_for_date(
+        self,
+        target_date: date,
+        min_price: float = 0.25,
+        max_price: Optional[float] = None,
+        min_volume: int = 100000
+    ) -> List[str]:
+        """
+        Get all stocks trading on a date that meet filters
+        
+        Args:
+            target_date: Date to query
+            min_price: Minimum price
+            max_price: Maximum price (optional)
+            min_volume: Minimum volume
+            
+        Returns:
+            List of symbols
+        """
+        try:
+            query = self.client.table(self.tables["historical"]) \
+                .select("symbol") \
+                .eq("date", target_date.isoformat()) \
+                .gte("close", min_price) \
+                .gte("volume", min_volume)
+            
+            if max_price:
+                query = query.lte("close", max_price)
+            
+            response = query.execute()
+            
+            if not response.data:
+                return []
+            
+            return [row['symbol'] for row in response.data]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting stocks for date: {e}")
+            return []
+    
+    def get_stock_data(self, symbol: str, target_date: date) -> Optional[Dict]:
+        """
+        Get OHLCV data for a stock on a specific date
+        
+        Args:
+            symbol: Stock symbol
+            target_date: Date to query
+            
+        Returns:
+            Dictionary with OHLCV data or None
+        """
+        try:
+            response = self.client.table(self.tables["historical"]) \
+                .select("*") \
+                .eq("symbol", symbol) \
+                .eq("date", target_date.isoformat()) \
+                .limit(1) \
+                .execute()
+            
+            if not response.data:
+                # Try closest prior date
+                response = self.client.table(self.tables["historical"]) \
+                    .select("*") \
+                    .eq("symbol", symbol) \
+                    .lte("date", target_date.isoformat()) \
+                    .order("date", desc=True) \
+                    .limit(1) \
+                    .execute()
+                
+                if not response.data:
+                    return None
+            
+            return response.data[0]
+            
+        except Exception as e:
+            self.logger.error(f"Error getting stock data: {e}")
+            return None
+    
+    def get_stock_history(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date
+    ) -> List[Dict]:
+        """
+        Get historical OHLCV data for a stock over a date range
+        Used for indicator calculation
+        
+        Args:
+            symbol: Stock symbol
+            start_date: Start date
+            end_date: End date
+            
+        Returns:
+            List of dictionaries with OHLCV data
+        """
+        try:
+            response = self.client.table(self.tables["historical"]) \
+                .select("*") \
+                .eq("symbol", symbol) \
+                .gte("date", start_date.isoformat()) \
+                .lte("date", end_date.isoformat()) \
+                .order("date") \
+                .execute()
+            
+            if not response.data:
+                return []
+            
+            return response.data
+            
+        except Exception as e:
+            self.logger.error(f"Error getting stock history: {e}")
+            return []
+    
+    # ========================================================================
+    # EXISTING METHODS (UNCHANGED)
+    # ========================================================================
     
     def _sanitize_value(self, value: Any) -> Any:
         """Sanitize value for PostgreSQL"""
@@ -86,7 +269,7 @@ class BacktestSupabaseClient:
                 'target_min_gain_pct': strategy_config['target_min_gain_pct'],
                 'target_days': strategy_config.get('target_days', 1),
                 'indicator_criteria': json.dumps(strategy_config['indicator_criteria']),
-                'min_price': strategy_config.get('min_price', 0.50),
+                'min_price': strategy_config.get('min_price', 0.25),
                 'max_price': strategy_config.get('max_price'),
                 'min_volume': strategy_config.get('min_volume', 100000),
                 'exchanges': strategy_config.get('exchanges', ['NASDAQ', 'NYSE', 'AMEX']),
