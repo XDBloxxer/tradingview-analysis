@@ -40,48 +40,19 @@ jobs:
         run: |
           mkdir -p logs
       
-      - name: Fetch strategy from database
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          python -c "
-          import os
-          import json
-          from backtesting.backtest_supabase_client import BacktestSupabaseClient
-          
-          config = {'backtesting': {}}
-          client = BacktestSupabaseClient(config)
-          strategy = client.get_strategy(${{ github.event.inputs.strategy_id }})
-          
-          if not strategy:
-              print('Strategy not found!')
-              exit(1)
-          
-          # Save strategy config to file
-          with open('strategy_config.json', 'w') as f:
-              json.dump(strategy, f)
-          
-          print(f\"Found strategy: {strategy['name']}\")
-          "
-      
       - name: Run backtest
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          python -c "
-          import json
-          from backtest_runner import run_backtest
+          ARGS="--strategy-id ${{ github.event.inputs.strategy_id }}"
           
-          # Load strategy config
-          with open('strategy_config.json', 'r') as f:
-              strategy = json.load(f)
+          if [ "${{ github.event.inputs.verbose }}" == "true" ]; then
+            ARGS="$ARGS --verbose"
+          fi
           
-          # Run backtest
-          result = run_backtest(strategy)
-          print(f\"Backtest completed! Strategy ID: {result['strategy_id']}\")
-          "
+          echo "Running backtest with args: $ARGS"
+          python backtest_runner.py $ARGS
       
       - name: Upload logs
         if: always()
