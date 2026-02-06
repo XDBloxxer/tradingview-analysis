@@ -44,17 +44,14 @@ class BacktestSupabaseClient:
         }
     
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
-        """Get available trading dates - FIXED to get distinct dates"""
+        """Get all unique trading dates that exist in the database between start and end"""
         try:
-            self.logger.info(f"Querying dates from {start_date} to {end_date}")
-            
-            # Strategy: Query in large batches and deduplicate client-side
-            # This is the most reliable approach given Supabase limitations
+            self.logger.info(f"Querying all unique dates from {start_date} to {end_date}")
             
             all_dates = set()
             offset = 0
-            batch_size = 10000  # Large batches to grab data quickly
-            last_processed_count = 0
+            batch_size = 1000  # Supabase default max
+            total_rows_processed = 0
             
             while True:
                 response = self.client.table(self.tables["historical"]) \
@@ -66,46 +63,44 @@ class BacktestSupabaseClient:
                     .execute()
                 
                 if not response.data:
-                    self.logger.debug(f"No data at offset {offset}, stopping")
+                    self.logger.debug(f"No more data at offset {offset}")
                     break
                 
-                # Add all dates from this batch
+                rows_fetched = len(response.data)
+                total_rows_processed += rows_fetched
+                
+                # Add dates to set
+                batch_dates_before = len(all_dates)
                 for row in response.data:
                     all_dates.add(datetime.fromisoformat(row['date']).date())
                 
-                rows_in_batch = len(response.data)
-                self.logger.debug(f"Offset {offset}: got {rows_in_batch} rows, total unique dates: {len(all_dates)}")
+                new_dates_found = len(all_dates) - batch_dates_before
                 
-                # If we got fewer rows than batch_size, we've reached the end
-                if rows_in_batch < batch_size:
-                    self.logger.debug(f"Got {rows_in_batch} < {batch_size}, reached end")
+                self.logger.debug(f"Offset {offset}: fetched {rows_fetched} rows, found {new_dates_found} new unique dates, total unique: {len(all_dates)}")
+                
+                # If we got fewer rows than batch_size, we're done
+                if rows_fetched < batch_size:
+                    self.logger.debug(f"Reached end of data (got {rows_fetched} < {batch_size})")
                     break
                 
                 # Move to next batch
                 offset += batch_size
                 
-                # Safety: if we've processed 1M rows and haven't found new dates in a while, stop
-                if offset > 1000000:
-                    self.logger.warning("Reached 1M row offset, stopping (safety limit)")
+                # Safety check to prevent infinite loops
+                if offset > 5000000:  # 5M rows safety limit
+                    self.logger.warning("Hit 5M row safety limit")
                     break
-                
-                # If dates haven't increased in last 100k rows, we might be stuck
-                if offset % 100000 == 0:
-                    if len(all_dates) == last_processed_count:
-                        self.logger.warning(f"No new dates found in last 100k rows, stopping")
-                        break
-                    last_processed_count = len(all_dates)
             
             available_dates = sorted(list(all_dates))
             
-            self.logger.info(f"Found {len(available_dates)} unique trading dates")
+            self.logger.info(f"Processed {total_rows_processed} total rows, found {len(available_dates)} unique dates")
             
             if not available_dates:
-                # Fallback to business days
                 self.logger.warning("No dates found in database, using business day fallback")
                 business_days = pd.bdate_range(start=start_date, end=end_date)
                 return [d.date() for d in business_days]
             
+            self.logger.info(f"Date range: {available_dates[0]} to {available_dates[-1]}")
             return available_dates
             
         except Exception as e:
