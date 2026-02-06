@@ -1,6 +1,7 @@
 """
-Intraday Data Collector - FIXED VERSION
+Intraday Data Collector - ENHANCED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
+ENHANCED: Added T-1 open data collection and many more technical indicators
 FIXED: Fetches sufficient historical data for indicator calculations
 FIXED: Handles the 60-day intraday limit by falling back to daily data for longer periods
 FIXED: Always creates market_close rows even when market hasn't closed (with nulls)
@@ -22,9 +23,10 @@ import yfinance as yf
 from .rate_limiter import RateLimiter
 
 # Technical analysis library
-from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, AwesomeOscillatorIndicator, UltimateOscillator
-from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator, CCIIndicator
-from ta.volatility import BollingerBands, AverageTrueRange
+from ta.momentum import RSIIndicator, StochasticOscillator, WilliamsRIndicator, AwesomeOscillatorIndicator, UltimateOscillator, ROCIndicator, KAMAIndicator, TSIIndicator
+from ta.trend import MACD, EMAIndicator, SMAIndicator, ADXIndicator, CCIIndicator, AroonIndicator, PSARIndicator, VortexIndicator, MassIndex, DPOIndicator, KSTIndicator
+from ta.volatility import BollingerBands, AverageTrueRange, KeltnerChannel, DonchianChannel
+from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, ForceIndexIndicator, EaseOfMovementIndicator, VolumePriceTrendIndicator, NegativeVolumeIndexIndicator, VolumeWeightedAveragePrice
 
 
 class IntradayDataCollector:
@@ -32,9 +34,10 @@ class IntradayDataCollector:
     Collects technical indicator data at specific times using INTRADAY data:
     - Market open (9:30am NYC) - from 5-minute bars
     - Market close (4pm NYC) - from 5-minute bars
-    - Previous day (T-1) - from daily bars
+    - Previous day OPEN (T-1 9:30am) - from 5-minute bars
+    - Previous day CLOSE (T-1 4pm) - from daily bars
     
-    Only includes indicators that exist in database schema
+    Includes comprehensive set of technical indicators
     """
     
     # Parallel processing settings
@@ -61,7 +64,7 @@ class IntradayDataCollector:
         # Cache for already-fetched data
         self.cache = {}
         
-        self.logger.info("Intraday data collector initialized")
+        self.logger.info("Intraday data collector initialized (ENHANCED with T-1 open)")
     
     def collect_intraday_data(
         self,
@@ -69,14 +72,14 @@ class IntradayDataCollector:
         target_date: datetime
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
-        Collect indicator data at market open, close, and T-1
+        Collect indicator data at market open, close, T-1 open, and T-1 close
         
         Args:
             winners: List of winner dictionaries
             target_date: Date to collect data for
             
         Returns:
-            Dictionary with 'market_open', 'market_close', 'day_prior'
+            Dictionary with 'market_open', 'market_close', 'day_prior_open', 'day_prior_close'
         """
         self.logger.info(f"Collecting intraday data for {len(winners)} winners on {target_date.date()}...")
         
@@ -85,7 +88,8 @@ class IntradayDataCollector:
         all_data = {
             'market_open': [],
             'market_close': [],
-            'day_prior': []
+            'day_prior_open': [],
+            'day_prior_close': []
         }
         
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
@@ -106,8 +110,10 @@ class IntradayDataCollector:
                             all_data['market_open'].append(result['market_open'])
                         if result['market_close']:
                             all_data['market_close'].append(result['market_close'])
-                        if result['day_prior']:
-                            all_data['day_prior'].append(result['day_prior'])
+                        if result['day_prior_open']:
+                            all_data['day_prior_open'].append(result['day_prior_open'])
+                        if result['day_prior_close']:
+                            all_data['day_prior_close'].append(result['day_prior_close'])
                 except Exception as e:
                     winner = future_to_winner[future]
                     self.logger.debug(f"Error processing {winner.get('symbol', 'unknown')}: {e}")
@@ -117,7 +123,8 @@ class IntradayDataCollector:
             f"✓ Collected - "
             f"Market Open: {len(all_data['market_open'])}, "
             f"Market Close: {len(all_data['market_close'])}, "
-            f"Day Prior: {len(all_data['day_prior'])}"
+            f"Day Prior Open: {len(all_data['day_prior_open'])}, "
+            f"Day Prior Close: {len(all_data['day_prior_close'])}"
         )
         
         return all_data
@@ -127,7 +134,7 @@ class IntradayDataCollector:
         winner: Dict,
         target_date: datetime
     ) -> Optional[Dict[str, Dict[str, Any]]]:
-        """Process a single winner and collect indicators at three time points"""
+        """Process a single winner and collect indicators at four time points"""
         symbol = winner.get('symbol')
         exchange = winner.get('exchange', 'NASDAQ')
 
@@ -147,27 +154,37 @@ class IntradayDataCollector:
             # Fetch TODAY's intraday data to get specific timestamps
             intraday_df = self._fetch_intraday_data_today(symbol, target_date)
             
+            # Fetch PREVIOUS DAY's intraday data for T-1 open
+            prior_date = target_date - timedelta(days=1)
+            prior_intraday_df = self._fetch_intraday_data_today(symbol, prior_date)
+            
             self.stats['success'] += 1
             
-            # Extract market open snapshot
+            # Extract market open snapshot (current day 9:30am)
             market_open_snapshot = self._extract_market_open(
                 intraday_df, daily_df, symbol, exchange, target_date
             )
             
-            # Extract market close snapshot (ALWAYS returns a dict, even if market not closed)
+            # Extract market close snapshot (current day 4pm)
             market_close_snapshot = self._extract_market_close(
                 intraday_df, daily_df, symbol, exchange, target_date
             )
             
-            # Extract day prior snapshot (from daily data)
-            day_prior_snapshot = self._extract_day_prior(
+            # Extract day prior OPEN snapshot (T-1 9:30am)
+            day_prior_open_snapshot = self._extract_day_prior_open(
+                prior_intraday_df, daily_df, symbol, exchange, target_date
+            )
+            
+            # Extract day prior CLOSE snapshot (T-1 4pm, from daily data)
+            day_prior_close_snapshot = self._extract_day_prior_close(
                 daily_df, symbol, exchange, target_date
             )
             
             return {
                 'market_open': market_open_snapshot,
                 'market_close': market_close_snapshot,
-                'day_prior': day_prior_snapshot
+                'day_prior_open': day_prior_open_snapshot,
+                'day_prior_close': day_prior_close_snapshot
             }
             
         except Exception as e:
@@ -180,7 +197,7 @@ class IntradayDataCollector:
         target_date: datetime
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch TODAY's 5-minute intraday data just to get current price at specific times
+        Fetch a specific day's 5-minute intraday data
         """
         target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
         cache_key = f"{symbol}:intraday:{target_date_obj}"
@@ -262,7 +279,7 @@ class IntradayDataCollector:
                 return None
             
             # Calculate indicators on daily data
-            indicators_df = self._calculate_minimal_indicators(df)
+            indicators_df = self._calculate_enhanced_indicators(df)
             indicators_df.index = pd.to_datetime(indicators_df.index).date
             
             self.logger.debug(f"Fetched {len(indicators_df)} days of data for {symbol}")
@@ -448,14 +465,87 @@ class IntradayDataCollector:
             # Still return the base snapshot with metadata even on error
             return snapshot
     
-    def _extract_day_prior(
+    def _extract_day_prior_open(
+        self,
+        prior_intraday_df: Optional[pd.DataFrame],
+        daily_df: pd.DataFrame,
+        symbol: str,
+        exchange: str,
+        target_date: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """Extract indicators for previous day's market open (T-1 9:30am)"""
+        try:
+            prior_date = target_date.date() - timedelta(days=1)
+            
+            # Get prior day's indicators from daily data
+            available_dates = [d for d in daily_df.index if d <= prior_date]
+            
+            if not available_dates:
+                self.logger.debug(f"No prior dates for {symbol}")
+                return None
+            
+            actual_date = available_dates[-1]
+            prior_data = daily_df.loc[actual_date].copy()
+            
+            # Try to get actual open price from intraday data
+            if prior_intraday_df is not None and len(prior_intraday_df) > 0:
+                # Find morning bars from previous day
+                morning_bars = prior_intraday_df[
+                    (prior_intraday_df.index.time >= time(9, 30)) &
+                    (prior_intraday_df.index.time <= time(10, 0))
+                ]
+                
+                if morning_bars.empty:
+                    morning_bars = prior_intraday_df[prior_intraday_df.index.time >= time(9, 30)]
+                    if morning_bars.empty:
+                        morning_bars = prior_intraday_df.head(1)
+                
+                if not morning_bars.empty:
+                    current_bar = morning_bars.iloc[0]
+                    actual_time = morning_bars.index[0].strftime('%H:%M:%S')
+                    self.logger.debug(f"Using {actual_time} bar for day_prior_open {symbol}")
+                    
+                    # Override OHLCV with actual values from that morning
+                    prior_data['open'] = current_bar['Open']
+                    prior_data['high'] = current_bar['High']
+                    prior_data['low'] = current_bar['Low']
+                    prior_data['close'] = current_bar['Close']
+                    prior_data['volume'] = current_bar['Volume']
+            
+            snapshot = {
+                'symbol': symbol,
+                'exchange': exchange,
+                'detection_date': target_date.date().isoformat(),
+                'snapshot_type': 'day_prior_open',
+                'snapshot_time': '09:30:00',
+                'snapshot_date': actual_date.isoformat()
+            }
+            
+            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
+                              'snapshot_time', 'snapshot_date'}
+            
+            for key, value in prior_data.items():
+                key_lower = key.lower()
+                if key_lower in reserved_fields:
+                    continue
+                    
+                snapshot[key_lower] = self._serialize_value(value)
+            
+            self.logger.debug(f"Extracted day_prior_open for {symbol} with {len(snapshot)} fields")
+            return snapshot
+            
+        except Exception as e:
+            self.logger.error(f"Error extracting day prior open for {symbol}: {e}", exc_info=True)
+            return None
+    
+    def _extract_day_prior_close(
         self,
         daily_df: pd.DataFrame,
         symbol: str,
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """Extract indicators for previous day"""
+        """Extract indicators for previous day's market close (T-1 4pm)"""
         try:
             prior_date = target_date.date() - timedelta(days=1)
             
@@ -472,7 +562,7 @@ class IntradayDataCollector:
                 'symbol': symbol,
                 'exchange': exchange,
                 'detection_date': target_date.date().isoformat(),
-                'snapshot_type': 'day_prior',
+                'snapshot_type': 'day_prior_close',
                 'snapshot_time': '16:00:00',
                 'snapshot_date': actual_date.isoformat()
             }
@@ -487,15 +577,15 @@ class IntradayDataCollector:
                     
                 snapshot[key_lower] = self._serialize_value(value)
             
-            self.logger.debug(f"Extracted day_prior for {symbol} with {len(snapshot)} fields")
+            self.logger.debug(f"Extracted day_prior_close for {symbol} with {len(snapshot)} fields")
             return snapshot
             
         except Exception as e:
-            self.logger.error(f"Error extracting day prior for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Error extracting day prior close for {symbol}: {e}", exc_info=True)
             return None
     
-    def _calculate_minimal_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate indicators matching database schema"""
+    def _calculate_enhanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate comprehensive set of technical indicators matching database schema"""
         result = pd.DataFrame(index=df.index)
         
         # Basic OHLCV
@@ -505,31 +595,32 @@ class IntradayDataCollector:
         result['low'] = df['Low']
         result['volume'] = df['Volume']
         
-        # RSI
+        # === MOMENTUM INDICATORS ===
+        
+        # RSI (14-period)
         try:
             rsi_ind = RSIIndicator(close=df['Close'], window=14)
             result['rsi'] = rsi_ind.rsi()
             result['rsi[1]'] = result['rsi'].shift(1)
+            result['rsi[2]'] = result['rsi'].shift(2)
         except:
             pass
         
-        # Momentum
+        # Momentum (10-period)
         try:
             result['mom'] = df['Close'].diff(10)
             result['mom[1]'] = result['mom'].shift(1)
         except:
             pass
         
-        # MACD
+        # Rate of Change (ROC)
         try:
-            macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
-            result['macd.macd'] = macd.macd()
-            result['macd.signal'] = macd.macd_signal()
-            result['macd_diff'] = macd.macd_diff()
+            roc = ROCIndicator(close=df['Close'], window=12)
+            result['roc'] = roc.roc()
         except:
             pass
         
-        # Stochastic
+        # Stochastic Oscillator
         try:
             stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
             result['stoch.k'] = stoch.stoch()
@@ -539,44 +630,10 @@ class IntradayDataCollector:
         except:
             pass
         
-        # ADX
-        try:
-            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
-            result['adx'] = adx.adx()
-            result['adx+di'] = adx.adx_pos()
-            result['adx-di'] = adx.adx_neg()
-        except:
-            pass
-        
-        # Bollinger Bands
-        try:
-            bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
-            result['bb.upper'] = bb.bollinger_hband()
-            result['bb.lower'] = bb.bollinger_lband()
-            result['bb.middle'] = bb.bollinger_mavg()
-            result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
-            result['bbpower'] = (df['Close'] - result['bb.lower']) / (result['bb.upper'] - result['bb.lower'])
-        except:
-            pass
-        
-        # ATR
-        try:
-            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=14)
-            result['atr'] = atr.average_true_range()
-        except:
-            pass
-        
         # Williams %R
         try:
             wr = WilliamsRIndicator(high=df['High'], low=df['Low'], close=df['Close'], lbp=14)
             result['w.r'] = wr.williams_r()
-        except:
-            pass
-        
-        # CCI
-        try:
-            cci = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20)
-            result['cci20'] = cci.cci()
         except:
             pass
         
@@ -595,6 +652,182 @@ class IntradayDataCollector:
         except:
             pass
         
+        # KAMA (Kaufman's Adaptive Moving Average)
+        try:
+            kama = KAMAIndicator(close=df['Close'], window=10, pow1=2, pow2=30)
+            result['kama'] = kama.kama()
+        except:
+            pass
+        
+        # TSI (True Strength Index)
+        try:
+            tsi = TSIIndicator(close=df['Close'], window_slow=25, window_fast=13)
+            result['tsi'] = tsi.tsi()
+        except:
+            pass
+        
+        # === TREND INDICATORS ===
+        
+        # MACD
+        try:
+            macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
+            result['macd.macd'] = macd.macd()
+            result['macd.signal'] = macd.macd_signal()
+            result['macd_diff'] = macd.macd_diff()
+        except:
+            pass
+        
+        # ADX
+        try:
+            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+            result['adx'] = adx.adx()
+            result['adx+di'] = adx.adx_pos()
+            result['adx-di'] = adx.adx_neg()
+        except:
+            pass
+        
+        # CCI (Commodity Channel Index)
+        try:
+            cci = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20)
+            result['cci20'] = cci.cci()
+        except:
+            pass
+        
+        # Aroon Indicator
+        try:
+            aroon = AroonIndicator(close=df['Close'], window=25)
+            result['aroon_up'] = aroon.aroon_up()
+            result['aroon_down'] = aroon.aroon_down()
+            result['aroon_indicator'] = aroon.aroon_indicator()
+        except:
+            pass
+        
+        # Parabolic SAR
+        try:
+            psar = PSARIndicator(high=df['High'], low=df['Low'], close=df['Close'])
+            result['psar'] = psar.psar()
+            result['psar_up'] = psar.psar_up()
+            result['psar_down'] = psar.psar_down()
+        except:
+            pass
+        
+        # Vortex Indicator
+        try:
+            vortex = VortexIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+            result['vortex_pos'] = vortex.vortex_indicator_pos()
+            result['vortex_neg'] = vortex.vortex_indicator_neg()
+        except:
+            pass
+        
+        # Mass Index
+        try:
+            mass = MassIndex(high=df['High'], low=df['Low'], window_fast=9, window_slow=25)
+            result['mass_index'] = mass.mass_index()
+        except:
+            pass
+        
+        # DPO (Detrended Price Oscillator)
+        try:
+            dpo = DPOIndicator(close=df['Close'], window=20)
+            result['dpo'] = dpo.dpo()
+        except:
+            pass
+        
+        # KST (Know Sure Thing)
+        try:
+            kst = KSTIndicator(close=df['Close'])
+            result['kst'] = kst.kst()
+            result['kst_signal'] = kst.kst_sig()
+        except:
+            pass
+        
+        # === VOLATILITY INDICATORS ===
+        
+        # Bollinger Bands
+        try:
+            bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
+            result['bb.upper'] = bb.bollinger_hband()
+            result['bb.lower'] = bb.bollinger_lband()
+            result['bb.middle'] = bb.bollinger_mavg()
+            result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
+            result['bbpower'] = (df['Close'] - result['bb.lower']) / (result['bb.upper'] - result['bb.lower'])
+        except:
+            pass
+        
+        # ATR (Average True Range)
+        try:
+            atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+            result['atr'] = atr.average_true_range()
+            result['atr_pct'] = (result['atr'] / df['Close']) * 100
+        except:
+            pass
+        
+        # Keltner Channel
+        try:
+            keltner = KeltnerChannel(high=df['High'], low=df['Low'], close=df['Close'], window=20)
+            result['keltner_upper'] = keltner.keltner_channel_hband()
+            result['keltner_lower'] = keltner.keltner_channel_lband()
+            result['keltner_middle'] = keltner.keltner_channel_mband()
+        except:
+            pass
+        
+        # Donchian Channel
+        try:
+            donchian = DonchianChannel(high=df['High'], low=df['Low'], close=df['Close'], window=20)
+            result['donchian_upper'] = donchian.donchian_channel_hband()
+            result['donchian_lower'] = donchian.donchian_channel_lband()
+            result['donchian_middle'] = donchian.donchian_channel_mband()
+        except:
+            pass
+        
+        # === VOLUME INDICATORS ===
+        
+        # On-Balance Volume (OBV)
+        try:
+            obv = OnBalanceVolumeIndicator(close=df['Close'], volume=df['Volume'])
+            result['obv'] = obv.on_balance_volume()
+        except:
+            pass
+        
+        # Chaikin Money Flow
+        try:
+            cmf = ChaikinMoneyFlowIndicator(high=df['High'], low=df['Low'], close=df['Close'], 
+                                           volume=df['Volume'], window=20)
+            result['cmf'] = cmf.chaikin_money_flow()
+        except:
+            pass
+        
+        # Force Index
+        try:
+            fi = ForceIndexIndicator(close=df['Close'], volume=df['Volume'], window=13)
+            result['force_index'] = fi.force_index()
+        except:
+            pass
+        
+        # Ease of Movement
+        try:
+            eom = EaseOfMovementIndicator(high=df['High'], low=df['Low'], volume=df['Volume'], window=14)
+            result['eom'] = eom.ease_of_movement()
+            result['eom_signal'] = eom.sma_ease_of_movement()
+        except:
+            pass
+        
+        # Volume Price Trend
+        try:
+            vpt = VolumePriceTrendIndicator(close=df['Close'], volume=df['Volume'])
+            result['vpt'] = vpt.volume_price_trend()
+        except:
+            pass
+        
+        # Negative Volume Index
+        try:
+            nvi = NegativeVolumeIndexIndicator(close=df['Close'], volume=df['Volume'])
+            result['nvi'] = nvi.negative_volume_index()
+        except:
+            pass
+        
+        # === MOVING AVERAGES ===
+        
         # EMAs
         for period in [5, 10, 20, 50, 100, 200]:
             try:
@@ -609,35 +842,42 @@ class IntradayDataCollector:
             except:
                 pass
         
-        # Volume indicators
+        # Volume SMAs
         try:
             result['volume_sma5'] = result['volume'].rolling(window=5).mean()
+            result['volume_sma10'] = result['volume'].rolling(window=10).mean()
             result['volume_sma20'] = result['volume'].rolling(window=20).mean()
             result['volume_ratio'] = result['volume'] / result['volume_sma20']
         except:
             pass
         
-        # Price changes
-        for days in [1, 3, 5, 10, 20]:
+        # === PRICE CHANGES ===
+        
+        for days in [1, 2, 3, 5, 10, 20, 30]:
             try:
                 result[f'price_change_{days}d'] = df['Close'].pct_change(days) * 100
             except:
                 pass
         
-        # Volatility
+        # === VOLATILITY MEASURES ===
+        
         try:
+            result['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100 * np.sqrt(252)
             result['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100 * np.sqrt(252)
+            result['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100 * np.sqrt(252)
         except:
             pass
         
-        # VWAP
+        # === VWAP ===
+        
         try:
             typical_price = (df['High'] + df['Low'] + df['Close']) / 3
             result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
         except:
             pass
         
-        # 52-week high/low
+        # === 52-WEEK HIGH/LOW ===
+        
         try:
             result['high_52w'] = df['High'].rolling(window=252, min_periods=1).max()
             result['low_52w'] = df['Low'].rolling(window=252, min_periods=1).min()
@@ -646,7 +886,8 @@ class IntradayDataCollector:
         except:
             pass
         
-        # Gaps
+        # === GAPS ===
+        
         try:
             result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
             result['gap_up'] = (result['gap_%'] > 2).astype(int)
@@ -654,12 +895,35 @@ class IntradayDataCollector:
         except:
             pass
         
-        # Trend indicators
+        # === TREND FLAGS ===
+        
         try:
             result['ema20_above_ema50'] = (result['ema20'] > result['ema50']).astype(int)
             result['ema50_above_ema200'] = (result['ema50'] > result['ema200']).astype(int)
             result['price_above_ema20'] = (df['Close'] > result['ema20']).astype(int)
             result['ema10_above_ema20'] = (result['ema10'] > result['ema20']).astype(int)
+            result['sma50_above_sma200'] = (result['sma50'] > result['sma200']).astype(int)
+        except:
+            pass
+        
+        # === CANDLESTICK PATTERNS (simple) ===
+        
+        try:
+            # Doji
+            body = abs(df['Close'] - df['Open'])
+            range_hl = df['High'] - df['Low']
+            result['doji'] = (body / range_hl < 0.1).astype(int)
+            
+            # Hammer
+            lower_shadow = df['Open'].combine(df['Close'], min) - df['Low']
+            upper_shadow = df['High'] - df['Open'].combine(df['Close'], max)
+            result['hammer'] = ((lower_shadow > 2 * body) & (upper_shadow < body)).astype(int)
+            
+            # Engulfing
+            prev_body = abs(df['Close'].shift(1) - df['Open'].shift(1))
+            result['bullish_engulfing'] = ((df['Close'] > df['Open']) & 
+                                          (df['Close'].shift(1) < df['Open'].shift(1)) &
+                                          (body > prev_body)).astype(int)
         except:
             pass
         
