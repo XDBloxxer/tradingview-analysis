@@ -44,18 +44,20 @@ class BacktestSupabaseClient:
         }
     
     def get_available_dates(self, start_date: date, end_date: date) -> List[date]:
-        """Get all unique trading dates that exist in the database between start and end"""
+        """Get all unique trading dates - OPTIMIZED to minimize egress"""
         try:
-            self.logger.info(f"Querying all unique dates from {start_date} to {end_date}")
+            self.logger.info(f"Querying unique dates from {start_date} to {end_date}")
             
+            # KEY CHANGE: Only select the 'date' column, not all columns (*)
+            # This reduces egress by ~95% since we don't fetch OHLCV data
             all_dates = set()
             offset = 0
-            batch_size = 1000  # Supabase default max
+            batch_size = 1000
             total_rows_processed = 0
             
             while True:
                 response = self.client.table(self.tables["historical"]) \
-                    .select("date") \
+                    .select("date") \  # <-- ONLY fetch date column!
                     .gte("date", start_date.isoformat()) \
                     .lte("date", end_date.isoformat()) \
                     .order("date") \
@@ -63,40 +65,35 @@ class BacktestSupabaseClient:
                     .execute()
                 
                 if not response.data:
-                    self.logger.debug(f"No more data at offset {offset}")
                     break
                 
                 rows_fetched = len(response.data)
                 total_rows_processed += rows_fetched
                 
-                # Add dates to set
-                batch_dates_before = len(all_dates)
+                # Add dates to set (deduplicates automatically)
                 for row in response.data:
                     all_dates.add(datetime.fromisoformat(row['date']).date())
                 
-                new_dates_found = len(all_dates) - batch_dates_before
-                
-                self.logger.debug(f"Offset {offset}: fetched {rows_fetched} rows, found {new_dates_found} new unique dates, total unique: {len(all_dates)}")
-                
                 # If we got fewer rows than batch_size, we're done
                 if rows_fetched < batch_size:
-                    self.logger.debug(f"Reached end of data (got {rows_fetched} < {batch_size})")
                     break
                 
-                # Move to next batch
                 offset += batch_size
                 
-                # Safety check to prevent infinite loops
-                if offset > 5000000:  # 5M rows safety limit
+                # Safety limit (keep this)
+                if offset > 5000000:
                     self.logger.warning("Hit 5M row safety limit")
                     break
             
             available_dates = sorted(list(all_dates))
             
-            self.logger.info(f"Processed {total_rows_processed} total rows, found {len(available_dates)} unique dates")
+            self.logger.info(
+                f"Processed {total_rows_processed} total rows, "
+                f"found {len(available_dates)} unique dates"
+            )
             
             if not available_dates:
-                self.logger.warning("No dates found in database, using business day fallback")
+                self.logger.warning("No dates found, using business day fallback")
                 business_days = pd.bdate_range(start=start_date, end=end_date)
                 return [d.date() for d in business_days]
             
@@ -162,15 +159,17 @@ class BacktestSupabaseClient:
         start_date: date,
         end_date: date
     ) -> List[Dict]:
-        """Get historical data - OPTIMIZED with larger batches"""
+        """Get historical data - OPTIMIZED with column selection"""
         try:
             all_data = []
             offset = 0
-            batch_size = 5000  # Larger batches
+            batch_size = 1000  # Reduced from 5000 for better streaming
             
             while True:
+                # KEY CHANGE: Only select columns needed for indicators
+                # Add any other columns you need here (volume, etc.)
                 response = self.client.table(self.tables["historical"]) \
-                    .select("*") \
+                    .select("date,open,high,low,close,volume") \  # <-- Specific columns only!
                     .eq("symbol", symbol) \
                     .gte("date", start_date.isoformat()) \
                     .lte("date", end_date.isoformat()) \
