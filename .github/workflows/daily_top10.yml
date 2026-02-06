@@ -3,7 +3,7 @@ name: Daily Winners Tracker
 on:
   # Run daily at 4:30 PM EST (after market close at 4pm)
   schedule:
-    - cron: '0 21 * * 1-5'  # 21:30 UTC = 4:30 PM EST (Mon-Fri only)
+    - cron: '50 20 * * 1-5'  # 21:30 UTC = 4:30 PM EST (Mon-Fri only)
   
   # Allow manual triggering
   workflow_dispatch:
