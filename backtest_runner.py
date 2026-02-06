@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Backtest Runner - Main entry point for running strategy backtests
-Can be called from command line or imported by dashboard
+Backtest Runner - UPDATED VERSION
+Uses database queries instead of dynamic market scanning
 """
 
 import argparse
@@ -14,8 +14,10 @@ from typing import Dict, Any, Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils import setup_logging, load_config
-from backtesting.strategy_backtester import StrategyBacktester
-from backtesting.backtest_supabase_client import BacktestSupabaseClient
+
+# Import NEW versions
+from strategy_backtester import StrategyBacktester
+from backtest_supabase_client import BacktestSupabaseClient
 
 
 def run_backtest(
@@ -53,9 +55,13 @@ def run_backtest(
         # Update status to running
         supabase.update_strategy_status(strategy_id, 'running')
         
-        # Run backtest
+        # Run backtest (PASS supabase client to backtester)
         logger.info("Running backtest...")
-        results = backtester.run_backtest(strategy_config, progress_callback)
+        results = backtester.run_backtest(
+            strategy_config, 
+            supabase,  # NEW: Pass client to backtester
+            progress_callback
+        )
         
         # Write results to Supabase
         logger.info("Writing results to Supabase...")
@@ -137,7 +143,7 @@ def main():
     parser.add_argument(
         "--min-price",
         type=float,
-        default=0.50,
+        default=0.25,
         help="Minimum stock price"
     )
     parser.add_argument(
@@ -145,12 +151,6 @@ def main():
         type=int,
         default=100000,
         help="Minimum volume"
-    )
-    parser.add_argument(
-        "--exchanges",
-        nargs='+',
-        default=['NASDAQ', 'NYSE', 'AMEX'],
-        help="Exchanges to scan"
     )
     parser.add_argument(
         "--verbose",
@@ -185,8 +185,7 @@ def main():
         'target_days': args.target_days,
         'indicator_criteria': criteria,
         'min_price': args.min_price,
-        'min_volume': args.min_volume,
-        'exchanges': args.exchanges
+        'min_volume': args.min_volume
     }
     
     try:
