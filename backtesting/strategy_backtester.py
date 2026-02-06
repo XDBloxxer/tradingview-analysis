@@ -53,7 +53,18 @@ class StrategyBacktester:
         strategy_id = strategy_config.get('id') or strategy_config.get('strategy_id')
         
         self.logger.info(f"Backtest: {start_date} to {end_date}, target: {target_gain_pct}% in {target_days}d")
-        self.logger.info(f"LOGIC: Check criteria on T-1, measure gain on T")
+        
+        # Explain lookback strategy
+        if target_days == 1:
+            lookback_desc = "T-1 (day before)"
+        elif target_days <= 5:
+            lookback_desc = "T-2 (2 days before)"
+        elif target_days <= 10:
+            lookback_desc = "T-3 (3 days before)"
+        else:
+            lookback_desc = "T-5 (5 days before)"
+        
+        self.logger.info(f"LOGIC: Check criteria at {lookback_desc}, measure gain {target_days} days later")
         
         # Get trading days
         trading_days = supabase_client.get_available_dates(start_date, end_date)
@@ -141,11 +152,20 @@ class StrategyBacktester:
         FIXED: test_date is when stocks MOVED, signal_date is when we CHECK criteria
         """
         
-        # KEY FIX: Calculate signal_date (when we check criteria)
-        # For target_days=1, signal_date = test_date - 1 day
-        signal_date = test_date - timedelta(days=target_days)
+        # VARIABLE LOOKBACK: Adjust signal date based on holding period
+        # Longer holds need more setup time
+        if target_days == 1:
+            lookback = 1  # T-1 for day trades
+        elif target_days <= 5:
+            lookback = 2  # T-2 for swing trades (3-5 days)
+        elif target_days <= 10:
+            lookback = 3  # T-3 for short-term (5-10 days)
+        else:
+            lookback = 5  # T-5 for position trades (10+ days)
         
-        self.logger.debug(f"Test date: {test_date}, Signal date: {signal_date}")
+        signal_date = test_date - timedelta(days=lookback)
+        
+        self.logger.debug(f"Test date: {test_date}, Signal date: {signal_date} (lookback: {lookback} days)")
         
         # Get top gainers on TEST_DATE (the explosion day)
         if test_date not in self._stock_universe_cache:
