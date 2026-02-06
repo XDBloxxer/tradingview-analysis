@@ -3,6 +3,7 @@ Intraday Data Collector - FIXED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
 FIXED: Fetches sufficient historical data for indicator calculations
 FIXED: Handles the 60-day intraday limit by falling back to daily data for longer periods
+FIXED: Always creates market_close rows even when market hasn't closed (with nulls)
 """
 
 import logging
@@ -151,12 +152,12 @@ class IntradayDataCollector:
             # Extract market open snapshot
             market_open_snapshot = self._extract_market_open(
                 intraday_df, daily_df, symbol, exchange, target_date
-            ) if intraday_df is not None else None
+            )
             
-            # Extract market close snapshot
+            # Extract market close snapshot (ALWAYS returns a dict, even if market not closed)
             market_close_snapshot = self._extract_market_close(
                 intraday_df, daily_df, symbol, exchange, target_date
-            ) if intraday_df is not None else None
+            )
             
             # Extract day prior snapshot (from daily data)
             day_prior_snapshot = self._extract_day_prior(
@@ -370,71 +371,82 @@ class IntradayDataCollector:
         symbol: str,
         exchange: str,
         target_date: datetime
-    ) -> Optional[Dict[str, Any]]:
-        """Extract indicators at market close - will be null if market hasn't closed yet"""
+    ) -> Dict[str, Any]:
+        """
+        Extract indicators at market close
+        ALWAYS returns a dict (even if market hasn't closed) with metadata fields
+        Indicator fields will be null if market hasn't closed yet
+        """
+        target_date_obj = target_date.date()
+        
+        # Start with base snapshot (always created)
+        snapshot = {
+            'symbol': symbol,
+            'exchange': exchange,
+            'detection_date': target_date_obj.isoformat(),
+            'snapshot_type': 'market_close',
+            'snapshot_time': '16:00:00'
+        }
+        
         try:
-            target_date_obj = target_date.date()
-            
             # Check if we have close bars in intraday data
-            if intraday_df is None or intraday_df.empty:
-                self.logger.debug(f"No intraday data for market_close {symbol}")
-                return None
+            has_close_data = False
             
-            close_bars = intraday_df[
-                (intraday_df.index.time >= time(15, 55)) &
-                (intraday_df.index.time <= time(16, 0))
-            ]
-            
-            if close_bars.empty:
-                self.logger.debug(f"Market hasn't closed yet for {symbol}")
-                return None
-            
-            # Get indicator values from daily data
-            if target_date_obj not in daily_df.index:
-                available_dates = [d for d in daily_df.index if d <= target_date_obj]
-                if not available_dates:
-                    self.logger.debug(f"No daily data for market close {symbol}")
-                    return None
-                indicator_date = available_dates[-1]
-            else:
-                indicator_date = target_date_obj
-            
-            indicator_data = daily_df.loc[indicator_date].copy()
-            
-            # Use actual close values
-            current_bar = close_bars.iloc[-1]
-            actual_time = close_bars.index[-1].strftime('%H:%M:%S')
-            self.logger.debug(f"Using {actual_time} bar for market_close {symbol}")
-            
-            indicator_data['open'] = current_bar['Open']
-            indicator_data['high'] = current_bar['High']
-            indicator_data['low'] = current_bar['Low']
-            indicator_data['close'] = current_bar['Close']
-            indicator_data['volume'] = current_bar['Volume']
-            
-            snapshot = {
-                'symbol': symbol,
-                'exchange': exchange,
-                'detection_date': target_date_obj.isoformat(),
-                'snapshot_type': 'market_close',
-                'snapshot_time': '16:00:00'
-            }
-            
-            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
-            
-            for key, value in indicator_data.items():
-                key_lower = key.lower()
-                if key_lower in reserved_fields:
-                    continue
+            if intraday_df is not None and not intraday_df.empty:
+                close_bars = intraday_df[
+                    (intraday_df.index.time >= time(15, 55)) &
+                    (intraday_df.index.time <= time(16, 0))
+                ]
+                
+                if not close_bars.empty:
+                    has_close_data = True
                     
-                snapshot[key_lower] = self._serialize_value(value)
+                    # Get indicator values from daily data
+                    if target_date_obj in daily_df.index:
+                        indicator_date = target_date_obj
+                    else:
+                        available_dates = [d for d in daily_df.index if d <= target_date_obj]
+                        if available_dates:
+                            indicator_date = available_dates[-1]
+                        else:
+                            self.logger.debug(f"No daily data for market close {symbol}")
+                            return snapshot  # Return with just metadata, no indicators
+                    
+                    indicator_data = daily_df.loc[indicator_date].copy()
+                    
+                    # Use actual close values
+                    current_bar = close_bars.iloc[-1]
+                    actual_time = close_bars.index[-1].strftime('%H:%M:%S')
+                    self.logger.debug(f"Using {actual_time} bar for market_close {symbol}")
+                    
+                    indicator_data['open'] = current_bar['Open']
+                    indicator_data['high'] = current_bar['High']
+                    indicator_data['low'] = current_bar['Low']
+                    indicator_data['close'] = current_bar['Close']
+                    indicator_data['volume'] = current_bar['Volume']
+                    
+                    # Add all indicator values
+                    reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
+                    
+                    for key, value in indicator_data.items():
+                        key_lower = key.lower()
+                        if key_lower in reserved_fields:
+                            continue
+                            
+                        snapshot[key_lower] = self._serialize_value(value)
+                    
+                    self.logger.debug(f"Extracted market_close for {symbol} with {len(snapshot)} fields")
+                else:
+                    self.logger.debug(f"Market hasn't closed yet for {symbol} - creating row with nulls")
+            else:
+                self.logger.debug(f"No intraday data for market_close {symbol} - creating row with nulls")
             
-            self.logger.debug(f"Extracted market_close for {symbol} with {len(snapshot)} fields")
             return snapshot
             
         except Exception as e:
             self.logger.error(f"Error extracting market close for {symbol}: {e}", exc_info=True)
-            return None
+            # Still return the base snapshot with metadata even on error
+            return snapshot
     
     def _extract_day_prior(
         self,
