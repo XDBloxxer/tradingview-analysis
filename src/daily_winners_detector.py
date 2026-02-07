@@ -1,21 +1,27 @@
 """
-Daily Winners Detector - Scrapes Yahoo Finance day gainers page
+Daily Winners Detector - Uses TradingView MarketMovers API
 Gets ACTUAL top daily gainers dynamically from market
+MUCH more reliable than web scraping!
 """
 
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+
+try:
+    from tradingview_scraper.symbols.market_movers import MarketMovers
+except ImportError:
+    raise ImportError(
+        "tradingview-scraper is required. Install with: pip install tradingview-scraper"
+    )
 
 from .rate_limiter import RateLimiter
 
 
 class DailyWinnersDetector:
     """
-    Detects top daily winners by scraping Yahoo Finance day gainers
+    Detects top daily winners using TradingView MarketMovers API
     """
     
     def __init__(self, config: dict):
@@ -37,14 +43,17 @@ class DailyWinnersDetector:
         # Initialize components
         self.rate_limiter = RateLimiter(config)
         
+        # Initialize MarketMovers
+        self.market_movers = MarketMovers(export_result=False)
+        
         self.logger.info(
-            f"Daily Winners detector initialized (scraping Yahoo Finance): "
+            f"Daily Winners detector initialized (TradingView MarketMovers): "
             f"min_price={self.min_price}, min_volume={self.min_volume}"
         )
     
     def detect_top_winners(self, top_n: int = 10, target_date: datetime = None) -> List[Dict[str, Any]]:
         """
-        Detect top N daily winners by scraping Yahoo Finance day gainers
+        Detect top N daily winners using TradingView MarketMovers API
         
         Args:
             top_n: Number of top winners to return
@@ -58,119 +67,103 @@ class DailyWinnersDetector:
         
         target_date_str = target_date.date().isoformat()
         
-        # Note: Yahoo Finance screeners only work for current day
+        # Note: TradingView MarketMovers shows current day data
         is_today = target_date.date() == datetime.now().date()
         
         if not is_today:
             self.logger.warning(
-                f"Yahoo Finance day gainers only shows current day. "
+                f"TradingView MarketMovers only shows current day data. "
                 f"Requested date {target_date_str} is not today. "
                 f"Will fetch current day's gainers instead."
             )
         
-        self.logger.info(f"Fetching ACTUAL day gainers from Yahoo Finance...")
+        self.logger.info(f"Fetching ACTUAL day gainers from TradingView...")
         
         try:
-            # Scrape Yahoo Finance day gainers page
-            url = "https://finance.yahoo.com/screener/predefined/day_gainers"
+            # Fetch more than we need to allow for filtering
+            fetch_limit = max(top_n * 3, 50)
             
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
+            # Custom fields we want
+            fields = [
+                'name',           # Company name
+                'close',          # Current/closing price
+                'change',         # Change percentage
+                'change_abs',     # Absolute price change
+                'volume',         # Trading volume
+                'market_cap_basic',  # Market cap (optional, for reference)
+                'description'     # Company description (optional)
+            ]
             
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
+            # Get gainers from TradingView
+            result = self.market_movers.scrape(
+                market='stocks-usa',
+                category='gainers',
+                fields=fields,
+                limit=fetch_limit
+            )
             
-            # Parse HTML
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Find the table with gainers data
-            # Yahoo Finance uses different structure, try to find the data
-            table = soup.find('table')
-            
-            if not table:
-                self.logger.error("Could not find data table on Yahoo Finance page")
+            if result['status'] != 'success':
+                self.logger.error(f"TradingView API returned non-success status: {result.get('status')}")
                 return []
             
-            # Parse table into DataFrame using StringIO to avoid warning
-            from io import StringIO
-            df = pd.read_html(StringIO(str(table)))[0]
+            data = result.get('data', [])
             
-            self.logger.info(f"Found {len(df)} stocks from Yahoo Finance day gainers")
+            if not data:
+                self.logger.warning("No data returned from TradingView MarketMovers")
+                return []
+            
+            self.logger.info(f"Received {len(data)} gainers from TradingView")
             
             # Process and filter results
             all_candidates = []
             
-            for idx, row in df.iterrows():
+            for item in data:
                 try:
-                    # Extract data from row
-                    # Column names vary, try different possibilities
-                    symbol_raw = row.get('Symbol', row.get('Ticker', ''))
-                    
-                    if not symbol_raw:
-                        continue
-                    
-                    # Clean up symbol - sometimes it has extra characters or spaces
-                    # If it's like "S SLAB", take the part after the space
-                    if isinstance(symbol_raw, str):
-                        symbol = symbol_raw.strip()
-                        # If there's a space, take the second part (the actual symbol)
-                        if ' ' in symbol:
-                            parts = symbol.split()
-                            symbol = parts[-1]  # Take the last part which is the actual symbol
+                    # Extract symbol from format "NASDAQ:AAPL" -> "AAPL"
+                    symbol_full = item.get('symbol', '')
+                    if ':' in symbol_full:
+                        exchange_prefix, symbol = symbol_full.split(':', 1)
+                        # Map TradingView exchange prefixes to standard names
+                        exchange_map = {
+                            'NASDAQ': 'NASDAQ',
+                            'NYSE': 'NYSE',
+                            'AMEX': 'AMEX',
+                            'OTC': 'OTC',
+                            'BATS': 'NASDAQ'  # BATS often used for NASDAQ stocks
+                        }
+                        exchange = exchange_map.get(exchange_prefix, exchange_prefix)
                     else:
-                        symbol = str(symbol_raw).strip()
+                        symbol = symbol_full
+                        exchange = 'NASDAQ'  # Default
                     
                     if not symbol:
                         continue
                     
                     # Get price and change
-                    price_str = row.get('Price (Intraday)', row.get('Price', '0'))
-                    change_str = row.get('% Change', row.get('Change %', '0'))
-                    volume_str = row.get('Volume', row.get('Avg Vol (3 month)', '0'))
-                    
-                    # Clean up and convert price (remove commas, dollar signs)
-                    if isinstance(price_str, str):
-                        price = float(price_str.replace('$', '').replace(',', ''))
-                    else:
-                        price = float(price_str)
-                    
-                    # Clean up change percentage (remove % sign)
-                    if isinstance(change_str, str):
-                        change_pct = float(change_str.replace('%', '').replace('+', ''))
-                    else:
-                        change_pct = float(change_str)
-                    
-                    # Clean up volume (remove commas, handle M/B suffixes)
-                    if isinstance(volume_str, str):
-                        volume_str = volume_str.replace(',', '')
-                        if 'M' in volume_str:
-                            volume = float(volume_str.replace('M', '')) * 1000000
-                        elif 'B' in volume_str:
-                            volume = float(volume_str.replace('B', '')) * 1000000000
-                        elif 'K' in volume_str:
-                            volume = float(volume_str.replace('K', '')) * 1000
-                        else:
-                            volume = float(volume_str)
-                    else:
-                        volume = float(volume_str)
-                    
-                    # Determine exchange (assume NASDAQ by default for US stocks)
-                    exchange = 'NASDAQ'
+                    price = float(item.get('close', 0))
+                    change_pct = float(item.get('change', 0))
+                    volume = int(item.get('volume', 0))
                     
                     # Apply filters
                     if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
                         all_candidates.append({
-                            'symbol': symbol,
+                            'symbol': symbol.strip().upper(),
                             'exchange': exchange,
                             'price': float(price),
                             'change_pct': float(change_pct),
-                            'volume': int(volume)
+                            'volume': int(volume),
+                            'name': item.get('name', ''),
+                            'market_cap': item.get('market_cap_basic', 0)
                         })
                         self.logger.debug(f"Added {symbol}: +{change_pct:.2f}%")
+                    else:
+                        self.logger.debug(
+                            f"Filtered out {symbol}: price=${price:.2f}, "
+                            f"volume={volume:,}, change={change_pct:.2f}%"
+                        )
                     
                 except Exception as e:
-                    self.logger.debug(f"Error processing row: {e}")
+                    self.logger.debug(f"Error processing item: {e}")
                     continue
             
             if not all_candidates:
@@ -188,6 +181,9 @@ class DailyWinnersDetector:
             for winner in top_winners:
                 winner['detection_date'] = target_date_str
                 winner['detection_time'] = '16:00:00'
+                # Remove fields we don't want to store
+                winner.pop('name', None)
+                winner.pop('market_cap', None)
             
             self.logger.info(f"✓ Found top {len(top_winners)} ACTUAL daily winners:")
             if top_winners:
@@ -199,5 +195,5 @@ class DailyWinnersDetector:
             return top_winners
             
         except Exception as e:
-            self.logger.error(f"Error fetching day gainers: {e}", exc_info=True)
+            self.logger.error(f"Error fetching day gainers from TradingView: {e}", exc_info=True)
             return []
