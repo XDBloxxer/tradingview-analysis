@@ -1,7 +1,7 @@
 """
 Daily Winners Detector - Uses TradingView MarketMovers API
 Gets ACTUAL top daily gainers dynamically from market
-MUCH more reliable than web scraping!
+FIXED: Proper field names and realistic filtering thresholds
 """
 
 import logging
@@ -36,7 +36,7 @@ class DailyWinnersDetector:
         
         detection_config = config.get("detection", {})
         
-        # Stock universe filters
+        # Stock universe filters - REALISTIC values for daily winners
         self.min_price = detection_config.get("min_price", 0.50)
         self.min_volume = detection_config.get("min_volume", 100000)
         
@@ -77,28 +77,16 @@ class DailyWinnersDetector:
                 f"Will fetch current day's gainers instead."
             )
         
-        self.logger.info(f"Fetching ACTUAL day gainers from TradingView...")
+        self.logger.info(f"Fetching ACTUAL day gainers from TradingView MarketMovers...")
         
         try:
             # Fetch more than we need to allow for filtering
             fetch_limit = max(top_n * 3, 50)
             
-            # Custom fields we want
-            fields = [
-                'name',           # Company name
-                'close',          # Current/closing price
-                'change',         # Change percentage
-                'change_abs',     # Absolute price change
-                'volume',         # Trading volume
-                'market_cap_basic',  # Market cap (optional, for reference)
-                'description'     # Company description (optional)
-            ]
-            
-            # Get gainers from TradingView
+            # Get gainers from TradingView - SIMPLIFIED, let API handle fields
             result = self.market_movers.scrape(
                 market='stocks-usa',
                 category='gainers',
-                fields=fields,
                 limit=fetch_limit
             )
             
@@ -113,6 +101,11 @@ class DailyWinnersDetector:
                 return []
             
             self.logger.info(f"Received {len(data)} gainers from TradingView")
+            
+            # Debug: Log first item to see actual structure
+            if data:
+                self.logger.info(f"Sample data structure: {list(data[0].keys())}")
+                self.logger.info(f"Sample item: {data[0]}")
             
             # Process and filter results
             all_candidates = []
@@ -139,12 +132,30 @@ class DailyWinnersDetector:
                     if not symbol:
                         continue
                     
-                    # Get price and change
-                    price = float(item.get('close', 0))
-                    change_pct = float(item.get('change', 0))
-                    volume = int(item.get('volume', 0))
+                    # Get price and change - check multiple possible field names
+                    price = item.get('close') or item.get('price') or item.get('last') or 0
                     
-                    # Apply filters
+                    # Try multiple field names for change percentage
+                    change_pct = (
+                        item.get('change') or 
+                        item.get('change_percentage') or 
+                        item.get('change_percent') or 
+                        item.get('perf') or
+                        0
+                    )
+                    
+                    volume = item.get('volume') or item.get('Volume') or 0
+                    
+                    # Convert to proper types
+                    try:
+                        price = float(price)
+                        change_pct = float(change_pct)
+                        volume = int(volume)
+                    except (ValueError, TypeError):
+                        self.logger.debug(f"Type conversion failed for {symbol}")
+                        continue
+                    
+                    # Apply REALISTIC filters - ANY positive gainer above min requirements
                     if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
                         all_candidates.append({
                             'symbol': symbol.strip().upper(),
@@ -155,7 +166,7 @@ class DailyWinnersDetector:
                             'name': item.get('name', ''),
                             'market_cap': item.get('market_cap_basic', 0)
                         })
-                        self.logger.debug(f"Added {symbol}: +{change_pct:.2f}%")
+                        self.logger.debug(f"Added {symbol}: +{change_pct:.2f}% @ ${price:.2f}, vol={volume:,}")
                     else:
                         self.logger.debug(
                             f"Filtered out {symbol}: price=${price:.2f}, "
@@ -168,6 +179,9 @@ class DailyWinnersDetector:
             
             if not all_candidates:
                 self.logger.warning("No winners found after filtering")
+                self.logger.warning(f"Original data count: {len(data)}")
+                if data:
+                    self.logger.warning(f"Sample raw item for debugging: {data[0]}")
                 return []
             
             # Convert to DataFrame and sort
