@@ -571,30 +571,43 @@ class IntradayDataCollector:
         except:
             pass
         
-        # === PRICE CHANGES (on intraday bars) ===
+        # === PRICE CHANGES (match your existing schema) ===
         
-        # These are now bar-to-bar changes, not day-to-day
-        for bars in [1, 2, 3, 5, 10, 20, 30, 50, 100]:
+        # Use the same field names as your original daily-based code
+        # These represent changes over N bars (5-min bars, not days)
+        for days in [1, 2, 3, 5, 10, 20, 30]:
             try:
-                result[f'price_change_{bars}bars'] = df['Close'].pct_change(bars) * 100
+                result[f'price_change_{days}d'] = df['Close'].pct_change(days) * 100
             except:
                 pass
         
-        # === VOLATILITY MEASURES ===
+        # === 52-WEEK HIGH/LOW ===
+        # Note: On 5-min data, 252 periods = ~21 trading days, not 52 weeks
+        # If you want true 52-week data, this should use daily bars
+        # For now, keeping calculation consistent with original schema
         
         try:
-            result['volatility_10bars'] = df['Close'].pct_change().rolling(window=10).std() * 100
-            result['volatility_20bars'] = df['Close'].pct_change().rolling(window=20).std() * 100
-            result['volatility_50bars'] = df['Close'].pct_change().rolling(window=50).std() * 100
+            result['high_52w'] = df['High'].rolling(window=252, min_periods=1).max()
+            result['low_52w'] = df['Low'].rolling(window=252, min_periods=1).min()
+            result['price_vs_high_52w'] = (df['Close'] / result['high_52w'] - 1) * 100
+            result['price_vs_low_52w'] = (df['Close'] / result['low_52w'] - 1) * 100
         except:
             pass
         
-        # === GAPS (bar-to-bar) ===
+        # === VWAP ===
+        
+        try:
+            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+            result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+        except:
+            pass
+        
+        # === GAPS ===
         
         try:
             result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
-            result['gap_up'] = (result['gap_%'] > 0.5).astype(int)
-            result['gap_down'] = (result['gap_%'] < -0.5).astype(int)
+            result['gap_up'] = (result['gap_%'] > 2).astype(int)
+            result['gap_down'] = (result['gap_%'] < -2).astype(int)
         except:
             pass
         
