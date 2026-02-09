@@ -81,7 +81,7 @@ class DailyWinnersDetector:
         
         try:
             # Fetch more than we need to allow for filtering
-            fetch_limit = max(top_n * 3, 200)
+            fetch_limit = max(top_n * 3, 50)
             
             # Get gainers from TradingView - SIMPLIFIED, let API handle fields
             result = self.market_movers.scrape(
@@ -121,7 +121,6 @@ class DailyWinnersDetector:
                             'NASDAQ': 'NASDAQ',
                             'NYSE': 'NYSE',
                             'AMEX': 'AMEX',
-                            'OTC': 'OTC',
                             'BATS': 'NASDAQ'  # BATS often used for NASDAQ stocks
                         }
                         exchange = exchange_map.get(exchange_prefix, exchange_prefix)
