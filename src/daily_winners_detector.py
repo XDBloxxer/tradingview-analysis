@@ -144,11 +144,9 @@ class DailyWinnersDetector:
                     # Get price
                     price = float(item.get('close', 0))
                     
-                    # Get change - CRITICAL: TradingView returns basis points * 100
-                    # So 10% gain shows as 1000, not 10
-                    # We need to divide by 100 to get actual percentage
-                    change_raw = float(item.get('change', 0))
-                    change_pct = change_raw / 100.0  # Convert to actual percentage
+                    # Get change percentage - this is already a percentage value
+                    # A 10% gain shows as 10.0, a 50% gain as 50.0
+                    change_pct = float(item.get('change', 0))
                     
                     # Get volume
                     volume = int(item.get('volume', 0))
