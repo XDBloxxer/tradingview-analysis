@@ -37,7 +37,7 @@ class DailyWinnersDetector:
         detection_config = config.get("detection", {})
         
         # Stock universe filters - REALISTIC values for daily winners
-        self.min_price = detection_config.get("min_price", 0.50)
+        self.min_price = detection_config.get("min_price", 0.25)
         self.min_volume = detection_config.get("min_volume", 100000)
         
         # Initialize components
@@ -81,7 +81,7 @@ class DailyWinnersDetector:
         
         try:
             # Fetch more than we need to allow for filtering
-            fetch_limit = max(top_n * 3, 50)
+            fetch_limit = max(top_n * 3, 200)
             
             # Get gainers from TradingView - SIMPLIFIED, let API handle fields
             result = self.market_movers.scrape(
