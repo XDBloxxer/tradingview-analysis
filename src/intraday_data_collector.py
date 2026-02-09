@@ -397,11 +397,10 @@ class IntradayDataCollector:
                 'exchange': exchange,
                 'detection_date': target_date_obj.isoformat(),
                 'snapshot_type': 'market_open',
-                'snapshot_time': '09:30:00',
-                'indicator_basis': 'prior_day_close'  # Document what timeframe indicators represent
+                'snapshot_time': '09:30:00'
             }
             
-            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time', 'indicator_basis'}
+            reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
             
             # Add all indicator values
             for key, value in indicator_data.items():
@@ -440,8 +439,7 @@ class IntradayDataCollector:
             'exchange': exchange,
             'detection_date': target_date_obj.isoformat(),
             'snapshot_type': 'market_close',
-            'snapshot_time': '16:00:00',
-            'indicator_basis': 'current_day_close'  # Document timeframe
+            'snapshot_time': '16:00:00'
         }
         
         try:
@@ -470,7 +468,7 @@ class IntradayDataCollector:
                         indicator_data['volume'] = current_bar['Volume']
                 
                 # Add all indicator values
-                reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time', 'indicator_basis'}
+                reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
                 
                 for key, value in indicator_data.items():
                     key_lower = key.lower()
@@ -552,12 +550,11 @@ class IntradayDataCollector:
                 'detection_date': target_date_obj.isoformat(),
                 'snapshot_type': 'day_prior_open',
                 'snapshot_time': '09:30:00',
-                'snapshot_date': prior_date_obj.isoformat(),
-                'indicator_basis': 't_minus_2_close'  # Document timeframe
+                'snapshot_date': prior_date_obj.isoformat()
             }
             
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
-                              'snapshot_time', 'snapshot_date', 'indicator_basis'}
+                              'snapshot_time', 'snapshot_date'}
             
             for key, value in prior_data.items():
                 key_lower = key.lower()
@@ -608,12 +605,11 @@ class IntradayDataCollector:
                 'detection_date': target_date_obj.isoformat(),
                 'snapshot_type': 'day_prior_close',
                 'snapshot_time': '16:00:00',
-                'snapshot_date': actual_date.isoformat(),
-                'indicator_basis': 'same_day_close'  # Document timeframe
+                'snapshot_date': actual_date.isoformat()
             }
             
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
-                              'snapshot_time', 'snapshot_date', 'indicator_basis'}
+                              'snapshot_time', 'snapshot_date'}
             
             for key, value in prior_data.items():
                 key_lower = key.lower()
