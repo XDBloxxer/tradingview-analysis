@@ -128,23 +128,29 @@ class IntradayDataCollector:
                 time_window=(time(15, 55), time(16, 0))
             )
             
-            prior_date = target_date - timedelta(days=1)
+            # For T-1 snapshots, we need to find the last valid trading day
+            prior_date = self._get_prior_trading_day(target_date, intraday_df_extended)
             
-            day_prior_open_snapshot = self._extract_timepoint_snapshot(
-                intraday_df_extended, symbol, exchange, prior_date,
-                snapshot_type='day_prior_open',
-                target_time=time(9, 30),
-                time_window=(time(9, 30), time(10, 0)),
-                detection_date=target_date  # Keep original detection date
-            )
-            
-            day_prior_close_snapshot = self._extract_timepoint_snapshot(
-                intraday_df_extended, symbol, exchange, prior_date,
-                snapshot_type='day_prior_close',
-                target_time=time(16, 0),
-                time_window=(time(15, 55), time(16, 0)),
-                detection_date=target_date  # Keep original detection date
-            )
+            if prior_date is None:
+                self.logger.warning(f"Could not find prior trading day for {symbol}")
+                day_prior_open_snapshot = None
+                day_prior_close_snapshot = None
+            else:
+                day_prior_open_snapshot = self._extract_timepoint_snapshot(
+                    intraday_df_extended, symbol, exchange, prior_date,
+                    snapshot_type='day_prior_open',
+                    target_time=time(9, 30),
+                    time_window=(time(9, 30), time(10, 0)),
+                    detection_date=target_date  # Keep original detection date
+                )
+                
+                day_prior_close_snapshot = self._extract_timepoint_snapshot(
+                    intraday_df_extended, symbol, exchange, prior_date,
+                    snapshot_type='day_prior_close',
+                    target_time=time(16, 0),
+                    time_window=(time(15, 55), time(16, 0)),
+                    detection_date=target_date  # Keep original detection date
+                )
             
             return {
                 'market_open': market_open_snapshot,
@@ -155,6 +161,36 @@ class IntradayDataCollector:
             
         except Exception as e:
             self.logger.error(f"Error processing {symbol}: {e}", exc_info=True)
+            return None
+    
+    def _get_prior_trading_day(self, target_date: datetime, intraday_df: pd.DataFrame) -> Optional[datetime]:
+        """
+        Find the most recent trading day before target_date in the intraday data
+        
+        Args:
+            target_date: Target date
+            intraday_df: DataFrame with intraday bars
+            
+        Returns:
+            Prior trading day as datetime, or None if not found
+        """
+        try:
+            target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+            
+            # Get all unique dates in the data before target date
+            available_dates = sorted([d for d in intraday_df.index.date if d < target_date_obj], reverse=True)
+            
+            if not available_dates:
+                self.logger.debug(f"No trading days before {target_date_obj} in intraday data")
+                return None
+            
+            # Return the most recent one
+            prior_date = available_dates[0]
+            self.logger.debug(f"Found prior trading day: {prior_date} (before {target_date_obj})")
+            return datetime.combine(prior_date, datetime.min.time())
+            
+        except Exception as e:
+            self.logger.error(f"Error finding prior trading day: {e}")
             return None
     
     def _fetch_intraday_extended(self, symbol: str, target_date: datetime) -> Optional[pd.DataFrame]:
