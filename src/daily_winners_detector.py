@@ -1,7 +1,7 @@
 """
 Daily Winners Detector - Uses TradingView MarketMovers API
 Gets ACTUAL top daily gainers dynamically from market
-FIXED: Proper field names and realistic filtering thresholds
+FIXED: Excludes OTC stocks and properly handles change field (basis points)
 """
 
 import logging
@@ -36,9 +36,9 @@ class DailyWinnersDetector:
         
         detection_config = config.get("detection", {})
         
-        # Stock universe filters - REALISTIC values for daily winners
+        # Stock universe filters
         self.min_price = detection_config.get("min_price", 0.25)
-        self.min_volume = detection_config.get("min_volume", 100000)
+        self.min_volume = detection_config.get("min_volume", 10000)
         
         # Initialize components
         self.rate_limiter = RateLimiter(config)
@@ -48,15 +48,16 @@ class DailyWinnersDetector:
         
         self.logger.info(
             f"Daily Winners detector initialized (TradingView MarketMovers): "
-            f"min_price={self.min_price}, min_volume={self.min_volume}"
+            f"min_price={self.min_price}, min_volume={self.min_volume}, "
+            f"excludes OTC stocks"
         )
     
-    def detect_top_winners(self, top_n: int = 10, target_date: datetime = None) -> List[Dict[str, Any]]:
+    def detect_top_winners(self, top_n: int = 15, target_date: datetime = None) -> List[Dict[str, Any]]:
         """
         Detect top N daily winners using TradingView MarketMovers API
         
         Args:
-            top_n: Number of top winners to return
+            top_n: Number of top winners to return (default 15)
             target_date: Date to detect winners for (defaults to today)
             
         Returns:
@@ -77,13 +78,13 @@ class DailyWinnersDetector:
                 f"Will fetch current day's gainers instead."
             )
         
-        self.logger.info(f"Fetching ACTUAL day gainers from TradingView MarketMovers...")
+        self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
         
         try:
-            # Fetch more than we need to allow for filtering
-            fetch_limit = max(top_n * 3, 50)
+            # Fetch more than we need to allow for filtering out OTC
+            fetch_limit = max(top_n * 10, 500)  # Fetch lots since we'll filter OTC
             
-            # Get gainers from TradingView - SIMPLIFIED, let API handle fields
+            # Get gainers from TradingView
             result = self.market_movers.scrape(
                 market='stocks-usa',
                 category='gainers',
@@ -102,13 +103,15 @@ class DailyWinnersDetector:
             
             self.logger.info(f"Received {len(data)} gainers from TradingView")
             
-            # Debug: Log first item to see actual structure
-            if data:
-                self.logger.info(f"Sample data structure: {list(data[0].keys())}")
-                self.logger.info(f"Sample item: {data[0]}")
-            
             # Process and filter results
             all_candidates = []
+            filtered_counts = {
+                'otc_excluded': 0,
+                'low_price': 0,
+                'low_volume': 0,
+                'no_change': 0,
+                'parse_error': 0
+            }
             
             for item in data:
                 try:
@@ -116,94 +119,111 @@ class DailyWinnersDetector:
                     symbol_full = item.get('symbol', '')
                     if ':' in symbol_full:
                         exchange_prefix, symbol = symbol_full.split(':', 1)
-                        # Map TradingView exchange prefixes to standard names
-                        exchange_map = {
-                            'NASDAQ': 'NASDAQ',
-                            'NYSE': 'NYSE',
-                            'AMEX': 'AMEX',
-                            'BATS': 'NASDAQ'  # BATS often used for NASDAQ stocks
-                        }
-                        exchange = exchange_map.get(exchange_prefix, exchange_prefix)
                     else:
                         symbol = symbol_full
-                        exchange = 'NASDAQ'  # Default
+                        exchange_prefix = 'NASDAQ'  # Default
                     
                     if not symbol:
                         continue
                     
-                    # Get price and change - check multiple possible field names
-                    price = item.get('close') or item.get('price') or item.get('last') or 0
-                    
-                    # Try multiple field names for change percentage
-                    change_pct = (
-                        item.get('change') or 
-                        item.get('change_percentage') or 
-                        item.get('change_percent') or 
-                        item.get('perf') or
-                        0
-                    )
-                    
-                    volume = item.get('volume') or item.get('Volume') or 0
-                    
-                    # Convert to proper types
-                    try:
-                        price = float(price)
-                        change_pct = float(change_pct)
-                        volume = int(volume)
-                    except (ValueError, TypeError):
-                        self.logger.debug(f"Type conversion failed for {symbol}")
+                    # EXCLUDE OTC STOCKS ENTIRELY
+                    if exchange_prefix == 'OTC':
+                        filtered_counts['otc_excluded'] += 1
+                        self.logger.debug(f"Filtered OTC stock: {symbol}")
                         continue
                     
-                    # Apply REALISTIC filters - ANY positive gainer above min requirements
-                    if price >= self.min_price and volume >= self.min_volume and change_pct > 0:
-                        all_candidates.append({
-                            'symbol': symbol.strip().upper(),
-                            'exchange': exchange,
-                            'price': float(price),
-                            'change_pct': float(change_pct),
-                            'volume': int(volume),
-                            'name': item.get('name', ''),
-                            'market_cap': item.get('market_cap_basic', 0)
-                        })
-                        self.logger.debug(f"Added {symbol}: +{change_pct:.2f}% @ ${price:.2f}, vol={volume:,}")
-                    else:
-                        self.logger.debug(
-                            f"Filtered out {symbol}: price=${price:.2f}, "
-                            f"volume={volume:,}, change={change_pct:.2f}%"
-                        )
+                    # Map TradingView exchange prefixes to standard names
+                    exchange_map = {
+                        'NASDAQ': 'NASDAQ',
+                        'NYSE': 'NYSE',
+                        'AMEX': 'AMEX',
+                        'BATS': 'NASDAQ'
+                    }
+                    exchange = exchange_map.get(exchange_prefix, exchange_prefix)
+                    
+                    # Get price
+                    price = float(item.get('close', 0))
+                    
+                    # Get change - CRITICAL: TradingView returns basis points * 100
+                    # So 10% gain shows as 1000, not 10
+                    # We need to divide by 100 to get actual percentage
+                    change_raw = float(item.get('change', 0))
+                    change_pct = change_raw / 100.0  # Convert to actual percentage
+                    
+                    # Get volume
+                    volume = int(item.get('volume', 0))
+                    
+                    # Apply filters
+                    if price < self.min_price:
+                        filtered_counts['low_price'] += 1
+                        self.logger.debug(f"Filtered {symbol}: price ${price:.2f} < ${self.min_price}")
+                        continue
+                    
+                    if volume < self.min_volume:
+                        filtered_counts['low_volume'] += 1
+                        self.logger.debug(f"Filtered {symbol}: volume {volume:,} < {self.min_volume:,}")
+                        continue
+                    
+                    if change_pct <= 0:
+                        filtered_counts['no_change'] += 1
+                        self.logger.debug(f"Filtered {symbol}: change {change_pct:.2f}% <= 0")
+                        continue
+                    
+                    # Stock passed all filters
+                    all_candidates.append({
+                        'symbol': symbol.strip().upper(),
+                        'exchange': exchange,
+                        'price': float(price),
+                        'change_pct': float(change_pct),
+                        'volume': int(volume),
+                        'name': item.get('description', ''),
+                        'market_cap': item.get('market_cap_basic', 0)
+                    })
+                    
+                    self.logger.debug(
+                        f"✓ Added {exchange}:{symbol}: +{change_pct:.2f}% @ ${price:.2f}, vol={volume:,}"
+                    )
                     
                 except Exception as e:
+                    filtered_counts['parse_error'] += 1
                     self.logger.debug(f"Error processing item: {e}")
                     continue
             
+            # Log filtering statistics
+            self.logger.info(f"Filtering results:")
+            self.logger.info(f"  - Total fetched: {len(data)}")
+            self.logger.info(f"  - OTC excluded: {filtered_counts['otc_excluded']}")
+            self.logger.info(f"  - Low price (< ${self.min_price}): {filtered_counts['low_price']}")
+            self.logger.info(f"  - Low volume (< {self.min_volume:,}): {filtered_counts['low_volume']}")
+            self.logger.info(f"  - No/negative change: {filtered_counts['no_change']}")
+            self.logger.info(f"  - Parse errors: {filtered_counts['parse_error']}")
+            self.logger.info(f"  - ✅ Passed all filters: {len(all_candidates)}")
+            
             if not all_candidates:
-                self.logger.warning("No winners found after filtering")
-                self.logger.warning(f"Original data count: {len(data)}")
-                if data:
-                    self.logger.warning(f"Sample raw item for debugging: {data[0]}")
+                self.logger.warning("⚠️ No winners found after filtering!")
                 return []
             
-            # Convert to DataFrame and sort
+            # Convert to DataFrame and sort by change percentage
             df_results = pd.DataFrame(all_candidates)
             df_results = df_results.sort_values('change_pct', ascending=False)
             
             # Take top N
             top_winners = df_results.head(top_n).to_dict('records')
             
-            # Add detection date and time
+            # Add detection date and time, remove unnecessary fields
             for winner in top_winners:
                 winner['detection_date'] = target_date_str
                 winner['detection_time'] = '16:00:00'
-                # Remove fields we don't want to store
                 winner.pop('name', None)
                 winner.pop('market_cap', None)
             
-            self.logger.info(f"✓ Found top {len(top_winners)} ACTUAL daily winners:")
-            if top_winners:
-                for i, winner in enumerate(top_winners[:5], 1):
-                    self.logger.info(f"  #{i}: {winner['symbol']} (+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}")
-                if len(top_winners) > 5:
-                    self.logger.info(f"  ... and {len(top_winners) - 5} more")
+            self.logger.info(f"✅ Found top {len(top_winners)} daily winners (OTC excluded):")
+            for i, winner in enumerate(top_winners, 1):
+                self.logger.info(
+                    f"  #{i}: {winner['exchange']}:{winner['symbol']} "
+                    f"(+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}, "
+                    f"vol={winner['volume']:,}"
+                )
             
             return top_winners
             
