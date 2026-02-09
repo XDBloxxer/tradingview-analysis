@@ -1,9 +1,10 @@
 """
-Intraday Data Collector - FIXED VERSION
+Intraday Data Collector - ENHANCED VERSION
 Captures indicators at ACTUAL market open (9:30am) and close (4pm) using intraday data
-FIXED: Properly calculates indicators at each timepoint using appropriate data
-FIXED: Handles weekend/holiday trading days correctly
-FIXED: All snapshots use consistent timeframes
+ENHANCED: Added T-1 open data collection and many more technical indicators
+FIXED: Fetches sufficient historical data for indicator calculations
+FIXED: Handles the 60-day intraday limit by falling back to daily data for longer periods
+FIXED: Always creates market_close rows even when market hasn't closed (with nulls)
 """
 
 import logging
@@ -30,11 +31,11 @@ from ta.volume import OnBalanceVolumeIndicator, ChaikinMoneyFlowIndicator, Force
 
 class IntradayDataCollector:
     """
-    Collects technical indicator data at specific times using HYBRID approach:
-    - Market open (9:30am NYC) - Uses daily data up to previous close + morning gap
-    - Market close (4pm NYC) - Uses full day's data including intraday
-    - Previous day OPEN (T-1 9:30am) - Uses daily data up to T-2 close
-    - Previous day CLOSE (T-1 4pm) - Uses daily bars (full day T-1)
+    Collects technical indicator data at specific times using INTRADAY data:
+    - Market open (9:30am NYC) - from 5-minute bars
+    - Market close (4pm NYC) - from 5-minute bars
+    - Previous day OPEN (T-1 9:30am) - from 5-minute bars
+    - Previous day CLOSE (T-1 4pm) - from daily bars
     
     Includes comprehensive set of technical indicators
     """
@@ -63,7 +64,7 @@ class IntradayDataCollector:
         # Cache for already-fetched data
         self.cache = {}
         
-        self.logger.info("Intraday data collector initialized (FIXED - consistent timeframes)")
+        self.logger.info("Intraday data collector initialized (ENHANCED with T-1 open)")
     
     def collect_intraday_data(
         self,
@@ -128,30 +129,6 @@ class IntradayDataCollector:
         
         return all_data
     
-    def _get_previous_trading_day(self, date: datetime) -> datetime:
-        """
-        Get previous trading day, properly handling weekends and holidays
-        
-        Args:
-            date: Current date
-            
-        Returns:
-            Previous trading day (skips weekends)
-        """
-        prev_day = date - timedelta(days=1)
-        
-        # If Sunday, go back to Friday
-        if prev_day.weekday() == 6:  # Sunday
-            prev_day = prev_day - timedelta(days=2)
-        # If Saturday, go back to Friday
-        elif prev_day.weekday() == 5:  # Saturday
-            prev_day = prev_day - timedelta(days=1)
-        
-        # TODO: Add US market holiday checking if needed
-        # For now, this handles weekends which is 95% of cases
-        
-        return prev_day
-    
     def _process_winner(
         self,
         winner: Dict,
@@ -167,46 +144,40 @@ class IntradayDataCollector:
             return None
         
         try:
-            # Get previous trading day (handles weekends)
-            prior_date = self._get_previous_trading_day(target_date)
-            
-            # Fetch historical DAILY data for baseline indicator calculation
+            # Fetch historical DAILY data for indicator calculation (need 200+ days)
             daily_df = self._fetch_daily_data_extended(symbol, target_date.date())
             
-            if daily_df is None or daily_df.empty:
+            if daily_df is None:
                 self.stats['failed'] += 1
                 return None
             
-            # Fetch TODAY's intraday data
-            intraday_df = self._fetch_intraday_data(symbol, target_date)
+            # Fetch TODAY's intraday data to get specific timestamps
+            intraday_df = self._fetch_intraday_data_today(symbol, target_date)
             
-            # Fetch PREVIOUS DAY's intraday data
-            prior_intraday_df = self._fetch_intraday_data(symbol, prior_date)
+            # Fetch PREVIOUS DAY's intraday data for T-1 open
+            prior_date = target_date - timedelta(days=1)
+            prior_intraday_df = self._fetch_intraday_data_today(symbol, prior_date)
             
             self.stats['success'] += 1
             
             # Extract market open snapshot (current day 9:30am)
-            # Uses daily indicators up to T-1 close, adjusts for morning gap
             market_open_snapshot = self._extract_market_open(
                 intraday_df, daily_df, symbol, exchange, target_date
             )
             
             # Extract market close snapshot (current day 4pm)
-            # Uses full day's data including all intraday action
             market_close_snapshot = self._extract_market_close(
                 intraday_df, daily_df, symbol, exchange, target_date
             )
             
             # Extract day prior OPEN snapshot (T-1 9:30am)
-            # Uses daily indicators up to T-2 close
             day_prior_open_snapshot = self._extract_day_prior_open(
-                prior_intraday_df, daily_df, symbol, exchange, target_date, prior_date
+                prior_intraday_df, daily_df, symbol, exchange, target_date
             )
             
-            # Extract day prior CLOSE snapshot (T-1 4pm)
-            # Uses complete T-1 daily bar
+            # Extract day prior CLOSE snapshot (T-1 4pm, from daily data)
             day_prior_close_snapshot = self._extract_day_prior_close(
-                daily_df, symbol, exchange, target_date, prior_date
+                daily_df, symbol, exchange, target_date
             )
             
             return {
@@ -220,7 +191,7 @@ class IntradayDataCollector:
             self.logger.error(f"Error processing {symbol}: {e}", exc_info=True)
             return None
     
-    def _fetch_intraday_data(
+    def _fetch_intraday_data_today(
         self,
         symbol: str,
         target_date: datetime
@@ -341,41 +312,33 @@ class IntradayDataCollector:
         exchange: str,
         target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """
-        Extract indicators at market open (9:30am)
-        
-        Strategy: Use T-1 close indicators as baseline, get current OHLCV from 9:30am bar
-        This represents: "What the indicators looked like going into today's open"
-        """
+        """Extract indicators at market open using daily data for indicators + intraday for current price"""
         try:
             target_date_obj = target_date.date()
             
-            # Get PREVIOUS day's indicators (most recent complete day)
-            prior_date = self._get_previous_trading_day(target_date).date()
-            
-            if prior_date not in daily_df.index:
-                # Find most recent available date
-                available_dates = [d for d in daily_df.index if d <= prior_date]
+            # Get today's indicators from daily data (will be most recent available)
+            if target_date_obj not in daily_df.index:
+                # Use most recent date
+                available_dates = [d for d in daily_df.index if d <= target_date_obj]
                 if not available_dates:
-                    self.logger.debug(f"No prior daily data for market open {symbol}")
+                    self.logger.debug(f"No daily data available for market open {symbol}")
                     return None
                 indicator_date = available_dates[-1]
             else:
-                indicator_date = prior_date
+                indicator_date = target_date_obj
             
-            # Get the indicator values from previous close
-            indicator_data = daily_df.loc[indicator_date].copy()
+            # Get the indicator values
+            indicator_data = daily_df.loc[indicator_date]
             
-            # Get current OHLCV from 9:30am intraday bar
+            # Get current OHLCV from intraday if available
             if intraday_df is not None and len(intraday_df) > 0:
-                # Find morning bars (9:30-10:00)
+                # Find morning bars
                 morning_bars = intraday_df[
                     (intraday_df.index.time >= time(9, 30)) &
                     (intraday_df.index.time <= time(10, 0))
                 ]
                 
                 if morning_bars.empty:
-                    # Fallback: any bar after 9:30
                     morning_bars = intraday_df[intraday_df.index.time >= time(9, 30)]
                     if morning_bars.empty:
                         morning_bars = intraday_df.head(1)
@@ -385,7 +348,8 @@ class IntradayDataCollector:
                     actual_time = morning_bars.index[0].strftime('%H:%M:%S')
                     self.logger.debug(f"Using {actual_time} bar for market_open {symbol}")
                     
-                    # Override OHLCV with actual opening values
+                    # Override OHLCV with current values
+                    indicator_data = indicator_data.copy()
                     indicator_data['open'] = current_bar['Open']
                     indicator_data['high'] = current_bar['High']
                     indicator_data['low'] = current_bar['Low']
@@ -426,10 +390,9 @@ class IntradayDataCollector:
         target_date: datetime
     ) -> Dict[str, Any]:
         """
-        Extract indicators at market close (4pm)
-        
-        Strategy: Use TODAY's complete daily bar which includes full day's action
-        This represents: "Indicators as of end of day, incorporating all intraday movement"
+        Extract indicators at market close
+        ALWAYS returns a dict (even if market hasn't closed) with metadata fields
+        Indicator fields will be null if market hasn't closed yet
         """
         target_date_obj = target_date.date()
         
@@ -443,50 +406,64 @@ class IntradayDataCollector:
         }
         
         try:
-            # Try to use today's complete daily bar (includes all intraday action)
-            if target_date_obj in daily_df.index:
-                # We have today's complete bar - use it for everything
-                indicator_data = daily_df.loc[target_date_obj].copy()
+            # Check if we have close bars in intraday data
+            has_close_data = False
+            
+            if intraday_df is not None and not intraday_df.empty:
+                close_bars = intraday_df[
+                    (intraday_df.index.time >= time(15, 55)) &
+                    (intraday_df.index.time <= time(16, 0))
+                ]
                 
-                # Optionally refine OHLCV with exact 4pm intraday bar if available
-                if intraday_df is not None and not intraday_df.empty:
-                    close_bars = intraday_df[
-                        (intraday_df.index.time >= time(15, 55)) &
-                        (intraday_df.index.time <= time(16, 0))
-                    ]
+                if not close_bars.empty:
+                    has_close_data = True
                     
-                    if not close_bars.empty:
-                        current_bar = close_bars.iloc[-1]
-                        actual_time = close_bars.index[-1].strftime('%H:%M:%S')
-                        self.logger.debug(f"Using {actual_time} bar for market_close {symbol}")
-                        
-                        # Use intraday close values (should match daily, but more precise)
-                        indicator_data['open'] = current_bar['Open']
-                        indicator_data['high'] = current_bar['High']
-                        indicator_data['low'] = current_bar['Low']
-                        indicator_data['close'] = current_bar['Close']
-                        indicator_data['volume'] = current_bar['Volume']
-                
-                # Add all indicator values
-                reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
-                
-                for key, value in indicator_data.items():
-                    key_lower = key.lower()
-                    if key_lower in reserved_fields:
-                        continue
-                        
-                    snapshot[key_lower] = self._serialize_value(value)
-                
-                self.logger.debug(f"Extracted market_close for {symbol} with {len(snapshot)} fields")
+                    # Get indicator values from daily data
+                    if target_date_obj in daily_df.index:
+                        indicator_date = target_date_obj
+                    else:
+                        available_dates = [d for d in daily_df.index if d <= target_date_obj]
+                        if available_dates:
+                            indicator_date = available_dates[-1]
+                        else:
+                            self.logger.debug(f"No daily data for market close {symbol}")
+                            return snapshot  # Return with just metadata, no indicators
+                    
+                    indicator_data = daily_df.loc[indicator_date].copy()
+                    
+                    # Use actual close values
+                    current_bar = close_bars.iloc[-1]
+                    actual_time = close_bars.index[-1].strftime('%H:%M:%S')
+                    self.logger.debug(f"Using {actual_time} bar for market_close {symbol}")
+                    
+                    indicator_data['open'] = current_bar['Open']
+                    indicator_data['high'] = current_bar['High']
+                    indicator_data['low'] = current_bar['Low']
+                    indicator_data['close'] = current_bar['Close']
+                    indicator_data['volume'] = current_bar['Volume']
+                    
+                    # Add all indicator values
+                    reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 'snapshot_time'}
+                    
+                    for key, value in indicator_data.items():
+                        key_lower = key.lower()
+                        if key_lower in reserved_fields:
+                            continue
+                            
+                        snapshot[key_lower] = self._serialize_value(value)
+                    
+                    self.logger.debug(f"Extracted market_close for {symbol} with {len(snapshot)} fields")
+                else:
+                    self.logger.debug(f"Market hasn't closed yet for {symbol} - creating row with nulls")
             else:
-                # Market hasn't closed yet or data not available
-                self.logger.debug(f"No daily bar yet for market_close {symbol} - creating row with nulls")
+                self.logger.debug(f"No intraday data for market_close {symbol} - creating row with nulls")
             
             return snapshot
             
         except Exception as e:
             self.logger.error(f"Error extracting market close for {symbol}: {e}", exc_info=True)
-            return snapshot  # Return base snapshot even on error
+            # Still return the base snapshot with metadata even on error
+            return snapshot
     
     def _extract_day_prior_open(
         self,
@@ -494,35 +471,25 @@ class IntradayDataCollector:
         daily_df: pd.DataFrame,
         symbol: str,
         exchange: str,
-        target_date: datetime,
-        prior_date: datetime
+        target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """
-        Extract indicators for previous day's market open (T-1 9:30am)
-        
-        Strategy: Use T-2 close indicators, get OHLCV from T-1 9:30am bar
-        """
+        """Extract indicators for previous day's market open (T-1 9:30am)"""
         try:
-            target_date_obj = target_date.date()
-            prior_date_obj = prior_date.date()
+            prior_date = target_date.date() - timedelta(days=1)
             
-            # Get T-2 (two days before target) for indicator baseline
-            t_minus_2 = self._get_previous_trading_day(prior_date).date()
+            # Get prior day's indicators from daily data
+            available_dates = [d for d in daily_df.index if d <= prior_date]
             
-            if t_minus_2 not in daily_df.index:
-                available_dates = [d for d in daily_df.index if d <= t_minus_2]
-                if not available_dates:
-                    self.logger.debug(f"No T-2 data for day_prior_open {symbol}")
-                    return None
-                indicator_date = available_dates[-1]
-            else:
-                indicator_date = t_minus_2
+            if not available_dates:
+                self.logger.debug(f"No prior dates for {symbol}")
+                return None
             
-            # Get indicator values from T-2 close
-            prior_data = daily_df.loc[indicator_date].copy()
+            actual_date = available_dates[-1]
+            prior_data = daily_df.loc[actual_date].copy()
             
-            # Get OHLCV from T-1 morning bar
+            # Try to get actual open price from intraday data
             if prior_intraday_df is not None and len(prior_intraday_df) > 0:
+                # Find morning bars from previous day
                 morning_bars = prior_intraday_df[
                     (prior_intraday_df.index.time >= time(9, 30)) &
                     (prior_intraday_df.index.time <= time(10, 0))
@@ -538,6 +505,7 @@ class IntradayDataCollector:
                     actual_time = morning_bars.index[0].strftime('%H:%M:%S')
                     self.logger.debug(f"Using {actual_time} bar for day_prior_open {symbol}")
                     
+                    # Override OHLCV with actual values from that morning
                     prior_data['open'] = current_bar['Open']
                     prior_data['high'] = current_bar['High']
                     prior_data['low'] = current_bar['Low']
@@ -547,10 +515,10 @@ class IntradayDataCollector:
             snapshot = {
                 'symbol': symbol,
                 'exchange': exchange,
-                'detection_date': target_date_obj.isoformat(),
+                'detection_date': target_date.date().isoformat(),
                 'snapshot_type': 'day_prior_open',
                 'snapshot_time': '09:30:00',
-                'snapshot_date': prior_date_obj.isoformat()
+                'snapshot_date': actual_date.isoformat()
             }
             
             reserved_fields = {'symbol', 'exchange', 'detection_date', 'snapshot_type', 
@@ -575,34 +543,25 @@ class IntradayDataCollector:
         daily_df: pd.DataFrame,
         symbol: str,
         exchange: str,
-        target_date: datetime,
-        prior_date: datetime
+        target_date: datetime
     ) -> Optional[Dict[str, Any]]:
-        """
-        Extract indicators for previous day's market close (T-1 4pm)
-        
-        Strategy: Use T-1's complete daily bar (fully consistent - same timeframe for all data)
-        """
+        """Extract indicators for previous day's market close (T-1 4pm)"""
         try:
-            target_date_obj = target_date.date()
-            prior_date_obj = prior_date.date()
+            prior_date = target_date.date() - timedelta(days=1)
             
-            if prior_date_obj not in daily_df.index:
-                available_dates = [d for d in daily_df.index if d <= prior_date_obj]
-                if not available_dates:
-                    self.logger.debug(f"No prior date data for day_prior_close {symbol}")
-                    return None
-                actual_date = available_dates[-1]
-            else:
-                actual_date = prior_date_obj
+            available_dates = [d for d in daily_df.index if d <= prior_date]
             
-            # Get complete T-1 daily bar (everything consistent)
+            if not available_dates:
+                self.logger.debug(f"No prior dates for {symbol}")
+                return None
+            
+            actual_date = available_dates[-1]
             prior_data = daily_df.loc[actual_date]
             
             snapshot = {
                 'symbol': symbol,
                 'exchange': exchange,
-                'detection_date': target_date_obj.isoformat(),
+                'detection_date': target_date.date().isoformat(),
                 'snapshot_type': 'day_prior_close',
                 'snapshot_time': '16:00:00',
                 'snapshot_date': actual_date.isoformat()
@@ -626,262 +585,262 @@ class IntradayDataCollector:
             return None
     
     def _calculate_enhanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate comprehensive technical indicators from OHLCV data
-        
-        Args:
-            df: DataFrame with OHLCV data
-            
-        Returns:
-            DataFrame with all calculated indicators
-        """
+        """Calculate comprehensive set of technical indicators matching database schema"""
         result = pd.DataFrame(index=df.index)
         
-        # ===== BASIC PRICE DATA =====
+        # Basic OHLCV
         result['close'] = df['Close']
         result['open'] = df['Open']
         result['high'] = df['High']
         result['low'] = df['Low']
         result['volume'] = df['Volume']
         
-        # ===== RSI & MOMENTUM =====
-        try:
-            rsi = RSIIndicator(close=df['Close'], window=14)
-            result['RSI'] = rsi.rsi()
-            result['RSI[1]'] = result['RSI'].shift(1)
-        except Exception as e:
-            self.logger.debug(f"Error calculating RSI: {e}")
+        # === MOMENTUM INDICATORS ===
         
+        # RSI (14-period)
         try:
-            result['Mom'] = df['Close'].diff(10)
-            result['Mom[1]'] = result['Mom'].shift(1)
-        except Exception as e:
-            self.logger.debug(f"Error calculating Momentum: {e}")
+            rsi_ind = RSIIndicator(close=df['Close'], window=14)
+            result['rsi'] = rsi_ind.rsi()
+            result['rsi[1]'] = result['rsi'].shift(1)
+            result['rsi[2]'] = result['rsi'].shift(2)
+        except:
+            pass
         
-        # ===== MACD =====
+        # Momentum (10-period)
         try:
-            macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
-            result['MACD.macd'] = macd.macd()
-            result['MACD.signal'] = macd.macd_signal()
-            result['MACD_diff'] = macd.macd_diff()
-        except Exception as e:
-            self.logger.debug(f"Error calculating MACD: {e}")
+            result['mom'] = df['Close'].diff(10)
+            result['mom[1]'] = result['mom'].shift(1)
+        except:
+            pass
         
-        # ===== STOCHASTIC =====
-        try:
-            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
-            result['Stoch.K'] = stoch.stoch()
-            result['Stoch.D'] = stoch.stoch_signal()
-            result['Stoch.K[1]'] = result['Stoch.K'].shift(1)
-            result['Stoch.D[1]'] = result['Stoch.D'].shift(1)
-        except Exception as e:
-            self.logger.debug(f"Error calculating Stochastic: {e}")
-        
-        # ===== ADX (TREND STRENGTH) =====
-        try:
-            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
-            result['ADX'] = adx.adx()
-            result['ADX+DI'] = adx.adx_pos()
-            result['ADX-DI'] = adx.adx_neg()
-        except Exception as e:
-            self.logger.debug(f"Error calculating ADX: {e}")
-        
-        # ===== CCI (COMMODITY CHANNEL INDEX) =====
-        try:
-            cci = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20)
-            result['CCI20'] = cci.cci()
-        except Exception as e:
-            self.logger.debug(f"Error calculating CCI: {e}")
-        
-        # ===== AWESOME OSCILLATOR =====
-        try:
-            ao = AwesomeOscillatorIndicator(high=df['High'], low=df['Low'], window1=5, window2=34)
-            result['AO'] = ao.awesome_oscillator()
-        except Exception as e:
-            self.logger.debug(f"Error calculating AO: {e}")
-        
-        # ===== WILLIAMS %R =====
-        try:
-            wr = WilliamsRIndicator(high=df['High'], low=df['Low'], close=df['Close'], lbp=14)
-            result['W.R'] = wr.williams_r()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Williams %R: {e}")
-        
-        # ===== ULTIMATE OSCILLATOR =====
-        try:
-            uo = UltimateOscillator(high=df['High'], low=df['Low'], close=df['Close'], 
-                                   window1=7, window2=14, window3=28)
-            result['UO'] = uo.ultimate_oscillator()
-        except Exception as e:
-            self.logger.debug(f"Error calculating UO: {e}")
-        
-        # ===== KAMA (Kaufman's Adaptive Moving Average) =====
-        try:
-            kama = KAMAIndicator(close=df['Close'], window=10, pow1=2, pow2=30)
-            result['kama'] = kama.kama()
-        except Exception as e:
-            self.logger.debug(f"Error calculating KAMA: {e}")
-        
-        # ===== TSI (True Strength Index) =====
-        try:
-            tsi = TSIIndicator(close=df['Close'], window_slow=25, window_fast=13)
-            result['tsi'] = tsi.tsi()
-        except Exception as e:
-            self.logger.debug(f"Error calculating TSI: {e}")
-        
-        # ===== ROC (Rate of Change) =====
+        # Rate of Change (ROC)
         try:
             roc = ROCIndicator(close=df['Close'], window=12)
             result['roc'] = roc.roc()
-        except Exception as e:
-            self.logger.debug(f"Error calculating ROC: {e}")
+        except:
+            pass
         
-        # ===== AROON =====
+        # Stochastic Oscillator
+        try:
+            stoch = StochasticOscillator(high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3)
+            result['stoch.k'] = stoch.stoch()
+            result['stoch.d'] = stoch.stoch_signal()
+            result['stoch.k[1]'] = result['stoch.k'].shift(1)
+            result['stoch.d[1]'] = result['stoch.d'].shift(1)
+        except:
+            pass
+        
+        # Williams %R
+        try:
+            wr = WilliamsRIndicator(high=df['High'], low=df['Low'], close=df['Close'], lbp=14)
+            result['w.r'] = wr.williams_r()
+        except:
+            pass
+        
+        # Awesome Oscillator
+        try:
+            ao = AwesomeOscillatorIndicator(high=df['High'], low=df['Low'], window1=5, window2=34)
+            result['ao'] = ao.awesome_oscillator()
+        except:
+            pass
+        
+        # Ultimate Oscillator
+        try:
+            uo = UltimateOscillator(high=df['High'], low=df['Low'], close=df['Close'], 
+                                   window1=7, window2=14, window3=28)
+            result['uo'] = uo.ultimate_oscillator()
+        except:
+            pass
+        
+        # KAMA (Kaufman's Adaptive Moving Average)
+        try:
+            kama = KAMAIndicator(close=df['Close'], window=10, pow1=2, pow2=30)
+            result['kama'] = kama.kama()
+        except:
+            pass
+        
+        # TSI (True Strength Index)
+        try:
+            tsi = TSIIndicator(close=df['Close'], window_slow=25, window_fast=13)
+            result['tsi'] = tsi.tsi()
+        except:
+            pass
+        
+        # === TREND INDICATORS ===
+        
+        # MACD
+        try:
+            macd = MACD(close=df['Close'], window_slow=26, window_fast=12, window_sign=9)
+            result['macd.macd'] = macd.macd()
+            result['macd.signal'] = macd.macd_signal()
+            result['macd_diff'] = macd.macd_diff()
+        except:
+            pass
+        
+        # ADX
+        try:
+            adx = ADXIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+            result['adx'] = adx.adx()
+            result['adx+di'] = adx.adx_pos()
+            result['adx-di'] = adx.adx_neg()
+        except:
+            pass
+        
+        # CCI (Commodity Channel Index)
+        try:
+            cci = CCIIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=20)
+            result['cci20'] = cci.cci()
+        except:
+            pass
+        
+        # Aroon Indicator
         try:
             aroon = AroonIndicator(close=df['Close'], window=25)
             result['aroon_up'] = aroon.aroon_up()
             result['aroon_down'] = aroon.aroon_down()
             result['aroon_indicator'] = aroon.aroon_indicator()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Aroon: {e}")
+        except:
+            pass
         
-        # ===== PARABOLIC SAR =====
+        # Parabolic SAR
         try:
             psar = PSARIndicator(high=df['High'], low=df['Low'], close=df['Close'])
             result['psar'] = psar.psar()
             result['psar_up'] = psar.psar_up()
             result['psar_down'] = psar.psar_down()
-        except Exception as e:
-            self.logger.debug(f"Error calculating PSAR: {e}")
+        except:
+            pass
         
-        # ===== VORTEX =====
+        # Vortex Indicator
         try:
             vortex = VortexIndicator(high=df['High'], low=df['Low'], close=df['Close'], window=14)
             result['vortex_pos'] = vortex.vortex_indicator_pos()
             result['vortex_neg'] = vortex.vortex_indicator_neg()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Vortex: {e}")
+        except:
+            pass
         
-        # ===== MASS INDEX =====
+        # Mass Index
         try:
             mass = MassIndex(high=df['High'], low=df['Low'], window_fast=9, window_slow=25)
             result['mass_index'] = mass.mass_index()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Mass Index: {e}")
+        except:
+            pass
         
-        # ===== DPO (Detrended Price Oscillator) =====
+        # DPO (Detrended Price Oscillator)
         try:
             dpo = DPOIndicator(close=df['Close'], window=20)
             result['dpo'] = dpo.dpo()
-        except Exception as e:
-            self.logger.debug(f"Error calculating DPO: {e}")
+        except:
+            pass
         
-        # ===== KST (Know Sure Thing) =====
+        # KST (Know Sure Thing)
         try:
             kst = KSTIndicator(close=df['Close'])
             result['kst'] = kst.kst()
             result['kst_signal'] = kst.kst_sig()
-        except Exception as e:
-            self.logger.debug(f"Error calculating KST: {e}")
+        except:
+            pass
         
-        # ===== BOLLINGER BANDS =====
+        # === VOLATILITY INDICATORS ===
+        
+        # Bollinger Bands
         try:
             bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
-            result['BB.upper'] = bb.bollinger_hband()
-            result['BB.lower'] = bb.bollinger_lband()
-            result['BB.middle'] = bb.bollinger_mavg()
-            result['BB_width'] = (result['BB.upper'] - result['BB.lower']) / result['BB.middle'] * 100
-            result['BBPower'] = (df['Close'] - result['BB.lower']) / (result['BB.upper'] - result['BB.lower'])
-        except Exception as e:
-            self.logger.debug(f"Error calculating Bollinger Bands: {e}")
+            result['bb.upper'] = bb.bollinger_hband()
+            result['bb.lower'] = bb.bollinger_lband()
+            result['bb.middle'] = bb.bollinger_mavg()
+            result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
+            result['bbpower'] = (df['Close'] - result['bb.lower']) / (result['bb.upper'] - result['bb.lower'])
+        except:
+            pass
         
-        # ===== ATR (VOLATILITY) =====
+        # ATR (Average True Range)
         try:
             atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=14)
-            result['ATR'] = atr.average_true_range()
-            result['atr_pct'] = (result['ATR'] / df['Close']) * 100
-        except Exception as e:
-            self.logger.debug(f"Error calculating ATR: {e}")
+            result['atr'] = atr.average_true_range()
+            result['atr_pct'] = (result['atr'] / df['Close']) * 100
+        except:
+            pass
         
-        # ===== KELTNER CHANNEL =====
+        # Keltner Channel
         try:
             keltner = KeltnerChannel(high=df['High'], low=df['Low'], close=df['Close'], window=20)
             result['keltner_upper'] = keltner.keltner_channel_hband()
             result['keltner_lower'] = keltner.keltner_channel_lband()
             result['keltner_middle'] = keltner.keltner_channel_mband()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Keltner: {e}")
+        except:
+            pass
         
-        # ===== DONCHIAN CHANNEL =====
+        # Donchian Channel
         try:
             donchian = DonchianChannel(high=df['High'], low=df['Low'], close=df['Close'], window=20)
             result['donchian_upper'] = donchian.donchian_channel_hband()
             result['donchian_lower'] = donchian.donchian_channel_lband()
             result['donchian_middle'] = donchian.donchian_channel_mband()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Donchian: {e}")
+        except:
+            pass
         
-        # ===== VOLUME INDICATORS =====
+        # === VOLUME INDICATORS ===
         
         # On-Balance Volume (OBV)
         try:
             obv = OnBalanceVolumeIndicator(close=df['Close'], volume=df['Volume'])
             result['obv'] = obv.on_balance_volume()
-        except Exception as e:
-            self.logger.debug(f"Error calculating OBV: {e}")
+        except:
+            pass
         
         # Chaikin Money Flow
         try:
             cmf = ChaikinMoneyFlowIndicator(high=df['High'], low=df['Low'], close=df['Close'], 
                                            volume=df['Volume'], window=20)
             result['cmf'] = cmf.chaikin_money_flow()
-        except Exception as e:
-            self.logger.debug(f"Error calculating CMF: {e}")
+        except:
+            pass
         
         # Force Index
         try:
             fi = ForceIndexIndicator(close=df['Close'], volume=df['Volume'], window=13)
             result['force_index'] = fi.force_index()
-        except Exception as e:
-            self.logger.debug(f"Error calculating Force Index: {e}")
+        except:
+            pass
         
         # Ease of Movement
         try:
             eom = EaseOfMovementIndicator(high=df['High'], low=df['Low'], volume=df['Volume'], window=14)
             result['eom'] = eom.ease_of_movement()
             result['eom_signal'] = eom.sma_ease_of_movement()
-        except Exception as e:
-            self.logger.debug(f"Error calculating EOM: {e}")
+        except:
+            pass
         
         # Volume Price Trend
         try:
             vpt = VolumePriceTrendIndicator(close=df['Close'], volume=df['Volume'])
             result['vpt'] = vpt.volume_price_trend()
-        except Exception as e:
-            self.logger.debug(f"Error calculating VPT: {e}")
+        except:
+            pass
         
         # Negative Volume Index
         try:
             nvi = NegativeVolumeIndexIndicator(close=df['Close'], volume=df['Volume'])
             result['nvi'] = nvi.negative_volume_index()
-        except Exception as e:
-            self.logger.debug(f"Error calculating NVI: {e}")
+        except:
+            pass
         
-        # ===== MOVING AVERAGES =====
+        # === MOVING AVERAGES ===
         
         # EMAs
         for period in [5, 10, 20, 50, 100, 200]:
             try:
-                result[f'EMA{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
-            except Exception as e:
-                self.logger.debug(f"Error calculating EMA{period}: {e}")
+                result[f'ema{period}'] = EMAIndicator(close=df['Close'], window=period).ema_indicator()
+            except:
+                pass
         
         # SMAs
         for period in [5, 10, 20, 50, 100, 200]:
             try:
-                result[f'SMA{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
-            except Exception as e:
-                self.logger.debug(f"Error calculating SMA{period}: {e}")
+                result[f'sma{period}'] = SMAIndicator(close=df['Close'], window=period).sma_indicator()
+            except:
+                pass
         
         # Volume SMAs
         try:
@@ -889,65 +848,65 @@ class IntradayDataCollector:
             result['volume_sma10'] = result['volume'].rolling(window=10).mean()
             result['volume_sma20'] = result['volume'].rolling(window=20).mean()
             result['volume_ratio'] = result['volume'] / result['volume_sma20']
-        except Exception as e:
-            self.logger.debug(f"Error calculating volume indicators: {e}")
+        except:
+            pass
         
-        # ===== PRICE CHANGES =====
+        # === PRICE CHANGES ===
         
         for days in [1, 2, 3, 5, 10, 20, 30]:
             try:
                 result[f'price_change_{days}d'] = df['Close'].pct_change(days) * 100
-            except Exception as e:
-                self.logger.debug(f"Error calculating price_change_{days}d: {e}")
+            except:
+                pass
         
-        # ===== VOLATILITY MEASURES =====
+        # === VOLATILITY MEASURES ===
         
         try:
             result['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100 * np.sqrt(252)
             result['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100 * np.sqrt(252)
             result['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100 * np.sqrt(252)
-        except Exception as e:
-            self.logger.debug(f"Error calculating volatility: {e}")
+        except:
+            pass
         
-        # ===== VWAP =====
+        # === VWAP ===
         
         try:
             typical_price = (df['High'] + df['Low'] + df['Close']) / 3
             result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
-        except Exception as e:
-            self.logger.debug(f"Error calculating VWAP: {e}")
+        except:
+            pass
         
-        # ===== 52-WEEK HIGH/LOW =====
+        # === 52-WEEK HIGH/LOW ===
         
         try:
             result['high_52w'] = df['High'].rolling(window=252, min_periods=1).max()
             result['low_52w'] = df['Low'].rolling(window=252, min_periods=1).min()
             result['price_vs_high_52w'] = (df['Close'] / result['high_52w'] - 1) * 100
             result['price_vs_low_52w'] = (df['Close'] / result['low_52w'] - 1) * 100
-        except Exception as e:
-            self.logger.debug(f"Error calculating 52w high/low: {e}")
+        except:
+            pass
         
-        # ===== GAPS =====
+        # === GAPS ===
         
         try:
             result['gap_%'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
             result['gap_up'] = (result['gap_%'] > 2).astype(int)
             result['gap_down'] = (result['gap_%'] < -2).astype(int)
-        except Exception as e:
-            self.logger.debug(f"Error calculating gaps: {e}")
+        except:
+            pass
         
-        # ===== TREND FLAGS =====
+        # === TREND FLAGS ===
         
         try:
-            result['ema20_above_ema50'] = (result['EMA20'] > result['EMA50']).astype(int)
-            result['ema50_above_ema200'] = (result['EMA50'] > result['EMA200']).astype(int)
-            result['price_above_ema20'] = (df['Close'] > result['EMA20']).astype(int)
-            result['ema10_above_ema20'] = (result['EMA10'] > result['EMA20']).astype(int)
-            result['sma50_above_sma200'] = (result['SMA50'] > result['SMA200']).astype(int)
-        except Exception as e:
-            self.logger.debug(f"Error calculating trend indicators: {e}")
+            result['ema20_above_ema50'] = (result['ema20'] > result['ema50']).astype(int)
+            result['ema50_above_ema200'] = (result['ema50'] > result['ema200']).astype(int)
+            result['price_above_ema20'] = (df['Close'] > result['ema20']).astype(int)
+            result['ema10_above_ema20'] = (result['ema10'] > result['ema20']).astype(int)
+            result['sma50_above_sma200'] = (result['sma50'] > result['sma200']).astype(int)
+        except:
+            pass
         
-        # ===== CANDLESTICK PATTERNS (simple) =====
+        # === CANDLESTICK PATTERNS (simple) ===
         
         try:
             # Doji
@@ -965,7 +924,7 @@ class IntradayDataCollector:
             result['bullish_engulfing'] = ((df['Close'] > df['Open']) & 
                                           (df['Close'].shift(1) < df['Open'].shift(1)) &
                                           (body > prev_body)).astype(int)
-        except Exception as e:
-            self.logger.debug(f"Error calculating candlestick patterns: {e}")
+        except:
+            pass
         
         return result
