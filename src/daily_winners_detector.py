@@ -1,7 +1,11 @@
 """
-Daily Winners Detector - Uses TradingView MarketMovers API with yfinance fallback
-Gets ACTUAL top daily gainers dynamically from market
-FIXED: Excludes OTC stocks, properly handles change field, validates data freshness, falls back to yfinance
+Daily Winners Detector - FIXED VERSION
+Uses TradingView MarketMovers API with yfinance fallback
+FIXES:
+1. Smarter freshness validation that doesn't call yfinance for every symbol
+2. Batch verification to reduce API calls
+3. Better handling of current-day data from TradingView
+4. Improved OTC filtering
 """
 
 import logging
@@ -9,6 +13,7 @@ from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
 import pandas as pd
 import yfinance as yf
+import time
 
 try:
     from tradingview_scraper.symbols.market_movers import MarketMovers
@@ -24,6 +29,14 @@ class DailyWinnersDetector:
     """
     Detects top daily winners using TradingView MarketMovers API with yfinance fallback
     """
+    
+    # Known problematic exchanges/suffixes to exclude
+    EXCLUDED_PATTERNS = [
+        'OTC',  # Over-the-counter
+        '.PK',  # Pink sheets
+        '.OB',  # OTC Bulletin Board
+        '-',    # Often delisted stocks
+    ]
     
     def __init__(self, config: dict):
         """
@@ -47,10 +60,13 @@ class DailyWinnersDetector:
         # Initialize MarketMovers
         self.market_movers = MarketMovers(export_result=False)
         
+        # Cache for freshness checks to avoid redundant API calls
+        self.freshness_cache = {}
+        
         self.logger.info(
-            f"Daily Winners detector initialized (TradingView + yfinance fallback): "
+            f"Daily Winners detector initialized: "
             f"min_price={self.min_price}, min_volume={self.min_volume}, "
-            f"excludes OTC stocks, validates data freshness"
+            f"excludes OTC/delisted stocks with improved validation"
         )
     
     def detect_top_winners(self, top_n: int = 15, target_date: datetime = None) -> List[Dict[str, Any]]:
@@ -109,8 +125,16 @@ class DailyWinnersDetector:
             self.logger.warning("⚠️ No winners found from either source!")
             return []
         
+        # FINAL BATCH VALIDATION: Verify freshness for top candidates only
+        self.logger.info(f"Performing final batch freshness validation on top {min(len(candidates), top_n * 2)} candidates...")
+        validated_candidates = self._batch_verify_freshness(candidates[:top_n * 2], target_date)
+        
+        if not validated_candidates:
+            self.logger.warning("⚠️ All candidates failed freshness validation!")
+            return []
+        
         # Sort by change percentage and take top N
-        df_results = pd.DataFrame(candidates)
+        df_results = pd.DataFrame(validated_candidates)
         df_results = df_results.sort_values('change_pct', ascending=False)
         top_winners = df_results.head(top_n).to_dict('records')
         
@@ -129,6 +153,34 @@ class DailyWinnersDetector:
             )
         
         return top_winners
+    
+    def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
+        """
+        Check if a symbol should be excluded based on pattern matching
+        
+        Args:
+            symbol: Stock symbol
+            exchange: Exchange name
+            
+        Returns:
+            True if symbol should be excluded
+        """
+        # Check exchange
+        if exchange == 'OTC':
+            return True
+        
+        # Check symbol patterns
+        symbol_upper = symbol.upper()
+        for pattern in self.EXCLUDED_PATTERNS:
+            if pattern in symbol_upper:
+                return True
+        
+        # Check for unusual symbol patterns that indicate delisted/problematic stocks
+        # Examples: symbols with too many letters, unusual characters
+        if len(symbol) > 5:  # Most valid symbols are 1-5 characters
+            return True
+        
+        return False
     
     def _fetch_from_tradingview(self, target_date: datetime, top_n: int) -> List[Dict[str, Any]]:
         """
@@ -167,11 +219,10 @@ class DailyWinnersDetector:
             # Process and filter results
             all_candidates = []
             filtered_counts = {
-                'otc_excluded': 0,
+                'excluded_pattern': 0,
                 'low_price': 0,
                 'low_volume': 0,
                 'no_change': 0,
-                'stale_data': 0,
                 'parse_error': 0
             }
             
@@ -188,12 +239,6 @@ class DailyWinnersDetector:
                     if not symbol:
                         continue
                     
-                    # EXCLUDE OTC STOCKS ENTIRELY
-                    if exchange_prefix == 'OTC':
-                        filtered_counts['otc_excluded'] += 1
-                        self.logger.debug(f"Filtered OTC stock: {symbol}")
-                        continue
-                    
                     # Map TradingView exchange prefixes to standard names
                     exchange_map = {
                         'NASDAQ': 'NASDAQ',
@@ -202,6 +247,12 @@ class DailyWinnersDetector:
                         'BATS': 'NASDAQ'
                     }
                     exchange = exchange_map.get(exchange_prefix, exchange_prefix)
+                    
+                    # Check for excluded patterns (OTC, delisted, etc.)
+                    if self._is_excluded_symbol(symbol, exchange):
+                        filtered_counts['excluded_pattern'] += 1
+                        self.logger.debug(f"Filtered excluded symbol: {exchange}:{symbol}")
+                        continue
                     
                     # Get price
                     price = float(item.get('close', 0))
@@ -228,13 +279,7 @@ class DailyWinnersDetector:
                         self.logger.debug(f"Filtered {symbol}: change {change_pct:.2f}% <= 0")
                         continue
                     
-                    # NEW: Verify data freshness
-                    if not self._verify_fresh_data(symbol, target_date):
-                        filtered_counts['stale_data'] += 1
-                        self.logger.debug(f"Filtered {symbol}: stale data (last update not recent)")
-                        continue
-                    
-                    # Stock passed all filters
+                    # Stock passed all filters (freshness check will be done in batch later)
                     all_candidates.append({
                         'symbol': symbol.strip().upper(),
                         'exchange': exchange,
@@ -256,19 +301,126 @@ class DailyWinnersDetector:
             # Log filtering statistics
             self.logger.info(f"TradingView filtering results:")
             self.logger.info(f"  - Total fetched: {len(data)}")
-            self.logger.info(f"  - OTC excluded: {filtered_counts['otc_excluded']}")
+            self.logger.info(f"  - Excluded patterns (OTC, delisted, etc.): {filtered_counts['excluded_pattern']}")
             self.logger.info(f"  - Low price (< ${self.min_price}): {filtered_counts['low_price']}")
             self.logger.info(f"  - Low volume (< {self.min_volume:,}): {filtered_counts['low_volume']}")
             self.logger.info(f"  - No/negative change: {filtered_counts['no_change']}")
-            self.logger.info(f"  - Stale data: {filtered_counts['stale_data']}")
             self.logger.info(f"  - Parse errors: {filtered_counts['parse_error']}")
-            self.logger.info(f"  - ✅ Passed all filters: {len(all_candidates)}")
+            self.logger.info(f"  - ✅ Passed filters (before freshness check): {len(all_candidates)}")
             
             return all_candidates
             
         except Exception as e:
             self.logger.error(f"Error fetching from TradingView: {e}", exc_info=True)
             return []
+    
+    def _batch_verify_freshness(
+        self, 
+        candidates: List[Dict[str, Any]], 
+        target_date: datetime,
+        batch_size: int = 50
+    ) -> List[Dict[str, Any]]:
+        """
+        Verify freshness for a batch of candidates using yfinance
+        More efficient than checking one by one
+        
+        Args:
+            candidates: List of candidate dictionaries
+            target_date: Target date for validation
+            batch_size: Number of symbols to check at once
+            
+        Returns:
+            List of candidates that passed freshness check
+        """
+        if not candidates:
+            return []
+        
+        valid_candidates = []
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        
+        # Process in batches to reduce API calls
+        symbols = [c['symbol'] for c in candidates]
+        
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols = symbols[i:i+batch_size]
+            batch_candidates = candidates[i:i+batch_size]
+            
+            self.logger.debug(f"Verifying freshness for batch {i//batch_size + 1}: {len(batch_symbols)} symbols")
+            
+            try:
+                # Download batch data (last 5 days)
+                data = yf.download(
+                    batch_symbols,
+                    period='5d',
+                    interval='1d',
+                    group_by='ticker',
+                    progress=False,
+                    threads=True,
+                    show_errors=False  # Suppress yfinance errors
+                )
+                
+                if data.empty:
+                    self.logger.warning(f"No data returned for batch {i//batch_size + 1}")
+                    continue
+                
+                # Check each symbol in the batch
+                for idx, (symbol, candidate) in enumerate(zip(batch_symbols, batch_candidates)):
+                    try:
+                        # Handle both single and multi-ticker responses
+                        if len(batch_symbols) == 1:
+                            symbol_data = data
+                        else:
+                            if symbol not in data.columns.levels[0]:
+                                self.logger.debug(f"{symbol}: No data in response")
+                                continue
+                            symbol_data = data[symbol]
+                        
+                        if symbol_data.empty or len(symbol_data) < 1:
+                            self.logger.debug(f"{symbol}: Empty data")
+                            continue
+                        
+                        # Get the most recent trading date
+                        last_date = symbol_data.index[-1].date()
+                        
+                        # Calculate days difference
+                        days_diff = (target_date_obj - last_date).days
+                        
+                        # Allow up to 5 days difference (accounts for weekends, holidays, and delays)
+                        if days_diff > 5:
+                            self.logger.debug(
+                                f"{symbol}: Stale data (last update: {last_date}, target: {target_date_obj}, "
+                                f"diff: {days_diff} days) - REJECTED"
+                            )
+                            continue
+                        
+                        # Verify volume is reasonable (not zero)
+                        last_volume = symbol_data['Volume'].iloc[-1]
+                        if last_volume < self.min_volume:
+                            self.logger.debug(f"{symbol}: Last volume {last_volume:,} too low - REJECTED")
+                            continue
+                        
+                        # Stock passed freshness check
+                        self.logger.debug(f"{symbol}: Fresh data (last update: {last_date}) - PASSED")
+                        valid_candidates.append(candidate)
+                        
+                    except Exception as e:
+                        self.logger.debug(f"{symbol}: Error verifying freshness: {e}")
+                        continue
+                
+                # Small delay between batches to be nice to the API
+                if i + batch_size < len(symbols):
+                    time.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"Error in batch freshness verification: {e}")
+                continue
+        
+        self.logger.info(
+            f"Freshness validation: {len(valid_candidates)}/{len(candidates)} candidates passed "
+            f"({len(candidates) - len(valid_candidates)} rejected as stale/delisted)"
+        )
+        
+        return valid_candidates
     
     def _fetch_from_yfinance(
         self, 
@@ -290,113 +442,98 @@ class DailyWinnersDetector:
         try:
             self.logger.info(f"Fetching gainers from yfinance (excluding {len(exclude_symbols)} existing symbols)...")
             
-            # Get gainers from yfinance screener
-            # yfinance doesn't have a direct API for this, so we'll use a workaround
-            # Fetch popular gainers using yfinance's Ticker.history
-            
-            # Try to get S&P 500 stocks and find today's gainers
             candidates = []
             
-            # Download major indices to find gainers
-            try:
-                # Get a broader list of active stocks from major ETFs
-                etf_symbols = ['SPY', 'QQQ', 'IWM', 'DIA']  # Major ETFs
-                all_stocks = set()
+            # Get a broader list of active stocks
+            liquid_stocks = self._get_liquid_stocks_list()
+            
+            # Remove excluded symbols
+            liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
+            
+            self.logger.info(f"Scanning {len(liquid_stocks)} liquid stocks for gainers...")
+            
+            # Fetch data for multiple stocks at once
+            batch_size = 50
+            for i in range(0, len(liquid_stocks), batch_size):
+                batch = liquid_stocks[i:i+batch_size]
                 
-                for etf in etf_symbols:
-                    try:
-                        etf_ticker = yf.Ticker(etf)
-                        # Try to get holdings (not always available)
-                        # Fallback: we'll use a predefined list of liquid stocks
-                        pass
-                    except:
-                        pass
-                
-                # Fallback: Use a predefined list of liquid stocks
-                # In production, you'd want to maintain a more comprehensive list
-                liquid_stocks = self._get_liquid_stocks_list()
-                
-                self.logger.info(f"Scanning {len(liquid_stocks)} liquid stocks for gainers...")
-                
-                # Fetch data for multiple stocks at once
-                batch_size = 50
-                for i in range(0, len(liquid_stocks), batch_size):
-                    batch = liquid_stocks[i:i+batch_size]
+                try:
+                    # Download batch data
+                    data = yf.download(
+                        batch,
+                        period='2d',
+                        interval='1d',
+                        group_by='ticker',
+                        progress=False,
+                        threads=True,
+                        show_errors=False
+                    )
                     
-                    try:
-                        # Download batch data
-                        data = yf.download(
-                            batch,
-                            period='2d',
-                            interval='1d',
-                            group_by='ticker',
-                            progress=False,
-                            threads=True
-                        )
+                    # Process each stock in batch
+                    for symbol in batch:
+                        if symbol in exclude_symbols:
+                            continue
                         
-                        # Process each stock in batch
-                        for symbol in batch:
-                            if symbol in exclude_symbols:
+                        try:
+                            if len(batch) == 1:
+                                stock_data = data
+                            else:
+                                if symbol not in data.columns.levels[0]:
+                                    continue
+                                stock_data = data[symbol]
+                            
+                            if stock_data.empty or len(stock_data) < 2:
                                 continue
                             
-                            try:
-                                if len(batch) == 1:
-                                    stock_data = data
-                                else:
-                                    stock_data = data[symbol]
-                                
-                                if stock_data.empty or len(stock_data) < 2:
-                                    continue
-                                
-                                # Get latest and previous close
-                                latest = stock_data.iloc[-1]
-                                previous = stock_data.iloc[-2]
-                                
-                                close = latest['Close']
-                                prev_close = previous['Close']
-                                volume = latest['Volume']
-                                
-                                # Calculate change
-                                change_pct = ((close - prev_close) / prev_close) * 100
-                                
-                                # Apply filters
-                                if close < self.min_price:
-                                    continue
-                                if volume < self.min_volume:
-                                    continue
-                                if change_pct <= 0:
-                                    continue
-                                
-                                # Verify freshness
-                                if not self._verify_fresh_data(symbol, target_date):
-                                    continue
-                                
-                                # Add candidate
-                                candidates.append({
-                                    'symbol': symbol,
-                                    'exchange': 'NASDAQ',  # Default, could be improved
-                                    'price': float(close),
-                                    'change_pct': float(change_pct),
-                                    'volume': int(volume),
-                                    'source': 'yfinance'
-                                })
-                                
-                                self.logger.debug(f"✓ Added from yfinance: {symbol} (+{change_pct:.2f}%)")
-                                
-                            except Exception as e:
-                                self.logger.debug(f"Error processing {symbol} from yfinance: {e}")
+                            # Get latest and previous close
+                            latest = stock_data.iloc[-1]
+                            previous = stock_data.iloc[-2]
+                            
+                            close = latest['Close']
+                            prev_close = previous['Close']
+                            volume = latest['Volume']
+                            
+                            # Calculate change
+                            change_pct = ((close - prev_close) / prev_close) * 100
+                            
+                            # Apply filters
+                            if close < self.min_price:
                                 continue
-                    
-                    except Exception as e:
-                        self.logger.debug(f"Error downloading batch: {e}")
-                        continue
-                    
-                    # Stop if we have enough
-                    if len(candidates) >= limit:
-                        break
+                            if volume < self.min_volume:
+                                continue
+                            if change_pct <= 0:
+                                continue
+                            
+                            # Check for excluded patterns
+                            if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                                continue
+                            
+                            # Add candidate (already validated by yfinance having recent data)
+                            candidates.append({
+                                'symbol': symbol,
+                                'exchange': 'NASDAQ',  # Default
+                                'price': float(close),
+                                'change_pct': float(change_pct),
+                                'volume': int(volume),
+                                'source': 'yfinance'
+                            })
+                            
+                            self.logger.debug(f"✓ Added from yfinance: {symbol} (+{change_pct:.2f}%)")
+                            
+                        except Exception as e:
+                            self.logger.debug(f"Error processing {symbol} from yfinance: {e}")
+                            continue
                 
-            except Exception as e:
-                self.logger.error(f"Error in yfinance scan: {e}")
+                except Exception as e:
+                    self.logger.debug(f"Error downloading batch: {e}")
+                    continue
+                
+                # Stop if we have enough
+                if len(candidates) >= limit:
+                    break
+                
+                # Small delay between batches
+                time.sleep(0.5)
             
             # Sort by change percentage
             if candidates:
@@ -413,10 +550,7 @@ class DailyWinnersDetector:
     def _get_liquid_stocks_list(self) -> List[str]:
         """
         Get a list of liquid stocks to scan
-        In production, you'd want to maintain this from a more comprehensive source
         """
-        # This is a subset of liquid stocks - you may want to expand this
-        # or fetch from a more comprehensive source
         return [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK.B', 'UNH', 'JNJ',
             'V', 'PG', 'JPM', 'MA', 'HD', 'CVX', 'MRK', 'ABBV', 'PEP', 'COST',
@@ -428,54 +562,4 @@ class DailyWinnersDetector:
             'CI', 'SYK', 'REGN', 'ZTS', 'PLD', 'AMT', 'DUK', 'SO', 'PGR', 'BDX',
             'MO', 'TGT', 'CL', 'USB', 'BMY', 'SCHW', 'CVS', 'CB', 'BSX', 'LRCX',
             'SLB', 'EOG', 'ITW', 'NOC', 'EQIX', 'MMM', 'C', 'PNC', 'EMR', 'AMAT',
-            # Add more as needed
         ]
-    
-    def _verify_fresh_data(self, symbol: str, target_date: datetime) -> bool:
-        """
-        Verify that a stock has fresh data from the target date
-        Filters out delisted/halted stocks with stale data
-        
-        Args:
-            symbol: Stock symbol
-            target_date: Expected date of latest data
-            
-        Returns:
-            True if data is fresh, False if stale
-        """
-        try:
-            # Allow a grace period for market holidays
-            # If target is today but it's a holiday, accept yesterday's data
-            target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
-            
-            # Fetch recent 1-day data
-            ticker = yf.Ticker(symbol)
-            hist = ticker.history(period='5d')  # Get last 5 days to be safe
-            
-            if hist.empty:
-                self.logger.debug(f"{symbol}: No recent data available")
-                return False
-            
-            # Get the most recent trading date
-            last_date = hist.index[-1].date()
-            
-            # Calculate days difference
-            days_diff = (target_date_obj - last_date).days
-            
-            # Allow up to 3 days difference (accounts for weekends and holidays)
-            if days_diff > 3:
-                self.logger.debug(
-                    f"{symbol}: Stale data (last update: {last_date}, target: {target_date_obj}, "
-                    f"diff: {days_diff} days)"
-                )
-                return False
-            
-            # If it's Monday and last data is Friday, that's acceptable
-            # If today and data is from today or yesterday, that's acceptable
-            self.logger.debug(f"{symbol}: Fresh data (last update: {last_date})")
-            return True
-            
-        except Exception as e:
-            self.logger.debug(f"{symbol}: Error verifying freshness: {e}")
-            # On error, be conservative and reject
-            return False
