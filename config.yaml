@@ -141,6 +141,7 @@ daily_winners:
   market_close_table: "winners_market_close"
   day_prior_open_table: "winners_day_prior_open"
   day_prior_close_table: "winners_day_prior_close"
+  skip_freshness_validation: false # Trust TradingView, skip yfinance checks
   
   # Number of top winners to track daily
   top_n: 15
@@ -148,6 +149,7 @@ daily_winners:
   # Market times (NYC timezone)
   market_open_time: "09:30:00"
   market_close_time: "16:00:00"
+
 
 
 # ============================================================================
