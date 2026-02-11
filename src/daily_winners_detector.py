@@ -1,11 +1,11 @@
 """
-Daily Winners Detector - FIXED VERSION
+Daily Winners Detector - FULLY FIXED VERSION
 Uses TradingView MarketMovers API with yfinance fallback
 FIXES:
-1. Smarter freshness validation that doesn't call yfinance for every symbol
-2. Batch verification to reduce API calls
-3. Better handling of current-day data from TradingView
-4. Improved OTC filtering
+1. Removed show_errors parameter (not supported in all yfinance versions)
+2. Fixed yfinance fallback to properly supplement TradingView data
+3. Smarter freshness validation
+4. Better pattern-based filtering
 """
 
 import logging
@@ -101,36 +101,44 @@ class DailyWinnersDetector:
         candidates = self._fetch_from_tradingview(target_date, top_n)
         
         # If we don't have enough, supplement with yfinance
-        if len(candidates) < top_n:
+        needed = top_n - len(candidates)
+        if needed > 0:
             self.logger.warning(
                 f"Only found {len(candidates)} valid winners from TradingView. "
-                f"Fetching additional candidates from yfinance..."
+                f"Need {needed} more. Fetching from yfinance to reach {top_n} total..."
             )
             
             # Get symbols we already have to avoid duplicates
             existing_symbols = {c['symbol'] for c in candidates}
             
-            # Fetch from yfinance
-            yf_candidates = self._fetch_from_yfinance(target_date, top_n * 2, existing_symbols)
+            # Fetch MORE than we need from yfinance (to allow for filtering)
+            yf_candidates = self._fetch_from_yfinance_screener(target_date, needed * 3, existing_symbols)
             
-            # Combine and sort
-            candidates.extend(yf_candidates)
+            # Combine and take what we need
+            candidates.extend(yf_candidates[:needed])
             self.logger.info(
-                f"Combined total: {len(candidates)} candidates "
-                f"({len(candidates) - len(yf_candidates)} from TradingView, "
-                f"{len(yf_candidates)} from yfinance)"
+                f"Added {len(yf_candidates[:needed])} candidates from yfinance. "
+                f"Total: {len(candidates)} candidates"
             )
         
         if not candidates:
             self.logger.warning("⚠️ No winners found from either source!")
             return []
         
-        # FINAL BATCH VALIDATION: Verify freshness for top candidates only
-        self.logger.info(f"Performing final batch freshness validation on top {min(len(candidates), top_n * 2)} candidates...")
-        validated_candidates = self._batch_verify_freshness(candidates[:top_n * 2], target_date)
+        # OPTIONAL: Skip batch validation for TradingView data if configured
+        skip_validation = self.config.get('daily_winners', {}).get('skip_freshness_validation', False)
+        
+        if skip_validation:
+            self.logger.info("⚠️ Skipping freshness validation (configured to trust source data)")
+            validated_candidates = candidates
+        else:
+            # FINAL BATCH VALIDATION: Verify freshness for candidates
+            self.logger.info(f"Performing batch freshness validation on {len(candidates)} candidates...")
+            validated_candidates = self._batch_verify_freshness(candidates, target_date)
         
         if not validated_candidates:
             self.logger.warning("⚠️ All candidates failed freshness validation!")
+            self.logger.warning("💡 TIP: Add 'skip_freshness_validation: true' to daily_winners config to trust TradingView data")
             return []
         
         # Sort by change percentage and take top N
@@ -314,6 +322,204 @@ class DailyWinnersDetector:
             self.logger.error(f"Error fetching from TradingView: {e}", exc_info=True)
             return []
     
+    def _fetch_from_yfinance_screener(
+        self, 
+        target_date: datetime, 
+        limit: int,
+        exclude_symbols: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch gainers from yfinance screener (uses a different approach than liquid stocks scan)
+        This gets actual day's gainers, not just from a predefined list
+        
+        Args:
+            target_date: Target date
+            limit: Number of gainers to fetch
+            exclude_symbols: Symbols to exclude
+            
+        Returns:
+            List of gainer dictionaries
+        """
+        try:
+            self.logger.info(f"Fetching top gainers from yfinance screener...")
+            
+            # Use yfinance Screener to get day gainers
+            # Note: This requires yfinance >= 0.2.28
+            try:
+                from yfinance import Screener
+                
+                # Get day gainers
+                screener = Screener()
+                gainers_data = screener.get_screeners(['day_gainers'], count=limit * 2)
+                
+                if not gainers_data or 'day_gainers' not in gainers_data:
+                    self.logger.warning("No day_gainers data from yfinance Screener")
+                    return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+                
+                quotes = gainers_data['day_gainers'].get('quotes', [])
+                
+                candidates = []
+                for quote in quotes:
+                    symbol = quote.get('symbol', '')
+                    
+                    if not symbol or symbol in exclude_symbols:
+                        continue
+                    
+                    # Check excluded patterns
+                    if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                        continue
+                    
+                    price = quote.get('regularMarketPrice', 0)
+                    change_pct = quote.get('regularMarketChangePercent', 0)
+                    volume = quote.get('regularMarketVolume', 0)
+                    
+                    # Apply filters
+                    if price < self.min_price:
+                        continue
+                    if volume < self.min_volume:
+                        continue
+                    if change_pct <= 0:
+                        continue
+                    
+                    candidates.append({
+                        'symbol': symbol.upper(),
+                        'exchange': quote.get('exchange', 'NASDAQ'),
+                        'price': float(price),
+                        'change_pct': float(change_pct),
+                        'volume': int(volume),
+                        'source': 'yfinance_screener'
+                    })
+                    
+                    if len(candidates) >= limit:
+                        break
+                
+                self.logger.info(f"✅ Found {len(candidates)} gainers from yfinance Screener")
+                return candidates
+                
+            except (ImportError, AttributeError) as e:
+                self.logger.warning(f"yfinance Screener not available: {e}")
+                self.logger.info("Falling back to liquid stocks scan...")
+                return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+                
+        except Exception as e:
+            self.logger.error(f"Error in yfinance screener: {e}", exc_info=True)
+            return []
+    
+    def _fetch_from_liquid_stocks(
+        self,
+        target_date: datetime,
+        limit: int,
+        exclude_symbols: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Fallback: Scan predefined list of liquid stocks for gainers
+        
+        Args:
+            target_date: Target date
+            limit: Number of gainers needed
+            exclude_symbols: Symbols to exclude
+            
+        Returns:
+            List of gainer dictionaries
+        """
+        try:
+            self.logger.info(f"Scanning liquid stocks for gainers...")
+            
+            candidates = []
+            liquid_stocks = self._get_liquid_stocks_list()
+            
+            # Remove excluded symbols
+            liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
+            
+            # Fetch in batches
+            batch_size = 50
+            for i in range(0, len(liquid_stocks), batch_size):
+                batch = liquid_stocks[i:i+batch_size]
+                
+                try:
+                    # Download batch data (no show_errors parameter)
+                    data = yf.download(
+                        batch,
+                        period='2d',
+                        interval='1d',
+                        group_by='ticker',
+                        progress=False,
+                        threads=True
+                    )
+                    
+                    if data.empty:
+                        continue
+                    
+                    # Process each symbol
+                    for symbol in batch:
+                        if symbol in exclude_symbols:
+                            continue
+                        
+                        try:
+                            if len(batch) == 1:
+                                stock_data = data
+                            else:
+                                if symbol not in data.columns.levels[0]:
+                                    continue
+                                stock_data = data[symbol]
+                            
+                            if stock_data.empty or len(stock_data) < 2:
+                                continue
+                            
+                            latest = stock_data.iloc[-1]
+                            previous = stock_data.iloc[-2]
+                            
+                            close = latest['Close']
+                            prev_close = previous['Close']
+                            volume = latest['Volume']
+                            
+                            change_pct = ((close - prev_close) / prev_close) * 100
+                            
+                            # Filters
+                            if close < self.min_price:
+                                continue
+                            if volume < self.min_volume:
+                                continue
+                            if change_pct <= 0:
+                                continue
+                            if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                                continue
+                            
+                            candidates.append({
+                                'symbol': symbol.upper(),
+                                'exchange': 'NASDAQ',
+                                'price': float(close),
+                                'change_pct': float(change_pct),
+                                'volume': int(volume),
+                                'source': 'yfinance_liquid'
+                            })
+                            
+                        except Exception as e:
+                            self.logger.debug(f"Error processing {symbol}: {e}")
+                            continue
+                
+                except Exception as e:
+                    self.logger.debug(f"Error downloading batch: {e}")
+                    continue
+                
+                # Stop if we have enough
+                if len(candidates) >= limit:
+                    break
+                
+                time.sleep(0.3)  # Rate limiting
+            
+            # Sort by change
+            if candidates:
+                candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)
+                candidates = candidates[:limit]
+            
+            self.logger.info(f"✅ Found {len(candidates)} gainers from liquid stocks")
+            return candidates
+            
+        except Exception as e:
+            self.logger.error(f"Error in liquid stocks scan: {e}", exc_info=True)
+            return []
+    
     def _batch_verify_freshness(
         self, 
         candidates: List[Dict[str, Any]], 
@@ -348,15 +554,14 @@ class DailyWinnersDetector:
             self.logger.debug(f"Verifying freshness for batch {i//batch_size + 1}: {len(batch_symbols)} symbols")
             
             try:
-                # Download batch data (last 5 days)
+                # Download batch data (last 5 days) - NO show_errors parameter
                 data = yf.download(
                     batch_symbols,
                     period='5d',
                     interval='1d',
                     group_by='ticker',
                     progress=False,
-                    threads=True,
-                    show_errors=False  # Suppress yfinance errors
+                    threads=True
                 )
                 
                 if data.empty:
@@ -422,135 +627,8 @@ class DailyWinnersDetector:
         
         return valid_candidates
     
-    def _fetch_from_yfinance(
-        self, 
-        target_date: datetime, 
-        limit: int,
-        exclude_symbols: Set[str]
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch candidates from yfinance as fallback
-        
-        Args:
-            target_date: Target date for validation
-            limit: Maximum number of candidates to fetch
-            exclude_symbols: Set of symbols to exclude (already have from TradingView)
-            
-        Returns:
-            List of valid candidate dictionaries
-        """
-        try:
-            self.logger.info(f"Fetching gainers from yfinance (excluding {len(exclude_symbols)} existing symbols)...")
-            
-            candidates = []
-            
-            # Get a broader list of active stocks
-            liquid_stocks = self._get_liquid_stocks_list()
-            
-            # Remove excluded symbols
-            liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
-            
-            self.logger.info(f"Scanning {len(liquid_stocks)} liquid stocks for gainers...")
-            
-            # Fetch data for multiple stocks at once
-            batch_size = 50
-            for i in range(0, len(liquid_stocks), batch_size):
-                batch = liquid_stocks[i:i+batch_size]
-                
-                try:
-                    # Download batch data
-                    data = yf.download(
-                        batch,
-                        period='2d',
-                        interval='1d',
-                        group_by='ticker',
-                        progress=False,
-                        threads=True,
-                        show_errors=False
-                    )
-                    
-                    # Process each stock in batch
-                    for symbol in batch:
-                        if symbol in exclude_symbols:
-                            continue
-                        
-                        try:
-                            if len(batch) == 1:
-                                stock_data = data
-                            else:
-                                if symbol not in data.columns.levels[0]:
-                                    continue
-                                stock_data = data[symbol]
-                            
-                            if stock_data.empty or len(stock_data) < 2:
-                                continue
-                            
-                            # Get latest and previous close
-                            latest = stock_data.iloc[-1]
-                            previous = stock_data.iloc[-2]
-                            
-                            close = latest['Close']
-                            prev_close = previous['Close']
-                            volume = latest['Volume']
-                            
-                            # Calculate change
-                            change_pct = ((close - prev_close) / prev_close) * 100
-                            
-                            # Apply filters
-                            if close < self.min_price:
-                                continue
-                            if volume < self.min_volume:
-                                continue
-                            if change_pct <= 0:
-                                continue
-                            
-                            # Check for excluded patterns
-                            if self._is_excluded_symbol(symbol, 'NASDAQ'):
-                                continue
-                            
-                            # Add candidate (already validated by yfinance having recent data)
-                            candidates.append({
-                                'symbol': symbol,
-                                'exchange': 'NASDAQ',  # Default
-                                'price': float(close),
-                                'change_pct': float(change_pct),
-                                'volume': int(volume),
-                                'source': 'yfinance'
-                            })
-                            
-                            self.logger.debug(f"✓ Added from yfinance: {symbol} (+{change_pct:.2f}%)")
-                            
-                        except Exception as e:
-                            self.logger.debug(f"Error processing {symbol} from yfinance: {e}")
-                            continue
-                
-                except Exception as e:
-                    self.logger.debug(f"Error downloading batch: {e}")
-                    continue
-                
-                # Stop if we have enough
-                if len(candidates) >= limit:
-                    break
-                
-                # Small delay between batches
-                time.sleep(0.5)
-            
-            # Sort by change percentage
-            if candidates:
-                candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)
-                candidates = candidates[:limit]
-            
-            self.logger.info(f"✅ Found {len(candidates)} valid gainers from yfinance")
-            return candidates
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching from yfinance: {e}", exc_info=True)
-            return []
-    
     def _get_liquid_stocks_list(self) -> List[str]:
-        """
-        Get a list of liquid stocks to scan
-        """
+        """Get a list of liquid stocks to scan"""
         return [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK.B', 'UNH', 'JNJ',
             'V', 'PG', 'JPM', 'MA', 'HD', 'CVX', 'MRK', 'ABBV', 'PEP', 'COST',
