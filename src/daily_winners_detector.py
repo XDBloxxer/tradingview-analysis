@@ -58,24 +58,30 @@ class DailyWinnersDetector:
         
         self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
         
+        # Fetch MORE than we need initially to account for validation rejections
+        # We'll fetch 2x to have buffer for rejections
+        initial_fetch_size = top_n * 2
+        
         # Fetch from TradingView
-        candidates = self._fetch_from_tradingview(target_date, top_n)
+        candidates = self._fetch_from_tradingview(target_date, initial_fetch_size)
         
         # Supplement with yfinance if needed
-        needed = top_n - len(candidates)
+        needed = initial_fetch_size - len(candidates)
         if needed > 0:
-            self.logger.warning(
-                f"Only found {len(candidates)} valid winners from TradingView. "
-                f"Need {needed} more from yfinance..."
+            self.logger.info(
+                f"TradingView returned {len(candidates)}/{initial_fetch_size}. "
+                f"Fetching {needed} more from yfinance..."
             )
             
             existing_symbols = {c['symbol'] for c in candidates}
-            yf_candidates = self._fetch_from_yfinance_screener(target_date, needed * 3, existing_symbols)
+            yf_candidates = self._fetch_from_yfinance_screener(target_date, needed * 2, existing_symbols)
             candidates.extend(yf_candidates[:needed])
         
         if not candidates:
             self.logger.warning("⚠️ No winners found!")
             return []
+        
+        self.logger.info(f"Total candidates before validation: {len(candidates)}")
         
         # Check skip validation config
         skip_validation = self.config.get('daily_winners', {}).get('skip_freshness_validation', False)
@@ -93,22 +99,70 @@ class DailyWinnersDetector:
             self.logger.warning("⚠️ All candidates failed freshness validation!")
             return []
         
-        # Sort and return top N
+        # Sort by change percentage
         df_results = pd.DataFrame(validated_candidates)
         df_results = df_results.sort_values('change_pct', ascending=False)
+        
+        # Check if we have enough after validation
+        if len(df_results) < top_n:
+            shortage = top_n - len(df_results)
+            self.logger.warning(
+                f"⚠️ Only {len(df_results)} stocks passed validation (need {top_n}). "
+                f"Shortage: {shortage} stocks"
+            )
+            self.logger.info("💡 Trying to backfill with additional candidates...")
+            
+            # Get symbols we already have (both validated and rejected)
+            existing_symbols = {c['symbol'] for c in candidates}
+            
+            # Fetch more candidates from yfinance
+            additional_candidates = self._fetch_from_yfinance_screener(
+                target_date, 
+                shortage * 3,  # Fetch 3x to account for more rejections
+                existing_symbols
+            )
+            
+            if additional_candidates:
+                self.logger.info(f"Fetched {len(additional_candidates)} additional candidates for backfill")
+                
+                # Validate the new candidates
+                if not skip_validation:
+                    additional_validated = self._batch_verify_freshness(additional_candidates, target_date)
+                else:
+                    additional_validated = additional_candidates
+                
+                if additional_validated:
+                    self.logger.info(f"✅ {len(additional_validated)} additional candidates passed validation")
+                    validated_candidates.extend(additional_validated)
+                    
+                    # Re-sort with new candidates
+                    df_results = pd.DataFrame(validated_candidates)
+                    df_results = df_results.sort_values('change_pct', ascending=False)
+                else:
+                    self.logger.warning("❌ No additional candidates passed validation")
+            else:
+                self.logger.warning("❌ Could not fetch additional candidates for backfill")
+        
+        # Take top N
         top_winners = df_results.head(top_n).to_dict('records')
         
         for winner in top_winners:
             winner['detection_date'] = target_date_str
             winner['detection_time'] = '16:00:00'
         
-        self.logger.info(f"✅ Found top {len(top_winners)} daily winners:")
+        self.logger.info(f"✅ Found top {len(top_winners)} daily winners (target: {top_n}):")
         for i, winner in enumerate(top_winners, 1):
             source = winner.pop('source', 'unknown')
             self.logger.info(
                 f"  #{i}: {winner['exchange']}:{winner['symbol']} "
                 f"(+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}, "
                 f"vol={winner['volume']:,} [{source}]"
+            )
+        
+        if len(top_winners) < top_n:
+            self.logger.warning(
+                f"⚠️ WARNING: Only found {len(top_winners)}/{top_n} winners after validation and backfill. "
+                f"Consider checking data sources or relaxing filters."
             )
         
         return top_winners
