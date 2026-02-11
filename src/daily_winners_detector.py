@@ -439,9 +439,21 @@ class DailyWinnersDetector:
                             self.logger.warning(f"  ❌ {symbol}: Empty data frame")
                             continue
                         
-                        # Show all available dates
+                        # Show all available dates and data quality
                         available_dates = symbol_data.index.date
                         self.logger.info(f"  📅 Available dates: {[str(d) for d in available_dates]}")
+                        
+                        # Check data quality for each day
+                        nan_days = []
+                        for date_idx in range(len(symbol_data)):
+                            date = symbol_data.index[date_idx].date()
+                            close = symbol_data['Close'].iloc[date_idx]
+                            volume = symbol_data['Volume'].iloc[date_idx]
+                            if pd.isna(close) or pd.isna(volume):
+                                nan_days.append(str(date))
+                        
+                        if nan_days:
+                            self.logger.warning(f"  ⚠️  Days with NaN data: {nan_days}")
                         
                         # Get most recent date
                         last_date = symbol_data.index[-1].date()
@@ -449,8 +461,15 @@ class DailyWinnersDetector:
                         last_volume = symbol_data['Volume'].iloc[-1]
                         
                         self.logger.info(f"  📊 Last trading day: {last_date}")
-                        self.logger.info(f"  💰 Last close: ${last_close:.2f}")
-                        self.logger.info(f"  📈 Last volume: {last_volume:,}")
+                        if pd.isna(last_close):
+                            self.logger.warning(f"  💰 Last close: NaN (INVALID DATA)")
+                        else:
+                            self.logger.info(f"  💰 Last close: ${last_close:.2f}")
+                        
+                        if pd.isna(last_volume):
+                            self.logger.warning(f"  📈 Last volume: NaN (INVALID DATA)")
+                        else:
+                            self.logger.info(f"  📈 Last volume: {last_volume:,}")
                         
                         # Calculate age
                         days_diff = (target_date_obj - last_date).days
@@ -465,7 +484,16 @@ class DailyWinnersDetector:
                         else:
                             self.logger.info(f"  ✅ PASS: Data age OK ({days_diff} <= 5 days)")
                         
-                        # Check 2: Volume
+                        # Check 2: NaN/Invalid data
+                        if pd.isna(last_close) or pd.isna(last_volume):
+                            self.logger.warning(
+                                f"  ❌ REJECTED: Invalid data (NaN close or volume)"
+                            )
+                            continue
+                        else:
+                            self.logger.info(f"  ✅ PASS: Data validity OK (no NaN values)")
+                        
+                        # Check 3: Volume
                         if last_volume < self.min_volume:
                             self.logger.warning(
                                 f"  ❌ REJECTED: Last volume {last_volume:,} < minimum {self.min_volume:,}"
