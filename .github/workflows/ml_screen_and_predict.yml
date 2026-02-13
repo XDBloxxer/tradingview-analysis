@@ -1,0 +1,92 @@
+name: ML Screen & Predict (Autonomous)
+
+on:
+  schedule:
+    # Run daily BEFORE market open
+    # 1:00 PM UTC = 8:00 AM EST = 3:00 PM Estonia
+    # Gives predictions before market opens at 4:30 PM Estonia
+    - cron: '0 13 * * 1-5'  # Mon-Fri at 1:00 PM UTC
+  
+  workflow_dispatch:
+    inputs:
+      universe:
+        description: 'Stock universe to screen'
+        required: false
+        type: choice
+        options:
+          - 'auto'
+          - 'sp500'
+          - 'nasdaq'
+          - 'all'
+        default: 'auto'
+      top_n:
+        description: 'Number of top predictions to store'
+        required: false
+        default: '50'
+        type: string
+
+jobs:
+  screen-and-predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true  # For model files
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Autonomous screening & prediction
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+        run: |
+          UNIVERSE="${{ github.event.inputs.universe }}"
+          TOP_N="${{ github.event.inputs.top_n }}"
+          
+          if [ -z "$UNIVERSE" ]; then
+            UNIVERSE="auto"
+          fi
+          
+          if [ -z "$TOP_N" ]; then
+            TOP_N="50"
+          fi
+          
+          python ml_screen_and_predict.py \
+            --universe "$UNIVERSE" \
+            --max-workers 15 \
+            --top-n "$TOP_N" \
+            --verbose
+      
+      - name: Upload screening results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screening-results-${{ github.run_number }}
+          path: ml_screening_results_*.csv
+          retention-days: 30
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screening-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 30
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::error::ML screening failed. Check logs for details."
