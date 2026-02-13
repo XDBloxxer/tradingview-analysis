@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive ML Accuracy Tracker
+Comprehensive ML Accuracy Tracker - FIXED WEEKEND HANDLING
 Tracks BOTH prediction accuracy AND missed opportunities
 Analyzes failures in detail for continuous learning
 """
@@ -18,6 +18,31 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from src.utils import setup_logging, load_config
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
+
+
+def get_last_trading_day(from_date: datetime = None) -> str:
+    """
+    Get last trading day (skip weekends)
+    
+    Args:
+        from_date: Start date (defaults to today)
+    
+    Returns:
+        Last trading day as ISO string (YYYY-MM-DD)
+    """
+    if from_date is None:
+        from_date = datetime.now().date()
+    elif isinstance(from_date, datetime):
+        from_date = from_date.date()
+    
+    # Start with yesterday
+    check_date = from_date - timedelta(days=1)
+    
+    # Skip backwards until we find a weekday
+    while check_date.weekday() >= 5:  # 5=Saturday, 6=Sunday
+        check_date = check_date - timedelta(days=1)
+    
+    return check_date.isoformat()
 
 
 class ComprehensiveAccuracyTracker:
@@ -503,13 +528,18 @@ def main():
     logger.info("COMPREHENSIVE ML ACCURACY TRACKING")
     logger.info("="*80)
     
-    # Get date to check (yesterday by default)
+    # Get date to check - FIXED: Handle weekends properly
     if args.date:
         check_date = args.date
+        logger.info(f"Using manually specified date: {check_date}")
     else:
-        check_date = (datetime.now() - timedelta(days=1)).date().isoformat()
-    
-    logger.info(f"\nChecking accuracy for: {check_date}")
+        check_date = get_last_trading_day()
+        logger.info(f"Auto-detected last trading day: {check_date}")
+        
+        # Show what day of week it is
+        date_obj = datetime.fromisoformat(check_date)
+        day_name = date_obj.strftime("%A")
+        logger.info(f"  ({day_name})")
     
     # Initialize tracker
     tracker = ComprehensiveAccuracyTracker(config)
@@ -520,12 +550,15 @@ def main():
     
     if predictions_df.empty:
         logger.warning(f"No predictions found for {check_date}")
-        logger.info("Make sure ml_screen_and_predict.py ran successfully")
+        logger.info("Make sure ml_screen_and_predict.py ran successfully for this date")
         return 1
     
     if winners_df.empty:
         logger.warning(f"No winners found for {check_date}")
-        logger.info("Make sure daily_winners workflow ran successfully")
+        logger.info("This could mean:")
+        logger.info("  1. No stocks gained 20%+ on this date")
+        logger.info("  2. Daily winners workflow hasn't run yet")
+        logger.info("  3. This was a weekend/holiday (no trading)")
         return 1
     
     # Run comprehensive analysis
