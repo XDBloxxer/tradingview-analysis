@@ -413,6 +413,37 @@ def main():
     logger.info(f"\nResults saved to: {csv_path}")
     logger.info(f"Database table: ml_explosion_predictions")
     logger.info(f"\nNext: Wait for market close, then run ml_track_comprehensive_accuracy.py")
+
+
+    # Step 8: Log screening statistics
+    logger.info("\n" + "="*80)
+    logger.info("STEP 7: LOG SCREENING STATISTICS")
+    logger.info("="*80)
+    
+    screening_log = {
+        'screening_date': prediction_date,
+        'total_symbols_attempted': len(symbols),
+        'symbols_fetched_successfully': len(stock_data),
+        'symbols_failed_fetch': len(symbols) - len(stock_data),
+        'symbols_after_price_filter': len(filtered_data),
+        'symbols_after_volume_filter': len(filtered_data),
+        'symbols_after_all_filters': len(filtered_data),
+        'total_predictions': len(predictions_df),
+        'strong_buy_count': len(predictions_df[predictions_df['signal'] == 'STRONG BUY']),
+        'buy_count': len(predictions_df[predictions_df['signal'] == 'BUY']),
+        'hold_count': len(predictions_df[predictions_df['signal'] == 'HOLD']),
+        'avoid_count': len(predictions_df[predictions_df['signal'] == 'AVOID']),
+        'avg_probability': float(predictions_df['explosion_probability'].mean()),
+        'max_probability': float(predictions_df['explosion_probability'].max()),
+        'min_probability': float(predictions_df['explosion_probability'].min()),
+        'screening_duration_seconds': None,  # Add timing if needed
+        'prediction_duration_seconds': None,
+        'model_version': 'xgboost_v1',
+        'screening_universe': args.universe
+    }
+    
+    if supabase.write_screening_log(screening_log):
+        logger.info("✓ Screening statistics logged")
     
     return 0
 
