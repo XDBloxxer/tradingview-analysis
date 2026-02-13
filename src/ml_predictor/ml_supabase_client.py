@@ -41,7 +41,7 @@ class MLPredictionSupabaseClient:
         self.tables = {
             "predictions": "ml_explosion_predictions",
             "accuracy": "ml_prediction_accuracy",
-            "self_discovered": "ml_self_discovered_stocks"  # NEW - stocks model found itself
+            "screening_logs": "ml_screening_logs"
         }
     
     # ===== OPTIMIZED READ METHODS (MINIMAL EGRESS) =====
@@ -308,135 +308,99 @@ class MLPredictionSupabaseClient:
             self.logger.error(f"Error writing accuracy records: {e}")
             raise
     
-    def write_self_discovered_stocks(
-        self,
-        stocks: List[Dict[str, Any]],
-        batch_size: int = 500
-    ) -> int:
-        """
-        Write stocks that model discovered on its own (not in daily winners)
-        Used for tracking model's independent discovery accuracy
-        """
-        if not stocks:
-            return 0
-        
+    def write_screening_log(self, log_data: dict) -> bool:
+        """Write screening statistics log"""
         try:
-            sanitized = [self._sanitize_dict(s) for s in stocks]
+            sanitized = self._sanitize_dict(log_data)
             
-            total_written = 0
+            self.client.table(self.tables["screening_logs"]).upsert(
+                sanitized,
+                on_conflict="screening_date"
+            ).execute()
             
-            for i in range(0, len(sanitized), batch_size):
-                batch = sanitized[i:i + batch_size]
-                
-                response = self.client.table(self.tables["self_discovered"]).upsert(
-                    batch,
-                    on_conflict="symbol,prediction_date"
-                ).execute()
-                
-                total_written += len(batch)
-            
-            self.logger.info(f"✓ Wrote {total_written} self-discovered stocks")
-            return total_written
-            
+            return True
         except Exception as e:
-            self.logger.error(f"Error writing self-discovered stocks: {e}")
-
-            raise
-    # Add to MLPredictionSupabaseClient class
-
-def write_screening_log(self, log_data: dict) -> bool:
-    """Write screening statistics log"""
-    try:
-        sanitized = self._sanitize_dict(log_data)
-        
-        self.client.table("ml_screening_logs").upsert(
-            sanitized,
-            on_conflict="screening_date"
-        ).execute()
-        
-        return True
-    except Exception as e:
-        self.logger.error(f"Failed to write screening log: {e}")
-        return False
-
-def get_latest_screening_stats(self) -> dict:
-    """Get latest screening statistics"""
-    try:
-        response = self.client.table("ml_screening_logs")\
-            .select("*")\
-            .order("screening_date", desc=True)\
-            .limit(1)\
-            .execute()
-        
-        if response.data:
-            return response.data[0]
-        return {}
-    except Exception as e:
-        self.logger.error(f"Failed to get screening stats: {e}")
-        return {}
-
-def get_accuracy_summary(self, days_back: int = 30) -> pd.DataFrame:
-    """Get accuracy summary from materialized view"""
-    try:
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days_back)
-        
-        response = self.client.table("v_ml_daily_accuracy_summary")\
-            .select("*")\
-            .gte("prediction_date", start_date.isoformat())\
-            .lte("prediction_date", end_date.isoformat())\
-            .execute()
-        
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        self.logger.error(f"Failed to get accuracy summary: {e}")
-        return pd.DataFrame()
-
-def get_signal_performance(self) -> pd.DataFrame:
-    """Get signal performance from materialized view"""
-    try:
-        response = self.client.table("v_ml_signal_performance")\
-            .select("*")\
-            .execute()
-        
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        self.logger.error(f"Failed to get signal performance: {e}")
-        return pd.DataFrame()
-
-def get_missed_opportunities_summary(self, days_back: int = 30) -> pd.DataFrame:
-    """Get missed opportunities summary"""
-    try:
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days_back)
-        
-        response = self.client.table("v_ml_missed_summary")\
-            .select("*")\
-            .gte("detection_date", start_date.isoformat())\
-            .lte("detection_date", end_date.isoformat())\
-            .execute()
-        
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        self.logger.error(f"Failed to get missed opportunities: {e}")
-        return pd.DataFrame()
-
-def get_false_positive_patterns(self) -> pd.DataFrame:
-    """Get false positive patterns from materialized view"""
-    try:
-        response = self.client.table("v_ml_false_positive_patterns")\
-            .select("*")\
-            .execute()
-        
-        if response.data:
-            return pd.DataFrame(response.data)
-        return pd.DataFrame()
-    except Exception as e:
-        self.logger.error(f"Failed to get FP patterns: {e}")
-        return pd.DataFrame()
+            self.logger.error(f"Failed to write screening log: {e}")
+            return False
+    
+    def get_latest_screening_stats(self) -> dict:
+        """Get latest screening statistics"""
+        try:
+            response = self.client.table(self.tables["screening_logs"])\
+                .select("*")\
+                .order("screening_date", desc=True)\
+                .limit(1)\
+                .execute()
+            
+            if response.data:
+                return response.data[0]
+            return {}
+        except Exception as e:
+            self.logger.error(f"Failed to get screening stats: {e}")
+            return {}
+    
+    def get_accuracy_summary(self, days_back: int = 30) -> pd.DataFrame:
+        """Get accuracy summary from materialized view"""
+        try:
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days_back)
+            
+            response = self.client.table("v_ml_daily_accuracy_summary")\
+                .select("*")\
+                .gte("prediction_date", start_date.isoformat())\
+                .lte("prediction_date", end_date.isoformat())\
+                .execute()
+            
+            if response.data:
+                return pd.DataFrame(response.data)
+            return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"Failed to get accuracy summary: {e}")
+            return pd.DataFrame()
+    
+    def get_signal_performance(self) -> pd.DataFrame:
+        """Get signal performance from materialized view"""
+        try:
+            response = self.client.table("v_ml_signal_performance")\
+                .select("*")\
+                .execute()
+            
+            if response.data:
+                return pd.DataFrame(response.data)
+            return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"Failed to get signal performance: {e}")
+            return pd.DataFrame()
+    
+    def get_missed_opportunities_summary(self, days_back: int = 30) -> pd.DataFrame:
+        """Get missed opportunities summary"""
+        try:
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days_back)
+            
+            response = self.client.table("v_ml_missed_summary")\
+                .select("*")\
+                .gte("detection_date", start_date.isoformat())\
+                .lte("detection_date", end_date.isoformat())\
+                .execute()
+            
+            if response.data:
+                return pd.DataFrame(response.data)
+            return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"Failed to get missed opportunities: {e}")
+            return pd.DataFrame()
+    
+    def get_false_positive_patterns(self) -> pd.DataFrame:
+        """Get false positive patterns from materialized view"""
+        try:
+            response = self.client.table("v_ml_false_positive_patterns")\
+                .select("*")\
+                .execute()
+            
+            if response.data:
+                return pd.DataFrame(response.data)
+            return pd.DataFrame()
+        except Exception as e:
+            self.logger.error(f"Failed to get FP patterns: {e}")
+            return pd.DataFrame()
