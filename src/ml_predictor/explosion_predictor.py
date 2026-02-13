@@ -1,10 +1,10 @@
 """
-Explosion Predictor - ADAPTIVE & SMART
+Explosion Predictor - FIXED FOR JOBLIB
 Handles missing features, multiple timepoints, target gain estimation
 """
 
 import logging
-import pickle
+import joblib  # ← FIXED: Changed from pickle to joblib
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -36,7 +36,7 @@ class ExplosionPredictor:
         self.feature_mapper = FeatureMapper()
     
     def _load_model(self):
-        """Load trained model and scaler"""
+        """Load trained model and scaler - FIXED for joblib"""
         try:
             model_path = self.model_dir / "best_model.pkl"
             scaler_path = self.model_dir / "scaler.pkl"
@@ -44,11 +44,11 @@ class ExplosionPredictor:
             if not model_path.exists() or not scaler_path.exists():
                 raise FileNotFoundError(f"Model files not found in {self.model_dir}")
             
-            with open(model_path, 'rb') as f:
-                self.model = pickle.load(f)
+            # FIXED: Use joblib.load instead of pickle.load
+            self.model = joblib.load(model_path)
+            self.scaler = joblib.load(scaler_path)
             
-            with open(scaler_path, 'rb') as f:
-                self.scaler = pickle.load(f)
+            self.logger.info("✓ Loaded model and scaler using joblib")
             
             # Try to load metadata
             metadata_path = self.model_dir / "model_metadata.json"
