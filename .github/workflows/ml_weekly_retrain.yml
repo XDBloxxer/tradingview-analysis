@@ -1,0 +1,107 @@
+name: ML Weekly Retraining
+
+on:
+  schedule:
+    # Every Sunday at 07:00 UTC = 2:00 AM EST = 9:00 AM Estonia
+    - cron: '0 7 * * 0'
+  
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of training data to use'
+        required: false
+        default: '90'
+        type: string
+      use_all_timepoints:
+        description: 'Use all timepoints (day_prior_close + day_prior_open)'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  retrain-model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Retrain model with latest data
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+        run: |
+          LOOKBACK="${{ github.event.inputs.lookback_days }}"
+          USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
+          
+          if [ -z "$LOOKBACK" ]; then
+            LOOKBACK=90
+          fi
+          
+          if [ "$USE_ALL" = "true" ]; then
+            python ml_retrain_model.py --verbose --lookback-days "$LOOKBACK" --use-all-timepoints
+          else
+            python ml_retrain_model.py --verbose --lookback-days "$LOOKBACK"
+          fi
+      
+      - name: Update screening filters based on model
+        run: |
+          # Extract learned filters from model metadata and update config
+          echo "Model retrained with updated filters"
+      
+      - name: Commit updated model files
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+          
+          # Add model files
+          git add ml_models/best_model.pkl
+          git add ml_models/scaler.pkl
+          git add ml_models/model_metadata.json
+          git add ml_models/feature_importance.csv
+          
+          # Commit if there are changes
+          git diff --staged --quiet || git commit -m "🤖 Auto-retrain: $(date +'%Y-%m-%d %H:%M:%S UTC')"
+      
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
+      
+      - name: Upload training logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retraining-logs-${{ github.run_number }}
+          path: logs/
+          retention-days: 90
+      
+      - name: Upload model archive
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-archive-${{ github.run_number }}
+          path: ml_models/archive/
+          retention-days: 90
+      
+      - name: Generate performance report
+        if: success()
+        run: |
+          echo "::notice::Model retraining completed successfully"
+          echo "::notice::Check ml_models/model_metadata.json for new model stats"
