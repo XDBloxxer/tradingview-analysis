@@ -50,24 +50,36 @@ class ExplosionPredictor:
             
             self.logger.info("✓ Loaded model and scaler using joblib")
             
-            # Try to load metadata
-            metadata_path = self.model_dir / "model_metadata.json"
-            if metadata_path.exists():
-                import json
-                with open(metadata_path, 'r') as f:
-                    self.metadata = json.load(f)
-                    self.feature_names = self.metadata.get('features', [])
-            
-            # If no metadata, try to infer from scaler
-            if not self.feature_names and hasattr(self.scaler, 'feature_names_in_'):
-                self.feature_names = list(self.scaler.feature_names_in_)
-            
-            if not self.feature_names:
-                # Fall back to generic feature count
-                n_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else 97
-                self.feature_names = [f'feature_{i}' for i in range(n_features)]
-            
-            self.logger.info(f"✓ Loaded model with {len(self.feature_names)} features")
+            # Try to load metadata (optional - not critical)
+            try:
+                metadata_path = self.model_dir / "model_metadata.json"
+                if metadata_path.exists():
+                    try:
+                        import json
+                        with open(metadata_path, 'r') as f:
+                            self.metadata = json.load(f)
+                            self.feature_names = self.metadata.get('features', [])
+                        self.logger.info("✓ Loaded metadata from JSON")
+                    except Exception as e:
+                        self.logger.warning(f"Could not load metadata JSON: {e}")
+                        self.metadata = None
+                
+                # If no metadata, try to infer from scaler
+                if not self.feature_names and hasattr(self.scaler, 'feature_names_in_'):
+                    self.feature_names = list(self.scaler.feature_names_in_)
+                    self.logger.info("✓ Inferred feature names from scaler")
+                
+                if not self.feature_names:
+                    # Fall back to generic feature count
+                    n_features = self.scaler.n_features_in_ if hasattr(self.scaler, 'n_features_in_') else 97
+                    self.feature_names = [f'feature_{i}' for i in range(n_features)]
+                    self.logger.warning(f"Using generic feature names for {n_features} features")
+                
+                self.logger.info(f"✓ Ready with {len(self.feature_names)} features")
+                
+            except Exception as e:
+                self.logger.error(f"Failed to setup features: {e}")
+                raise
             
         except Exception as e:
             self.logger.error(f"Failed to load model: {e}")
