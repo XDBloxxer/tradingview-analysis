@@ -1,5 +1,5 @@
 # Core dependencies
-tradingview-scraper==0.4.19
+tradingview-scraper>=0.4.19
 pandas>=2.0.3
 numpy>=1.24.0
 yfinance>=0.2.28
