@@ -1,406 +1,213 @@
 """
-ML Prediction Supabase Client - OPTIMIZED FOR MINIMAL EGRESS
-Follows same patterns as daily_winners and backtesting clients
+ML Supabase Client - Handles ML prediction storage and retrieval
 """
 
 import logging
-import os
 from typing import List, Dict, Any, Optional
-from datetime import datetime, timedelta, date
-from supabase import create_client, Client
+from datetime import datetime, date
 import pandas as pd
-import numpy as np
+from supabase import create_client, Client
 
 
 class MLPredictionSupabaseClient:
     """
-    Handler for ML prediction data - EGRESS OPTIMIZED
-    Only selects necessary columns, uses batching, implements caching
+    Client for storing and retrieving ML predictions
     """
     
     def __init__(self, config: dict):
+        """Initialize Supabase client"""
         self.logger = logging.getLogger(__name__)
-        self.config = config
         
-        # Suppress httpx logging
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        
-        supabase_url = os.environ.get("SUPABASE_URL")
-        supabase_key = os.environ.get("SUPABASE_KEY")
+        supabase_url = config.get('supabase', {}).get('url')
+        supabase_key = config.get('supabase', {}).get('key')
         
         if not supabase_url or not supabase_key:
-            raise ValueError("Missing Supabase credentials")
+            raise ValueError("Supabase URL and KEY must be provided in config")
         
-        try:
-            self.client: Client = create_client(supabase_url, supabase_key)
-        except Exception as e:
-            self.logger.error(f"Failed to connect: {e}")
-            raise
+        self.client: Client = create_client(supabase_url, supabase_key)
         
         # Table names
-        self.tables = {
-            "predictions": "ml_explosion_predictions",
-            "accuracy": "ml_prediction_accuracy",
-            "screening_logs": "ml_screening_logs"
-        }
+        self.predictions_table = "ml_predictions"
+        
+        self.logger.info("ML Supabase client initialized")
     
-    # ===== OPTIMIZED READ METHODS (MINIMAL EGRESS) =====
+    def write_predictions(self, predictions: List[Dict[str, Any]]) -> int:
+        """
+        Write ML predictions to database
+        
+        Args:
+            predictions: List of prediction dictionaries
+            
+        Returns:
+            Number of records written
+        """
+        
+        if not predictions:
+            self.logger.warning("No predictions to write")
+            return 0
+        
+        try:
+            # Check for existing predictions (prevent duplicates)
+            prediction_date = predictions[0].get('prediction_date')
+            symbols = [p['symbol'] for p in predictions]
+            
+            existing = self.client.table(self.predictions_table)\
+                .select("symbol")\
+                .eq("prediction_date", prediction_date)\
+                .in_("symbol", symbols)\
+                .execute()
+            
+            existing_symbols = set(r['symbol'] for r in existing.data) if existing.data else set()
+            
+            # Filter out existing
+            new_predictions = [p for p in predictions if p['symbol'] not in existing_symbols]
+            
+            if len(existing_symbols) > 0:
+                self.logger.info(f"Skipping {len(existing_symbols)} predictions that already exist")
+            
+            if not new_predictions:
+                self.logger.info("No new predictions to write")
+                return 0
+            
+            # Sanitize data
+            sanitized = []
+            for pred in new_predictions:
+                record = {
+                    'symbol': pred['symbol'],
+                    'prediction_date': pred['prediction_date'],
+                    'probability': float(pred['probability']),
+                    'confidence': pred['confidence'],
+                    'prediction': int(pred['prediction']),
+                    'model_version': pred.get('model_version', 'unknown'),
+                    'indicators': pred.get('indicators', {})
+                }
+                sanitized.append(record)
+            
+            # Write to database
+            response = self.client.table(self.predictions_table).insert(sanitized).execute()
+            
+            count = len(response.data) if response.data else 0
+            self.logger.info(f"✓ Wrote {count} predictions to database")
+            
+            return count
+            
+        except Exception as e:
+            self.logger.error(f"Failed to write predictions: {e}", exc_info=True)
+            raise
     
-    def get_latest_day_prior_close(
-        self, 
-        detection_date: str = None,
-        limit: int = 1000
+    def read_predictions(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        symbol: Optional[str] = None,
+        min_probability: Optional[float] = None
     ) -> pd.DataFrame:
         """
-        Get T-1 close data - ONLY COLUMNS NEEDED FOR PREDICTION
-        EGRESS OPTIMIZATION: Select only indicator columns
+        Read predictions from database
+        
+        Args:
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            symbol: Filter by symbol
+            min_probability: Minimum probability threshold
+            
+        Returns:
+            DataFrame with predictions
         """
+        
         try:
-            # CRITICAL: Only select columns we actually need
-            # This reduces egress by ~80% compared to SELECT *
-            select_cols = (
-                "symbol,exchange,detection_date,"
-                # Momentum
-                "rsi,\"rsi[1]\",\"rsi[2]\",mom,\"mom[1]\","
-                "\"stoch.k\",\"stoch.d\",\"stoch.k[1]\",\"stoch.d[1]\","
-                "\"w.r\",ao,uo,roc,kama,tsi,"
-                # Trend
-                "\"macd.macd\",\"macd.signal\",macd_diff,"
-                "adx,\"adx+di\",\"adx-di\",cci20,"
-                "aroon_up,aroon_down,aroon_indicator,"
-                # Moving Averages
-                "ema5,ema10,ema20,ema50,ema100,ema200,"
-                "sma5,sma10,sma20,sma50,sma100,sma200,"
-                # Volatility
-                "atr,atr_pct,\"bb.upper\",\"bb.lower\",\"bb.middle\",bb_width,bbpower,"
-                "volatility_20d,keltner_upper,keltner_lower,donchian_upper,donchian_lower,"
-                # Volume
-                "volume,volume_sma5,volume_sma10,volume_sma20,volume_ratio,obv,cmf,"
-                # Price
-                "close,open,high,low,vwap,"
-                # Price Changes
-                "price_change_1d,price_change_2d,price_change_3d,price_change_5d,price_change_10d,price_change_20d,"
-                # Other
-                "high_52w,low_52w,\"gap_%\""
-            )
+            query = self.client.table(self.predictions_table).select("*")
             
-            query = self.client.table("winners_day_prior_close").select(select_cols)
+            if start_date:
+                query = query.gte("prediction_date", start_date)
             
-            if detection_date:
-                query = query.eq("detection_date", detection_date)
-            else:
-                # Get most recent date
-                response = self.client.table("winners_day_prior_close")\
-                    .select("detection_date")\
-                    .order("detection_date", desc=True)\
-                    .limit(1)\
-                    .execute()
-                
-                if response.data:
-                    latest_date = response.data[0]['detection_date']
-                    query = query.eq("detection_date", latest_date)
+            if end_date:
+                query = query.lte("prediction_date", end_date)
             
-            query = query.limit(limit)
+            if symbol:
+                query = query.eq("symbol", symbol)
+            
+            if min_probability:
+                query = query.gte("probability", min_probability)
+            
             response = query.execute()
             
             if not response.data:
-                return pd.DataFrame()
-            
-            return pd.DataFrame(response.data)
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching day prior close: {e}")
-            return pd.DataFrame()
-    
-    def get_historical_prediction_accuracy(
-        self, 
-        days_back: int = 30
-    ) -> pd.DataFrame:
-        """
-        Get historical accuracy data for gain calibration
-        EGRESS OPTIMIZED: Only needed columns
-        """
-        try:
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=days_back)
-            
-            # Only select columns needed for calibration
-            response = self.client.table(self.tables["accuracy"])\
-                .select("predicted_probability,actual_gain_pct,became_winner")\
-                .gte("prediction_date", start_date.isoformat())\
-                .lte("prediction_date", end_date.isoformat())\
-                .eq("became_winner", True)\
-                .limit(1000)\
-                .execute()
-            
-            if not response.data:
+                self.logger.info("No predictions found")
                 return pd.DataFrame()
             
             df = pd.DataFrame(response.data)
-            df = df.rename(columns={'predicted_probability': 'probability'})
+            self.logger.info(f"Retrieved {len(df)} predictions")
             
             return df
             
         except Exception as e:
-            self.logger.error(f"Error fetching historical accuracy: {e}")
+            self.logger.error(f"Failed to read predictions: {e}", exc_info=True)
             return pd.DataFrame()
     
-    def get_predictions(
-        self, 
-        prediction_date: str = None, 
-        limit: int = 100
-    ) -> pd.DataFrame:
-        """
-        Get predictions - OPTIMIZED COLUMN SELECTION
-        """
-        try:
-            # Only select display columns
-            select_cols = (
-                "symbol,exchange,prediction_date,explosion_probability,prediction,signal,"
-                "target_gain_pct,target_gain_low,target_gain_high,"
-                "current_price,target_price,target_price_low,target_price_high,"
-                "rsi,macd,adx,volume_ratio,hv_20,bb_width"
-            )
-            
-            query = self.client.table(self.tables["predictions"]).select(select_cols)
-            
-            if prediction_date:
-                query = query.eq("prediction_date", prediction_date)
-            
-            query = query.order("explosion_probability", desc=True).limit(limit)
-            
-            response = query.execute()
-            
-            if not response.data:
-                return pd.DataFrame()
-            
-            return pd.DataFrame(response.data)
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching predictions: {e}")
-            return pd.DataFrame()
-    
-    def get_accuracy_data(
+    def get_prediction_accuracy(
         self,
-        prediction_date: str = None,
-        days_back: int = 30
-    ) -> pd.DataFrame:
-        """Get accuracy tracking data - OPTIMIZED"""
-        try:
-            query = self.client.table(self.tables["accuracy"]).select(
-                "symbol,prediction_date,predicted_probability,predicted_signal,"
-                "predicted_target_gain,predicted_target_price,"
-                "became_winner,actual_gain_pct,actual_price,"
-                "prediction_correct,gain_error_pct"
-            )
-            
-            if prediction_date:
-                query = query.eq("prediction_date", prediction_date)
-            else:
-                end_date = datetime.now().date()
-                start_date = end_date - timedelta(days=days_back)
-                query = query.gte("prediction_date", start_date.isoformat())\
-                             .lte("prediction_date", end_date.isoformat())
-            
-            query = query.limit(1000)
-            
-            response = query.execute()
-            
-            if not response.data:
-                return pd.DataFrame()
-            
-            return pd.DataFrame(response.data)
-            
-        except Exception as e:
-            self.logger.error(f"Error fetching accuracy data: {e}")
-            return pd.DataFrame()
-    
-    # ===== WRITE METHODS (OPTIMIZED BATCHING) =====
-    
-    def _sanitize_value(self, value: Any) -> Any:
-        """Sanitize value for PostgreSQL"""
-        if value is None or pd.isna(value):
-            return None
-        
-        if isinstance(value, (np.integer, int)):
-            return int(value)
-        
-        if isinstance(value, (np.floating, float)):
-            if np.isinf(value) or np.isnan(value):
-                return None
-            return float(value)
-        
-        if isinstance(value, np.bool_):
-            return bool(value)
-        
-        return value
-    
-    def _sanitize_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Sanitize dictionary and remove auto-fields"""
-        auto_fields = {'id', 'created_at', 'updated_at'}
-        return {
-            k: self._sanitize_value(v) 
-            for k, v in data.items() 
-            if k not in auto_fields
-        }
-    
-    def write_predictions(
-        self, 
-        predictions: List[Dict[str, Any]],
-        batch_size: int = 500
-    ) -> int:
+        prediction_date: str
+    ) -> Dict[str, Any]:
         """
-        Write predictions - OPTIMIZED BATCHING
+        Calculate prediction accuracy for a given date
+        by comparing with actual winners
+        
+        Args:
+            prediction_date: Date of predictions (YYYY-MM-DD)
+            
+        Returns:
+            Dictionary with accuracy metrics
         """
-        if not predictions:
-            return 0
         
         try:
-            sanitized = [self._sanitize_dict(p) for p in predictions]
-            
-            total_written = 0
-            
-            for i in range(0, len(sanitized), batch_size):
-                batch = sanitized[i:i + batch_size]
-                
-                response = self.client.table(self.tables["predictions"]).upsert(
-                    batch,
-                    on_conflict="symbol,prediction_date"
-                ).execute()
-                
-                total_written += len(batch)
-            
-            self.logger.info(f"✓ Wrote {total_written} predictions")
-            return total_written
-            
-        except Exception as e:
-            self.logger.error(f"Error writing predictions: {e}")
-            raise
-    
-    def write_accuracy_records(
-        self,
-        accuracy_records: List[Dict[str, Any]],
-        batch_size: int = 500
-    ) -> int:
-        """Write accuracy tracking records - OPTIMIZED"""
-        if not accuracy_records:
-            return 0
-        
-        try:
-            sanitized = [self._sanitize_dict(r) for r in accuracy_records]
-            
-            total_written = 0
-            
-            for i in range(0, len(sanitized), batch_size):
-                batch = sanitized[i:i + batch_size]
-                
-                response = self.client.table(self.tables["accuracy"]).upsert(
-                    batch,
-                    on_conflict="symbol,prediction_date"
-                ).execute()
-                
-                total_written += len(batch)
-            
-            self.logger.info(f"✓ Wrote {total_written} accuracy records")
-            return total_written
-            
-        except Exception as e:
-            self.logger.error(f"Error writing accuracy records: {e}")
-            raise
-    
-    def write_screening_log(self, log_data: dict) -> bool:
-        """Write screening statistics log"""
-        try:
-            sanitized = self._sanitize_dict(log_data)
-            
-            self.client.table(self.tables["screening_logs"]).upsert(
-                sanitized,
-                on_conflict="screening_date"
-            ).execute()
-            
-            return True
-        except Exception as e:
-            self.logger.error(f"Failed to write screening log: {e}")
-            return False
-    
-    def get_latest_screening_stats(self) -> dict:
-        """Get latest screening statistics"""
-        try:
-            response = self.client.table(self.tables["screening_logs"])\
-                .select("*")\
-                .order("screening_date", desc=True)\
-                .limit(1)\
+            # Get predictions
+            predictions = self.client.table(self.predictions_table)\
+                .select("symbol,probability,prediction")\
+                .eq("prediction_date", prediction_date)\
                 .execute()
             
-            if response.data:
-                return response.data[0]
-            return {}
-        except Exception as e:
-            self.logger.error(f"Failed to get screening stats: {e}")
-            return {}
-    
-    def get_accuracy_summary(self, days_back: int = 30) -> pd.DataFrame:
-        """Get accuracy summary from materialized view"""
-        try:
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=days_back)
+            if not predictions.data:
+                return {'error': 'No predictions found'}
             
-            response = self.client.table("v_ml_daily_accuracy_summary")\
-                .select("*")\
-                .gte("prediction_date", start_date.isoformat())\
-                .lte("prediction_date", end_date.isoformat())\
+            pred_df = pd.DataFrame(predictions.data)
+            
+            # Get actual winners (stocks that exploded on this date)
+            winners = self.client.table("daily_winners")\
+                .select("symbol,change_pct")\
+                .eq("detection_date", prediction_date)\
                 .execute()
             
-            if response.data:
-                return pd.DataFrame(response.data)
-            return pd.DataFrame()
-        except Exception as e:
-            self.logger.error(f"Failed to get accuracy summary: {e}")
-            return pd.DataFrame()
-    
-    def get_signal_performance(self) -> pd.DataFrame:
-        """Get signal performance from materialized view"""
-        try:
-            response = self.client.table("v_ml_signal_performance")\
-                .select("*")\
-                .execute()
+            if not winners.data:
+                return {'error': 'No winners data available yet'}
             
-            if response.data:
-                return pd.DataFrame(response.data)
-            return pd.DataFrame()
-        except Exception as e:
-            self.logger.error(f"Failed to get signal performance: {e}")
-            return pd.DataFrame()
-    
-    def get_missed_opportunities_summary(self, days_back: int = 30) -> pd.DataFrame:
-        """Get missed opportunities summary"""
-        try:
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=days_back)
+            winner_symbols = set(w['symbol'] for w in winners.data)
             
-            response = self.client.table("v_ml_missed_summary")\
-                .select("*")\
-                .gte("detection_date", start_date.isoformat())\
-                .lte("detection_date", end_date.isoformat())\
-                .execute()
+            # Calculate accuracy
+            tp = len(pred_df[pred_df['symbol'].isin(winner_symbols)])  # True positives
+            fp = len(pred_df[~pred_df['symbol'].isin(winner_symbols)])  # False positives
             
-            if response.data:
-                return pd.DataFrame(response.data)
-            return pd.DataFrame()
-        except Exception as e:
-            self.logger.error(f"Failed to get missed opportunities: {e}")
-            return pd.DataFrame()
-    
-    def get_false_positive_patterns(self) -> pd.DataFrame:
-        """Get false positive patterns from materialized view"""
-        try:
-            response = self.client.table("v_ml_false_positive_patterns")\
-                .select("*")\
-                .execute()
+            # Get false negatives (winners we didn't predict)
+            fn = len(winner_symbols - set(pred_df['symbol']))
             
-            if response.data:
-                return pd.DataFrame(response.data)
-            return pd.DataFrame()
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+            f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            
+            return {
+                'prediction_date': prediction_date,
+                'total_predictions': len(pred_df),
+                'true_positives': tp,
+                'false_positives': fp,
+                'false_negatives': fn,
+                'precision': precision,
+                'recall': recall,
+                'f1_score': f1,
+                'actual_winners': len(winner_symbols),
+                'predicted_symbols': list(pred_df['symbol']),
+                'winner_symbols': list(winner_symbols)
+            }
+            
         except Exception as e:
-            self.logger.error(f"Failed to get FP patterns: {e}")
-            return pd.DataFrame()
+            self.logger.error(f"Failed to calculate accuracy: {e}", exc_info=True)
+            return {'error': str(e)}
