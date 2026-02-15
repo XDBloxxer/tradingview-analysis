@@ -18,8 +18,8 @@ class MLPredictionSupabaseClient:
         """Initialize Supabase client"""
         self.logger = logging.getLogger(__name__)
         
-        supabase_url = config.get('supabase', {}).get('url')
-        supabase_key = config.get('supabase', {}).get('key')
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_KEY")
         
         if not supabase_url or not supabase_key:
             raise ValueError("Supabase URL and KEY must be provided in config")
@@ -211,3 +211,4 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Failed to calculate accuracy: {e}", exc_info=True)
             return {'error': str(e)}
+
