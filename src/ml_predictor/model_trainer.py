@@ -1,11 +1,14 @@
 """
-Model Trainer - INCREMENTAL LEARNING SYSTEM
-Combines original research data with new daily winners data
-Prevents catastrophic forgetting of historical patterns
+Model Trainer - FIXED VERSION WITH NON-WINNERS SUPPORT
+Addresses all issues from the analysis conversation:
+1. Training data leakage (only uses T-1 data)
+2. Selection bias (includes negative examples)
+3. Incremental learning (preserves historical patterns)
+4. Same-day data exclusion (never trains on current day)
 """
 
 import logging
-import pickle
+import joblib  # Use joblib instead of pickle
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -41,7 +44,7 @@ class ModelTrainer:
     def load_historical_training_data(self) -> Tuple[pd.DataFrame, pd.Series, Dict]:
         """
         Load original historical training data (10k stocks × 2 years)
-        This preserves your original research insights
+        This preserves your original research insights with T-3, T-5, T-10 lags
         
         Expected file: ml_models/historical_data/original_training_data.pkl
         Format: {'X': DataFrame, 'y': Series, 'metadata': dict}
@@ -55,12 +58,11 @@ class ModelTrainer:
             self.logger.info("To preserve original research:")
             self.logger.info("  1. Save your original training data as:")
             self.logger.info(f"     {historical_file}")
-            self.logger.info("  2. Format: pickle file with dict containing 'X', 'y', 'metadata'")
+            self.logger.info("  2. Format: joblib dump with dict containing 'X', 'y', 'metadata'")
             return None, None, None
         
         try:
-            with open(historical_file, 'rb') as f:
-                data = pickle.load(f)
+            data = joblib.load(historical_file)
             
             X = data['X']
             y = data['y']
@@ -83,27 +85,33 @@ class ModelTrainer:
         self,
         supabase_client,
         lookback_days: int = 90,
-        use_all_timepoints: bool = True
+        use_all_timepoints: bool = True,
+        include_non_winners: bool = True
     ) -> Tuple[pd.DataFrame, pd.Series, Dict]:
         """
-        Prepare NEW training data from Daily Winners system
-        This adds real-world performance data
+        Prepare NEW training data from Daily Winners AND Non-Winners systems
+        FIXED: Only uses T-1 data (day_prior_open, day_prior_close)
+        NEVER uses same-day data (market_open, market_close) per the analysis
         
         Strategy:
-        1. Get all day_prior_close data (T-1 indicators) - PRIMARY SOURCE
-        2. Optionally add day_prior_open for MORE DATA
-        3. Label stocks that became winners next day as 1, others as 0
+        1. Get T-1 close data (PRIMARY - most important)
+        2. Optionally add T-1 open for more examples
+        3. Include both winners (label=1) and non-winners (label=0)
+        4. CRITICAL: Never train on same-day data (prevents leakage)
         """
         
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=lookback_days)
         
-        self.logger.info(f"Preparing NEW training data from daily winners ({start_date} to {end_date})")
+        self.logger.info(f"Preparing NEW training data ({start_date} to {end_date})")
+        self.logger.info(f"Include non-winners (negative examples): {include_non_winners}")
+        self.logger.info("TRAINING STRATEGY: Use ONLY T-1 data (day_prior_close, day_prior_open)")
+        self.logger.info("                   NEVER use same-day data (prevents leakage)")
         
         client = supabase_client.client
         
-        # ===== STEP 1: Get T-1 close data (PRIMARY) =====
-        self.logger.info("Loading day_prior_close data...")
+        # ===== STEP 1: Get WINNERS T-1 close data (POSITIVE EXAMPLES) =====
+        self.logger.info("\nLoading WINNERS day_prior_close data (positive examples)...")
         
         response = client.table("winners_day_prior_close")\
             .select("*")\
@@ -112,14 +120,47 @@ class ModelTrainer:
             .execute()
         
         if not response.data:
-            self.logger.warning("No day_prior_close data available")
+            self.logger.warning("No winners day_prior_close data available")
+            winners_day_prior_close_df = pd.DataFrame()
+        else:
+            winners_day_prior_close_df = pd.DataFrame(response.data)
+            self.logger.info(f"  Loaded {len(winners_day_prior_close_df)} winners T-1 close records")
+        
+        # ===== STEP 1b: Get NON-WINNERS T-1 close data (NEGATIVE EXAMPLES) =====
+        non_winners_day_prior_close_df = pd.DataFrame()
+        
+        if include_non_winners:
+            self.logger.info("Loading NON-WINNERS day_prior_close data (negative examples)...")
+            
+            try:
+                response = client.table("non_winners_day_prior_close")\
+                    .select("*")\
+                    .gte("detection_date", start_date.isoformat())\
+                    .lte("detection_date", end_date.isoformat())\
+                    .execute()
+                
+                if response.data:
+                    non_winners_day_prior_close_df = pd.DataFrame(response.data)
+                    self.logger.info(f"  Loaded {len(non_winners_day_prior_close_df)} non-winners T-1 close records")
+                else:
+                    self.logger.warning("  No non-winners data found - run daily_non_winners_main.py")
+            except Exception as e:
+                self.logger.warning(f"  Could not load non-winners data: {e}")
+                self.logger.warning("  Training WITHOUT negative examples (high false positive risk!)")
+        
+        # Combine winners and non-winners
+        if not winners_day_prior_close_df.empty and not non_winners_day_prior_close_df.empty:
+            day_prior_close_df = pd.concat([winners_day_prior_close_df, non_winners_day_prior_close_df], ignore_index=True)
+            self.logger.info(f"  Combined: {len(day_prior_close_df)} total T-1 close records")
+        elif not winners_day_prior_close_df.empty:
+            day_prior_close_df = winners_day_prior_close_df
+            self.logger.warning("  Using ONLY winners data (no negative examples - BIASED!)")
+        else:
+            self.logger.error("  No training data available!")
             return pd.DataFrame(), pd.Series(), {}
         
-        day_prior_close_df = pd.DataFrame(response.data)
-        self.logger.info(f"  Loaded {len(day_prior_close_df)} T-1 close records")
-        
         # ===== STEP 2: Get actual winners for labeling =====
-        self.logger.info("Loading actual winners for labeling...")
+        self.logger.info("\nLoading actual winners for labeling...")
         
         response = client.table("daily_winners")\
             .select("symbol,detection_date,change_pct,price")\
@@ -134,12 +175,11 @@ class ModelTrainer:
         winners_df = pd.DataFrame(response.data)
         self.logger.info(f"  Loaded {len(winners_df)} actual winner records")
         
-        # ===== STEP 3: Create training samples =====
-        self.logger.info("Creating labeled training samples...")
+        # ===== STEP 3: Create training samples from T-1 CLOSE =====
+        self.logger.info("\nCreating labeled training samples from T-1 CLOSE data...")
         
         training_samples = []
         
-        # Process day_prior_close (best data)
         for _, row in day_prior_close_df.iterrows():
             symbol = row['symbol']
             detection_date = row['detection_date']
@@ -152,15 +192,13 @@ class ModelTrainer:
             
             is_winner = len(winner_match) > 0
             
-            # Get actual gain if winner
             if is_winner:
                 actual_gain = winner_match.iloc[0]['change_pct']
                 actual_price = winner_match.iloc[0]['price']
             else:
-                actual_gain = 0  # Didn't explode
+                actual_gain = 0
                 actual_price = row.get('close', 0)
             
-            # Create training sample
             sample = {
                 'symbol': symbol,
                 'detection_date': detection_date,
@@ -178,25 +216,54 @@ class ModelTrainer:
             
             training_samples.append(sample)
         
-        # ===== OPTIONAL: Add more timepoints for additional data =====
+        # ===== STEP 4: OPTIONAL - Add T-1 OPEN data =====
         if use_all_timepoints:
-            self.logger.info("Adding day_prior_open data for more training samples...")
+            self.logger.info("\nAdding T-1 OPEN data for more training samples...")
             
+            # Load winners T-1 open
             response = client.table("winners_day_prior_open")\
                 .select("*")\
                 .gte("detection_date", start_date.isoformat())\
                 .lte("detection_date", end_date.isoformat())\
                 .execute()
             
-            if response.data:
-                day_prior_open_df = pd.DataFrame(response.data)
-                self.logger.info(f"  Loaded {len(day_prior_open_df)} T-1 open records")
+            winners_day_prior_open_df = pd.DataFrame(response.data) if response.data else pd.DataFrame()
+            
+            if not winners_day_prior_open_df.empty:
+                self.logger.info(f"  Loaded {len(winners_day_prior_open_df)} winners T-1 open records")
+            
+            # Load non-winners T-1 open
+            non_winners_day_prior_open_df = pd.DataFrame()
+            if include_non_winners:
+                try:
+                    response = client.table("non_winners_day_prior_open")\
+                        .select("*")\
+                        .gte("detection_date", start_date.isoformat())\
+                        .lte("detection_date", end_date.isoformat())\
+                        .execute()
+                    
+                    if response.data:
+                        non_winners_day_prior_open_df = pd.DataFrame(response.data)
+                        self.logger.info(f"  Loaded {len(non_winners_day_prior_open_df)} non-winners T-1 open records")
+                except Exception as e:
+                    self.logger.warning(f"  Could not load non-winners T-1 open: {e}")
+            
+            # Combine T-1 open data
+            if not winners_day_prior_open_df.empty and not non_winners_day_prior_open_df.empty:
+                day_prior_open_df = pd.concat([winners_day_prior_open_df, non_winners_day_prior_open_df], ignore_index=True)
+            elif not winners_day_prior_open_df.empty:
+                day_prior_open_df = winners_day_prior_open_df
+            else:
+                day_prior_open_df = pd.DataFrame()
+            
+            if not day_prior_open_df.empty:
+                self.logger.info(f"  Combined T-1 open: {len(day_prior_open_df)} records")
                 
                 for _, row in day_prior_open_df.iterrows():
                     symbol = row['symbol']
                     detection_date = row['detection_date']
                     
-                    # Skip if we already have this stock from day_prior_close
+                    # Skip if we already have this stock from T-1 close
                     if any(s['symbol'] == symbol and s['detection_date'] == detection_date 
                           and s['timepoint'] == 'day_prior_close' for s in training_samples):
                         continue
@@ -237,10 +304,11 @@ class ModelTrainer:
         # Convert to DataFrame
         df = pd.DataFrame(training_samples)
         
-        self.logger.info(f"Created {len(df)} NEW training samples from daily winners")
-        self.logger.info(f"  - Positives (explosions): {df['label'].sum()}")
-        self.logger.info(f"  - Negatives (no explosion): {len(df) - df['label'].sum()}")
+        self.logger.info(f"\n✓ Created {len(df)} NEW training samples")
+        self.logger.info(f"  - Positives (winners): {df['label'].sum()}")
+        self.logger.info(f"  - Negatives (non-winners): {len(df) - df['label'].sum()}")
         self.logger.info(f"  - Positive rate: {df['label'].mean()*100:.2f}%")
+        self.logger.info(f"  - Timepoints used: {list(df['timepoint'].unique())}")
         
         # Separate features and labels
         exclude_cols = ['symbol', 'detection_date', 'label', 'actual_gain_pct', 
@@ -259,8 +327,11 @@ class ModelTrainer:
             'date_range': f"{start_date} to {end_date}",
             'feature_count': len(feature_cols),
             'features': feature_cols,
-            'source': 'daily_winners',
-            'timepoints_used': list(df['timepoint'].unique())
+            'source': 'daily_winners_and_non_winners' if include_non_winners else 'daily_winners_only',
+            'timepoints_used': list(df['timepoint'].unique()),
+            'includes_negative_examples': include_non_winners,
+            'uses_only_t1_data': True,  # Confirms no same-day data leakage
+            'same_day_data_excluded': True  # Per analysis requirements
         }
         
         return X, y, metadata
@@ -271,19 +342,19 @@ class ModelTrainer:
         historical_y: pd.Series,
         new_X: pd.DataFrame,
         new_y: pd.Series,
-        historical_weight: float = 0.7
-    ) -> Tuple[pd.DataFrame, pd.Series, Dict]:
+        historical_weight: float = 1.0
+    ) -> Tuple[pd.DataFrame, pd.Series, Dict, np.ndarray]:
         """
         CRITICAL: Combine historical and new data intelligently
+        Per analysis: Keep historical weight at 1.0 to preserve T-3, T-5, T-10 insights
         
         Strategy:
         1. Keep ALL historical data (preserve research insights)
-        2. Add new daily winners data (real-world calibration)
-        3. Apply sample weighting to balance importance
+        2. Add new daily winners/non-winners data (real-world calibration)
+        3. Apply sample weighting: EQUAL weight to both (1.0 each)
         
         Args:
-            historical_weight: How much to weight historical samples (0.7 = 70% weight)
-                              This prevents new data from drowning out historical patterns
+            historical_weight: Weight for historical samples (1.0 = equal, RECOMMENDED)
         """
         
         self.logger.info("\n" + "="*80)
@@ -292,12 +363,12 @@ class ModelTrainer:
         
         if historical_X is None or historical_X.empty:
             self.logger.warning("No historical data - using ONLY new data")
-            self.logger.warning("Model may forget time-lag patterns and deep analysis!")
-            return new_X, new_y, {'source': 'new_only'}
+            self.logger.warning("Model may forget time-lag patterns (T-3, T-5, T-10)!")
+            return new_X, new_y, {'source': 'new_only'}, None
         
         if new_X.empty:
             self.logger.warning("No new data - using ONLY historical data")
-            return historical_X, historical_y, {'source': 'historical_only'}
+            return historical_X, historical_y, {'source': 'historical_only'}, None
         
         # Align features (use union of all features)
         all_features = sorted(list(set(historical_X.columns) | set(new_X.columns)))
@@ -322,22 +393,22 @@ class ModelTrainer:
         X_combined = pd.concat([historical_X, new_X], ignore_index=True)
         y_combined = pd.concat([historical_y, new_y], ignore_index=True)
         
-        # Create sample weights
-        # Historical samples get higher weight to preserve insights
+        # Create sample weights - EQUAL weighting per analysis
         historical_samples = len(historical_X)
         new_samples = len(new_X)
         
         sample_weights = np.concatenate([
             np.full(historical_samples, historical_weight),
-            np.full(new_samples, 1.0 - historical_weight)
+            np.full(new_samples, historical_weight)  # EQUAL weight
         ])
         
         self.logger.info(f"\nCombined training data:")
         self.logger.info(f"  Historical samples: {historical_samples} (weight: {historical_weight})")
-        self.logger.info(f"  New samples: {new_samples} (weight: {1.0 - historical_weight})")
+        self.logger.info(f"  New samples: {new_samples} (weight: {historical_weight})")
         self.logger.info(f"  Total samples: {len(X_combined)}")
         self.logger.info(f"  Total positives: {y_combined.sum()}")
         self.logger.info(f"  Positive rate: {y_combined.mean()*100:.2f}%")
+        self.logger.info("  ✓ Equal weighting preserves historical T-lag insights")
         
         metadata = {
             'n_samples': len(X_combined),
@@ -386,7 +457,6 @@ class ModelTrainer:
         
         # Split data
         if use_time_series_split:
-            # Time-series split (no random shuffling)
             split_idx = int(len(X) * (1 - test_size))
             X_train = X.iloc[:split_idx]
             X_test = X.iloc[split_idx:]
@@ -403,7 +473,6 @@ class ModelTrainer:
             self.logger.info("Using time-series split (preserves temporal order)")
         else:
             if sample_weights is not None:
-                # Can't use stratify with sample weights easily
                 X_train, X_test, y_train, y_test, weights_train, weights_test = train_test_split(
                     X, y, sample_weights, test_size=test_size, random_state=42
                 )
@@ -527,19 +596,16 @@ class ModelTrainer:
             archive_scaler = self.archive_dir / f"scaler_{version}.pkl"
             old_scaler_path.rename(archive_scaler)
         
-        # Save new model - CRITICAL FIX: Add protocol=4 for compatibility
+        # Save new model - Use joblib
         model_path = self.model_dir / "best_model.pkl"
         scaler_path = self.model_dir / "scaler.pkl"
         
-        with open(model_path, 'wb') as f:
-            pickle.dump(model, f, protocol=4)
-        
-        with open(scaler_path, 'wb') as f:
-            pickle.dump(scaler, f, protocol=4)
+        joblib.dump(model, model_path)
+        joblib.dump(scaler, scaler_path)
         
         # Save metadata
         metadata['model_version'] = version
-        metadata['pickle_protocol'] = 4
+        metadata['saved_with'] = 'joblib'
         
         metadata_path = self.model_dir / "model_metadata.json"
         import json
