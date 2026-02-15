@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Optional
 from datetime import datetime, date
 import pandas as pd
 from supabase import create_client, Client
+import os
 
 
 class MLPredictionSupabaseClient:
@@ -211,4 +212,5 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Failed to calculate accuracy: {e}", exc_info=True)
             return {'error': str(e)}
+
 
