@@ -12,12 +12,27 @@ from pathlib import Path
 import sys
 import pandas as pd
 import numpy as np
+import yaml
 from tradingview_ta import TA_Handler, Interval
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.utils import setup_logging, load_config
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
+
+
+def load_config(config_path: str) -> dict:
+    """Load config from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def setup_logging(level: str = "INFO"):
+    """Setup basic logging"""
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
 
 
 def get_last_trading_day(from_date: datetime = None) -> str:
@@ -522,7 +537,7 @@ def main():
     
     config = load_config(args.config)
     log_level = "DEBUG" if args.verbose else "INFO"
-    logger = setup_logging(log_level, config.get("logging", {}))
+    logger = setup_logging(log_level)
     
     logger.info("="*80)
     logger.info("COMPREHENSIVE ML ACCURACY TRACKING")
