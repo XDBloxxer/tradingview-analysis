@@ -32,7 +32,7 @@ class MLPredictionSupabaseClient:
         # Table names
         self.predictions_table = "ml_explosion_predictions"
         self.accuracy_table = "ml_prediction_accuracy"
-        self.screening_log_table = "ml_screening_log"
+        self.screening_log_table = "ml_screening_logs"
         
         self.logger.info("ML Supabase client initialized")
     
@@ -592,3 +592,4 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Failed to calculate accuracy stats: {e}")
             return {'error': str(e)}
+
