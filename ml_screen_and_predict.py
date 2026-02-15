@@ -89,30 +89,14 @@ class SmartScreener:
                 {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
             ]
             
-            # Request columns that TradingView API actually supports
-            # Only use documented field names from TradingView
-            columns = [
-                'name', 'close', 'open', 'high', 'low', 'volume', 
-                'market_cap_basic',
-                'RSI', 'RSI[1]',
-                'Stoch.K', 'Stoch.D',
-                'MACD.macd', 'MACD.signal',
-                'ADX', 'ADX+DI', 'ADX-DI',
-                'AO', 'UO', 'CCI20',
-                'EMA5', 'EMA10', 'EMA20', 'EMA50', 'EMA100', 'EMA200',
-                'SMA5', 'SMA10', 'SMA20', 'SMA50', 'SMA100', 'SMA200',
-                'VWAP',
-                'BB.upper', 'BB.lower', 'BB.middle',
-                'ATR',
-                'Rec.All',
-                'change', 'change_abs',
-                'Volatility.D',
-            ]
+            # Don't specify columns - let TradingView return defaults
+            # Then we'll work with whatever we get
+            
+            self.logger.debug("Requesting default columns from TradingView...")
             
             result = self.screener.screen(
                 market='america',
                 filters=filters,
-                columns=columns,
                 sort_by='volume',
                 sort_order='desc',
                 limit=max_results
@@ -120,6 +104,10 @@ class SmartScreener:
             
             if result['status'] == 'success' and result.get('data'):
                 df = pd.DataFrame(result['data'])
+                
+                # Log what columns we actually got
+                self.logger.info(f"Received columns from TradingView: {list(df.columns)}")
+                
                 self.logger.info(f"✓ Found {len(df)} stocks (total available: {result.get('totalCount', '?')})")
                 return df
             
