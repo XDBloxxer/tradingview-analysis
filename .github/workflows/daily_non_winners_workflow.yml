@@ -3,7 +3,7 @@ name: Daily Non-Winners Tracker
 on:
   # Run daily at 5:00 PM EST (after daily winners at 4:30 PM)
   schedule:
-    - cron: '50 21 * * 1-5'  # 22:00 UTC = 5:00 PM EST (Mon-Fri only)
+    - cron: '50 20 * * 1-5'  # 22:00 UTC = 5:00 PM EST (Mon-Fri only)
   
   # Allow manual triggering
   workflow_dispatch:
