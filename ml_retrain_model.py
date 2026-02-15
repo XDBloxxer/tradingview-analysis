@@ -1,11 +1,11 @@
 """
 ML Model Retraining Script - FIXED VERSION
-Implements incremental learning with non-winners support
+Implements incremental learning with correct sample weighting
 
 Key fixes:
 1. Only uses T-1 data (no same-day leakage)
 2. Includes non-winners (negative examples)
-3. Equal weighting preserves historical patterns
+3. Historical weight = 10.0 (preserves T-3, T-5, T-10 patterns)
 4. Uses joblib for model persistence
 """
 
@@ -31,8 +31,8 @@ def main():
                        help='Use both T-1 close and T-1 open data')
     parser.add_argument('--no-non-winners', action='store_true',
                        help='Exclude non-winners (NOT recommended - causes bias)')
-    parser.add_argument('--historical-weight', type=float, default=1.0,
-                       help='Weight for historical samples (default: 1.0 = equal)')
+    parser.add_argument('--historical-weight', type=float, default=10.0,
+                       help='Weight for historical samples (default: 10.0 to preserve T-lag patterns)')
     parser.add_argument('--test-size', type=float, default=0.2,
                        help='Test set proportion (default: 0.2)')
     parser.add_argument('--verbose', action='store_true',
@@ -58,6 +58,11 @@ def main():
         logger.warning("⚠️  Training WITHOUT non-winners - this causes selection bias!")
         logger.warning("⚠️  Model will have high false positive rate!")
     
+    if args.historical_weight < 5.0:
+        logger.warning(f"⚠️  Historical weight {args.historical_weight} is LOW!")
+        logger.warning("⚠️  Model may forget T-3, T-5, T-10 patterns!")
+        logger.warning("⚠️  Recommended: 10.0 or higher")
+    
     try:
         # Load config
         config = load_config()
@@ -82,6 +87,7 @@ def main():
             logger.info("  2. Format: joblib dump with {'X': df, 'y': series, 'metadata': dict}")
         else:
             logger.info(f"✓ Historical data loaded: {len(historical_X)} samples")
+            logger.info(f"  This preserves your T-3, T-5, T-10 lag patterns")
         
         # ===== STEP 2: Prepare New Training Data from Daily Systems =====
         logger.info("\n" + "="*80)
@@ -115,6 +121,9 @@ def main():
         logger.info("\n" + "="*80)
         logger.info("STEP 3: Combining Historical + New Data")
         logger.info("="*80)
+        logger.info(f"Historical weight: {args.historical_weight}x")
+        logger.info(f"New data weight: 1.0x")
+        logger.info("This preserves T-3, T-5, T-10 patterns while learning T-1")
         
         X_combined, y_combined, combined_metadata, sample_weights = trainer.combine_training_data(
             historical_X,
@@ -234,6 +243,13 @@ def main():
             logger.warning("  - Lower precision (more false positives)")
             logger.warning("  - Poor discrimination")
             logger.warning("  - Less reliable predictions")
+        
+        if args.historical_weight >= 10.0:
+            logger.info("\n✓ Historical weight is optimal (10.0+)")
+            logger.info("  T-3, T-5, T-10 patterns preserved")
+        else:
+            logger.warning(f"\n⚠️  Historical weight is {args.historical_weight}")
+            logger.warning("  Model may gradually forget time-lag patterns")
         
         logger.info(f"\nFinished at: {datetime.now()}")
         
