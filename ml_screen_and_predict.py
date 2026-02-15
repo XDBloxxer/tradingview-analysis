@@ -222,7 +222,12 @@ class SmartScreener:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Efficient ML stock screening with tradingview-scraper")
+    parser = argparse.ArgumentParser(description="Efficient ML stock screening with tradingview-screner")
+    parser.add_argument("--universe", type=str, default="auto",
+                       choices=["auto", "sp500", "nasdaq", "all"],
+                       help="Stock universe (ignored - using tradingview-screener)")
+    parser.add_argument("--max-workers", type=int, default=15,
+                       help="Max workers (ignored - tradingview-screener is single query)")
     parser.add_argument("--max-results", type=int, default=500,
                        help="Maximum stocks to screen")
     parser.add_argument("--top-n", type=int, default=50,
