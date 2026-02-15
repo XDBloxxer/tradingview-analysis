@@ -154,7 +154,6 @@ class MLPredictionSupabaseClient:
                 - max_probability
                 - min_probability
                 - model_version
-                - screening_method
                 
         Returns:
             True if successful
@@ -592,4 +591,5 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Failed to calculate accuracy stats: {e}")
             return {'error': str(e)}
+
 
