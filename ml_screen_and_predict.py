@@ -89,12 +89,17 @@ class SmartScreener:
                 {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
             ]
             
+            # Request ALL columns the model needs
             columns = [
-                'name', 'close', 'volume', 'market_cap_basic',
+                'name', 'close', 'open', 'high', 'low', 'volume', 'market_cap_basic',
                 'RSI', 'ADX', 'MACD.macd', 'MACD.signal',
                 'Stoch.K', 'Stoch.D', 
-                'EMA20', 'SMA20', 'ATR', 'BB.upper', 'BB.lower',
-                'change'
+                'EMA5', 'EMA10', 'EMA20', 'EMA50', 'EMA100', 'EMA200',
+                'SMA5', 'SMA10', 'SMA20', 'SMA50', 'SMA100', 'SMA200',
+                'ATR', 'BB.upper', 'BB.lower', 'BB.middle',
+                'CCI20', 'AO', 'UO',
+                'VWAP', 'OBV',
+                'change', 'volume_change_abs', 'Volatility.D'
             ]
             
             result = self.screener.screen(
@@ -126,9 +131,13 @@ class SmartScreener:
             screened_df['ticker'] = screened_df['symbol'].str.split(':').str[-1]
             screened_df['exchange_prefix'] = screened_df['symbol'].str.split(':').str[0]
         
+        # Complete column mapping
         rename_map = {
             'ticker': 'symbol',
             'close': 'close',
+            'open': 'open',
+            'high': 'high',
+            'low': 'low',
             'volume': 'volume',
             'RSI': 'rsi',
             'ADX': 'adx',
@@ -136,19 +145,77 @@ class SmartScreener:
             'MACD.signal': 'macd.signal',
             'Stoch.K': 'stoch.k',
             'Stoch.D': 'stoch.d',
+            'EMA5': 'ema5',
+            'EMA10': 'ema10',
             'EMA20': 'ema20',
+            'EMA50': 'ema50',
+            'EMA100': 'ema100',
+            'EMA200': 'ema200',
+            'SMA5': 'sma5',
+            'SMA10': 'sma10',
             'SMA20': 'sma20',
+            'SMA50': 'sma50',
+            'SMA100': 'sma100',
+            'SMA200': 'sma200',
             'ATR': 'atr',
             'BB.upper': 'bb.upper',
             'BB.lower': 'bb.lower',
+            'BB.middle': 'bb.middle',
+            'CCI20': 'cci20',
+            'AO': 'ao',
+            'UO': 'uo',
+            'VWAP': 'vwap',
+            'OBV': 'obv',
+            'volume_change_abs': 'volume_change',
+            'Volatility.D': 'volatility_20d',
         }
         
         features_df = screened_df.rename(columns=rename_map)
         
+        # Calculate derived features
         if 'bb.upper' in features_df.columns and 'bb.lower' in features_df.columns:
             features_df['bb_width'] = features_df['bb.upper'] - features_df['bb.lower']
         
+        # Calculate volume ratio if we have volume
+        if 'volume' in features_df.columns and 'sma20' in features_df.columns:
+            # Estimate volume SMA as volume / 1.5 (rough approximation)
+            features_df['volume_ratio'] = features_df['volume'] / (features_df['volume'] / 1.5)
+        elif 'volume' in features_df.columns:
+            features_df['volume_ratio'] = 1.0
+        
+        # Fill in missing features with sensible defaults
+        # Price-based features
+        if 'open' not in features_df.columns and 'close' in features_df.columns:
+            features_df['open'] = features_df['close']
+        if 'high' not in features_df.columns and 'close' in features_df.columns:
+            features_df['high'] = features_df['close'] * 1.02
+        if 'low' not in features_df.columns and 'close' in features_df.columns:
+            features_df['low'] = features_df['close'] * 0.98
+        
+        # Keltner channels (use BB as proxy if not available)
+        if 'keltner_upper' not in features_df.columns and 'bb.upper' in features_df.columns:
+            features_df['keltner_upper'] = features_df['bb.upper']
+            features_df['keltner_lower'] = features_df['bb.lower']
+        
+        # Donchian channels (use high/low if available)
+        if 'donchian_upper' not in features_df.columns and 'high' in features_df.columns:
+            features_df['donchian_upper'] = features_df['high']
+            features_df['donchian_lower'] = features_df['low']
+            features_df['donchian_middle'] = (features_df['high'] + features_df['low']) / 2
+        
+        # Volatility estimates
+        if 'volatility_10d' not in features_df.columns and 'volatility_20d' in features_df.columns:
+            features_df['volatility_10d'] = features_df['volatility_20d']
+            features_df['volatility_30d'] = features_df['volatility_20d']
+        elif 'volatility_10d' not in features_df.columns:
+            features_df['volatility_10d'] = 1.0
+            features_df['volatility_20d'] = 1.0
+            features_df['volatility_30d'] = 1.0
+        
+        # Set exchange
         features_df['exchange'] = features_df.get('exchange_prefix', 'NASDAQ')
+        
+        self.logger.info(f"Features prepared: {len(features_df.columns)} columns")
         
         return features_df
 
