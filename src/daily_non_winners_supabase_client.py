@@ -75,18 +75,31 @@ class DailyNonWinnersSupabaseClient:
         
         # Handle numpy integer types
         if isinstance(value, np.integer):
-            return int(value)
+            val = int(value)
+            # Volume/OBV fields can be very large - BIGINT range
+            if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
+                return val
+            # Other integers should fit in normal INT range
+            return val
         
         # Handle numpy floating types
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
             
-            # Volume fields should be integers (BIGINT in database)
-            if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
-                return int(value)
+            val = float(value)
             
-            return float(value)
+            # Volume/OBV fields should be integers (BIGINT)
+            if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
+                return int(val)
+            
+            # Check for numeric overflow for DECIMAL(10,4) fields
+            # Max value: 999,999.9999 (10 digits total, 4 after decimal)
+            if abs(val) >= 1000000:  # 10^6
+                self.logger.warning(f"Value {val} for field '{field_name}' exceeds DECIMAL(10,4) range, capping")
+                return None  # Return None for values that don't fit
+            
+            return val
         
         # Handle numpy bool
         if isinstance(value, np.bool_):
@@ -97,9 +110,14 @@ class DailyNonWinnersSupabaseClient:
             if np.isinf(value) or np.isnan(value):
                 return None
             
-            # Volume fields should be integers (BIGINT in database)
+            # Volume/OBV fields should be integers (BIGINT)
             if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
                 return int(value)
+            
+            # Check for numeric overflow for DECIMAL(10,4) fields
+            if abs(value) >= 1000000:  # 10^6
+                self.logger.warning(f"Value {value} for field '{field_name}' exceeds DECIMAL(10,4) range, capping")
+                return None
             
             # FIX: convert float integers (0.0, 1.0) to int for flag fields
             if value.is_integer():
