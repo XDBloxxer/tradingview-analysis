@@ -270,13 +270,141 @@ def main():
         logger.error("No stocks passed screening")
         return 1
     
-    # STEP 2: PREPARE FEATURES
+    logger.info(f"✓ Screened {len(screened_df)} stocks from TradingView")
+    
+    # STEP 2: FETCH TECHNICAL INDICATORS
     logger.info("\n" + "="*80)
-    logger.info("STEP 2: PREPARE FEATURES")
+    logger.info("STEP 2: FETCH TECHNICAL INDICATORS")
     logger.info("="*80)
     
-    features_df = screener.prepare_features(screened_df)
-    logger.info(f"Prepared {len(features_df)} stocks for prediction")
+    # Extract symbols from screened results
+    symbols = []
+    if 'symbol' in screened_df.columns:
+        # Handle "NASDAQ:AAPL" format
+        symbols = screened_df['symbol'].str.split(':').str[-1].tolist()
+    else:
+        logger.error("No symbol column in screened results")
+        return 1
+    
+    logger.info(f"Fetching detailed indicators for {len(symbols)} stocks using yfinance...")
+    
+    # Fetch indicators using yfinance + ta library
+    import yfinance as yf
+    import ta
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    def fetch_stock_indicators(symbol):
+        """Fetch full technical indicators for a stock"""
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period="3mo", interval="1d")
+            
+            if df.empty or len(df) < 20:
+                return None
+            
+            # Calculate all technical indicators
+            # Trend indicators
+            df['sma5'] = ta.trend.sma_indicator(df['Close'], window=5)
+            df['sma10'] = ta.trend.sma_indicator(df['Close'], window=10)
+            df['sma20'] = ta.trend.sma_indicator(df['Close'], window=20)
+            df['sma50'] = ta.trend.sma_indicator(df['Close'], window=50)
+            df['sma100'] = ta.trend.sma_indicator(df['Close'], window=100)
+            df['sma200'] = ta.trend.sma_indicator(df['Close'], window=200)
+            
+            df['ema5'] = ta.trend.ema_indicator(df['Close'], window=5)
+            df['ema10'] = ta.trend.ema_indicator(df['Close'], window=10)
+            df['ema20'] = ta.trend.ema_indicator(df['Close'], window=20)
+            df['ema50'] = ta.trend.ema_indicator(df['Close'], window=50)
+            df['ema100'] = ta.trend.ema_indicator(df['Close'], window=100)
+            df['ema200'] = ta.trend.ema_indicator(df['Close'], window=200)
+            
+            # Momentum indicators
+            df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+            df['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14)
+            df['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14)
+            
+            df['macd.macd'] = ta.trend.macd(df['Close'])
+            df['macd.signal'] = ta.trend.macd_signal(df['Close'])
+            
+            df['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
+            df['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
+            df['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'])
+            df['uo'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
+            
+            # Volatility indicators
+            bb = ta.volatility.BollingerBands(df['Close'])
+            df['bb.upper'] = bb.bollinger_hband()
+            df['bb.lower'] = bb.bollinger_lband()
+            df['bb.middle'] = bb.bollinger_mavg()
+            df['bb_width'] = df['bb.upper'] - df['bb.lower']
+            
+            df['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
+            
+            keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'])
+            df['keltner_upper'] = keltner.keltner_channel_hband()
+            df['keltner_lower'] = keltner.keltner_channel_lband()
+            
+            donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'])
+            df['donchian_upper'] = donchian.donchian_channel_hband()
+            df['donchian_lower'] = donchian.donchian_channel_lband()
+            df['donchian_middle'] = donchian.donchian_channel_mband()
+            
+            # Volume indicators
+            df['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+            df['volume_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
+            
+            # VWAP
+            df['vwap'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
+            
+            # Volatility periods
+            df['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100
+            df['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100
+            df['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100
+            
+            # Get the most recent row
+            latest = df.iloc[-1]
+            
+            result = {
+                'symbol': symbol,
+                'close': latest['Close'],
+                'open': latest['Open'],
+                'high': latest['High'],
+                'low': latest['Low'],
+                'volume': latest['Volume'],
+                'exchange': 'NASDAQ',  # Default
+            }
+            
+            # Add all indicators
+            for col in df.columns:
+                if col not in ['Open', 'High', 'Low', 'Close', 'Volume']:
+                    result[col] = latest[col]
+            
+            return result
+            
+        except Exception as e:
+            logger.debug(f"Failed to fetch {symbol}: {e}")
+            return None
+    
+    # Fetch in parallel
+    enriched_stocks = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_stock_indicators, sym): sym for sym in symbols}
+        
+        for i, future in enumerate(as_completed(futures), 1):
+            if i % 50 == 0:
+                logger.info(f"  Fetched {i}/{len(symbols)} stocks...")
+            
+            result = future.result()
+            if result:
+                enriched_stocks.append(result)
+    
+    if not enriched_stocks:
+        logger.error("Failed to fetch indicators for any stocks")
+        return 1
+    
+    features_df = pd.DataFrame(enriched_stocks)
+    logger.info(f"✓ Fetched indicators for {len(features_df)} stocks")
+    logger.info(f"  Columns: {len(features_df.columns)}")
     
     # STEP 3: ML PREDICTION
     logger.info("\n" + "="*80)
