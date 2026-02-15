@@ -19,8 +19,9 @@ from src.ml_predictor.explosion_predictor import ExplosionPredictor
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
 # Import tradingview-scraper
+# FIXED: Changed from tradingview_screener to tradingview_scraper
 try:
-    from tradingview_scraper import Query, Column  
+    from tradingview_scraper import Query, Column  # ← FIXED LINE
     SCREENER_AVAILABLE = True
 except ImportError:
     SCREENER_AVAILABLE = False
@@ -225,9 +226,9 @@ def main():
     parser = argparse.ArgumentParser(description="Efficient ML stock screening with tradingview-screner")
     parser.add_argument("--universe", type=str, default="auto",
                        choices=["auto", "sp500", "nasdaq", "all"],
-                       help="Stock universe (ignored - using tradingview-screener)")
+                       help="Stock universe (ignored - using tradingview-scraper)")
     parser.add_argument("--max-workers", type=int, default=15,
-                       help="Max workers (ignored - tradingview-screener is single query)")
+                       help="Max workers (ignored - tradingview-scraper is single query)")
     parser.add_argument("--max-results", type=int, default=500,
                        help="Maximum stocks to screen")
     parser.add_argument("--top-n", type=int, default=50,
