@@ -1,0 +1,70 @@
+name: Daily Non-Winners Tracker
+
+on:
+  # Run daily at 5:00 PM EST (after daily winners at 4:30 PM)
+  schedule:
+    - cron: '0 22 * * 1-5'  # 22:00 UTC = 5:00 PM EST (Mon-Fri only)
+  
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Target date (YYYY-MM-DD, leave empty for today)'
+        required: false
+        default: ''
+      top_n:
+        description: 'Number of non-winners to track'
+        required: false
+        default: '15'
+
+jobs:
+  track-non-winners:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Create directories
+        run: |
+          mkdir -p data/cache
+          mkdir -p logs
+      
+      - name: Run daily non-winners tracker
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '15' }}"
+          
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          
+          echo "Running with args: $ARGS"
+          python daily_non_winners_main.py $ARGS
+      
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: non-winners-logs
+          path: logs/
+          retention-days: 30
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "Daily non-winners tracker failed. Check logs for details."
+          echo "Data may still be partially saved in Supabase."
