@@ -516,8 +516,7 @@ def main():
         'avg_probability': float(predictions_df['explosion_probability'].mean()),
         'max_probability': float(predictions_df['explosion_probability'].max()),
         'min_probability': float(predictions_df['explosion_probability'].min()),
-        'model_version': 'xgboost_v1',
-        'screening_method': 'tradingview_screener'
+        'model_version': 'xgboost_v1'
     }
     
     if supabase.write_screening_log(screening_log):
