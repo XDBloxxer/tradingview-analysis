@@ -10,12 +10,27 @@ import logging
 from datetime import datetime
 from pathlib import Path
 import sys
+import yaml
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.utils import setup_logging, load_config
 from src.ml_predictor.model_trainer import ModelTrainer
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
+
+
+def load_config(config_path: str) -> dict:
+    """Load config from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def setup_logging(level: str = "INFO"):
+    """Setup basic logging"""
+    logging.basicConfig(
+        level=getattr(logging, level.upper()),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
 
 
 def main():
@@ -25,8 +40,8 @@ def main():
                        help="Days of NEW data to use from daily winners")
     parser.add_argument("--use-all-timepoints", action="store_true",
                        help="Use all timepoints (day_prior_close + day_prior_open)")
-    parser.add_argument("--historical-weight", type=float, default=0.7,
-                       help="Weight for historical data (0.7 = 70%% importance)")
+    parser.add_argument("--historical-weight", type=float, default=1.0,
+                       help="Weight for historical data (1.0 = equal weight, NOT recommended to lower)")
     parser.add_argument("--skip-historical", action="store_true",
                        help="Skip historical data (NOT RECOMMENDED)")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -35,16 +50,16 @@ def main():
     
     config = load_config(args.config)
     log_level = "DEBUG" if args.verbose else "INFO"
-    logger = setup_logging(log_level, config.get("logging", {}))
+    logger = setup_logging(log_level)
     
     logger.info("="*80)
     logger.info("ML MODEL RETRAINING - INCREMENTAL LEARNING")
     logger.info("="*80)
     logger.info("\nSTRATEGY:")
-    logger.info("  1. Load original historical data (10k stocks × 2 years)")
-    logger.info("  2. Add new data from daily winners (real-world performance)")
-    logger.info("  3. Train on COMBINED dataset with weighted importance")
-    logger.info("  4. Preserve time-lag patterns while learning from mistakes")
+    logger.info("  1. Load original historical data (10k stocks × 2 years with time-lag features)")
+    logger.info("  2. Add new data from daily winners (real-world T-1 performance)")
+    logger.info("  3. Train on COMBINED dataset (equal weight by default)")
+    logger.info("  4. Preserve time-lag patterns (T-3, T-7, T-14) while learning from recent data")
     
     # Initialize
     trainer = ModelTrainer(config)
@@ -108,8 +123,9 @@ def main():
     logger.info("="*80)
     
     if historical_X is not None and not historical_X.empty:
-        logger.info(f"Historical weight: {args.historical_weight} (preserves original insights)")
-        logger.info(f"New data weight: {1.0 - args.historical_weight} (real-world calibration)")
+        logger.info(f"Historical weight: {args.historical_weight} (1.0 = equal importance)")
+        logger.info(f"New data weight: {args.historical_weight} (same as historical)")
+        logger.info("⚠️  Note: Both datasets weighted equally to preserve time-lag patterns")
         
         try:
             X, y, combined_metadata, sample_weights = trainer.combine_training_data(
