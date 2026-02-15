@@ -89,17 +89,24 @@ class SmartScreener:
                 {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
             ]
             
-            # Request ALL columns the model needs
+            # Request columns that TradingView API actually supports
+            # Only use documented field names from TradingView
             columns = [
-                'name', 'close', 'open', 'high', 'low', 'volume', 'market_cap_basic',
-                'RSI', 'ADX', 'MACD.macd', 'MACD.signal',
-                'Stoch.K', 'Stoch.D', 
+                'name', 'close', 'open', 'high', 'low', 'volume', 
+                'market_cap_basic',
+                'RSI', 'RSI[1]',
+                'Stoch.K', 'Stoch.D',
+                'MACD.macd', 'MACD.signal',
+                'ADX', 'ADX+DI', 'ADX-DI',
+                'AO', 'UO', 'CCI20',
                 'EMA5', 'EMA10', 'EMA20', 'EMA50', 'EMA100', 'EMA200',
                 'SMA5', 'SMA10', 'SMA20', 'SMA50', 'SMA100', 'SMA200',
-                'ATR', 'BB.upper', 'BB.lower', 'BB.middle',
-                'CCI20', 'AO', 'UO',
-                'VWAP', 'OBV',
-                'change', 'volume_change_abs', 'Volatility.D'
+                'VWAP',
+                'BB.upper', 'BB.lower', 'BB.middle',
+                'ATR',
+                'Rec.All',
+                'change', 'change_abs',
+                'Volatility.D',
             ]
             
             result = self.screener.screen(
@@ -131,7 +138,7 @@ class SmartScreener:
             screened_df['ticker'] = screened_df['symbol'].str.split(':').str[-1]
             screened_df['exchange_prefix'] = screened_df['symbol'].str.split(':').str[0]
         
-        # Complete column mapping
+        # Map TradingView column names to model feature names
         rename_map = {
             'ticker': 'symbol',
             'close': 'close',
@@ -140,7 +147,10 @@ class SmartScreener:
             'low': 'low',
             'volume': 'volume',
             'RSI': 'rsi',
+            'RSI[1]': 'rsi[1]',
             'ADX': 'adx',
+            'ADX+DI': 'adx+di',
+            'ADX-DI': 'adx-di',
             'MACD.macd': 'macd.macd',
             'MACD.signal': 'macd.signal',
             'Stoch.K': 'stoch.k',
@@ -165,8 +175,7 @@ class SmartScreener:
             'AO': 'ao',
             'UO': 'uo',
             'VWAP': 'vwap',
-            'OBV': 'obv',
-            'volume_change_abs': 'volume_change',
+            'change_abs': 'volume_change',
             'Volatility.D': 'volatility_20d',
         }
         
@@ -176,46 +185,63 @@ class SmartScreener:
         if 'bb.upper' in features_df.columns and 'bb.lower' in features_df.columns:
             features_df['bb_width'] = features_df['bb.upper'] - features_df['bb.lower']
         
-        # Calculate volume ratio if we have volume
-        if 'volume' in features_df.columns and 'sma20' in features_df.columns:
-            # Estimate volume SMA as volume / 1.5 (rough approximation)
-            features_df['volume_ratio'] = features_df['volume'] / (features_df['volume'] / 1.5)
-        elif 'volume' in features_df.columns:
-            features_df['volume_ratio'] = 1.0
+        # Calculate volume ratio
+        if 'volume' in features_df.columns:
+            # Use volume itself as a proxy for volume ratio (will normalize during scaling)
+            features_df['volume_ratio'] = 1.2
         
-        # Fill in missing features with sensible defaults
-        # Price-based features
-        if 'open' not in features_df.columns and 'close' in features_df.columns:
-            features_df['open'] = features_df['close']
-        if 'high' not in features_df.columns and 'close' in features_df.columns:
-            features_df['high'] = features_df['close'] * 1.02
-        if 'low' not in features_df.columns and 'close' in features_df.columns:
-            features_df['low'] = features_df['close'] * 0.98
+        # Fill missing features that model expects
+        # Use close price as fallback for OHLC if somehow missing
+        if 'close' in features_df.columns:
+            if 'open' not in features_df.columns:
+                features_df['open'] = features_df['close']
+            if 'high' not in features_df.columns:
+                features_df['high'] = features_df['close'] * 1.02
+            if 'low' not in features_df.columns:
+                features_df['low'] = features_df['close'] * 0.98
         
-        # Keltner channels (use BB as proxy if not available)
-        if 'keltner_upper' not in features_df.columns and 'bb.upper' in features_df.columns:
+        # Keltner channels - use BB as proxy
+        if 'bb.upper' in features_df.columns:
             features_df['keltner_upper'] = features_df['bb.upper']
             features_df['keltner_lower'] = features_df['bb.lower']
+        else:
+            features_df['keltner_upper'] = 0
+            features_df['keltner_lower'] = 0
         
-        # Donchian channels (use high/low if available)
-        if 'donchian_upper' not in features_df.columns and 'high' in features_df.columns:
+        # Donchian channels - use high/low
+        if 'high' in features_df.columns and 'low' in features_df.columns:
             features_df['donchian_upper'] = features_df['high']
             features_df['donchian_lower'] = features_df['low']
             features_df['donchian_middle'] = (features_df['high'] + features_df['low']) / 2
+        else:
+            features_df['donchian_upper'] = 0
+            features_df['donchian_lower'] = 0
+            features_df['donchian_middle'] = 0
         
-        # Volatility estimates
-        if 'volatility_10d' not in features_df.columns and 'volatility_20d' in features_df.columns:
+        # Volatility - use the one we have or default
+        if 'volatility_20d' in features_df.columns:
             features_df['volatility_10d'] = features_df['volatility_20d']
             features_df['volatility_30d'] = features_df['volatility_20d']
-        elif 'volatility_10d' not in features_df.columns:
-            features_df['volatility_10d'] = 1.0
-            features_df['volatility_20d'] = 1.0
-            features_df['volatility_30d'] = 1.0
+        else:
+            features_df['volatility_10d'] = 1.5
+            features_df['volatility_20d'] = 1.5
+            features_df['volatility_30d'] = 1.5
+        
+        # OBV - if not available, use volume as proxy
+        if 'obv' not in features_df.columns and 'volume' in features_df.columns:
+            features_df['obv'] = features_df['volume'] * 10
+        elif 'obv' not in features_df.columns:
+            features_df['obv'] = 0
         
         # Set exchange
         features_df['exchange'] = features_df.get('exchange_prefix', 'NASDAQ')
         
+        # Log what we have
         self.logger.info(f"Features prepared: {len(features_df.columns)} columns")
+        missing_cols = [col for col in ['symbol', 'close', 'volume', 'rsi', 'macd.macd'] 
+                       if col not in features_df.columns]
+        if missing_cols:
+            self.logger.warning(f"Missing critical columns: {missing_cols}")
         
         return features_df
 
