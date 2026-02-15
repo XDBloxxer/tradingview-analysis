@@ -20,7 +20,7 @@ from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
 # Import tradingview-scraper
 try:
-    from tradingview_screener import Query, Column
+    from tradingview_scraper import Query, Column  
     SCREENER_AVAILABLE = True
 except ImportError:
     SCREENER_AVAILABLE = False
