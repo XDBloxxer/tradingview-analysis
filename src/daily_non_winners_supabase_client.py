@@ -58,10 +58,14 @@ class DailyNonWinnersSupabaseClient:
         
         self.logger.info(f"Using non-winners tables: {', '.join(self.tables.values())}")
     
-    def _sanitize_value(self, value: Any) -> Any:
+    def _sanitize_value(self, value: Any, field_name: str = None) -> Any:
         """
         Sanitize a value for Supabase/PostgreSQL
         Handles type conversions and invalid values
+        
+        Args:
+            value: Value to sanitize
+            field_name: Optional field name for context-aware conversion
         """
         if value is None:
             return None
@@ -77,6 +81,11 @@ class DailyNonWinnersSupabaseClient:
         if isinstance(value, np.floating):
             if np.isinf(value) or np.isnan(value):
                 return None
+            
+            # Volume fields should be integers (BIGINT in database)
+            if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
+                return int(value)
+            
             return float(value)
         
         # Handle numpy bool
@@ -87,8 +96,12 @@ class DailyNonWinnersSupabaseClient:
         if isinstance(value, float):
             if np.isinf(value) or np.isnan(value):
                 return None
-        
-            # FIX: convert float integers (0.0, 1.0) to int
+            
+            # Volume fields should be integers (BIGINT in database)
+            if field_name and ('volume' in field_name.lower() or 'obv' in field_name.lower()):
+                return int(value)
+            
+            # FIX: convert float integers (0.0, 1.0) to int for flag fields
             if value.is_integer():
                 return int(value)
         
@@ -108,7 +121,8 @@ class DailyNonWinnersSupabaseClient:
             # Skip auto-generated fields
             if k in auto_fields:
                 continue
-            sanitized[k] = self._sanitize_value(v)
+            # Pass field name to sanitize_value for context-aware conversion
+            sanitized[k] = self._sanitize_value(v, field_name=k)
         
         return sanitized
     
