@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Autonomous ML Stock Screener & Predictor - FIXED VERSION
-Uses tradingview-scraper with correct imports
+Autonomous ML Stock Screener & Predictor - CORRECT VERSION
+Uses tradingview_scraper.symbols.screener.Screener for smart pre-filtering
 """
 
 import argparse
@@ -17,57 +17,20 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.ml_predictor.explosion_predictor import ExplosionPredictor
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
-# Import tradingview-scraper - TRY MULTIPLE IMPORT METHODS
-print("Attempting to import tradingview-scraper...")
+# Import tradingview-scraper CORRECTLY
+print("Attempting to import tradingview-scraper Screener...")
 
 SCREENER_AVAILABLE = False
-Query = None
-Column = None
+Screener = None
 
-# Method 1: Try the documented import
 try:
-    from tradingview_scraper import Query
-    from tradingview_scraper.query import Column
+    from tradingview_scraper.symbols.screener import Screener
     SCREENER_AVAILABLE = True
-    print("✓ Method 1 SUCCESS: from tradingview_scraper import Query")
-except ImportError as e1:
-    print(f"✗ Method 1 failed: {e1}")
-    
-    # Method 2: Try alternative import path
-    try:
-        from tradingview_scraper.query import Query, Column
-        SCREENER_AVAILABLE = True
-        print("✓ Method 2 SUCCESS: from tradingview_scraper.query import Query, Column")
-    except ImportError as e2:
-        print(f"✗ Method 2 failed: {e2}")
-        
-        # Method 3: Check if it's actually tradingview_ta (different package)
-        try:
-            # This is a DIFFERENT package - tradingview_ta (not tradingview_scraper)
-            from tradingview_ta import TA_Handler, Interval
-            print("⚠️  Found tradingview_ta instead of tradingview_scraper")
-            print("   These are different packages!")
-            SCREENER_AVAILABLE = False
-        except ImportError:
-            pass
-        
-        # Method 4: Try screener (if package name is different)
-        try:
-            import tradingview_screener
-            from tradingview_screener import Query, Column
-            SCREENER_AVAILABLE = True
-            print("✓ Method 4 SUCCESS: Package is 'tradingview_screener' not 'tradingview_scraper'")
-        except ImportError as e4:
-            print(f"✗ Method 4 failed: {e4}")
-            
-            print("\n⚠️  tradingview-scraper not properly installed")
-            print("   The package exists but Query and Column are not available")
-            print("   This might be a broken installation or wrong package")
-
-if not SCREENER_AVAILABLE:
-    print("\n" + "="*80)
-    print("WORKAROUND: Will use alternative screening method")
-    print("="*80)
+    print("✓ SUCCESS: Imported Screener from tradingview_scraper.symbols.screener")
+except ImportError as e:
+    print(f"✗ FAILED: {e}")
+    print("⚠️  tradingview-scraper Screener not available")
+    print("   Install with: pip install tradingview-scraper")
 
 
 def setup_logging(verbose: bool = False):
@@ -82,20 +45,37 @@ def setup_logging(verbose: bool = False):
 
 class SmartScreener:
     """
-    Intelligent screener - with fallback if tradingview-scraper unavailable
+    Intelligent screener that uses tradingview-scraper's Screener
+    Adapts filters based on model performance
     """
     
     def __init__(self, config: dict = None, logger: logging.Logger = None):
         self.logger = logger or logging.getLogger(__name__)
         self.config = config or {}
+        
+        # Load learned filters
         self.filters = self._load_learned_filters()
+        
+        # Initialize screener if available
+        if SCREENER_AVAILABLE:
+            self.screener = Screener()
+        else:
+            self.screener = None
     
     def _load_learned_filters(self) -> dict:
+        """
+        Load screening filters - FULLY LEARNABLE
+        These are updated weekly based on what actually exploded
+        """
+        
+        # STARTING defaults (will be replaced by learning)
         defaults = {
             'min_price': 3.0,
             'max_price': 500.0,
             'min_volume': 500000,
-            'min_rsi': None,
+            
+            # LEARNABLE filters (updated weekly)
+            'min_rsi': None,      # No filter initially - let model learn
             'max_rsi': None,
             'min_adx': None,
             'max_adx': None,
@@ -103,20 +83,28 @@ class SmartScreener:
             'max_macd': None,
             'min_volume_change': None,
             'max_volume_change': None,
-            'market_cap_max': None,
+            
+            # Market cap filter (optional)
+            'market_cap_max': None,  # None = no limit
         }
         
+        # Load learned filters from weekly analysis
         try:
             filter_path = Path('ml_models/learned_filters.json')
             if filter_path.exists():
                 with open(filter_path, 'r') as f:
                     learned = json.load(f)
+                    
+                # Override defaults with learned values
                 for key, value in learned.items():
-                    if value is not None:
+                    if value is not None:  # Only use non-None learned values
                         defaults[key] = value
+                
                 self.logger.info("✓ Loaded learned screening filters")
+                self.logger.info(f"  Active filters: {sum(1 for v in learned.values() if v is not None)}")
             else:
                 self.logger.info("No learned filters yet - using minimal constraints")
+                
         except Exception as e:
             self.logger.debug(f"Using default filters: {e}")
         
@@ -124,75 +112,116 @@ class SmartScreener:
     
     def screen_with_tradingview(self, max_results: int = 500) -> pd.DataFrame:
         """
-        Use tradingview-scraper with DYNAMIC learnable filters
+        Use tradingview-scraper's Screener with DYNAMIC learnable filters
+        Only applies filters that have been learned (not None)
         """
         
-        if not SCREENER_AVAILABLE:
-            self.logger.error("tradingview-scraper not available!")
-            self.logger.warning("Using fallback screening from Supabase instead...")
+        if not SCREENER_AVAILABLE or self.screener is None:
+            self.logger.error("tradingview-scraper Screener not available!")
             return pd.DataFrame()
         
-        self.logger.info("Screening stocks with tradingview-scraper...")
+        self.logger.info("Screening stocks with tradingview-scraper Screener...")
         self.logger.info("Active filters:")
         self.logger.info(f"  Price: ${self.filters['min_price']}-${self.filters['max_price']}")
         self.logger.info(f"  Volume: >= {self.filters['min_volume']:,}")
         
+        # Log learned filters (only non-None)
+        learned_active = {k: v for k, v in self.filters.items() 
+                         if v is not None and k not in ['min_price', 'max_price', 'min_volume']}
+        if learned_active:
+            self.logger.info("  Learned filters:")
+            for key, value in learned_active.items():
+                self.logger.info(f"    {key}: {value}")
+        else:
+            self.logger.info("  No learned filters active yet (first run)")
+        
         try:
-            # Build query with ONLY active filters
-            query = (Query()
-                .select('name', 'close', 'volume', 'market_cap_basic', 
-                       'RSI', 'ADX', 'MACD.macd', 'MACD.signal',
-                       'Stoch.K', 'Stoch.D', 'Rec.All',
-                       'EMA20', 'SMA20', 'ATR', 'BB.upper', 'BB.lower',
-                       'volume_change', 'change')
-                .where(
-                    Column('close').between(self.filters['min_price'], self.filters['max_price']),
-                    Column('volume').above(self.filters['min_volume']),
-                    Column('type').equals('stock'),
-                    Column('is_primary').equals(True)
-                )
-            )
+            # Build filter list for Screener API
+            screener_filters = [
+                {'left': 'close', 'operation': 'in_range', 'right': [self.filters['min_price'], self.filters['max_price']]},
+                {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
+            ]
             
             # Add learned filters ONLY if they exist (not None)
             if self.filters['min_rsi'] is not None and self.filters['max_rsi'] is not None:
-                query = query.where(Column('RSI').between(self.filters['min_rsi'], self.filters['max_rsi']))
+                screener_filters.append({
+                    'left': 'RSI',
+                    'operation': 'in_range',
+                    'right': [self.filters['min_rsi'], self.filters['max_rsi']]
+                })
             
             if self.filters['min_adx'] is not None:
-                query = query.where(Column('ADX').above(self.filters['min_adx']))
+                screener_filters.append({
+                    'left': 'ADX',
+                    'operation': 'greater',
+                    'right': self.filters['min_adx']
+                })
             
             if self.filters['max_adx'] is not None:
-                query = query.where(Column('ADX').below(self.filters['max_adx']))
+                screener_filters.append({
+                    'left': 'ADX',
+                    'operation': 'less',
+                    'right': self.filters['max_adx']
+                })
             
             if self.filters['min_macd'] is not None:
-                query = query.where(Column('MACD.macd').above(self.filters['min_macd']))
+                screener_filters.append({
+                    'left': 'MACD.macd',
+                    'operation': 'greater',
+                    'right': self.filters['min_macd']
+                })
             
             if self.filters['max_macd'] is not None:
-                query = query.where(Column('MACD.macd').below(self.filters['max_macd']))
-            
-            if self.filters['min_volume_change'] is not None:
-                query = query.where(Column('volume_change').above(self.filters['min_volume_change']))
+                screener_filters.append({
+                    'left': 'MACD.macd',
+                    'operation': 'less',
+                    'right': self.filters['max_macd']
+                })
             
             if self.filters['market_cap_max'] is not None:
-                query = query.where(Column('market_cap_basic').below(self.filters['market_cap_max']))
+                screener_filters.append({
+                    'left': 'market_cap_basic',
+                    'operation': 'less',
+                    'right': self.filters['market_cap_max']
+                })
             
-            # Order by volume and limit
-            query = query.order_by('volume', ascending=False).limit(max_results)
+            # Define columns to retrieve
+            columns = [
+                'name', 'close', 'volume', 'market_cap_basic',
+                'RSI', 'ADX', 'MACD.macd', 'MACD.signal',
+                'Stoch.K', 'Stoch.D', 'Rec.All',
+                'EMA20', 'SMA20', 'ATR', 'BB.upper', 'BB.lower',
+                'change'
+            ]
             
-            # Execute query
-            result = query.get_scanner_data()
+            # Execute screening
+            self.logger.info(f"Calling screener with {len(screener_filters)} filters...")
+            result = self.screener.screen(
+                market='america',
+                filters=screener_filters,
+                columns=columns,
+                sort_by='volume',
+                sort_order='desc',
+                limit=max_results
+            )
             
-            if not result or len(result[1]) == 0:
+            if result['status'] != 'success' or not result.get('data'):
                 self.logger.warning("No stocks matched screening criteria")
+                self.logger.warning("Filters may be too restrictive - will be adjusted in weekly learning")
                 return pd.DataFrame()
             
             # Convert to DataFrame
-            df = pd.DataFrame(result[1])
+            df = pd.DataFrame(result['data'])
+            
             self.logger.info(f"✓ Found {len(df)} stocks matching criteria")
+            self.logger.info(f"  Total available: {result.get('totalCount', 'unknown')}")
             
             return df
             
         except Exception as e:
             self.logger.error(f"Screening failed: {e}")
+            import traceback
+            traceback.print_exc()
             return pd.DataFrame()
     
     def screen_from_supabase_fallback(self, supabase_client, max_results: int = 500) -> pd.DataFrame:
@@ -239,9 +268,15 @@ class SmartScreener:
         
         self.logger.info("Preparing features for model...")
         
+        # Handle symbol field - Screener returns 'symbol' with exchange prefix
+        if 'symbol' in screened_df.columns:
+            # Extract just the ticker from "NASDAQ:AAPL" format
+            screened_df['ticker'] = screened_df['symbol'].str.split(':').str[1]
+            screened_df['exchange_prefix'] = screened_df['symbol'].str.split(':').str[0]
+        
         # Rename columns to match what model expects
         rename_map = {
-            'name': 'symbol',
+            'ticker': 'symbol',
             'close': 'close',
             'volume': 'volume',
             'RSI': 'rsi',
@@ -263,15 +298,17 @@ class SmartScreener:
         if 'bb.upper' in features_df.columns and 'bb.lower' in features_df.columns:
             features_df['bb_width'] = features_df['bb.upper'] - features_df['bb.lower']
         
-        # Add exchange if not present
-        if 'exchange' not in features_df.columns:
+        # Add exchange
+        if 'exchange_prefix' in features_df.columns:
+            features_df['exchange'] = features_df['exchange_prefix']
+        elif 'exchange' not in features_df.columns:
             features_df['exchange'] = 'NASDAQ'
         
         return features_df
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ML stock screening with fallback support")
+    parser = argparse.ArgumentParser(description="ML stock screening with tradingview-scraper")
     parser.add_argument("--universe", type=str, default="auto")
     parser.add_argument("--max-workers", type=int, default=15)
     parser.add_argument("--max-results", type=int, default=500)
@@ -441,7 +478,7 @@ def main():
         'max_probability': float(predictions_df['explosion_probability'].max()),
         'min_probability': float(predictions_df['explosion_probability'].min()),
         'model_version': 'xgboost_v1',
-        'screening_method': 'supabase_fallback' if not SCREENER_AVAILABLE else 'tradingview_screener'
+        'screening_method': 'tradingview_screener' if SCREENER_AVAILABLE else 'supabase_fallback'
     }
     
     if supabase.write_screening_log(screening_log):
