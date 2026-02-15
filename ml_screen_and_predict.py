@@ -411,7 +411,7 @@ def main():
     logger.info("STEP 3: ML PREDICTION")
     logger.info("="*80)
     
-    historical_gains = supabase.get_prediction_accuracy(days_back=30)
+    historical_gains = supabase.get_historical_prediction_accuracy(days_back=30)
     if not historical_gains.empty:
         logger.info(f"Using {len(historical_gains)} historical records for calibration")
     
