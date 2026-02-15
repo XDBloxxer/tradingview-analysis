@@ -1,257 +1,247 @@
-#!/usr/bin/env python3
 """
-Retrain ML model using INCREMENTAL LEARNING
-Combines historical research data + new daily winners data
-PREVENTS CATASTROPHIC FORGETTING
+ML Model Retraining Script - FIXED VERSION
+Implements incremental learning with non-winners support
+
+Key fixes:
+1. Only uses T-1 data (no same-day leakage)
+2. Includes non-winners (negative examples)
+3. Equal weighting preserves historical patterns
+4. Uses joblib for model persistence
 """
 
-import argparse
 import logging
+import argparse
 from datetime import datetime
 from pathlib import Path
 import sys
-import yaml
 
-sys.path.insert(0, str(Path(__file__).parent))
+# Add src to path
+sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
+from src.utils import load_config, setup_logging
 from src.ml_predictor.model_trainer import ModelTrainer
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
 
-def load_config(config_path: str) -> dict:
-    """Load config from YAML file"""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-def setup_logging(level: str = "INFO"):
-    """Setup basic logging"""
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    return logging.getLogger(__name__)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Retrain ML explosion model with incremental learning")
-    parser.add_argument("--config", default="config.yaml")
-    parser.add_argument("--lookback-days", type=int, default=90, 
-                       help="Days of NEW data to use from daily winners")
-    parser.add_argument("--use-all-timepoints", action="store_true",
-                       help="Use all timepoints (day_prior_close + day_prior_open)")
-    parser.add_argument("--historical-weight", type=float, default=1.0,
-                       help="Weight for historical data (1.0 = equal weight, NOT recommended to lower)")
-    parser.add_argument("--skip-historical", action="store_true",
-                       help="Skip historical data (NOT RECOMMENDED)")
-    parser.add_argument("--verbose", "-v", action="store_true")
+    parser = argparse.ArgumentParser(description='Retrain ML prediction model')
+    parser.add_argument('--lookback-days', type=int, default=90,
+                       help='Days of new data to include (default: 90)')
+    parser.add_argument('--use-all-timepoints', action='store_true', default=True,
+                       help='Use both T-1 close and T-1 open data')
+    parser.add_argument('--no-non-winners', action='store_true',
+                       help='Exclude non-winners (NOT recommended - causes bias)')
+    parser.add_argument('--historical-weight', type=float, default=1.0,
+                       help='Weight for historical samples (default: 1.0 = equal)')
+    parser.add_argument('--test-size', type=float, default=0.2,
+                       help='Test set proportion (default: 0.2)')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose logging')
     
     args = parser.parse_args()
     
-    config = load_config(args.config)
-    log_level = "DEBUG" if args.verbose else "INFO"
-    logger = setup_logging(log_level)
+    # Setup logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    setup_logging(level=log_level)
+    logger = logging.getLogger(__name__)
     
     logger.info("="*80)
     logger.info("ML MODEL RETRAINING - INCREMENTAL LEARNING")
     logger.info("="*80)
-    logger.info("\nSTRATEGY:")
-    logger.info("  1. Load original historical data (10k stocks × 2 years with time-lag features)")
-    logger.info("  2. Add new data from daily winners (real-world T-1 performance)")
-    logger.info("  3. Train on COMBINED dataset (equal weight by default)")
-    logger.info("  4. Preserve time-lag patterns (T-3, T-7, T-14) while learning from recent data")
+    logger.info(f"Started at: {datetime.now()}")
+    logger.info(f"Lookback days: {args.lookback_days}")
+    logger.info(f"Use all timepoints: {args.use_all_timepoints}")
+    logger.info(f"Include non-winners: {not args.no_non_winners}")
+    logger.info(f"Historical weight: {args.historical_weight}")
     
-    # Initialize
-    trainer = ModelTrainer(config)
-    supabase = MLPredictionSupabaseClient(config)
-    
-    # ===== STEP 1: Load historical research data =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 1: LOAD HISTORICAL RESEARCH DATA")
-    logger.info("="*80)
-    
-    if args.skip_historical:
-        logger.warning("⚠️  SKIPPING HISTORICAL DATA (--skip-historical flag)")
-        logger.warning("⚠️  Model will ONLY train on recent daily winners")
-        logger.warning("⚠️  May lose time-lag analysis and deep pattern insights!")
-        historical_X, historical_y, historical_metadata = None, None, None
-    else:
-        historical_X, historical_y, historical_metadata = trainer.load_historical_training_data()
-        
-        if historical_X is None:
-            logger.warning("\n⚠️  NO HISTORICAL DATA FOUND!")
-            logger.warning("⚠️  To preserve your original research:")
-            logger.warning("⚠️  Save your 10k stocks × 2 years dataset as:")
-            logger.warning("⚠️    ml_models/historical_data/original_training_data.pkl")
-            logger.warning("⚠️  Format: {'X': DataFrame, 'y': Series, 'metadata': dict}")
-            logger.warning("\n⚠️  Continuing with ONLY daily winners data...")
-    
-    # ===== STEP 2: Prepare new data from Daily Winners =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 2: PREPARE NEW DATA FROM DAILY WINNERS")
-    logger.info("="*80)
-    logger.info(f"Looking back {args.lookback_days} days")
-    logger.info(f"Using all timepoints: {args.use_all_timepoints}")
+    if args.no_non_winners:
+        logger.warning("⚠️  Training WITHOUT non-winners - this causes selection bias!")
+        logger.warning("⚠️  Model will have high false positive rate!")
     
     try:
+        # Load config
+        config = load_config()
+        
+        # Initialize trainer and database client
+        trainer = ModelTrainer(config)
+        supabase = MLPredictionSupabaseClient(config)
+        
+        # ===== STEP 1: Load Historical Training Data =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1: Loading Historical Training Data")
+        logger.info("="*80)
+        
+        historical_X, historical_y, historical_metadata = trainer.load_historical_training_data()
+        
+        if historical_X is None or historical_X.empty:
+            logger.warning("No historical data found!")
+            logger.warning("Proceeding with ONLY new daily data (not ideal)")
+            logger.info("\nTo add historical data:")
+            logger.info("  1. Save your original research data as:")
+            logger.info("     ml_models/historical_data/original_training_data.pkl")
+            logger.info("  2. Format: joblib dump with {'X': df, 'y': series, 'metadata': dict}")
+        else:
+            logger.info(f"✓ Historical data loaded: {len(historical_X)} samples")
+        
+        # ===== STEP 2: Prepare New Training Data from Daily Systems =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 2: Preparing New Training Data")
+        logger.info("="*80)
+        logger.info("Source: Daily Winners + Daily Non-Winners")
+        logger.info("Strategy: T-1 data ONLY (no same-day leakage)")
+        
         new_X, new_y, new_metadata = trainer.prepare_training_data_from_daily_winners(
             supabase,
             lookback_days=args.lookback_days,
-            use_all_timepoints=args.use_all_timepoints
+            use_all_timepoints=args.use_all_timepoints,
+            include_non_winners=not args.no_non_winners
         )
-    except Exception as e:
-        logger.error(f"Failed to prepare new training data: {e}")
-        return 1
-    
-    if new_X.empty:
-        logger.error("No new training data available from daily winners")
-        logger.error("Cannot train model without any data")
-        return 1
-    
-    logger.info(f"\nNew training data prepared:")
-    logger.info(f"  Samples: {new_metadata['n_samples']}")
-    logger.info(f"  Features: {new_metadata['feature_count']}")
-    logger.info(f"  Positive samples: {new_metadata['n_positives']}")
-    logger.info(f"  Negative samples: {new_metadata['n_negatives']}")
-    logger.info(f"  Positive rate: {new_metadata['positive_rate']*100:.2f}%")
-    logger.info(f"  Date range: {new_metadata['date_range']}")
-    logger.info(f"  Timepoints: {', '.join(new_metadata['timepoints_used'])}")
-    
-    # ===== STEP 3: Combine historical + new data =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 3: COMBINE HISTORICAL + NEW DATA")
-    logger.info("="*80)
-    
-    if historical_X is not None and not historical_X.empty:
-        logger.info(f"Historical weight: {args.historical_weight} (1.0 = equal importance)")
-        logger.info(f"New data weight: {args.historical_weight} (same as historical)")
-        logger.info("⚠️  Note: Both datasets weighted equally to preserve time-lag patterns")
         
-        try:
-            X, y, combined_metadata, sample_weights = trainer.combine_training_data(
-                historical_X, historical_y,
-                new_X, new_y,
-                historical_weight=args.historical_weight
-            )
-        except Exception as e:
-            logger.error(f"Failed to combine data: {e}")
+        if new_X.empty:
+            logger.error("No new training data available!")
+            logger.error("Possible causes:")
+            logger.error("  - No daily winners data collected")
+            logger.error("  - No non-winners data collected (if enabled)")
+            logger.error("  - Database connection issue")
             return 1
-    else:
-        logger.warning("Using ONLY new data (no historical data available)")
-        X = new_X
-        y = new_y
-        combined_metadata = new_metadata
-        sample_weights = None
-    
-    # ===== STEP 4: Train model =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 4: TRAIN MODEL")
-    logger.info("="*80)
-    
-    try:
-        results = trainer.train_model(
-            X, y, 
-            sample_weights=sample_weights,
-            use_time_series_split=True
+        
+        logger.info(f"✓ New training data prepared: {len(new_X)} samples")
+        logger.info(f"  Data source: {new_metadata.get('source', 'unknown')}")
+        logger.info(f"  Includes negatives: {new_metadata.get('includes_negative_examples', False)}")
+        logger.info(f"  Uses T-1 only: {new_metadata.get('uses_only_t1_data', False)}")
+        logger.info(f"  No leakage: {new_metadata.get('same_day_data_excluded', False)}")
+        
+        # ===== STEP 3: Combine Historical and New Data =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 3: Combining Historical + New Data")
+        logger.info("="*80)
+        
+        X_combined, y_combined, combined_metadata, sample_weights = trainer.combine_training_data(
+            historical_X,
+            historical_y,
+            new_X,
+            new_y,
+            historical_weight=args.historical_weight
         )
-    except Exception as e:
-        logger.error(f"Failed to train model: {e}")
-        return 1
-    
-    # ===== STEP 5: Calculate feature importance =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 5: ANALYZE FEATURE IMPORTANCE")
-    logger.info("="*80)
-    
-    importance_df = trainer.calculate_feature_importance(
-        results['model'],
-        results['feature_names']
-    )
-    
-    logger.info("\nTop 20 Important Features:")
-    for idx, row in importance_df.head(20).iterrows():
-        logger.info(f"  {idx+1:2d}. {row['feature']:35s}: {row['importance']:.6f}")
-    
-    # ===== STEP 6: Save model =====
-    logger.info("\n" + "="*80)
-    logger.info("STEP 6: SAVE MODEL")
-    logger.info("="*80)
-    
-    version = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Combine metadata
-    final_metadata = {
-        **combined_metadata,
-        'features': results['feature_names'],
-        'trained_at': datetime.now().isoformat(),
-        'training_mode': 'incremental_learning',
-        'historical_weight': args.historical_weight if sample_weights is not None else None,
-        'lookback_days': args.lookback_days,
-        'use_all_timepoints': args.use_all_timepoints
-    }
-    
-    try:
+        
+        if X_combined.empty:
+            logger.error("Failed to combine training data!")
+            return 1
+        
+        logger.info(f"✓ Combined training data: {len(X_combined)} samples")
+        
+        # ===== STEP 4: Train Model =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 4: Training XGBoost Model")
+        logger.info("="*80)
+        
+        results = trainer.train_model(
+            X_combined,
+            y_combined,
+            sample_weights=sample_weights,
+            use_time_series_split=True,
+            test_size=args.test_size
+        )
+        
+        # ===== STEP 5: Calculate Feature Importance =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 5: Analyzing Feature Importance")
+        logger.info("="*80)
+        
+        importance_df = trainer.calculate_feature_importance(
+            results['model'],
+            results['feature_names']
+        )
+        
+        logger.info(f"\nTop 10 Most Important Features:")
+        for i, row in importance_df.head(10).iterrows():
+            logger.info(f"  {row['feature']:30s}: {row['importance']:.4f}")
+        
+        # ===== STEP 6: Save Model =====
+        logger.info("\n" + "="*80)
+        logger.info("STEP 6: Saving Model")
+        logger.info("="*80)
+        
+        version = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Combine all metadata
+        full_metadata = {
+            'version': version,
+            'trained_at': datetime.now().isoformat(),
+            'training_config': {
+                'lookback_days': args.lookback_days,
+                'use_all_timepoints': args.use_all_timepoints,
+                'include_non_winners': not args.no_non_winners,
+                'historical_weight': args.historical_weight,
+                'test_size': args.test_size
+            },
+            'data_sources': {
+                'historical': historical_metadata if historical_metadata else {},
+                'new_daily': new_metadata,
+                'combined': combined_metadata
+            },
+            'performance': {
+                'train_accuracy': results['train_accuracy'],
+                'test_accuracy': results['test_accuracy'],
+                'train_auc': results['train_auc'],
+                'test_auc': results['test_auc'],
+                'precision': results['precision'],
+                'recall': results['recall'],
+                'f1_score': results['f1_score'],
+                'true_positives': results['true_positives'],
+                'false_positives': results['false_positives'],
+                'true_negatives': results['true_negatives'],
+                'false_negatives': results['false_negatives']
+            },
+            'feature_names': results['feature_names'],
+            'n_features': len(results['feature_names'])
+        }
+        
         trainer.save_model(
             results['model'],
             results['scaler'],
-            final_metadata,
-            version
+            full_metadata,
+            version=version
         )
+        
+        # ===== SUMMARY =====
+        logger.info("\n" + "="*80)
+        logger.info("RETRAINING COMPLETE")
+        logger.info("="*80)
+        logger.info(f"✓ Model version: {version}")
+        logger.info(f"✓ Total training samples: {len(X_combined)}")
+        logger.info(f"✓ Test accuracy: {results['test_accuracy']:.4f}")
+        logger.info(f"✓ Test AUC: {results['test_auc']:.4f}")
+        logger.info(f"✓ Precision: {results['precision']:.4f}")
+        logger.info(f"✓ Recall: {results['recall']:.4f}")
+        logger.info(f"✓ F1 Score: {results['f1_score']:.4f}")
+        
+        logger.info("\nConfusion Matrix:")
+        logger.info(f"  True Positives:  {results['true_positives']}")
+        logger.info(f"  False Positives: {results['false_positives']}")
+        logger.info(f"  True Negatives:  {results['true_negatives']}")
+        logger.info(f"  False Negatives: {results['false_negatives']}")
+        
+        if not args.no_non_winners and new_metadata.get('includes_negative_examples'):
+            logger.info("\n✓ Model trained with negative examples (non-winners)")
+            logger.info("  Expected improvements:")
+            logger.info("  - Higher precision (fewer false positives)")
+            logger.info("  - Better discrimination")
+            logger.info("  - More reliable predictions")
+        else:
+            logger.warning("\n⚠️  Model trained WITHOUT negative examples")
+            logger.warning("  This may result in:")
+            logger.warning("  - Lower precision (more false positives)")
+            logger.warning("  - Poor discrimination")
+            logger.warning("  - Less reliable predictions")
+        
+        logger.info(f"\nFinished at: {datetime.now()}")
+        
+        return 0
+        
     except Exception as e:
-        logger.error(f"Failed to save model: {e}")
+        logger.error(f"Training failed: {e}", exc_info=True)
         return 1
-    
-    # ===== Final summary =====
-    logger.info("\n" + "="*80)
-    logger.info("✓ INCREMENTAL LEARNING COMPLETE")
-    logger.info("="*80)
-    logger.info(f"\nModel Version: {version}")
-    
-    if historical_X is not None and not historical_X.empty:
-        logger.info(f"\nTraining Data Composition:")
-        logger.info(f"  Historical samples: {combined_metadata.get('n_historical', 0)} ({args.historical_weight*100:.0f}% weight)")
-        logger.info(f"  New samples: {combined_metadata.get('n_new', 0)} ({(1-args.historical_weight)*100:.0f}% weight)")
-        logger.info(f"  Total samples: {combined_metadata['n_samples']}")
-        logger.info(f"\n✓ Model preserves original research insights")
-        logger.info(f"✓ Model learns from recent real-world performance")
-    else:
-        logger.info(f"\nTraining Data:")
-        logger.info(f"  Total samples: {combined_metadata['n_samples']}")
-        logger.info(f"\n⚠️  Model trained ONLY on recent data")
-        logger.info(f"⚠️  May have lost time-lag pattern insights")
-    
-    logger.info(f"\nPerformance Metrics:")
-    logger.info(f"  Train Accuracy: {results['train_accuracy']:.2%}")
-    logger.info(f"  Test Accuracy: {results['test_accuracy']:.2%}")
-    logger.info(f"  Train AUC: {results['train_auc']:.4f}")
-    logger.info(f"  Test AUC: {results['test_auc']:.4f}")
-    logger.info(f"  Precision: {results['precision']:.2%}")
-    logger.info(f"  Recall: {results['recall']:.2%}")
-    logger.info(f"  F1 Score: {results['f1_score']:.4f}")
-    
-    logger.info(f"\nConfusion Matrix:")
-    logger.info(f"  True Positives:  {results['true_positives']}")
-    logger.info(f"  False Positives: {results['false_positives']}")
-    logger.info(f"  True Negatives:  {results['true_negatives']}")
-    logger.info(f"  False Negatives: {results['false_negatives']}")
-    
-    logger.info(f"\nModel files saved to: {trainer.model_dir}")
-    logger.info(f"Old model archived to: {trainer.archive_dir}")
-    
-    logger.info("\n" + "="*80)
-    logger.info("NEXT STEPS:")
-    logger.info("="*80)
-    logger.info("1. Test predictions: python ml_screen_and_predict.py --verbose")
-    logger.info("2. Track accuracy: python ml_track_comprehensive_accuracy.py --verbose")
-    logger.info("3. Monitor feature importance in ml_models/feature_importance.csv")
-    
-    if historical_X is None or historical_X.empty:
-        logger.info("\n⚠️  IMPORTANT: Save your historical training data!")
-        logger.info("   Format: {'X': DataFrame, 'y': Series, 'metadata': dict}")
-        logger.info("   Location: ml_models/historical_data/original_training_data.pkl")
-        logger.info("   This preserves your 10k stocks × 2 years research")
-    
-    return 0
 
 
 if __name__ == "__main__":
