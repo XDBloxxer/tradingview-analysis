@@ -52,9 +52,9 @@ class SmartScreener:
     
     def _load_learned_filters(self) -> dict:
         defaults = {
-            'min_price': 3.0,
-            'max_price': 500.0,
-            'min_volume': 500000,
+            'min_price': 0.25,
+            'max_price': 250.0,
+            'min_volume': 50000,
         }
         
         try:
