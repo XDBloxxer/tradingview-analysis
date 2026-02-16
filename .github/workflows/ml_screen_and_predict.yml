@@ -5,7 +5,7 @@ on:
     # Run daily BEFORE market open
     # 1:00 PM UTC = 8:00 AM EST = 3:00 PM Estonia
     # Gives predictions before market opens at 4:30 PM Estonia
-    - cron: '0 13 * * 1-5'  # Mon-Fri at 1:00 PM UTC
+    - cron: '0 4 * * 2-6'  # 11:00 PM EST previous day - fresh data
   
   workflow_dispatch:
     inputs:
