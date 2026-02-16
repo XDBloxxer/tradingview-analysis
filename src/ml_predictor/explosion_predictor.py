@@ -1,6 +1,8 @@
 """
-Explosion Predictor - MULTI-TIMEPOINT VERSION
-Handles models trained on multi-timepoint features (t0_open_*, t1_close_*, t3_*, etc.)
+Explosion Predictor - HYBRID MODEL VERSION
+Works with models that know BOTH:
+- T-3, T-5, T-10 (flat features from CSV: Close, RSI_14, MACD)
+- T-1 open/close (prefixed features from database: t1_open_rsi, t1_close_macd)
 """
 
 import logging
@@ -13,8 +15,8 @@ from typing import Dict, List, Optional
 
 class ExplosionPredictor:
     """
-    Multi-timepoint explosion predictor
-    Works with models that expect features across multiple timepoints
+    Hybrid explosion predictor
+    Works with models that expect BOTH old CSV features AND new T-1 split features
     """
     
     def __init__(self, model_dir: str = "ml_models"):
@@ -25,7 +27,6 @@ class ExplosionPredictor:
         self.scaler = None
         self.feature_names = None
         self.metadata = None
-        self.is_multi_timepoint = False
         
         self._load_model()
     
@@ -51,22 +52,26 @@ class ExplosionPredictor:
                     self.metadata = json.load(f)
                     self.feature_names = self.metadata.get('features', [])
                     
-                    # Detect if multi-timepoint model
-                    self.is_multi_timepoint = any('t0_' in f or 't1_' in f or 't3' in f or 't5' in f or 't10' in f 
-                                                   for f in self.feature_names)
+                    self.logger.info(f"✓ Model expects {len(self.feature_names)} features")
                     
-                    model_type = "MULTI-TIMEPOINT" if self.is_multi_timepoint else "SINGLE-TIMEPOINT"
-                    self.logger.info(f"✓ Model type: {model_type}")
-                    self.logger.info(f"✓ Expects {len(self.feature_names)} features")
+                    # Show what model knows
+                    has_t1_features = any('t1_open' in f or 't1_close' in f for f in self.feature_names)
+                    has_flat_features = any(f in ['Close', 'RSI_14', 'MACD_12_26_9'] for f in self.feature_names)
+                    
+                    if has_flat_features and has_t1_features:
+                        self.logger.info("✓ Model type: HYBRID (knows T-3/T-5/T-10 + T-1 open/close)")
+                    elif has_flat_features:
+                        self.logger.info("✓ Model type: CSV-ONLY (knows T-3/T-5/T-10)")
+                    elif has_t1_features:
+                        self.logger.info("✓ Model type: DATABASE-ONLY (knows T-1 open/close)")
+                    
             else:
                 # Infer from scaler
                 if hasattr(self.scaler, 'feature_names_in_'):
                     self.feature_names = list(self.scaler.feature_names_in_)
-                    self.is_multi_timepoint = any('t0_' in f or 't1_' in f for f in self.feature_names)
                 else:
                     n_features = self.scaler.n_features_in_
                     self.feature_names = [f'feature_{i}' for i in range(n_features)]
-                    self.is_multi_timepoint = False
                 
                 self.logger.warning(f"No metadata - inferred {len(self.feature_names)} features")
             
@@ -77,16 +82,16 @@ class ExplosionPredictor:
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
         """
         Prepare features for prediction
-        Handles both multi-timepoint and single-timepoint data
         
-        For multi-timepoint model:
-        - Expects features like: t0_open_rsi, t1_close_macd, t3_close, etc.
+        Input data should have flat features from T-3 (fetched from yfinance):
+        - Close, High, Low, Open, Volume
+        - RSI_14, RSI_7, RSI_21, RSI_28
+        - MACD_12_26_9, MACDh_12_26_9, etc.
         
-        For single-timepoint model:
-        - Expects features like: rsi, macd, close, etc.
+        This function maps them to whatever the model expects
         """
         
-        self.logger.info(f"Preparing features (model is {self.is_multi_timepoint and 'multi' or 'single'}-timepoint)")
+        self.logger.info(f"Preparing features for {len(data_df)} stocks")
         
         # Create feature DataFrame with all expected features
         feature_df_final = pd.DataFrame(index=data_df.index)
@@ -102,6 +107,7 @@ class ExplosionPredictor:
         
         for feature in self.feature_names:
             if feature in data_df.columns:
+                # Direct match
                 feature_df_final[feature] = data_df[feature]
                 matched += 1
             else:
@@ -120,10 +126,10 @@ class ExplosionPredictor:
         self.logger.info(f"Feature coverage: {coverage:.1f}% ({matched}/{len(self.feature_names)})")
         
         if missing > 0:
-            self.logger.warning(f"Missing {missing} features - using defaults")
+            self.logger.debug(f"Missing {missing} features - using defaults")
         
-        if coverage < 30:
-            self.logger.error(f"⚠️  VERY LOW feature coverage ({coverage:.1f}%) - predictions unreliable!")
+        if coverage < 50:
+            self.logger.warning(f"⚠️  LOW feature coverage ({coverage:.1f}%) - predictions may be unreliable")
         
         return feature_df_final
     
@@ -134,13 +140,13 @@ class ExplosionPredictor:
         
         # Strip timepoint prefix for analysis
         base_feature = feature_lower
-        for prefix in ['t0_open_', 't0_close_', 't1_open_', 't1_close_', 't3_', 't5_', 't10_']:
+        for prefix in ['t1_open_', 't1_close_']:
             if feature_lower.startswith(prefix):
                 base_feature = feature_lower[len(prefix):]
                 break
         
         # Normalized indicators (0-100)
-        if any(ind in base_feature for ind in ['rsi', 'stoch', 'w.r', 'cci']):
+        if any(ind in base_feature for ind in ['rsi', 'stoch', 'w.r', 'cci', 'willr']):
             return 50.0
         
         # Percentages
@@ -153,7 +159,6 @@ class ExplosionPredictor:
         
         # Volume
         if 'volume' in base_feature:
-            # Try to find any volume column in data
             for col in data.columns:
                 if 'volume' in col.lower() and col not in ['symbol', 'exchange']:
                     return data[col].median()
@@ -161,7 +166,6 @@ class ExplosionPredictor:
         
         # Price
         if any(word in base_feature for word in ['price', 'close', 'open', 'high', 'low']):
-            # Try to find any close price
             for col in data.columns:
                 if 'close' in col.lower() and col not in ['symbol', 'exchange']:
                     return data[col].median()
@@ -172,16 +176,17 @@ class ExplosionPredictor:
             return 0.0
         
         # Moving averages
-        if any(ind in base_feature for ind in ['ema', 'sma', 'wma', 'vwap']):
+        if any(ind in base_feature for ind in ['ema', 'sma', 'wma', 'vwap', 'hma']):
             for col in data.columns:
                 if 'close' in col.lower():
                     return data[col].median()
             return 50.0
         
         # Volatility
-        if any(ind in base_feature for ind in ['atr', 'volatility', 'hv', 'bb_width']):
+        if any(ind in base_feature for ind in ['atr', 'volatility', 'hv', 'bb']):
             return 1.0
         
+        # Default
         return 0.0
     
     def predict(self, data_df: pd.DataFrame) -> pd.DataFrame:
@@ -189,7 +194,7 @@ class ExplosionPredictor:
         Make predictions on data
         
         Args:
-            data_df: Input data (multi-timepoint with prefixes)
+            data_df: Input data with flat features from T-3 (from yfinance)
         
         Returns:
             DataFrame with predictions
@@ -281,12 +286,11 @@ class ExplosionPredictor:
             predictions.loc[mask, 'target_gain_low'] = predictions.loc[mask, 'target_gain_pct'] * 0.5
             predictions.loc[mask, 'target_gain_high'] = predictions.loc[mask, 'target_gain_pct'] * 1.5
         
-        # Add target prices - try to find close price in any timepoint
+        # Add target prices - find close price
         if 'symbol' in predictions.columns:
-            # Find close price from any timepoint
             close_col = None
             for col in features_df.columns:
-                if 'close' in col.lower() and col not in ['symbol', 'exchange']:
+                if col == 'Close' or col == 'close':
                     close_col = col
                     break
             
