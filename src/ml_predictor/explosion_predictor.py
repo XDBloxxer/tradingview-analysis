@@ -276,7 +276,7 @@ class ExplosionPredictor:
             predictions['target_gain_high'] = predicted_gains * 1.2
         # Estimate target gains
         elif historical_gains_df is not None and not historical_gains_df.empty:
-        self.logger.info("Using historical calibration for gain predictions")
+            self.logger.info("Using historical calibration for gain predictions")
             # Use historical calibration
             gain_buckets = historical_gains_df.copy()
             gain_buckets['prob_bucket'] = pd.cut(
@@ -364,4 +364,5 @@ class ExplosionPredictor:
             return 7.0
         else:
             return 3.0
+
 
