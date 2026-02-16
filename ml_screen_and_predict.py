@@ -1,16 +1,12 @@
 #!/usr/bin/env python3
 """
-Autonomous ML Stock Screener & Predictor - COMPLETE FIXED VERSION
+ML Stock Screener & Predictor - MULTI-TIMEPOINT VERSION
 
-WORKFLOW:
-1. Runs at 7 AM UTC (2 AM EST) - 1 hour before pre-market
-2. Screens stocks using learned filters
-3. Fetches multi-timepoint data:
-   - T-0 open/close: Yesterday's 5-min candles (open at 9:30am, close at 4pm)
-   - T-1 open/close: Day before yesterday's 5-min candles  
-   - T-3, T-5, T-10: Daily candles
-4. Makes predictions for today
-5. Stores predictions for evening accuracy analysis
+This version:
+1. Fetches ALL timepoints (T-0 open/close, T-1 open/close, T-3, T-5, T-10)
+2. Preserves timepoint prefixes (t0_open_rsi, t1_close_macd, etc.)
+3. Feeds multi-timepoint features to model
+4. Model learns temporal patterns across all timepoints
 """
 
 import argparse
@@ -65,8 +61,6 @@ class SmartScreener:
             'min_price': 0.50,
             'max_price': 500.0,
             'min_volume': 100000,
-            'min_volatility': None,  # Will learn this
-            'max_volatility': None,  # Will learn this
         }
         
         try:
@@ -78,9 +72,6 @@ class SmartScreener:
                     if value is not None:
                         defaults[key] = value
                 self.logger.info("✓ Loaded learned screening filters")
-                self.logger.info(f"  Filters: {learned}")
-            else:
-                self.logger.info("No learned filters yet - using defaults")
         except Exception as e:
             self.logger.debug(f"Using default filters: {e}")
         
@@ -93,8 +84,6 @@ class SmartScreener:
             return pd.DataFrame()
         
         self.logger.info("Screening stocks with learned filters...")
-        self.logger.info(f"  Price: ${self.filters['min_price']}-${self.filters['max_price']}")
-        self.logger.info(f"  Volume: >= {self.filters['min_volume']:,}")
         
         try:
             filters = [
@@ -116,7 +105,6 @@ class SmartScreener:
                 self.logger.info(f"✓ Screened {len(df)} stocks")
                 return df
             
-            self.logger.warning("No results from screener")
             return pd.DataFrame()
             
         except Exception as e:
@@ -126,19 +114,20 @@ class SmartScreener:
 
 def fetch_complete_timepoint_data(symbol: str, logger: logging.Logger) -> dict:
     """
-    Fetch ALL required timepoint data for a stock:
+    Fetch ALL timepoint data for multi-timepoint model
     
-    T-0 (yesterday): 
-        - open (9:30am) - 5min candles
-        - close (4pm) - 5min candles
-    T-1 (day before yesterday):
-        - open (9:30am) - 5min candles  
-        - close (4pm) - 5min candles
-    T-3 (3 days ago): daily candles
-    T-5 (5 days ago): daily candles
-    T-10 (10 days ago): daily candles
-    
-    This matches EXACTLY what the model was trained on.
+    Returns dict with ALL timepoints preserved:
+    {
+        'symbol': 'AAPL',
+        'exchange': 'NASDAQ',
+        't0_open': {indicators},
+        't0_close': {indicators},
+        't1_open': {indicators},
+        't1_close': {indicators},
+        't3': {indicators},
+        't5': {indicators},
+        't10': {indicators}
+    }
     """
     import yfinance as yf
     import ta
@@ -146,14 +135,12 @@ def fetch_complete_timepoint_data(symbol: str, logger: logging.Logger) -> dict:
     try:
         ticker = yf.Ticker(symbol)
         nyc_tz = pytz.timezone('America/New_York')
-        now_nyc = datetime.now(nyc_tz)
         
-        # === FETCH 5-MINUTE DATA FOR T-0 AND T-1 ===
-        logger.debug(f"{symbol}: Fetching 5-minute candle data...")
+        # Fetch 5-minute data for T-0 and T-1
         df_5min = ticker.history(period='60d', interval='5m')
         
         if df_5min.empty or len(df_5min) < 200:
-            logger.warning(f"{symbol}: Insufficient 5-minute data")
+            logger.debug(f"{symbol}: Insufficient 5-minute data")
             return None
         
         # Normalize timezone
@@ -165,75 +152,49 @@ def fetch_complete_timepoint_data(symbol: str, logger: logging.Logger) -> dict:
         # Calculate indicators on 5-minute data
         df_5min_indicators = calculate_indicators_5min(df_5min)
         
-        # Get available trading days from 5-min data
+        # Get available trading days
         available_dates_5min = sorted(list(set(df_5min_indicators.index.date)), reverse=True)
         
         if len(available_dates_5min) < 2:
-            logger.warning(f"{symbol}: Need at least 2 days of 5-min data")
             return None
         
-        # T-0 = most recent complete trading day (yesterday if run before market open)
         t0_date = available_dates_5min[0]
-        # T-1 = day before that
         t1_date = available_dates_5min[1]
         
-        # Extract T-0 snapshots
+        # Extract T-0 and T-1 snapshots
         t0_open = extract_timepoint_5min(df_5min_indicators, t0_date, 'open', logger, symbol)
         t0_close = extract_timepoint_5min(df_5min_indicators, t0_date, 'close', logger, symbol)
-        
-        # Extract T-1 snapshots
         t1_open = extract_timepoint_5min(df_5min_indicators, t1_date, 'open', logger, symbol)
         t1_close = extract_timepoint_5min(df_5min_indicators, t1_date, 'close', logger, symbol)
         
         if not all([t0_open, t0_close, t1_open, t1_close]):
-            logger.warning(f"{symbol}: Missing some T-0/T-1 timepoints")
             return None
         
-        # === FETCH DAILY DATA FOR T-3, T-5, T-10 ===
-        logger.debug(f"{symbol}: Fetching daily candle data...")
+        # Fetch daily data for T-3, T-5, T-10
         df_daily = ticker.history(period='90d', interval='1d')
         
         if df_daily.empty or len(df_daily) < 20:
-            logger.warning(f"{symbol}: Insufficient daily data")
             return None
         
-        # Calculate indicators on daily data
         df_daily_indicators = calculate_indicators_daily(df_daily)
-        
-        # Get available trading days from daily data
         available_dates_daily = sorted(df_daily_indicators.index.date, reverse=True)
         
-        # Find T-0 in daily data to anchor our counting
         if t0_date not in available_dates_daily:
-            logger.warning(f"{symbol}: T-0 date {t0_date} not in daily data")
             return None
         
         t0_idx = available_dates_daily.index(t0_date)
         
         snapshots = {}
         
-        # T-3 (3 trading days before T-0)
-        if t0_idx + 3 < len(available_dates_daily):
-            t3_date = available_dates_daily[t0_idx + 3]
-            t3_data = extract_timepoint_daily(df_daily_indicators, t3_date, logger, symbol)
-            if t3_data:
-                snapshots['t3'] = t3_data
+        # T-3, T-5, T-10
+        for lag_name, lag_days in [('t3', 3), ('t5', 5), ('t10', 10)]:
+            if t0_idx + lag_days < len(available_dates_daily):
+                lag_date = available_dates_daily[t0_idx + lag_days]
+                lag_data = extract_timepoint_daily(df_daily_indicators, lag_date, logger, symbol)
+                if lag_data:
+                    snapshots[lag_name] = lag_data
         
-        # T-5 (5 trading days before T-0)
-        if t0_idx + 5 < len(available_dates_daily):
-            t5_date = available_dates_daily[t0_idx + 5]
-            t5_data = extract_timepoint_daily(df_daily_indicators, t5_date, logger, symbol)
-            if t5_data:
-                snapshots['t5'] = t5_data
-        
-        # T-10 (10 trading days before T-0)
-        if t0_idx + 10 < len(available_dates_daily):
-            t10_date = available_dates_daily[t0_idx + 10]
-            t10_data = extract_timepoint_daily(df_daily_indicators, t10_date, logger, symbol)
-            if t10_data:
-                snapshots['t10'] = t10_data
-        
-        # Combine all timepoints
+        # Return ALL timepoints
         result = {
             'symbol': symbol,
             'exchange': 'NASDAQ',
@@ -244,48 +205,42 @@ def fetch_complete_timepoint_data(symbol: str, logger: logging.Logger) -> dict:
             **snapshots
         }
         
-        logger.debug(f"{symbol}: Successfully fetched {2 + len(snapshots)} timepoints")
+        logger.debug(f"{symbol}: Fetched {len(result)-2} timepoints")
         
         return result
         
     except Exception as e:
-        logger.debug(f"{symbol}: Error fetching data: {e}")
+        logger.debug(f"{symbol}: Error - {e}")
         return None
 
 
 def extract_timepoint_5min(df: pd.DataFrame, date, timepoint: str, logger, symbol: str) -> dict:
     """Extract indicators from 5-min data at specific timepoint"""
     
-    # Filter to specific date
     day_bars = df[df.index.date == date]
     
     if day_bars.empty:
-        logger.debug(f"{symbol}: No bars for {date}")
         return None
     
-    # Get appropriate time window
     if timepoint == 'open':
-        # Market open: 9:30-10:00 AM
         target_bars = day_bars[(day_bars.index.time >= dt_time(9, 30)) & 
                                (day_bars.index.time <= dt_time(10, 0))]
         if target_bars.empty:
             target_bars = day_bars[day_bars.index.time >= dt_time(9, 30)]
         if not target_bars.empty:
-            bar = target_bars.iloc[0]  # First bar after open
+            bar = target_bars.iloc[0]
         else:
             return None
     else:  # close
-        # Market close: 3:55-4:00 PM
         target_bars = day_bars[(day_bars.index.time >= dt_time(15, 55)) & 
                                (day_bars.index.time <= dt_time(16, 0))]
         if target_bars.empty:
             target_bars = day_bars[day_bars.index.time >= dt_time(15, 0)]
         if not target_bars.empty:
-            bar = target_bars.iloc[-1]  # Last bar before close
+            bar = target_bars.iloc[-1]
         else:
             return None
     
-    # Convert to dict
     return {k.lower(): (v if pd.notna(v) and not np.isinf(v) else None) 
             for k, v in bar.to_dict().items()}
 
@@ -296,7 +251,6 @@ def extract_timepoint_daily(df: pd.DataFrame, date, logger, symbol: str) -> dict
     day_bars = df[df.index.date == date]
     
     if day_bars.empty:
-        logger.debug(f"{symbol}: No daily bar for {date}")
         return None
     
     bar = day_bars.iloc[-1]
@@ -306,7 +260,7 @@ def extract_timepoint_daily(df: pd.DataFrame, date, logger, symbol: str) -> dict
 
 
 def calculate_indicators_5min(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate indicators on 5-minute bars (matches training data)"""
+    """Calculate indicators on 5-minute bars"""
     import ta
     
     result = pd.DataFrame(index=df.index)
@@ -473,12 +427,10 @@ def main():
     logger = setup_logging(args.verbose)
     
     logger.info("="*80)
-    logger.info("ML STOCK SCREENING & PREDICTION - COMPLETE SYSTEM")
+    logger.info("ML SCREENING & PREDICTION - MULTI-TIMEPOINT SYSTEM")
     logger.info("="*80)
-    logger.info("TIMEPOINT DATA COLLECTION:")
-    logger.info("  T-0: Yesterday open/close (5-min candles)")
-    logger.info("  T-1: Day before open/close (5-min candles)")
-    logger.info("  T-3, T-5, T-10: Historical (daily candles)")
+    logger.info("Fetching ALL timepoints: T-0 open/close, T-1 open/close, T-3, T-5, T-10")
+    logger.info("Model will learn temporal patterns across all timepoints")
     logger.info("="*80)
     
     # Initialize
@@ -509,12 +461,12 @@ def main():
     if 'symbol' in screened_df.columns:
         symbols = screened_df['symbol'].str.split(':').str[-1].tolist()
     else:
-        logger.error("No symbol column in screened results")
+        logger.error("No symbol column")
         return 1
     
     # STEP 2: FETCH COMPLETE TIMEPOINT DATA
     logger.info("\n" + "="*80)
-    logger.info("STEP 2: FETCH COMPLETE TIMEPOINT DATA")
+    logger.info("STEP 2: FETCH ALL TIMEPOINT DATA")
     logger.info("="*80)
     logger.info(f"Fetching data for {len(symbols)} stocks...")
     
@@ -534,14 +486,14 @@ def main():
                 enriched_stocks.append(result)
     
     if not enriched_stocks:
-        logger.error("Failed to fetch data for any stocks")
+        logger.error("Failed to fetch data")
         return 1
     
     logger.info(f"✓ Fetched complete data for {len(enriched_stocks)} stocks")
     
-    # STEP 3: PREPARE FEATURES FOR PREDICTION
+    # STEP 3: PREPARE MULTI-TIMEPOINT FEATURES
     logger.info("\n" + "="*80)
-    logger.info("STEP 3: PREPARE FEATURES")
+    logger.info("STEP 3: PREPARE MULTI-TIMEPOINT FEATURES")
     logger.info("="*80)
     
     features_list = []
@@ -551,7 +503,7 @@ def main():
             'exchange': stock['exchange']
         }
         
-        # Add all timepoint features with proper prefixes
+        # Add ALL timepoint features WITH PREFIXES
         for timepoint in ['t0_open', 't0_close', 't1_open', 't1_close', 't3', 't5', 't10']:
             if timepoint in stock:
                 for k, v in stock[timepoint].items():
@@ -560,16 +512,14 @@ def main():
         features_list.append(feature_row)
     
     features_df = pd.DataFrame(features_list)
-    logger.info(f"✓ Prepared {len(features_df)} stocks with {len(features_df.columns)} features")
+    logger.info(f"✓ Prepared {len(features_df)} stocks with {len(features_df.columns)} multi-timepoint features")
     
     # STEP 4: ML PREDICTION
     logger.info("\n" + "="*80)
-    logger.info("STEP 4: ML PREDICTION")
+    logger.info("STEP 4: MULTI-TIMEPOINT ML PREDICTION")
     logger.info("="*80)
     
     historical_gains = supabase.get_historical_prediction_accuracy(days_back=30)
-    if not historical_gains.empty:
-        logger.info(f"Using {len(historical_gains)} historical records for calibration")
     
     try:
         predictions_df = predictor.predict_with_targets(features_df, historical_gains)
@@ -594,8 +544,12 @@ def main():
     
     for idx, row in top_predictions.head(20).iterrows():
         current_price = row.get('current_price', 0)
-        if current_price == 0 and 't0_close_close' in row:
-            current_price = row.get('t0_close_close', 0)
+        if current_price == 0:
+            # Try to get from any close feature
+            for col in row.index:
+                if 'close' in col and row[col] > 0:
+                    current_price = row[col]
+                    break
         
         logger.info(
             f"{idx+1:<4} {row['symbol']:<8} {row['signal']:<13} "
@@ -607,7 +561,7 @@ def main():
     
     # STEP 6: STORE PREDICTIONS
     logger.info("\n" + "="*80)
-    logger.info("STEP 6: STORE PREDICTIONS FOR EVENING ANALYSIS")
+    logger.info("STEP 6: STORE PREDICTIONS")
     logger.info("="*80)
     
     prediction_date = datetime.now().date().isoformat()
@@ -615,8 +569,11 @@ def main():
     
     for _, row in top_predictions.iterrows():
         current_price = row.get('current_price', 0)
-        if current_price == 0 and 't0_close_close' in row:
-            current_price = row.get('t0_close_close', 0)
+        if current_price == 0:
+            for col in row.index:
+                if 'close' in col and row[col] > 0:
+                    current_price = row[col]
+                    break
         
         prediction_record = {
             'symbol': row['symbol'],
@@ -632,31 +589,19 @@ def main():
             'target_price': float(row.get('target_price', 0)),
             'target_price_low': float(row.get('target_price_low', 0)),
             'target_price_high': float(row.get('target_price_high', 0)),
-            'rsi': float(row.get('t0_close_rsi', 0)) if pd.notna(row.get('t0_close_rsi')) else None,
-            'macd': float(row.get('t0_close_macd.macd', 0)) if pd.notna(row.get('t0_close_macd.macd')) else None,
-            'adx': float(row.get('t0_close_adx', 0)) if pd.notna(row.get('t0_close_adx')) else None,
-            'volume_ratio': float(row.get('t0_close_volume_ratio', 0)) if pd.notna(row.get('t0_close_volume_ratio')) else None,
-            'bb_width': float(row.get('t0_close_bb_width', 0)) if pd.notna(row.get('t0_close_bb_width')) else None,
         }
         
         predictions_list.append(prediction_record)
     
     if predictions_list:
-        logger.info(f"Writing {len(predictions_list)} predictions to database...")
         count = supabase.write_predictions(predictions_list)
         logger.info(f"✓ Wrote {count} predictions")
     
     # STEP 7: LOG STATISTICS
-    logger.info("\n" + "="*80)
-    logger.info("STEP 7: LOG STATISTICS")
-    logger.info("="*80)
-    
     screening_log = {
         'screening_date': prediction_date,
         'total_symbols_attempted': args.max_results,
         'symbols_fetched_successfully': len(screened_df),
-        'symbols_after_price_filter': len(screened_df),
-        'symbols_after_volume_filter': len(screened_df),
         'symbols_after_all_filters': len(features_df),
         'total_predictions': len(predictions_df),
         'strong_buy_count': len(predictions_df[predictions_df['signal'] == 'STRONG BUY']),
@@ -664,29 +609,20 @@ def main():
         'hold_count': len(predictions_df[predictions_df['signal'] == 'HOLD']),
         'avoid_count': len(predictions_df[predictions_df['signal'] == 'AVOID']),
         'avg_probability': float(predictions_df['explosion_probability'].mean()),
-        'max_probability': float(predictions_df['explosion_probability'].max()),
-        'min_probability': float(predictions_df['explosion_probability'].min()),
-        'model_version': 'xgboost_complete_timepoints_v2'
+        'model_version': 'xgboost_multi_timepoint_v1'
     }
     
-    if supabase.write_screening_log(screening_log):
-        logger.info("✓ Screening statistics logged")
+    supabase.write_screening_log(screening_log)
     
     # Export CSV
     csv_path = Path(f"ml_screening_results_{prediction_date}.csv")
     top_predictions.to_csv(csv_path, index=False)
-    logger.info(f"✓ Exported to {csv_path}")
     
-    # FINAL SUMMARY
     logger.info("\n" + "="*80)
     logger.info("✓ PREDICTION COMPLETE")
     logger.info("="*80)
-    logger.info(f"\nPredictions for: {prediction_date}")
-    logger.info(f"Total screened: {len(screened_df)} stocks")
-    logger.info(f"Complete data fetched: {len(enriched_stocks)} stocks")
-    logger.info(f"Predictions generated: {len(predictions_df)}")
-    logger.info(f"Top predictions stored: {len(predictions_list)}")
-    logger.info(f"\nNext: ml_track_comprehensive_accuracy.py will analyze results after market close")
+    logger.info(f"Predictions for: {prediction_date}")
+    logger.info(f"Model type: MULTI-TIMEPOINT (learns from T-0, T-1, T-3, T-5, T-10)")
     
     return 0
 
