@@ -1,34 +1,39 @@
 #!/usr/bin/env python3
 """
-Autonomous ML Stock Screener & Predictor - COMPLETE VERSION
-Uses tradingview_scraper.symbols.screener.Screener for screening
+Autonomous ML Stock Screener & Predictor - COMPLETE FIXED VERSION
+
+WORKFLOW:
+1. Runs at 7 AM UTC (2 AM EST) - 1 hour before pre-market
+2. Screens stocks using learned filters
+3. Fetches multi-timepoint data:
+   - T-0 open/close: Yesterday's 5-min candles (open at 9:30am, close at 4pm)
+   - T-1 open/close: Day before yesterday's 5-min candles  
+   - T-3, T-5, T-10: Daily candles
+4. Makes predictions for today
+5. Stores predictions for evening accuracy analysis
 """
 
 import argparse
 import logging
 import pytz
 from datetime import time as dt_time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 import pandas as pd
 import json
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.ml_predictor.explosion_predictor import ExplosionPredictor
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
-# Import tradingview-scraper
-SCREENER_AVAILABLE = False
-Screener = None
-
 try:
     from tradingview_scraper.symbols.screener import Screener
     SCREENER_AVAILABLE = True
-    print("✓ Imported Screener from tradingview_scraper.symbols.screener")
-except ImportError as e:
-    print(f"✗ Failed to import: {e}")
+except ImportError:
+    SCREENER_AVAILABLE = False
 
 
 def setup_logging(verbose: bool = False):
@@ -42,6 +47,8 @@ def setup_logging(verbose: bool = False):
 
 
 class SmartScreener:
+    """Intelligent screener that learns optimal filters over time"""
+    
     def __init__(self, config: dict = None, logger: logging.Logger = None):
         self.logger = logger or logging.getLogger(__name__)
         self.config = config or {}
@@ -53,10 +60,13 @@ class SmartScreener:
             self.screener = None
     
     def _load_learned_filters(self) -> dict:
+        """Load learned filters from previous model training"""
         defaults = {
-            'min_price': 0.25,
-            'max_price': 250.0,
-            'min_volume': 50000,
+            'min_price': 0.50,
+            'max_price': 500.0,
+            'min_volume': 100000,
+            'min_volatility': None,  # Will learn this
+            'max_volatility': None,  # Will learn this
         }
         
         try:
@@ -67,20 +77,22 @@ class SmartScreener:
                 for key, value in learned.items():
                     if value is not None:
                         defaults[key] = value
-                self.logger.info("✓ Loaded learned filters")
+                self.logger.info("✓ Loaded learned screening filters")
+                self.logger.info(f"  Filters: {learned}")
             else:
-                self.logger.info("No learned filters yet - using minimal constraints")
+                self.logger.info("No learned filters yet - using defaults")
         except Exception as e:
             self.logger.debug(f"Using default filters: {e}")
         
         return defaults
     
     def screen_with_tradingview(self, max_results: int = 500) -> pd.DataFrame:
+        """Screen stocks using TradingView with learned filters"""
         if not SCREENER_AVAILABLE or self.screener is None:
-            self.logger.error("Screener not available!")
+            self.logger.error("TradingView screener not available!")
             return pd.DataFrame()
         
-        self.logger.info("Screening stocks with tradingview-scraper...")
+        self.logger.info("Screening stocks with learned filters...")
         self.logger.info(f"  Price: ${self.filters['min_price']}-${self.filters['max_price']}")
         self.logger.info(f"  Volume: >= {self.filters['min_volume']:,}")
         
@@ -90,11 +102,6 @@ class SmartScreener:
                 {'left': 'close', 'operation': 'less', 'right': self.filters['max_price']},
                 {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
             ]
-            
-            # Don't specify columns - let TradingView return defaults
-            # Then we'll work with whatever we get
-            
-            self.logger.debug("Requesting default columns from TradingView...")
             
             result = self.screener.screen(
                 market='america',
@@ -106,11 +113,7 @@ class SmartScreener:
             
             if result['status'] == 'success' and result.get('data'):
                 df = pd.DataFrame(result['data'])
-                
-                # Log what columns we actually got
-                self.logger.info(f"Received columns from TradingView: {list(df.columns)}")
-                
-                self.logger.info(f"✓ Found {len(df)} stocks (total available: {result.get('totalCount', '?')})")
+                self.logger.info(f"✓ Screened {len(df)} stocks")
                 return df
             
             self.logger.warning("No results from screener")
@@ -119,127 +122,349 @@ class SmartScreener:
         except Exception as e:
             self.logger.error(f"Screening failed: {e}")
             return pd.DataFrame()
+
+
+def fetch_complete_timepoint_data(symbol: str, logger: logging.Logger) -> dict:
+    """
+    Fetch ALL required timepoint data for a stock:
     
-    def prepare_features(self, screened_df: pd.DataFrame) -> pd.DataFrame:
-        self.logger.info("Preparing features...")
+    T-0 (yesterday): 
+        - open (9:30am) - 5min candles
+        - close (4pm) - 5min candles
+    T-1 (day before yesterday):
+        - open (9:30am) - 5min candles  
+        - close (4pm) - 5min candles
+    T-3 (3 days ago): daily candles
+    T-5 (5 days ago): daily candles
+    T-10 (10 days ago): daily candles
+    
+    This matches EXACTLY what the model was trained on.
+    """
+    import yfinance as yf
+    import ta
+    
+    try:
+        ticker = yf.Ticker(symbol)
+        nyc_tz = pytz.timezone('America/New_York')
+        now_nyc = datetime.now(nyc_tz)
         
-        # Extract ticker from "NASDAQ:AAPL" format
-        if 'symbol' in screened_df.columns:
-            screened_df['ticker'] = screened_df['symbol'].str.split(':').str[-1]
-            screened_df['exchange_prefix'] = screened_df['symbol'].str.split(':').str[0]
+        # === FETCH 5-MINUTE DATA FOR T-0 AND T-1 ===
+        logger.debug(f"{symbol}: Fetching 5-minute candle data...")
+        df_5min = ticker.history(period='60d', interval='5m')
         
-        # Map TradingView column names to model feature names
-        rename_map = {
-            'ticker': 'symbol',
-            'close': 'close',
-            'open': 'open',
-            'high': 'high',
-            'low': 'low',
-            'volume': 'volume',
-            'RSI': 'rsi',
-            'RSI[1]': 'rsi[1]',
-            'ADX': 'adx',
-            'ADX+DI': 'adx+di',
-            'ADX-DI': 'adx-di',
-            'MACD.macd': 'macd.macd',
-            'MACD.signal': 'macd.signal',
-            'Stoch.K': 'stoch.k',
-            'Stoch.D': 'stoch.d',
-            'EMA5': 'ema5',
-            'EMA10': 'ema10',
-            'EMA20': 'ema20',
-            'EMA50': 'ema50',
-            'EMA100': 'ema100',
-            'EMA200': 'ema200',
-            'SMA5': 'sma5',
-            'SMA10': 'sma10',
-            'SMA20': 'sma20',
-            'SMA50': 'sma50',
-            'SMA100': 'sma100',
-            'SMA200': 'sma200',
-            'ATR': 'atr',
-            'BB.upper': 'bb.upper',
-            'BB.lower': 'bb.lower',
-            'BB.middle': 'bb.middle',
-            'CCI20': 'cci20',
-            'AO': 'ao',
-            'UO': 'uo',
-            'VWAP': 'vwap',
-            'change_abs': 'volume_change',
-            'Volatility.D': 'volatility_20d',
+        if df_5min.empty or len(df_5min) < 200:
+            logger.warning(f"{symbol}: Insufficient 5-minute data")
+            return None
+        
+        # Normalize timezone
+        if df_5min.index.tz is None:
+            df_5min.index = df_5min.index.tz_localize('America/New_York')
+        else:
+            df_5min.index = df_5min.index.tz_convert('America/New_York')
+        
+        # Calculate indicators on 5-minute data
+        df_5min_indicators = calculate_indicators_5min(df_5min)
+        
+        # Get available trading days from 5-min data
+        available_dates_5min = sorted(list(set(df_5min_indicators.index.date)), reverse=True)
+        
+        if len(available_dates_5min) < 2:
+            logger.warning(f"{symbol}: Need at least 2 days of 5-min data")
+            return None
+        
+        # T-0 = most recent complete trading day (yesterday if run before market open)
+        t0_date = available_dates_5min[0]
+        # T-1 = day before that
+        t1_date = available_dates_5min[1]
+        
+        # Extract T-0 snapshots
+        t0_open = extract_timepoint_5min(df_5min_indicators, t0_date, 'open', logger, symbol)
+        t0_close = extract_timepoint_5min(df_5min_indicators, t0_date, 'close', logger, symbol)
+        
+        # Extract T-1 snapshots
+        t1_open = extract_timepoint_5min(df_5min_indicators, t1_date, 'open', logger, symbol)
+        t1_close = extract_timepoint_5min(df_5min_indicators, t1_date, 'close', logger, symbol)
+        
+        if not all([t0_open, t0_close, t1_open, t1_close]):
+            logger.warning(f"{symbol}: Missing some T-0/T-1 timepoints")
+            return None
+        
+        # === FETCH DAILY DATA FOR T-3, T-5, T-10 ===
+        logger.debug(f"{symbol}: Fetching daily candle data...")
+        df_daily = ticker.history(period='90d', interval='1d')
+        
+        if df_daily.empty or len(df_daily) < 20:
+            logger.warning(f"{symbol}: Insufficient daily data")
+            return None
+        
+        # Calculate indicators on daily data
+        df_daily_indicators = calculate_indicators_daily(df_daily)
+        
+        # Get available trading days from daily data
+        available_dates_daily = sorted(df_daily_indicators.index.date, reverse=True)
+        
+        # Find T-0 in daily data to anchor our counting
+        if t0_date not in available_dates_daily:
+            logger.warning(f"{symbol}: T-0 date {t0_date} not in daily data")
+            return None
+        
+        t0_idx = available_dates_daily.index(t0_date)
+        
+        snapshots = {}
+        
+        # T-3 (3 trading days before T-0)
+        if t0_idx + 3 < len(available_dates_daily):
+            t3_date = available_dates_daily[t0_idx + 3]
+            t3_data = extract_timepoint_daily(df_daily_indicators, t3_date, logger, symbol)
+            if t3_data:
+                snapshots['t3'] = t3_data
+        
+        # T-5 (5 trading days before T-0)
+        if t0_idx + 5 < len(available_dates_daily):
+            t5_date = available_dates_daily[t0_idx + 5]
+            t5_data = extract_timepoint_daily(df_daily_indicators, t5_date, logger, symbol)
+            if t5_data:
+                snapshots['t5'] = t5_data
+        
+        # T-10 (10 trading days before T-0)
+        if t0_idx + 10 < len(available_dates_daily):
+            t10_date = available_dates_daily[t0_idx + 10]
+            t10_data = extract_timepoint_daily(df_daily_indicators, t10_date, logger, symbol)
+            if t10_data:
+                snapshots['t10'] = t10_data
+        
+        # Combine all timepoints
+        result = {
+            'symbol': symbol,
+            'exchange': 'NASDAQ',
+            't0_open': t0_open,
+            't0_close': t0_close,
+            't1_open': t1_open,
+            't1_close': t1_close,
+            **snapshots
         }
         
-        features_df = screened_df.rename(columns=rename_map)
+        logger.debug(f"{symbol}: Successfully fetched {2 + len(snapshots)} timepoints")
         
-        # Calculate derived features
-        if 'bb.upper' in features_df.columns and 'bb.lower' in features_df.columns:
-            features_df['bb_width'] = features_df['bb.upper'] - features_df['bb.lower']
+        return result
         
-        # Calculate volume ratio
-        if 'volume' in features_df.columns:
-            # Use volume itself as a proxy for volume ratio (will normalize during scaling)
-            features_df['volume_ratio'] = 1.2
-        
-        # Fill missing features that model expects
-        # Use close price as fallback for OHLC if somehow missing
-        if 'close' in features_df.columns:
-            if 'open' not in features_df.columns:
-                features_df['open'] = features_df['close']
-            if 'high' not in features_df.columns:
-                features_df['high'] = features_df['close'] * 1.02
-            if 'low' not in features_df.columns:
-                features_df['low'] = features_df['close'] * 0.98
-        
-        # Keltner channels - use BB as proxy
-        if 'bb.upper' in features_df.columns:
-            features_df['keltner_upper'] = features_df['bb.upper']
-            features_df['keltner_lower'] = features_df['bb.lower']
+    except Exception as e:
+        logger.debug(f"{symbol}: Error fetching data: {e}")
+        return None
+
+
+def extract_timepoint_5min(df: pd.DataFrame, date, timepoint: str, logger, symbol: str) -> dict:
+    """Extract indicators from 5-min data at specific timepoint"""
+    
+    # Filter to specific date
+    day_bars = df[df.index.date == date]
+    
+    if day_bars.empty:
+        logger.debug(f"{symbol}: No bars for {date}")
+        return None
+    
+    # Get appropriate time window
+    if timepoint == 'open':
+        # Market open: 9:30-10:00 AM
+        target_bars = day_bars[(day_bars.index.time >= dt_time(9, 30)) & 
+                               (day_bars.index.time <= dt_time(10, 0))]
+        if target_bars.empty:
+            target_bars = day_bars[day_bars.index.time >= dt_time(9, 30)]
+        if not target_bars.empty:
+            bar = target_bars.iloc[0]  # First bar after open
         else:
-            features_df['keltner_upper'] = 0
-            features_df['keltner_lower'] = 0
-        
-        # Donchian channels - use high/low
-        if 'high' in features_df.columns and 'low' in features_df.columns:
-            features_df['donchian_upper'] = features_df['high']
-            features_df['donchian_lower'] = features_df['low']
-            features_df['donchian_middle'] = (features_df['high'] + features_df['low']) / 2
+            return None
+    else:  # close
+        # Market close: 3:55-4:00 PM
+        target_bars = day_bars[(day_bars.index.time >= dt_time(15, 55)) & 
+                               (day_bars.index.time <= dt_time(16, 0))]
+        if target_bars.empty:
+            target_bars = day_bars[day_bars.index.time >= dt_time(15, 0)]
+        if not target_bars.empty:
+            bar = target_bars.iloc[-1]  # Last bar before close
         else:
-            features_df['donchian_upper'] = 0
-            features_df['donchian_lower'] = 0
-            features_df['donchian_middle'] = 0
+            return None
+    
+    # Convert to dict
+    return {k.lower(): (v if pd.notna(v) and not np.isinf(v) else None) 
+            for k, v in bar.to_dict().items()}
+
+
+def extract_timepoint_daily(df: pd.DataFrame, date, logger, symbol: str) -> dict:
+    """Extract indicators from daily data"""
+    
+    day_bars = df[df.index.date == date]
+    
+    if day_bars.empty:
+        logger.debug(f"{symbol}: No daily bar for {date}")
+        return None
+    
+    bar = day_bars.iloc[-1]
+    
+    return {k.lower(): (v if pd.notna(v) and not np.isinf(v) else None) 
+            for k, v in bar.to_dict().items()}
+
+
+def calculate_indicators_5min(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate indicators on 5-minute bars (matches training data)"""
+    import ta
+    
+    result = pd.DataFrame(index=df.index)
+    
+    # Basic OHLCV
+    result['close'] = df['Close']
+    result['open'] = df['Open']
+    result['high'] = df['High']
+    result['low'] = df['Low']
+    result['volume'] = df['Volume']
+    
+    # Momentum
+    try:
+        result['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+        result['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+        result['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+        result['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
+        result['uo'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
+    except: pass
+    
+    # Trend
+    try:
+        result['macd.macd'] = ta.trend.macd(df['Close'], window_slow=26, window_fast=12)
+        result['macd.signal'] = ta.trend.macd_signal(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+        result['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
+        result['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
+    except: pass
+    
+    # Volatility
+    try:
+        bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
+        result['bb.upper'] = bb.bollinger_hband()
+        result['bb.lower'] = bb.bollinger_lband()
+        result['bb.middle'] = bb.bollinger_mavg()
+        result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
         
-        # Volatility - use the one we have or default
-        if 'volatility_20d' in features_df.columns:
-            features_df['volatility_10d'] = features_df['volatility_20d']
-            features_df['volatility_30d'] = features_df['volatility_20d']
-        else:
-            features_df['volatility_10d'] = 1.5
-            features_df['volatility_20d'] = 1.5
-            features_df['volatility_30d'] = 1.5
+        result['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         
-        # OBV - if not available, use volume as proxy
-        if 'obv' not in features_df.columns and 'volume' in features_df.columns:
-            features_df['obv'] = features_df['volume'] * 10
-        elif 'obv' not in features_df.columns:
-            features_df['obv'] = 0
+        keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
+        result['keltner_upper'] = keltner.keltner_channel_hband()
+        result['keltner_lower'] = keltner.keltner_channel_lband()
         
-        # Set exchange
-        features_df['exchange'] = features_df.get('exchange_prefix', 'NASDAQ')
+        donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
+        result['donchian_upper'] = donchian.donchian_channel_hband()
+        result['donchian_lower'] = donchian.donchian_channel_lband()
+        result['donchian_middle'] = donchian.donchian_channel_mband()
+    except: pass
+    
+    # Volume
+    try:
+        result['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+        result['volume_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
+    except: pass
+    
+    # Moving averages
+    for period in [5, 10, 20, 50, 100, 200]:
+        try:
+            result[f'ema{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
+            result[f'sma{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
+        except: pass
+    
+    # VWAP
+    try:
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    except: pass
+    
+    # Volatility measures
+    try:
+        result['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100
+        result['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100
+        result['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100
+    except: pass
+    
+    return result
+
+
+def calculate_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate indicators on daily bars (for T-3, T-5, T-10)"""
+    import ta
+    
+    result = pd.DataFrame(index=df.index)
+    
+    # Basic OHLCV
+    result['close'] = df['Close']
+    result['open'] = df['Open']
+    result['high'] = df['High']
+    result['low'] = df['Low']
+    result['volume'] = df['Volume']
+    
+    # Momentum
+    try:
+        result['rsi'] = ta.momentum.rsi(df['Close'], window=14)
+        result['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+        result['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+        result['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
+        result['uo'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
+    except: pass
+    
+    # Trend
+    try:
+        result['macd.macd'] = ta.trend.macd(df['Close'], window_slow=26, window_fast=12)
+        result['macd.signal'] = ta.trend.macd_signal(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+        result['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
+        result['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
+    except: pass
+    
+    # Volatility
+    try:
+        bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
+        result['bb.upper'] = bb.bollinger_hband()
+        result['bb.lower'] = bb.bollinger_lband()
+        result['bb.middle'] = bb.bollinger_mavg()
+        result['bb_width'] = (result['bb.upper'] - result['bb.lower']) / result['bb.middle'] * 100
         
-        # Log what we have
-        self.logger.info(f"Features prepared: {len(features_df.columns)} columns")
-        missing_cols = [col for col in ['symbol', 'close', 'volume', 'rsi', 'macd.macd'] 
-                       if col not in features_df.columns]
-        if missing_cols:
-            self.logger.warning(f"Missing critical columns: {missing_cols}")
+        result['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         
-        return features_df
+        keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
+        result['keltner_upper'] = keltner.keltner_channel_hband()
+        result['keltner_lower'] = keltner.keltner_channel_lband()
+        
+        donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
+        result['donchian_upper'] = donchian.donchian_channel_hband()
+        result['donchian_lower'] = donchian.donchian_channel_lband()
+        result['donchian_middle'] = donchian.donchian_channel_mband()
+    except: pass
+    
+    # Volume
+    try:
+        result['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+        result['volume_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
+    except: pass
+    
+    # Moving averages
+    for period in [5, 10, 20, 50, 100, 200]:
+        try:
+            result[f'ema{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
+            result[f'sma{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
+        except: pass
+    
+    # VWAP
+    try:
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        result['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+    except: pass
+    
+    # Volatility measures
+    try:
+        result['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100
+        result['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100
+        result['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100
+    except: pass
+    
+    return result
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--universe", type=str, default="auto")
-    parser.add_argument("--max-workers", type=int, default=15)
     parser.add_argument("--max-results", type=int, default=500)
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -248,7 +473,12 @@ def main():
     logger = setup_logging(args.verbose)
     
     logger.info("="*80)
-    logger.info("ML STOCK SCREENING & PREDICTION")
+    logger.info("ML STOCK SCREENING & PREDICTION - COMPLETE SYSTEM")
+    logger.info("="*80)
+    logger.info("TIMEPOINT DATA COLLECTION:")
+    logger.info("  T-0: Yesterday open/close (5-min candles)")
+    logger.info("  T-1: Day before open/close (5-min candles)")
+    logger.info("  T-3, T-5, T-10: Historical (daily candles)")
     logger.info("="*80)
     
     # Initialize
@@ -263,7 +493,7 @@ def main():
     
     # STEP 1: SCREENING
     logger.info("\n" + "="*80)
-    logger.info("STEP 1: SCREENING")
+    logger.info("STEP 1: INTELLIGENT SCREENING")
     logger.info("="*80)
     
     screened_df = screener.screen_with_tradingview(max_results=args.max_results)
@@ -272,183 +502,69 @@ def main():
         logger.error("No stocks passed screening")
         return 1
     
-    logger.info(f"✓ Screened {len(screened_df)} stocks from TradingView")
+    logger.info(f"✓ Screened {len(screened_df)} stocks")
     
-    # STEP 2: FETCH TECHNICAL INDICATORS
-    logger.info("\n" + "="*80)
-    logger.info("STEP 2: FETCH TECHNICAL INDICATORS")
-    logger.info("="*80)
-    
-    # Extract symbols from screened results
+    # Extract symbols
     symbols = []
     if 'symbol' in screened_df.columns:
-        # Handle "NASDAQ:AAPL" format
         symbols = screened_df['symbol'].str.split(':').str[-1].tolist()
     else:
         logger.error("No symbol column in screened results")
         return 1
     
-    logger.info(f"Fetching detailed indicators for {len(symbols)} stocks using yfinance...")
+    # STEP 2: FETCH COMPLETE TIMEPOINT DATA
+    logger.info("\n" + "="*80)
+    logger.info("STEP 2: FETCH COMPLETE TIMEPOINT DATA")
+    logger.info("="*80)
+    logger.info(f"Fetching data for {len(symbols)} stocks...")
     
-    # Fetch indicators using yfinance + ta library
-    import yfinance as yf
-    import ta
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    def fetch_intraday_indicators_like_training(symbol, logger):
-        """
-        Fetch 5-minute intraday indicators EXACTLY like training data collection:
-        - Uses 5-minute bars (not daily bars)
-        - Calculates indicators on 5-min data
-        - Extracts snapshots at market open/close for today and yesterday
-        """
-        try:
-            import yfinance as yf
-            import ta
-            
-            ticker = yf.Ticker(symbol)
-            
-            # Fetch 60 days of 5-minute data
-            df = ticker.history(period='60d', interval='5m')
-            
-            if df.empty or len(df) < 200:
-                return None
-            
-            # Normalize timezone to America/New_York
-            if df.index.tz is None:
-                df.index = df.index.tz_localize('America/New_York')
-            else:
-                df.index = df.index.tz_convert('America/New_York')
-            
-            # Calculate all indicators on 5-minute bars
-            # NOTE: On 5-min bars, 14-period RSI = 70 minutes (not 14 days)
-            
-            df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
-            df['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
-            df['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
-            df['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
-            df['uo'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
-            
-            df['macd.macd'] = ta.trend.macd(df['Close'], window_slow=26, window_fast=12)
-            df['macd.signal'] = ta.trend.macd_signal(df['Close'], window_slow=26, window_fast=12, window_sign=9)
-            df['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
-            df['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
-            
-            bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-            df['bb.upper'] = bb.bollinger_hband()
-            df['bb.lower'] = bb.bollinger_lband()
-            df['bb.middle'] = bb.bollinger_mavg()
-            df['bb_width'] = (df['bb.upper'] - df['bb.lower']) / df['bb.middle'] * 100
-            
-            df['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
-            
-            keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
-            df['keltner_upper'] = keltner.keltner_channel_hband()
-            df['keltner_lower'] = keltner.keltner_channel_lband()
-            
-            donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
-            df['donchian_upper'] = donchian.donchian_channel_hband()
-            df['donchian_lower'] = donchian.donchian_channel_lband()
-            df['donchian_middle'] = donchian.donchian_channel_mband()
-            
-            df['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
-            df['volume_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
-            
-            for period in [5, 10, 20, 50, 100, 200]:
-                df[f'ema{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
-                df[f'sma{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
-            
-            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-            df['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
-            
-            df['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100
-            df['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100
-            df['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100
-            
-            # Extract snapshots at specific timepoints
-            today = datetime.now(pytz.timezone('America/New_York')).date()
-            available_dates = sorted(df.index.date.unique())
-            
-            if today not in available_dates:
-                today = available_dates[-1]
-            
-            yesterday_idx = available_dates.index(today) - 1
-            if yesterday_idx < 0:
-                return None
-            
-            yesterday = available_dates[yesterday_idx]
-            
-            def extract_timepoint(target_date, target_time_start, target_time_end):
-                """Extract indicator snapshot at specific time"""
-                day_bars = df[df.index.date == target_date]
-                
-                if day_bars.empty:
-                    return None
-                
-                time_mask = (day_bars.index.time >= target_time_start) & (day_bars.index.time <= target_time_end)
-                target_bars = day_bars[time_mask]
-                
-                if target_bars.empty:
-                    target_bars = day_bars[day_bars.index.time >= target_time_start]
-                    if target_bars.empty:
-                        target_bars = day_bars
-                
-                if target_bars.empty:
-                    return None
-                
-                bar = target_bars.iloc[-1]
-                snapshot = {}
-                for col in df.columns:
-                    snapshot[col.lower()] = bar[col]
-                
-                return snapshot
-            
-            # Extract the 4 timepoints
-            day_prior_close = extract_timepoint(yesterday, dt_time(15, 55), dt_time(16, 0))
-            day_prior_open = extract_timepoint(yesterday, dt_time(9, 30), dt_time(10, 0))
-            market_close = extract_timepoint(today, dt_time(15, 55), dt_time(16, 0))
-            market_open = extract_timepoint(today, dt_time(9, 30), dt_time(10, 0))
-            
-            if not day_prior_close:
-                return None
-            
-            return {
-                'symbol': symbol,
-                'exchange': 'NASDAQ',
-                'day_prior_close': day_prior_close,
-                'day_prior_open': day_prior_open,
-                'market_close': market_close,
-                'market_open': market_open
-            }
-            
-        except Exception as e:
-            logger.debug(f"Failed to fetch {symbol}: {e}")
-            return None
-    
-    # Fetch in parallel
     enriched_stocks = []
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_stock_indicators, sym): sym for sym in symbols}
+        futures = {executor.submit(fetch_complete_timepoint_data, sym, logger): sym 
+                  for sym in symbols}
         
         for i, future in enumerate(as_completed(futures), 1):
             if i % 50 == 0:
-                logger.info(f"  Fetched {i}/{len(symbols)} stocks...")
+                logger.info(f"  Progress: {i}/{len(symbols)}")
             
             result = future.result()
             if result:
                 enriched_stocks.append(result)
     
     if not enriched_stocks:
-        logger.error("Failed to fetch indicators for any stocks")
+        logger.error("Failed to fetch data for any stocks")
         return 1
     
-    features_df = pd.DataFrame(enriched_stocks)
-    logger.info(f"✓ Fetched indicators for {len(features_df)} stocks")
-    logger.info(f"  Columns: {len(features_df.columns)}")
+    logger.info(f"✓ Fetched complete data for {len(enriched_stocks)} stocks")
     
-    # STEP 3: ML PREDICTION
+    # STEP 3: PREPARE FEATURES FOR PREDICTION
     logger.info("\n" + "="*80)
-    logger.info("STEP 3: ML PREDICTION")
+    logger.info("STEP 3: PREPARE FEATURES")
+    logger.info("="*80)
+    
+    features_list = []
+    for stock in enriched_stocks:
+        feature_row = {
+            'symbol': stock['symbol'], 
+            'exchange': stock['exchange']
+        }
+        
+        # Add all timepoint features with proper prefixes
+        for timepoint in ['t0_open', 't0_close', 't1_open', 't1_close', 't3', 't5', 't10']:
+            if timepoint in stock:
+                for k, v in stock[timepoint].items():
+                    feature_row[f'{timepoint}_{k}'] = v
+        
+        features_list.append(feature_row)
+    
+    features_df = pd.DataFrame(features_list)
+    logger.info(f"✓ Prepared {len(features_df)} stocks with {len(features_df.columns)} features")
+    
+    # STEP 4: ML PREDICTION
+    logger.info("\n" + "="*80)
+    logger.info("STEP 4: ML PREDICTION")
     logger.info("="*80)
     
     historical_gains = supabase.get_historical_prediction_accuracy(days_back=30)
@@ -464,53 +580,47 @@ def main():
         traceback.print_exc()
         return 1
     
-    # STEP 4: TOP PREDICTIONS
+    # STEP 5: TOP PREDICTIONS
     logger.info("\n" + "="*80)
-    logger.info(f"STEP 4: TOP {args.top_n} PREDICTIONS")
+    logger.info(f"STEP 5: TOP {args.top_n} PREDICTIONS")
     logger.info("="*80)
     
     top_predictions = predictions_df.head(args.top_n)
     
-    signal_counts = top_predictions['signal'].value_counts()
-    logger.info("\nSignal Distribution:")
-    for signal, count in signal_counts.items():
-        logger.info(f"  {signal}: {count}")
-    
-    prob_stats = top_predictions['explosion_probability']
-    logger.info(f"\nProbability Range: {prob_stats.min()*100:.2f}% - {prob_stats.max()*100:.2f}% (avg: {prob_stats.mean()*100:.2f}%)")
-    
     logger.info(f"\nTop {min(20, len(top_predictions))} Predictions:")
-    logger.info("-" * 90)
-    logger.info(f"{'Rank':<5} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<8} {'Target':<8} {'Gain':<8}")
-    logger.info("-" * 90)
+    logger.info("-" * 100)
+    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8}")
+    logger.info("-" * 100)
     
     for idx, row in top_predictions.head(20).iterrows():
+        current_price = row.get('current_price', 0)
+        if current_price == 0 and 't0_close_close' in row:
+            current_price = row.get('t0_close_close', 0)
+        
         logger.info(
-            f"{idx+1:<5} {row['symbol']:<8} {row['signal']:<13} "
+            f"{idx+1:<4} {row['symbol']:<8} {row['signal']:<13} "
             f"{row['explosion_probability']*100:>6.2f}%  "
-            f"${row.get('current_price', 0):>6.2f}  "
-            f"${row.get('target_price', 0):>6.2f}  "
+            f"${current_price:>8.2f}  "
+            f"${row.get('target_price', 0):>8.2f}  "
             f"+{row.get('target_gain_pct', 0):>5.1f}%"
         )
     
-    # STEP 5: STORE PREDICTIONS
+    # STEP 6: STORE PREDICTIONS
     logger.info("\n" + "="*80)
-    logger.info("STEP 5: STORE PREDICTIONS")
+    logger.info("STEP 6: STORE PREDICTIONS FOR EVENING ANALYSIS")
     logger.info("="*80)
     
     prediction_date = datetime.now().date().isoformat()
     predictions_list = []
     
     for _, row in top_predictions.iterrows():
-        original = features_df[features_df['symbol'] == row['symbol']]
-        if original.empty:
-            continue
-        
-        orig_row = original.iloc[0]
+        current_price = row.get('current_price', 0)
+        if current_price == 0 and 't0_close_close' in row:
+            current_price = row.get('t0_close_close', 0)
         
         prediction_record = {
             'symbol': row['symbol'],
-            'exchange': orig_row.get('exchange', 'NASDAQ'),
+            'exchange': row.get('exchange', 'NASDAQ'),
             'prediction_date': prediction_date,
             'explosion_probability': float(row['explosion_probability']),
             'prediction': int(row['prediction']),
@@ -518,15 +628,15 @@ def main():
             'target_gain_pct': float(row.get('target_gain_pct', 0)),
             'target_gain_low': float(row.get('target_gain_low', 0)),
             'target_gain_high': float(row.get('target_gain_high', 0)),
-            'current_price': float(row.get('current_price', 0)),
+            'current_price': float(current_price),
             'target_price': float(row.get('target_price', 0)),
             'target_price_low': float(row.get('target_price_low', 0)),
             'target_price_high': float(row.get('target_price_high', 0)),
-            'rsi': float(orig_row.get('rsi', 0)) if pd.notna(orig_row.get('rsi')) else None,
-            'macd': float(orig_row.get('macd.macd', 0)) if pd.notna(orig_row.get('macd.macd')) else None,
-            'adx': float(orig_row.get('adx', 0)) if pd.notna(orig_row.get('adx')) else None,
-            'volume_ratio': float(orig_row.get('volume_change', 0)) if pd.notna(orig_row.get('volume_change')) else None,
-            'bb_width': float(orig_row.get('bb_width', 0)) if pd.notna(orig_row.get('bb_width')) else None,
+            'rsi': float(row.get('t0_close_rsi', 0)) if pd.notna(row.get('t0_close_rsi')) else None,
+            'macd': float(row.get('t0_close_macd.macd', 0)) if pd.notna(row.get('t0_close_macd.macd')) else None,
+            'adx': float(row.get('t0_close_adx', 0)) if pd.notna(row.get('t0_close_adx')) else None,
+            'volume_ratio': float(row.get('t0_close_volume_ratio', 0)) if pd.notna(row.get('t0_close_volume_ratio')) else None,
+            'bb_width': float(row.get('t0_close_bb_width', 0)) if pd.notna(row.get('t0_close_bb_width')) else None,
         }
         
         predictions_list.append(prediction_record)
@@ -536,9 +646,9 @@ def main():
         count = supabase.write_predictions(predictions_list)
         logger.info(f"✓ Wrote {count} predictions")
     
-    # STEP 6: LOG STATISTICS
+    # STEP 7: LOG STATISTICS
     logger.info("\n" + "="*80)
-    logger.info("STEP 6: LOG STATISTICS")
+    logger.info("STEP 7: LOG STATISTICS")
     logger.info("="*80)
     
     screening_log = {
@@ -556,7 +666,7 @@ def main():
         'avg_probability': float(predictions_df['explosion_probability'].mean()),
         'max_probability': float(predictions_df['explosion_probability'].max()),
         'min_probability': float(predictions_df['explosion_probability'].min()),
-        'model_version': 'xgboost_v1'
+        'model_version': 'xgboost_complete_timepoints_v2'
     }
     
     if supabase.write_screening_log(screening_log):
@@ -569,12 +679,14 @@ def main():
     
     # FINAL SUMMARY
     logger.info("\n" + "="*80)
-    logger.info("✓ SCREENING COMPLETE")
+    logger.info("✓ PREDICTION COMPLETE")
     logger.info("="*80)
-    logger.info(f"\nScreened: {len(screened_df)} stocks")
-    logger.info(f"Predicted: {len(predictions_df)} stocks")
-    logger.info(f"Stored: {len(predictions_list)} top predictions")
-    logger.info(f"\nNext: Wait for market close, then run ml_track_comprehensive_accuracy.py")
+    logger.info(f"\nPredictions for: {prediction_date}")
+    logger.info(f"Total screened: {len(screened_df)} stocks")
+    logger.info(f"Complete data fetched: {len(enriched_stocks)} stocks")
+    logger.info(f"Predictions generated: {len(predictions_df)}")
+    logger.info(f"Top predictions stored: {len(predictions_list)}")
+    logger.info(f"\nNext: ml_track_comprehensive_accuracy.py will analyze results after market close")
     
     return 0
 
