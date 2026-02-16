@@ -373,37 +373,62 @@ def main():
         # STEP 5: TRAIN/TEST SPLIT
         # ========================================
         logger.info("\n" + "="*80)
-        logger.info("STEP 5: TRAIN/TEST SPLIT (TIME-SERIES)")
+        logger.info("STEP 5: TRAIN/TEST SPLIT (STRATIFIED)")
         logger.info("="*80)
         
-        # Time-series split (keep chronological order)
-        split_idx = int(len(X) * (1 - args.test_size))
-        X_train = X.iloc[:split_idx]
-        X_test = X.iloc[split_idx:]
-        y_train = y.iloc[:split_idx]
-        y_test = y.iloc[split_idx:]
+        # Use stratified split to ensure both classes are represented
+        # This is critical when we have imbalanced data (86% positive)
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y,
+                test_size=args.test_size,
+                stratify=y,  # Ensure both classes in train and test
+                random_state=42
+            )
+            logger.info("✓ Using stratified split to maintain class balance")
+        except ValueError as e:
+            # If stratification fails (e.g., not enough samples per class)
+            logger.warning(f"⚠️  Stratified split failed: {e}")
+            logger.warning("   Falling back to random split")
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y,
+                test_size=args.test_size,
+                random_state=42
+            )
         
         logger.info(f"Training samples: {len(X_train)}")
         logger.info(f"Test samples: {len(X_test)}")
+        
+        # Show class distribution in each set
+        train_pos = (y_train == 1).sum()
+        train_neg = (y_train == 0).sum()
+        test_pos = (y_test == 1).sum()
+        test_neg = (y_test == 0).sum()
+        
+        logger.info(f"Training set: {train_pos} positives, {train_neg} negatives ({train_pos/(train_pos+train_neg)*100:.1f}% positive)")
+        logger.info(f"Test set: {test_pos} positives, {test_neg} negatives ({test_pos/(test_pos+test_neg)*100:.1f}% positive)")
         
         # VALIDATE: Check both classes exist in train and test
         train_classes = y_train.unique()
         test_classes = y_test.unique()
         
-        logger.info(f"Training set classes: {sorted(train_classes)}")
-        logger.info(f"Test set classes: {sorted(test_classes)}")
-        
         if len(train_classes) < 2:
             logger.error(f"❌ Training set has only one class: {train_classes}")
             logger.error("   Cannot train binary classifier with only one class")
-            logger.error("   Try:")
-            logger.error("   1. Increase --lookback-days to get more diverse data")
-            logger.error("   2. Check that both winners and non-winners tables have data")
+            logger.error("   Your data has too few examples of one class:")
+            logger.error(f"   - Total samples: {len(df)}")
+            logger.error(f"   - Positives (winners): {n_positives}")
+            logger.error(f"   - Negatives (non-winners): {n_negatives}")
+            logger.error("")
+            logger.error("   Solutions:")
+            logger.error("   1. Increase --lookback-days to get more historical data")
+            logger.error("   2. Run daily_non_winners_workflow.yml more days to collect more non-winners")
+            logger.error("   3. Wait until you have at least 20+ examples of each class")
             return 1
         
         if len(test_classes) < 2:
             logger.warning(f"⚠️  Test set has only one class: {test_classes}")
-            logger.warning("   Evaluation metrics may be incomplete")
+            logger.warning("   Evaluation metrics may be incomplete, but training will proceed")
         
         # ========================================
         # STEP 6: SCALE FEATURES
