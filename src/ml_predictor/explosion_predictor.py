@@ -31,18 +31,27 @@ class ExplosionPredictor:
         self._load_model()
     
     def _load_model(self):
-        """Load trained model and scaler"""
+        """Load trained classifier AND regressor"""
         try:
             model_path = self.model_dir / "best_model.pkl"
+            regressor_path = self.model_dir / "gain_regressor.pkl"
             scaler_path = self.model_dir / "scaler.pkl"
             
             if not model_path.exists() or not scaler_path.exists():
                 raise FileNotFoundError(f"Model files not found in {self.model_dir}")
             
+            # Load classifier (main model)
             self.model = joblib.load(model_path)
-            self.scaler = joblib.load(scaler_path)
             
-            self.logger.info("✓ Loaded model and scaler")
+            # Load regressor (for gain prediction)
+            if regressor_path.exists():
+                self.regressor = joblib.load(regressor_path)
+                self.logger.info("✓ Loaded classifier + regressor (dual-output mode)")
+            else:
+                self.regressor = None
+                self.logger.warning("⚠ Regressor not found - will use rule-based gain estimates")
+            
+            self.scaler = joblib.load(scaler_path)
             
             # Load metadata
             metadata_path = self.model_dir / "model_metadata.json"
@@ -243,11 +252,31 @@ class ExplosionPredictor:
         # Get base predictions
         predictions = self.predict(data_df)
         
-        # Prepare features to get current price
+        # Prepare features
         features_df = self.prepare_features(data_df)
         
+        # Extract only feature columns for prediction
+        X = features_df[self.feature_names].copy()
+        
+        # Scale
+        X_scaled = self.scaler.transform(X)
+        
+        # OPTION 1: Use regressor if available (LEARNED predictions)
+        if self.regressor is not None:
+            self.logger.info("Using LEARNED gain predictions from regressor")
+            
+            # Predict gain for ALL stocks (regressor predicts actual gain, positive or negative)
+            predicted_gains = self.regressor.predict(X_scaled)
+            
+            predictions['target_gain_pct'] = predicted_gains
+            
+            # For confidence intervals, we can use historical calibration
+            # or assume ±20% error margin
+            predictions['target_gain_low'] = predicted_gains * 0.8
+            predictions['target_gain_high'] = predicted_gains * 1.2
         # Estimate target gains
-        if historical_gains_df is not None and not historical_gains_df.empty:
+        elif historical_gains_df is not None and not historical_gains_df.empty:
+        self.logger.info("Using historical calibration for gain predictions")
             # Use historical calibration
             gain_buckets = historical_gains_df.copy()
             gain_buckets['prob_bucket'] = pd.cut(
@@ -275,6 +304,7 @@ class ExplosionPredictor:
             predictions = predictions.drop(['prob_bucket', 'mean', 'median', 'std'], axis=1)
         else:
             # Use rule-based estimates
+            self.logger.warning("Using DEPRECATED rigid rules for gain prediction")
             predictions['target_gain_pct'] = predictions['explosion_probability'].apply(self._estimate_target_gain)
             predictions['target_gain_low'] = predictions['target_gain_pct'] * 0.5
             predictions['target_gain_high'] = predictions['target_gain_pct'] * 1.5
@@ -288,9 +318,10 @@ class ExplosionPredictor:
         
         # Add target prices - find close price
         if 'symbol' in predictions.columns:
+            # Find close price
             close_col = None
             for col in features_df.columns:
-                if col == 'Close' or col == 'close':
+                if 'Close' in col or 'close' in col:
                     close_col = col
                     break
             
@@ -305,7 +336,7 @@ class ExplosionPredictor:
                 predictions = predictions.drop('close', axis=1)
         
         return predictions
-    
+        
     def _classify_signal(self, probability: float) -> str:
         """Classify prediction into signal"""
         if probability >= 0.90:
@@ -333,3 +364,4 @@ class ExplosionPredictor:
             return 7.0
         else:
             return 3.0
+
