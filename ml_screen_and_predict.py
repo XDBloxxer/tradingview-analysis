@@ -6,6 +6,8 @@ Uses tradingview_scraper.symbols.screener.Screener for screening
 
 import argparse
 import logging
+import pytz
+from datetime import time as dt_time
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -293,93 +295,131 @@ def main():
     import ta
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
-    def fetch_stock_indicators(symbol):
-        """Fetch full technical indicators for a stock"""
+    def fetch_intraday_indicators_like_training(symbol, logger):
+        """
+        Fetch 5-minute intraday indicators EXACTLY like training data collection:
+        - Uses 5-minute bars (not daily bars)
+        - Calculates indicators on 5-min data
+        - Extracts snapshots at market open/close for today and yesterday
+        """
         try:
-            ticker = yf.Ticker(symbol)
-            df = ticker.history(period="3mo", interval="1d")
+            import yfinance as yf
+            import ta
             
-            if df.empty or len(df) < 20:
+            ticker = yf.Ticker(symbol)
+            
+            # Fetch 60 days of 5-minute data
+            df = ticker.history(period='60d', interval='5m')
+            
+            if df.empty or len(df) < 200:
                 return None
             
-            # Calculate all technical indicators
-            # Trend indicators
-            df['sma5'] = ta.trend.sma_indicator(df['Close'], window=5)
-            df['sma10'] = ta.trend.sma_indicator(df['Close'], window=10)
-            df['sma20'] = ta.trend.sma_indicator(df['Close'], window=20)
-            df['sma50'] = ta.trend.sma_indicator(df['Close'], window=50)
-            df['sma100'] = ta.trend.sma_indicator(df['Close'], window=100)
-            df['sma200'] = ta.trend.sma_indicator(df['Close'], window=200)
+            # Normalize timezone to America/New_York
+            if df.index.tz is None:
+                df.index = df.index.tz_localize('America/New_York')
+            else:
+                df.index = df.index.tz_convert('America/New_York')
             
-            df['ema5'] = ta.trend.ema_indicator(df['Close'], window=5)
-            df['ema10'] = ta.trend.ema_indicator(df['Close'], window=10)
-            df['ema20'] = ta.trend.ema_indicator(df['Close'], window=20)
-            df['ema50'] = ta.trend.ema_indicator(df['Close'], window=50)
-            df['ema100'] = ta.trend.ema_indicator(df['Close'], window=100)
-            df['ema200'] = ta.trend.ema_indicator(df['Close'], window=200)
+            # Calculate all indicators on 5-minute bars
+            # NOTE: On 5-min bars, 14-period RSI = 70 minutes (not 14 days)
             
-            # Momentum indicators
             df['rsi'] = ta.momentum.rsi(df['Close'], window=14)
-            df['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14)
-            df['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14)
-            
-            df['macd.macd'] = ta.trend.macd(df['Close'])
-            df['macd.signal'] = ta.trend.macd_signal(df['Close'])
-            
-            df['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
-            df['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
-            df['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'])
+            df['stoch.k'] = ta.momentum.stoch(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+            df['stoch.d'] = ta.momentum.stoch_signal(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
+            df['ao'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
             df['uo'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
             
-            # Volatility indicators
-            bb = ta.volatility.BollingerBands(df['Close'])
+            df['macd.macd'] = ta.trend.macd(df['Close'], window_slow=26, window_fast=12)
+            df['macd.signal'] = ta.trend.macd_signal(df['Close'], window_slow=26, window_fast=12, window_sign=9)
+            df['adx'] = ta.trend.adx(df['High'], df['Low'], df['Close'], window=14)
+            df['cci20'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=20)
+            
+            bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
             df['bb.upper'] = bb.bollinger_hband()
             df['bb.lower'] = bb.bollinger_lband()
             df['bb.middle'] = bb.bollinger_mavg()
-            df['bb_width'] = df['bb.upper'] - df['bb.lower']
+            df['bb_width'] = (df['bb.upper'] - df['bb.lower']) / df['bb.middle'] * 100
             
-            df['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'])
+            df['atr'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
             
-            keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'])
+            keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
             df['keltner_upper'] = keltner.keltner_channel_hband()
             df['keltner_lower'] = keltner.keltner_channel_lband()
             
-            donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'])
+            donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
             df['donchian_upper'] = donchian.donchian_channel_hband()
             df['donchian_lower'] = donchian.donchian_channel_lband()
             df['donchian_middle'] = donchian.donchian_channel_mband()
             
-            # Volume indicators
             df['obv'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
             df['volume_ratio'] = df['Volume'] / df['Volume'].rolling(window=20).mean()
             
-            # VWAP
-            df['vwap'] = (df['Volume'] * (df['High'] + df['Low'] + df['Close']) / 3).cumsum() / df['Volume'].cumsum()
+            for period in [5, 10, 20, 50, 100, 200]:
+                df[f'ema{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
+                df[f'sma{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
             
-            # Volatility periods
+            typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+            df['vwap'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+            
             df['volatility_10d'] = df['Close'].pct_change().rolling(window=10).std() * 100
             df['volatility_20d'] = df['Close'].pct_change().rolling(window=20).std() * 100
             df['volatility_30d'] = df['Close'].pct_change().rolling(window=30).std() * 100
             
-            # Get the most recent row
-            latest = df.iloc[-1]
+            # Extract snapshots at specific timepoints
+            today = datetime.now(pytz.timezone('America/New_York')).date()
+            available_dates = sorted(df.index.date.unique())
             
-            result = {
+            if today not in available_dates:
+                today = available_dates[-1]
+            
+            yesterday_idx = available_dates.index(today) - 1
+            if yesterday_idx < 0:
+                return None
+            
+            yesterday = available_dates[yesterday_idx]
+            
+            def extract_timepoint(target_date, target_time_start, target_time_end):
+                """Extract indicator snapshot at specific time"""
+                day_bars = df[df.index.date == target_date]
+                
+                if day_bars.empty:
+                    return None
+                
+                time_mask = (day_bars.index.time >= target_time_start) & (day_bars.index.time <= target_time_end)
+                target_bars = day_bars[time_mask]
+                
+                if target_bars.empty:
+                    target_bars = day_bars[day_bars.index.time >= target_time_start]
+                    if target_bars.empty:
+                        target_bars = day_bars
+                
+                if target_bars.empty:
+                    return None
+                
+                bar = target_bars.iloc[-1]
+                snapshot = {}
+                for col in df.columns:
+                    snapshot[col.lower()] = bar[col]
+                
+                return snapshot
+            
+            # Extract the 4 timepoints
+            day_prior_close = extract_timepoint(yesterday, dt_time(15, 55), dt_time(16, 0))
+            day_prior_open = extract_timepoint(yesterday, dt_time(9, 30), dt_time(10, 0))
+            market_close = extract_timepoint(today, dt_time(15, 55), dt_time(16, 0))
+            market_open = extract_timepoint(today, dt_time(9, 30), dt_time(10, 0))
+            
+            if not day_prior_close:
+                return None
+            
+            return {
                 'symbol': symbol,
-                'close': latest['Close'],
-                'open': latest['Open'],
-                'high': latest['High'],
-                'low': latest['Low'],
-                'volume': latest['Volume'],
-                'exchange': 'NASDAQ',  # Default
+                'exchange': 'NASDAQ',
+                'day_prior_close': day_prior_close,
+                'day_prior_open': day_prior_open,
+                'market_close': market_close,
+                'market_open': market_open
             }
-            
-            # Add all indicators
-            for col in df.columns:
-                if col not in ['Open', 'High', 'Low', 'Close', 'Volume']:
-                    result[col] = latest[col]
-            
-            return result
             
         except Exception as e:
             logger.debug(f"Failed to fetch {symbol}: {e}")
