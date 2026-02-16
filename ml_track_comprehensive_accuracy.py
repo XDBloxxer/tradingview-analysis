@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-Comprehensive ML Accuracy Tracker with LEARNING - FIXED VERSION
+Comprehensive ML Accuracy Tracker with LEARNING - IMPROVED VERSION
+
+IMPROVEMENTS:
+1. ✅ Finds most recent prediction date automatically (safer than assuming yesterday)
+2. ✅ Validates predictions exist before fetching winners (saves egress)
+3. ✅ Better error handling to prevent wasted API calls
+4. ✅ Early exit if no data to process (saves resources)
 
 This script:
 1. Compares predictions vs actual winners
@@ -19,6 +25,7 @@ import pandas as pd
 import numpy as np
 import yaml
 import json
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -40,19 +47,90 @@ def setup_logging(level: str = "INFO"):
     return logging.getLogger(__name__)
 
 
-def get_last_trading_day(from_date: datetime = None) -> str:
-    """Get last trading day (skip weekends)"""
-    if from_date is None:
-        from_date = datetime.now().date()
-    elif isinstance(from_date, datetime):
-        from_date = from_date.date()
+def get_most_recent_prediction_date(tracker) -> Optional[str]:
+    """
+    Find the most recent date that has predictions in the database
+    This is MUCH safer than assuming yesterday had predictions
     
-    check_date = from_date - timedelta(days=1)
+    Returns:
+        Most recent prediction date as ISO string, or None if no predictions found
+    """
+    try:
+        # Single lightweight query - just get the most recent date
+        response = tracker.client.table("ml_explosion_predictions")\
+            .select("prediction_date")\
+            .order("prediction_date", desc=True)\
+            .limit(1)\
+            .execute()
+        
+        if not response.data:
+            return None
+        
+        return response.data[0]['prediction_date']
+        
+    except Exception as e:
+        tracker.logger.error(f"Error finding most recent prediction date: {e}")
+        return None
+
+
+def validate_data_exists(tracker, check_date: str) -> dict:
+    """
+    Validate that both predictions AND winners exist for the date
+    Returns early if data is missing to save egress
     
-    while check_date.weekday() >= 5:
-        check_date = check_date - timedelta(days=1)
+    Returns:
+        Dict with 'predictions_exist', 'winners_exist', 'should_proceed', 'prediction_count', 'winner_count'
+    """
+    result = {
+        'predictions_exist': False,
+        'winners_exist': False,
+        'should_proceed': False,
+        'prediction_count': 0,
+        'winner_count': 0
+    }
     
-    return check_date.isoformat()
+    try:
+        # Check predictions (lightweight count query)
+        pred_response = tracker.client.table("ml_explosion_predictions")\
+            .select("*", count="exact")\
+            .eq("prediction_date", check_date)\
+            .limit(1)\
+            .execute()
+        
+        result['prediction_count'] = pred_response.count if pred_response.count else 0
+        result['predictions_exist'] = result['prediction_count'] > 0
+        
+        if not result['predictions_exist']:
+            tracker.logger.warning(f"⚠️ No predictions found for {check_date}")
+            tracker.logger.info("Make sure ml_screen_and_predict.yml ran successfully for this date")
+            return result
+        
+        tracker.logger.info(f"✓ Found {result['prediction_count']} predictions for {check_date}")
+        
+        # Check winners (lightweight count query)
+        winner_response = tracker.client.table("daily_winners")\
+            .select("*", count="exact")\
+            .eq("detection_date", check_date)\
+            .limit(1)\
+            .execute()
+        
+        result['winner_count'] = winner_response.count if winner_response.count else 0
+        result['winners_exist'] = result['winner_count'] > 0
+        
+        if not result['winners_exist']:
+            tracker.logger.warning(f"⚠️ No winners found for {check_date}")
+            tracker.logger.info("Make sure daily_top10.yml ran successfully for this date")
+            return result
+        
+        tracker.logger.info(f"✓ Found {result['winner_count']} winners for {check_date}")
+        
+        # Both exist - safe to proceed
+        result['should_proceed'] = True
+        return result
+        
+    except Exception as e:
+        tracker.logger.error(f"Error validating data: {e}")
+        return result
 
 
 class ComprehensiveAccuracyTracker:
@@ -411,31 +489,50 @@ def main():
     logger.info("COMPREHENSIVE ML ACCURACY TRACKING WITH LEARNING")
     logger.info("="*80)
     
+    tracker = ComprehensiveAccuracyTracker(config)
+    
     if args.date:
         check_date = args.date
         logger.info(f"Using manually specified date: {check_date}")
     else:
-        check_date = get_last_trading_day()
-        logger.info(f"Auto-detected last trading day: {check_date}")
+        # IMPROVED: Find most recent prediction date instead of assuming yesterday
+        check_date = get_most_recent_prediction_date(tracker)
+        
+        if not check_date:
+            logger.warning("⚠️ No predictions found in database. Nothing to track.")
+            logger.info("Make sure ml_screen_and_predict.yml has run successfully first.")
+            return 0  # Exit gracefully - not an error, just nothing to do
+        
+        logger.info(f"✓ Found most recent prediction date: {check_date}")
         
         date_obj = datetime.fromisoformat(check_date)
         day_name = date_obj.strftime("%A")
         logger.info(f"  ({day_name})")
     
-    tracker = ComprehensiveAccuracyTracker(config)
+    # IMPROVED: Validate data exists before doing expensive queries
+    validation = validate_data_exists(tracker, check_date)
+    
+    if not validation['should_proceed']:
+        logger.warning("="*80)
+        logger.warning("DATA VALIDATION FAILED - EXITING EARLY")
+        logger.warning("="*80)
+        logger.warning(f"  Predictions exist: {validation['predictions_exist']}")
+        logger.warning(f"  Winners exist: {validation['winners_exist']}")
+        logger.info("\nThis saves egress by not fetching data that doesn't exist.")
+        logger.info("Workflows will retry automatically when data is available.")
+        return 0  # Exit gracefully
+    
+    logger.info("")
+    logger.info("="*80)
+    logger.info("✓ DATA VALIDATION PASSED - PROCEEDING WITH ANALYSIS")
+    logger.info("="*80)
+    logger.info(f"  Predictions: {validation['prediction_count']}")
+    logger.info(f"  Winners: {validation['winner_count']}")
     
     # Get predictions and actual winners
     predictions_df = tracker.get_predictions_for_date(check_date)
     winners_df = tracker.get_actual_winners_for_date(check_date)
     non_winners_df = tracker.get_actual_non_winners_for_date(check_date)
-    
-    if predictions_df.empty:
-        logger.warning(f"No predictions found for {check_date}")
-        return 1
-    
-    if winners_df.empty:
-        logger.warning(f"No winners found for {check_date}")
-        return 1
     
     # Run comprehensive analysis
     logger.info("\n" + "="*80)
