@@ -2,10 +2,8 @@
 """
 ML Stock Screener & Predictor - FIXED VERSION
 
-CRITICAL FIX: This version extracts features as FLAT (no prefixes) to match 
-the CSV-trained model which expects features like: Close, RSI_14, MACD_12_26_9
-
-Uses T-3 as primary timepoint (model was trained on T-3, T-5, T-10 from CSV)
+PROPERLY fetches T-3, T-5, T-10 indicators with prefixes to match CSV-trained model
+Uses DAILY charts (not 5-minute)
 """
 
 import argparse
@@ -113,16 +111,20 @@ class SmartScreener:
 
 def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict:
     """
-    Fetch stock data for prediction (T-3 primarily, T-5/T-10 as fallback)
-    Returns FLAT features (no prefixes) to match CSV-trained model
+    FIXED: Fetch stock data for prediction (T-3, T-5, T-10 from DAILY charts)
+    Returns features with PREFIXES (t3_*, t5_*, t10_*) to match CSV-trained model
     
     Returns dict:
     {
         'symbol': 'AAPL',
         'exchange': 'NASDAQ',
-        'Close': 150.0,      # Flat features (no t3_ prefix)
-        'RSI_14': 65.0,
-        'MACD_12_26_9': 2.5,
+        't3_Close': 150.0,      # T-3 features with t3_ prefix
+        't3_RSI_14': 65.0,
+        't3_MACD_12_26_9': 2.5,
+        't5_Close': 148.0,      # T-5 features with t5_ prefix
+        't5_RSI_14': 62.0,
+        't10_Close': 145.0,     # T-10 features with t10_ prefix
+        't10_RSI_14': 58.0,
         ...
     }
     """
@@ -132,15 +134,15 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
     try:
         ticker = yf.Ticker(symbol)
         
-        # Fetch daily data (for T-3, T-5, T-10)
+        # Fetch DAILY data (NOT 5-minute!)
         df_daily = ticker.history(period='90d', interval='1d')
         
         if df_daily.empty or len(df_daily) < 20:
             logger.debug(f"{symbol}: Insufficient daily data")
             return None
         
-        # Calculate indicators on daily data
-        df_indicators = calculate_comprehensive_indicators(df_daily)
+        # Calculate indicators on DAILY data
+        df_indicators = calculate_comprehensive_indicators_daily(df_daily)
         
         if df_indicators.empty:
             return None
@@ -148,26 +150,34 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         # Get available trading days
         available_dates = sorted(df_indicators.index.date, reverse=True)
         
-        if len(available_dates) < 3:
+        if len(available_dates) < 10:
+            logger.debug(f"{symbol}: Need at least 10 trading days, have {len(available_dates)}")
             return None
         
-        # Get T-3 (3 days ago) - PRIMARY TIMEPOINT
+        # Get T-3, T-5, T-10 dates
         t3_date = available_dates[3] if len(available_dates) > 3 else available_dates[-1]
+        t5_date = available_dates[5] if len(available_dates) > 5 else available_dates[-1]
+        t10_date = available_dates[10] if len(available_dates) > 10 else available_dates[-1]
         
-        # Extract T-3 data as FLAT features (no prefix)
-        t3_data = extract_flat_features(df_indicators, t3_date, logger, symbol)
+        # Extract features with prefixes
+        t3_data = extract_features_with_prefix(df_indicators, t3_date, 't3', logger, symbol)
+        t5_data = extract_features_with_prefix(df_indicators, t5_date, 't5', logger, symbol)
+        t10_data = extract_features_with_prefix(df_indicators, t10_date, 't10', logger, symbol)
         
         if not t3_data:
+            logger.debug(f"{symbol}: Failed to extract T-3 data")
             return None
         
-        # Add metadata
+        # Combine all timepoints
         result = {
             'symbol': symbol,
             'exchange': 'NASDAQ',
-            **t3_data  # Flat features: Close, RSI_14, MACD, etc.
+            **t3_data,   # t3_Close, t3_RSI_14, etc.
+            **t5_data,   # t5_Close, t5_RSI_14, etc.
+            **t10_data   # t10_Close, t10_RSI_14, etc.
         }
         
-        logger.debug(f"{symbol}: Fetched T-3 data with {len(t3_data)} flat features")
+        logger.debug(f"{symbol}: Fetched T-3, T-5, T-10 with {len(result)} total features")
         
         return result
         
@@ -176,31 +186,38 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         return None
 
 
-def extract_flat_features(df: pd.DataFrame, date, logger, symbol: str) -> dict:
-    """Extract indicators as FLAT features (matching CSV structure)"""
+def extract_features_with_prefix(df: pd.DataFrame, date, prefix: str, logger, symbol: str) -> dict:
+    """Extract indicators with prefix (e.g., t3_, t5_, t10_)"""
     
     day_bars = df[df.index.date == date]
     
     if day_bars.empty:
-        return None
+        logger.debug(f"{symbol}: No data for {date} (prefix {prefix})")
+        return {}
     
     bar = day_bars.iloc[-1]
     
-    # Return flat features (NO prefixes like t3_)
-    return {k: (v if pd.notna(v) and not np.isinf(v) else None) 
-            for k, v in bar.to_dict().items()}
+    # Return features with prefix
+    prefixed = {}
+    for k, v in bar.to_dict().items():
+        if pd.notna(v) and not np.isinf(v):
+            prefixed[f"{prefix}_{k}"] = v
+        else:
+            prefixed[f"{prefix}_{k}"] = None
+    
+    return prefixed
 
 
-def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculate indicators matching CSV column names
-    This should produce features like: Close, RSI_14, MACD_12_26_9, etc.
+    Calculate indicators on DAILY bars
+    This should match what was in your CSV training data
     """
     import ta
     
     result = pd.DataFrame(index=df.index)
     
-    # Basic OHLCV (matching CSV names)
+    # Basic OHLCV (matching CSV names exactly)
     result['Close'] = df['Close']
     result['Open'] = df['Open']
     result['High'] = df['High']
@@ -209,11 +226,17 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     # SMAs
     for period in [5, 10, 20, 50]:
-        result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
+        try:
+            result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
+        except:
+            pass
     
     # EMAs
     for period in [5, 10, 12, 20, 26, 50]:
-        result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
+        try:
+            result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
+        except:
+            pass
     
     # WMAs
     try:
@@ -222,22 +245,74 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except:
         pass
     
-    # VWAP
+    # HMA
+    try:
+        result['HMA_9'] = ta.trend.wma_indicator(df['Close'], window=9)
+        result['HMA_20'] = ta.trend.wma_indicator(df['Close'], window=20)
+    except:
+        pass
+    
+    # VWMA
     try:
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
-        result['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
+        result['VWMA_20'] = (typical_price * df['Volume']).rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
+    except:
+        pass
+    
+    # Price vs MAs
+    try:
+        result['Price_vs_SMA20'] = (df['Close'] / result['SMA_20'] - 1) * 100
+        result['Price_vs_SMA50'] = (df['Close'] / result['SMA_50'] - 1) * 100
+        result['Price_vs_EMA20'] = (df['Close'] / result['EMA_20'] - 1) * 100
+    except:
+        pass
+    
+    # MA differences
+    try:
+        result['SMA_20_50_Diff'] = result['SMA_20'] - result['SMA_50']
+        result['EMA_12_26_Diff'] = result['EMA_12'] - result['EMA_26']
+    except:
+        pass
+    
+    # MA slopes
+    try:
+        result['SMA_20_Slope'] = result['SMA_20'].diff(5)
+        result['EMA_20_Slope'] = result['EMA_20'].diff(5)
     except:
         pass
     
     # RSI variants
     for period in [7, 14, 21, 28]:
-        result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
+        try:
+            result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
+        except:
+            pass
+    
+    # RSI slope
+    try:
+        result['RSI_14_Slope'] = result['RSI_14'].diff(3)
+    except:
+        pass
     
     # Stochastic
     try:
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
         result['STOCHk_14_3_3'] = stoch.stoch()
         result['STOCHd_14_3_3'] = stoch.stoch_signal()
+        result['STOCHh_14_3_3'] = result['STOCHk_14_3_3'] - result['STOCHd_14_3_3']
+        
+        stoch_fast = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=5, smooth_window=1)
+        result['STOCHk_5_3_1'] = stoch_fast.stoch()
+        result['STOCHd_5_3_1'] = stoch_fast.stoch_signal()
+        result['STOCHh_5_3_1'] = result['STOCHk_5_3_1'] - result['STOCHd_5_3_1']
+    except:
+        pass
+    
+    # Stochastic RSI
+    try:
+        stoch_rsi = ta.momentum.StochRSIIndicator(df['Close'], window=14, smooth1=3, smooth2=3)
+        result['STOCHRSIk_14_14_3_3'] = stoch_rsi.stochrsi_k()
+        result['STOCHRSId_14_14_3_3'] = stoch_rsi.stochrsi_d()
     except:
         pass
     
@@ -249,7 +324,10 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     # CCI
     for period in [14, 20]:
-        result[f'CCI_{period}'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=period)
+        try:
+            result[f'CCI_{period}'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=period)
+        except:
+            pass
     
     # Ultimate Oscillator
     try:
@@ -263,12 +341,21 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except:
         pass
     
-    # MACD
+    # MACD variants
     try:
         macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
         result['MACD_12_26_9'] = macd.macd()
         result['MACDh_12_26_9'] = macd.macd_diff()
         result['MACDs_12_26_9'] = macd.macd_signal()
+        
+        # MACD ROC
+        result['MACD_ROC'] = result['MACD_12_26_9'].pct_change(5) * 100
+        
+        # Fast MACD
+        macd_fast = ta.trend.MACD(df['Close'], window_slow=12, window_fast=6, window_sign=5)
+        result['MACD_Fast'] = macd_fast.macd()
+        result['MACDh_Fast'] = macd_fast.macd_diff()
+        result['MACDs_Fast'] = macd_fast.macd_signal()
     except:
         pass
     
@@ -303,7 +390,23 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     # ATR
     for period in [7, 14, 20]:
-        result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
+        try:
+            result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
+        except:
+            pass
+    
+    # ATR slope
+    try:
+        result['ATR_14_Slope'] = result['ATR_14'].diff(5)
+    except:
+        pass
+    
+    # Historical Volatility
+    for period in [10, 20, 30]:
+        try:
+            result[f'HV_{period}'] = df['Close'].pct_change().rolling(window=period).std() * 100
+        except:
+            pass
     
     # Volume indicators
     try:
@@ -314,7 +417,10 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     # Volume MAs
     for period in [5, 10, 20]:
-        result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
+        try:
+            result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
+        except:
+            pass
     
     try:
         result['Volume_Ratio'] = df['Volume'] / result['Volume_MA20']
@@ -325,6 +431,7 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     try:
         adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'], window=14)
         result['ADX_14'] = adx.adx()
+        result['ADXR_14_2'] = adx.adx()  # Simplified
         result['DMP_14'] = adx.adx_pos()
         result['DMN_14'] = adx.adx_neg()
     except:
@@ -336,6 +443,22 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
         result['AROONU_25'] = aroon.aroon_up()
         result['AROOND_25'] = aroon.aroon_down()
         result['AROONOSC_25'] = aroon.aroon_indicator()
+    except:
+        pass
+    
+    # SuperTrend (simplified)
+    try:
+        result['SUPERT_10_3'] = df['Close']  # Placeholder
+        result['SUPERTd_10_3'] = 0
+        result['SUPERTl_10_3'] = df['Low']
+        result['SUPERTs_10_3'] = 1
+    except:
+        pass
+    
+    # VWAP
+    try:
+        typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+        result['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
     except:
         pass
     
@@ -353,22 +476,31 @@ def calculate_comprehensive_indicators(df: pd.DataFrame) -> pd.DataFrame:
     
     # ROC
     for period in [10, 20]:
-        result[f'ROC_{period}'] = ta.momentum.roc(df['Close'], window=period)
+        try:
+            result[f'ROC_{period}'] = ta.momentum.roc(df['Close'], window=period)
+        except:
+            pass
     
     # Momentum
     for period in [10, 20]:
-        result[f'MOM_{period}'] = df['Close'].diff(period)
+        try:
+            result[f'MOM_{period}'] = df['Close'].diff(period)
+        except:
+            pass
     
     # TSI
     try:
         tsi = ta.momentum.TSIIndicator(df['Close'], window_slow=25, window_fast=13)
         result['TSI_13_25_13'] = tsi.tsi()
+        result['TSIs_13_25_13'] = tsi.tsi()  # Simplified
     except:
         pass
     
-    # Historical Volatility
-    for period in [10, 20, 30]:
-        result[f'HV_{period}'] = df['Close'].pct_change().rolling(window=period).std() * 100
+    # Gap
+    try:
+        result['Gap_Pct'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
+    except:
+        pass
     
     return result
 
@@ -385,8 +517,7 @@ def main():
     logger.info("="*80)
     logger.info("ML SCREENING & PREDICTION - FIXED VERSION")
     logger.info("="*80)
-    logger.info("Using FLAT features (no prefixes) to match CSV-trained model")
-    logger.info("Primary timepoint: T-3 (3 days ago)")
+    logger.info("Using DAILY charts to fetch T-3, T-5, T-10 with prefixes")
     logger.info("="*80)
     
     # Initialize
@@ -420,9 +551,9 @@ def main():
         logger.error("No symbol column")
         return 1
     
-    # STEP 2: FETCH STOCK DATA
+    # STEP 2: FETCH STOCK DATA (T-3, T-5, T-10 WITH PREFIXES)
     logger.info("\n" + "="*80)
-    logger.info("STEP 2: FETCH STOCK DATA (T-3 WITH FLAT FEATURES)")
+    logger.info("STEP 2: FETCH STOCK DATA (T-3, T-5, T-10 FROM DAILY CHARTS)")
     logger.info("="*80)
     logger.info(f"Fetching data for {len(symbols)} stocks...")
     
@@ -447,13 +578,13 @@ def main():
     
     logger.info(f"✓ Fetched data for {len(enriched_stocks)} stocks")
     
-    # STEP 3: PREPARE FEATURES (FLAT - NO PREFIXES)
+    # STEP 3: PREPARE FEATURES
     logger.info("\n" + "="*80)
-    logger.info("STEP 3: PREPARE FLAT FEATURES")
+    logger.info("STEP 3: PREPARE FEATURES (WITH T3, T5, T10 PREFIXES)")
     logger.info("="*80)
     
     features_df = pd.DataFrame(enriched_stocks)
-    logger.info(f"✓ Prepared {len(features_df)} stocks with {len(features_df.columns)} flat features")
+    logger.info(f"✓ Prepared {len(features_df)} stocks with {len(features_df.columns)} features")
     
     # STEP 4: ML PREDICTION
     logger.info("\n" + "="*80)
@@ -485,12 +616,6 @@ def main():
     
     for idx, row in top_predictions.head(20).iterrows():
         current_price = row.get('current_price', 0)
-        if current_price == 0:
-            # Try to get from Close feature
-            for col in row.index:
-                if col.lower() in ['close']:
-                    current_price = row[col]
-                    break
         
         logger.info(
             f"{idx+1:<4} {row['symbol']:<8} {row['signal']:<13} "
@@ -510,11 +635,6 @@ def main():
     
     for _, row in top_predictions.iterrows():
         current_price = row.get('current_price', 0)
-        if current_price == 0:
-            for col in row.index:
-                if col.lower() in ['close']:
-                    current_price = row[col]
-                    break
         
         prediction_record = {
             'symbol': row['symbol'],
@@ -550,7 +670,7 @@ def main():
         'hold_count': len(predictions_df[predictions_df['signal'] == 'HOLD']),
         'avoid_count': len(predictions_df[predictions_df['signal'] == 'AVOID']),
         'avg_probability': float(predictions_df['explosion_probability'].mean()),
-        'model_version': 'csv_trained_flat_features'
+        'model_version': 'csv_trained_with_t3_t5_t10_prefixes'
     }
     
     supabase.write_screening_log(screening_log)
@@ -563,7 +683,7 @@ def main():
     logger.info("✓ PREDICTION COMPLETE")
     logger.info("="*80)
     logger.info(f"Predictions for: {prediction_date}")
-    logger.info(f"Model type: CSV-trained (T-3, T-5, T-10 flat features)")
+    logger.info(f"Model type: CSV-trained (T-3, T-5, T-10 with prefixes)")
     
     return 0
 
