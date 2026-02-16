@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ML Model Fine-Tuning Script - FIXED VERSION
+ML Model Fine-Tuning Script - FIXED VERSION (No utils dependency)
 
 CRITICAL FIX: This script now TRULY fine-tunes instead of forgetting!
 
@@ -16,15 +16,16 @@ ADDS: Better T-1 open/close predictions
 
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import sys
 import joblib
 import json
+import yaml
+import os
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from src.utils import load_config, setup_logging
 from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
 import pandas as pd
@@ -33,6 +34,23 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, precision_score, recall_score, f1_score, confusion_matrix
 import xgboost as xgb
+
+
+def load_config(config_path: str = "config.yaml") -> dict:
+    """Load configuration from YAML file"""
+    with open(config_path, 'r') as f:
+        return yaml.safe_load(f)
+
+
+def setup_logging(verbose: bool = False):
+    """Setup basic logging"""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    # Create logs directory
+    Path("logs").mkdir(exist_ok=True)
 
 
 def main():
@@ -45,8 +63,7 @@ def main():
     
     args = parser.parse_args()
     
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    setup_logging(level=log_level)
+    setup_logging(verbose=args.verbose)
     logger = logging.getLogger(__name__)
     
     logger.info("="*80)
@@ -113,7 +130,6 @@ def main():
         logger.info("STEP 2: FETCH T-1 TRAINING DATA FROM DATABASE")
         logger.info("="*80)
         
-        from datetime import timedelta
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=args.lookback_days)
         
