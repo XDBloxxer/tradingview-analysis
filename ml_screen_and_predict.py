@@ -119,20 +119,10 @@ class SmartScreener:
                     'right': self.filters['min_volume_ratio']
                 })
             
-            # Trend filter
-            if self.filters.get('trend_filter') == 'bullish':
-                # Price above EMA20
-                filters.append({
-                    'left': 'close',
-                    'operation': 'greater',
-                    'right': 'EMA20'
-                })
-            elif self.filters.get('trend_filter') == 'bearish':
-                filters.append({
-                    'left': 'close',
-                    'operation': 'less',
-                    'right': 'EMA20'
-                })
+            # Trend filter - REMOVED
+            # TradingView API doesn't support field-to-field comparisons (e.g., close > EMA20)
+            # The 'right' parameter only accepts numeric values, not field names
+            # Trend filtering would need to be done post-screening if needed
             
             self.logger.info(f"Applying {len(filters)} filters")
             for f in filters:
