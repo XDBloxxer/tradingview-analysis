@@ -1,24 +1,13 @@
-name: ML Screen & Predict (Autonomous)
+name: ML Screen & Predict (Complete System)
 
 on:
   schedule:
-    # Run daily BEFORE market open
-    # 1:00 PM UTC = 8:00 AM EST = 3:00 PM Estonia
-    # Gives predictions before market opens at 4:30 PM Estonia
-    - cron: '0 4 * * 2-6'  # 11:00 PM EST previous day - fresh data
+    # Run at 7:00 AM UTC = 2:00 AM EST (1 hour before pre-market at 4 AM EST)
+    # This gives predictions before pre-market opens
+    - cron: '0 7 * * 1-5'  # Mon-Fri at 7:00 AM UTC
   
   workflow_dispatch:
     inputs:
-      universe:
-        description: 'Stock universe to screen'
-        required: false
-        type: choice
-        options:
-          - 'auto'
-          - 'sp500'
-          - 'nasdaq'
-          - 'all'
-        default: 'auto'
       top_n:
         description: 'Number of top predictions to store'
         required: false
@@ -45,29 +34,23 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir tradingview-scraper>=0.4.19  # Add this line
+          pip install --no-cache-dir tradingview-scraper>=0.4.19
           pip install -r requirements.txt
       
-      - name: Autonomous screening & prediction
+      - name: Run ML screening & prediction
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TZ: 'America/New_York'
         run: |
-          UNIVERSE="${{ github.event.inputs.universe }}"
           TOP_N="${{ github.event.inputs.top_n }}"
-          
-          if [ -z "$UNIVERSE" ]; then
-            UNIVERSE="auto"
-          fi
           
           if [ -z "$TOP_N" ]; then
             TOP_N="50"
           fi
           
           python ml_screen_and_predict.py \
-            --universe "$UNIVERSE" \
-            --max-workers 15 \
+            --max-results 500 \
             --top-n "$TOP_N" \
             --verbose
       
