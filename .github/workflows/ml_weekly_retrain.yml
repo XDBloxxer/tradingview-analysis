@@ -18,6 +18,10 @@ on:
         default: true
         type: boolean
 
+# CRITICAL: Grant write permissions to push model updates
+permissions:
+  contents: write
+
 jobs:
   retrain-model:
     runs-on: ubuntu-latest
@@ -28,6 +32,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           lfs: true
+          token: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -70,10 +75,10 @@ jobs:
           git config --local user.name "GitHub Action Bot"
           
           # Add model files
-          git add ml_models/best_model.pkl
-          git add ml_models/scaler.pkl
-          git add ml_models/model_metadata.json
-          git add ml_models/feature_importance.csv
+          git add ml_models/best_model.pkl || true
+          git add ml_models/scaler.pkl || true
+          git add ml_models/model_metadata.json || true
+          git add ml_models/feature_importance.csv || true
           
           # Commit if there are changes
           git diff --staged --quiet || git commit -m "🤖 Auto-retrain: $(date +'%Y-%m-%d %H:%M:%S UTC')"
