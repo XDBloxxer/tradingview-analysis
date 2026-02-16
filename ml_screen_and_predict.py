@@ -100,21 +100,21 @@ class SmartScreener:
             # Add indicator filters if specified
             if self.filters.get('min_rsi') is not None:
                 filters.append({
-                    'left': 'RSI', 
+                    'left': 'RSI',
                     'operation': 'greater', 
                     'right': self.filters['min_rsi']
                 })
             
             if self.filters.get('max_rsi') is not None:
                 filters.append({
-                    'left': 'RSI', 
+                    'left': 'RSI',
                     'operation': 'less', 
                     'right': self.filters['max_rsi']
                 })
             
             if self.filters.get('min_volume_ratio') is not None:
                 filters.append({
-                    'left': 'Relative Volume 10D calc', 
+                    'left': 'relative_volume_10d_calc',
                     'operation': 'greater', 
                     'right': self.filters['min_volume_ratio']
                 })
