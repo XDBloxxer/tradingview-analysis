@@ -144,6 +144,21 @@ def main():
         )
         logger.info(f"  ✓ Loaded {len(winners_t1_close_df)} winner T-1 close records")
         
+        if len(winners_t1_close_df) == 0:
+            logger.error("❌ No winner data found in winners_day_prior_close table")
+            logger.error(f"   Date range: {start_date} to {end_date}")
+            logger.error("   Action: Run daily_top10.yml workflow to collect winners first")
+            return 1
+        
+        # Show sample of unique dates
+        if 'detection_date' in winners_t1_close_df.columns:
+            unique_dates = sorted(winners_t1_close_df['detection_date'].unique())
+            logger.info(f"  Winner dates: {len(unique_dates)} unique dates")
+            if len(unique_dates) <= 5:
+                logger.info(f"    Dates: {', '.join(unique_dates)}")
+            else:
+                logger.info(f"    First: {unique_dates[0]}, Last: {unique_dates[-1]}")
+        
         # Fetch winners T-1 open (SECONDARY training data)
         winners_t1_open_df = pd.DataFrame()
         if args.use_all_timepoints:
@@ -163,6 +178,21 @@ def main():
             limit=5000
         )
         logger.info(f"  ✓ Loaded {len(non_winners_t1_close_df)} non-winner T-1 close records")
+        
+        if len(non_winners_t1_close_df) == 0:
+            logger.error("❌ No non-winner data found in non_winners_day_prior_close table")
+            logger.error(f"   Date range: {start_date} to {end_date}")
+            logger.error("   Action: Run daily_non_winners_workflow.yml to collect non-winners")
+            return 1
+        
+        # Show sample of unique dates
+        if 'detection_date' in non_winners_t1_close_df.columns:
+            unique_dates = sorted(non_winners_t1_close_df['detection_date'].unique())
+            logger.info(f"  Non-winner dates: {len(unique_dates)} unique dates")
+            if len(unique_dates) <= 5:
+                logger.info(f"    Dates: {', '.join(unique_dates)}")
+            else:
+                logger.info(f"    First: {unique_dates[0]}, Last: {unique_dates[-1]}")
         
         # Fetch non-winners T-1 open (NEGATIVE examples)
         non_winners_t1_open_df = pd.DataFrame()
@@ -275,9 +305,39 @@ def main():
         logger.info("TRAINING DATA SUMMARY")
         logger.info("="*80)
         logger.info(f"Total samples: {len(df)}")
-        logger.info(f"  Positives (winners): {df['label'].sum()}")
-        logger.info(f"  Negatives (non-winners): {len(df) - df['label'].sum()}")
+        
+        n_positives = int(df['label'].sum())
+        n_negatives = len(df) - n_positives
+        
+        logger.info(f"  Positives (winners): {n_positives}")
+        logger.info(f"  Negatives (non-winners): {n_negatives}")
         logger.info(f"  Positive rate: {df['label'].mean()*100:.2f}%")
+        
+        # CRITICAL VALIDATION: Check for class imbalance
+        if n_positives == 0:
+            logger.error("❌ No positive samples (winners) found!")
+            logger.error("   Cannot train model without positive examples.")
+            logger.error("   Possible causes:")
+            logger.error("   - daily_winners table is empty for this date range")
+            logger.error("   - winners_day_prior_close table is empty")
+            logger.error("   Solution: Run daily_top10.yml workflow first to collect winners")
+            return 1
+        
+        if n_negatives == 0:
+            logger.error("❌ No negative samples (non-winners) found!")
+            logger.error("   Cannot train model without negative examples.")
+            logger.error("   Possible causes:")
+            logger.error("   - daily_non_winners table is empty for this date range")
+            logger.error("   - non_winners_day_prior_close table is empty")
+            logger.error("   Solution: Run daily_non_winners_workflow.yml to collect non-winners")
+            return 1
+        
+        # Check for severe imbalance
+        min_class_count = min(n_positives, n_negatives)
+        if min_class_count < 10:
+            logger.warning(f"⚠️  WARNING: Very few samples in minority class ({min_class_count})")
+            logger.warning(f"   Model may not train well with < 10 examples of each class")
+            logger.warning(f"   Consider increasing --lookback-days (currently {args.lookback_days})")
         
         # ========================================
         # STEP 4: PREPARE FEATURES
@@ -325,6 +385,25 @@ def main():
         
         logger.info(f"Training samples: {len(X_train)}")
         logger.info(f"Test samples: {len(X_test)}")
+        
+        # VALIDATE: Check both classes exist in train and test
+        train_classes = y_train.unique()
+        test_classes = y_test.unique()
+        
+        logger.info(f"Training set classes: {sorted(train_classes)}")
+        logger.info(f"Test set classes: {sorted(test_classes)}")
+        
+        if len(train_classes) < 2:
+            logger.error(f"❌ Training set has only one class: {train_classes}")
+            logger.error("   Cannot train binary classifier with only one class")
+            logger.error("   Try:")
+            logger.error("   1. Increase --lookback-days to get more diverse data")
+            logger.error("   2. Check that both winners and non-winners tables have data")
+            return 1
+        
+        if len(test_classes) < 2:
+            logger.warning(f"⚠️  Test set has only one class: {test_classes}")
+            logger.warning("   Evaluation metrics may be incomplete")
         
         # ========================================
         # STEP 6: SCALE FEATURES
