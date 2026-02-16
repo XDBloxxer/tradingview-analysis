@@ -1009,5 +1009,27 @@
     "false_positives": 38,
     "false_negatives": 4,
     "true_positives": 690
+  },
+  "last_fine_tuned": "2026-02-16T16:44:11.203588",
+  "fine_tuning_version": "20260216_164411",
+  "fine_tuning_config": {
+    "lookback_days": 90,
+    "use_all_timepoints": true,
+    "test_size": 0.2
+  },
+  "fine_tuning_data": {
+    "n_samples": 108,
+    "n_positives": 93,
+    "n_negatives": 15,
+    "positive_rate": 0.8611111111111112
+  },
+  "fine_tuning_performance": {
+    "train_accuracy": 0.13953488372093023,
+    "test_accuracy": 0.13636363636363635,
+    "train_auc": 0.5,
+    "test_auc": 0.5,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1_score": 0.0
   }
 }
