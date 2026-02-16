@@ -4,7 +4,7 @@ on:
   schedule:
     # Run AFTER market close and daily winners collection
     # 03:30 UTC = 10:30 PM EST (winter) / 11:30 PM EDT (summer) = 5:30/6:30 AM Estonia
-    - cron: '30 3 * * 2-6'  # Tue-Sat (after Mon-Fri market close)
+    - cron: '10 0 * * 2-6'  # Tue-Sat (after Mon-Fri market close)
   
   workflow_dispatch:
     inputs:
