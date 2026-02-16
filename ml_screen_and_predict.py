@@ -215,11 +215,14 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         df_intraday = ticker.history(period='60d', interval='5m')
         
         if df_intraday.empty or len(df_intraday) < 200:
-            logger.debug(f"{symbol}: Insufficient intraday data for T-1")
-            # Fallback: use daily data for T-1
-            t1_date = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
-            t1_close_data = extract_features_with_prefix(df_indicators_daily, t1_date, 't1_close', logger, symbol)
-            t1_open_data = extract_features_with_prefix(df_indicators_daily, t1_date, 't1_open', logger, symbol)
+            # CRITICAL FIX: No fallback to daily data!
+            # Using daily data creates train/test distribution mismatch
+            # Training uses 5-min T-1 indicators, so predictions must too
+            logger.debug(f"{symbol}: Insufficient intraday data for T-1 - SKIPPING STOCK")
+            logger.debug(f"  Reason: Need 5-min data to match training distribution")
+            logger.debug(f"  Available 5-min bars: {len(df_intraday) if not df_intraday.empty else 0}")
+            logger.debug(f"  Required: 200+ bars (to calculate indicators)")
+            return None  # Skip this stock entirely
         else:
             # Calculate indicators on 5-MINUTE data
             df_indicators_intraday = calculate_comprehensive_indicators_intraday(df_intraday)
