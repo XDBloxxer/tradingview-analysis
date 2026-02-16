@@ -111,20 +111,23 @@ class SmartScreener:
 
 def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict:
     """
-    FIXED: Fetch stock data for prediction (T-3, T-5, T-10 from DAILY charts)
-    Returns features with PREFIXES (t3_*, t5_*, t10_*) to match CSV-trained model
+    FIXED: Fetch stock data for prediction (T-3, T-5, T-10, T-1 from DAILY charts)
+    Returns features with PREFIXES to match CSV-trained model
+    
+    Note: T-1 uses daily close as approximation for both open and close.
+    During fine-tuning, model learns actual 5-min intraday T-1 patterns,
+    but for prediction we use daily as a reasonable proxy.
     
     Returns dict:
     {
         'symbol': 'AAPL',
         'exchange': 'NASDAQ',
-        't3_Close': 150.0,      # T-3 features with t3_ prefix
+        't3_Close': 150.0,      # T-3 features
         't3_RSI_14': 65.0,
-        't3_MACD_12_26_9': 2.5,
-        't5_Close': 148.0,      # T-5 features with t5_ prefix
-        't5_RSI_14': 62.0,
-        't10_Close': 145.0,     # T-10 features with t10_ prefix
-        't10_RSI_14': 58.0,
+        't5_Close': 148.0,      # T-5 features
+        't10_Close': 145.0,     # T-10 features
+        't1_close_Close': 152.0,  # T-1 close features (yesterday EOD)
+        't1_open_Close': 152.0,   # T-1 open features (same as close for daily)
         ...
     }
     """
@@ -159,10 +162,18 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         t5_date = available_dates[5] if len(available_dates) > 5 else available_dates[-1]
         t10_date = available_dates[10] if len(available_dates) > 10 else available_dates[-1]
         
+        # Get T-1 date (yesterday - most recent trading day)
+        t1_date = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
+        
         # Extract features with prefixes
         t3_data = extract_features_with_prefix(df_indicators, t3_date, 't3', logger, symbol)
         t5_data = extract_features_with_prefix(df_indicators, t5_date, 't5', logger, symbol)
         t10_data = extract_features_with_prefix(df_indicators, t10_date, 't10', logger, symbol)
+        
+        # For T-1, we use DAILY close as approximation for both open and close
+        # (Model was trained on 5-min intraday, but for prediction we use daily as proxy)
+        t1_close_data = extract_features_with_prefix(df_indicators, t1_date, 't1_close', logger, symbol)
+        t1_open_data = extract_features_with_prefix(df_indicators, t1_date, 't1_open', logger, symbol)
         
         if not t3_data:
             logger.debug(f"{symbol}: Failed to extract T-3 data")
@@ -172,12 +183,14 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         result = {
             'symbol': symbol,
             'exchange': 'NASDAQ',
-            **t3_data,   # t3_Close, t3_RSI_14, etc.
-            **t5_data,   # t5_Close, t5_RSI_14, etc.
-            **t10_data   # t10_Close, t10_RSI_14, etc.
+            **t3_data,         # t3_Close, t3_RSI_14, etc.
+            **t5_data,         # t5_Close, t5_RSI_14, etc.
+            **t10_data,        # t10_Close, t10_RSI_14, etc.
+            **t1_close_data,   # t1_close_Close, t1_close_RSI_14, etc.
+            **t1_open_data     # t1_open_Close, t1_open_RSI_14, etc.
         }
         
-        logger.debug(f"{symbol}: Fetched T-3, T-5, T-10 with {len(result)} total features")
+        logger.debug(f"{symbol}: Fetched T-3, T-5, T-10, T-1 with {len(result)} total features")
         
         return result
         
