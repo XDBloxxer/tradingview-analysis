@@ -141,7 +141,12 @@ def main():
         logger.info(f"  {len(winners_t1_close_df)} winner T-1 close records")
 
         if len(winners_t1_close_df) == 0:
-            logger.error("No winner data found. Run daily_top10.yml first.")
+            logger.error("No winner data found in winners_day_prior_close table.")
+            logger.error(f"  Date range: {start_date} to {end_date}")
+            logger.error("  Possible causes:")
+            logger.error("    - daily_winners table is empty for this date range")
+            logger.error("    - winners_day_prior_close table is empty")
+            logger.error("  Solution: Run daily_top10.yml workflow first to collect winners")
             return 1
 
         winners_t1_open_df = pd.DataFrame()
@@ -159,7 +164,12 @@ def main():
         logger.info(f"  {len(non_winners_t1_close_df)} non-winner T-1 close records")
 
         if len(non_winners_t1_close_df) == 0:
-            logger.error("No non-winner data found. Run daily_non_winners_workflow.yml first.")
+            logger.error("No non-winner data found in non_winners_day_prior_close table.")
+            logger.error(f"  Date range: {start_date} to {end_date}")
+            logger.error("  Possible causes:")
+            logger.error("    - daily_non_winners table is empty for this date range")
+            logger.error("    - non_winners_day_prior_close table is empty")
+            logger.error("  Solution: Run daily_non_winners_workflow.yml to collect non-winners")
             return 1
 
         non_winners_t1_open_df = pd.DataFrame()
@@ -329,9 +339,19 @@ def main():
 
         train_classes = y_train.unique()
         if len(train_classes) < 2:
-            logger.error(f"Training set has only one class ({train_classes}). "
-                         "Increase --lookback-days or collect more data.")
+            logger.error(f"Training set has only one class ({train_classes}).")
+            logger.error("  Cannot train binary classifier with only one class.")
+            logger.error(f"  Total samples: {len(df)}, Positives: {n_positives}, Negatives: {n_negatives}")
+            logger.error("  Solutions:")
+            logger.error("    1. Increase --lookback-days to get more historical data")
+            logger.error("    2. Run daily_non_winners_workflow.yml more days to collect non-winners")
+            logger.error("    3. Wait until you have at least 20+ examples of each class")
             return 1
+
+        test_classes = y_test.unique()
+        if len(test_classes) < 2:
+            logger.warning(f"Test set has only one class ({test_classes}).")
+            logger.warning("  Evaluation metrics may be incomplete, but training will proceed.")
 
         # =====================================================================
         # STEP 6: SCALE
@@ -438,6 +458,17 @@ def main():
                             xgb_model=existing_reg.get_booster(),
                             verbose=False,
                         )
+
+                        # Evaluate regressor
+                        from sklearn.metrics import mean_absolute_error, r2_score
+                        reg_pred_test = fine_tuned_regressor.predict(Xr_te)
+                        if len(y_reg[split:]) > 0:
+                            reg_mae = mean_absolute_error(y_reg[split:], reg_pred_test)
+                            logger.info(f"  Regressor Test MAE: {reg_mae:.4f}%")
+                        if len(y_reg[split:]) > 1:
+                            reg_r2 = r2_score(y_reg[split:], reg_pred_test)
+                            logger.info(f"  Regressor Test R²: {reg_r2:.4f}")
+
                         logger.info("Gain regressor fine-tuned.")
             except Exception as e:
                 logger.error(f"Regressor fine-tuning failed: {e}")
@@ -464,9 +495,13 @@ def main():
         recall         = recall_score(y_test, test_pred, zero_division=0)
         f1             = f1_score(y_test, test_pred, zero_division=0)
 
+        cm = confusion_matrix(y_test, test_pred)
+        tn, fp, fn, tp = cm.ravel()
+
         logger.info(f"  Train Accuracy : {train_accuracy:.4f}  |  Test Accuracy : {test_accuracy:.4f}")
         logger.info(f"  Train AUC      : {train_auc:.4f}  |  Test AUC      : {test_auc:.4f}")
         logger.info(f"  Precision: {precision:.4f}  Recall: {recall:.4f}  F1: {f1:.4f}")
+        logger.info(f"  Confusion matrix — TN: {tn}, FP: {fp}, FN: {fn}, TP: {tp}")
 
         # ─── Mistake-specific diagnostics ────────────────────────────────────
         if not mistake_df.empty and "mistake_type" in frames[1].columns:
