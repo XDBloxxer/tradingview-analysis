@@ -566,6 +566,9 @@ class ComprehensiveAccuracyTracker:
         self.logger.info("ANALYZING PREDICTION ACCURACY")
         self.logger.info("=" * 60)
 
+        if not winners_df.empty:
+          self.logger.info(f"Winner columns: {winners_df.columns.tolist()}")
+          self.logger.info(f"Sample winner: {winners_df.iloc[0].to_dict()}")
         winners_set = set(winners_df["symbol"].tolist())
         accuracy_records = []
         details_records = []
@@ -631,6 +634,17 @@ class ComprehensiveAccuracyTracker:
                 }
             )
 
+            # Safely extract volume — int(NaN) throws ValueError which would
+            # silently abort the entire loop and leave all remaining records null.
+            actual_volume = None
+            if became_winner:
+                try:
+                    vol_series = winners_df[winners_df["symbol"] == symbol]["volume"]
+                    if not vol_series.empty and pd.notna(vol_series.iloc[0]):
+                        actual_volume = int(vol_series.iloc[0])
+                except (ValueError, TypeError, IndexError) as e:
+                    self.logger.warning(f"Could not extract volume for {symbol}: {e}")
+            
             details_records.append(
                 {
                     "symbol": symbol,
@@ -641,11 +655,7 @@ class ComprehensiveAccuracyTracker:
                     "became_winner": became_winner,
                     "actual_gain_pct": actual_gain if became_winner else None,
                     "actual_high_pct": actual_high_pct if became_winner else None,
-                    "actual_volume": (
-                        int(winners_df[winners_df["symbol"] == symbol]["volume"].iloc[0])
-                        if became_winner
-                        else None
-                    ),
+                    "actual_volume": actual_volume,
                     "failure_reason": None,
                 }
             )
