@@ -15,10 +15,15 @@ DATA SOURCES (combined into one training dataset):
                            (false positives: weight 3x, false negatives: weight 2x)
 
 NOTE ON CLASS BALANCE:
-  ml_training_base contains ONLY winners (label=1). Non-winners (label=0) come
-  entirely from the accumulated Supabase T-1 tables. Until enough T-1 data
-  accumulates, the model is trained on imbalanced data. scale_pos_weight in
-  XGBoost params compensates for this automatically via sample_weight.
+  ml_training_base contains both winners (label=1) and non-winners (label=0) from
+  the original CSV, all with t3_/t5_/t10_ features from daily bars.
+  
+  The T-1 snapshot tables (winners_day_prior_*, non_winners_day_prior_*) contain
+  raw intraday indicator data WITHOUT pre-assigned labels — the label is assigned
+  in load_t1_data() based on which table the row came from (winners → 1, non_winners → 0).
+  
+  daily_winners and daily_non_winners are ground-truth outcome tables used by the
+  accuracy tracker, not directly by the trainer.
 
 WHY FULL RETRAIN (not fine-tuning):
   - Only ~3,600 base rows — trivially fast to retrain (seconds, not minutes)
