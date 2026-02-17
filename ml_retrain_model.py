@@ -682,6 +682,7 @@ def main() -> int:
     combined_df = combine_datasets(base_df, t1_df)
 
     # ── Enrich combined_df with intraday peak gain from daily_winners ─────────
+# ── Enrich combined_df with intraday peak gain from daily_winners ─────────
     logger.info("Fetching intraday peak gain data from daily_winners for gain regressor...")
     try:
         winners_response = fetch_table_paginated(client, "daily_winners")
@@ -693,23 +694,31 @@ def main() -> int:
                     (winners_gain["high"] / winners_gain["price"] - 1) * 100
                 ).clip(lower=0)
     
-                # Find the date column in combined_df to join on
-                date_col = next(
-                    (c for c in combined_df.columns
-                     if "date" in c.lower() and c not in NON_FEATURE_COLS),
+                # Find symbol column — base CSV uses "ticker", T-1 data uses "symbol"
+                symbol_col = next(
+                    (c for c in ["symbol", "ticker"] if c in combined_df.columns),
                     None
                 )
-                if date_col:
+    
+                # Find date column — prioritize detection_date variants over event_date
+                date_col = next(
+                    (c for c in ["detection_date_x", "detection_date", "event_date"]
+                     if c in combined_df.columns),
+                    None
+                )
+    
+                if symbol_col and date_col:
+                    logger.info(f"Joining gain data on {symbol_col} + {date_col}")
                     combined_df = combined_df.merge(
                         winners_gain[["symbol", "detection_date", "actual_gain_pct"]],
-                        left_on=["symbol", date_col],
+                        left_on=[symbol_col, date_col],
                         right_on=["symbol", "detection_date"],
                         how="left",
                     ).drop(columns=["detection_date"], errors="ignore")
                     n_with_gain = combined_df["actual_gain_pct"].notna().sum()
                     logger.info(f"Enriched {n_with_gain} rows with intraday peak gain data")
                 else:
-                    logger.warning("No date column found in combined_df — gain regressor will be skipped")
+                    logger.warning(f"Could not find symbol col ({symbol_col}) or date col ({date_col}) — gain regressor will be skipped")
             else:
                 missing = required - set(winners_response.columns)
                 logger.warning(f"daily_winners missing columns: {missing} — gain regressor will be skipped")
