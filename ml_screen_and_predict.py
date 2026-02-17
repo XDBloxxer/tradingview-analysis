@@ -164,96 +164,207 @@ def get_next_trading_day() -> str:
     return prediction_day.date().isoformat()
 
 
+"""
+SmartScreener — PATCHED VERSION
+Drop-in replacement for the SmartScreener class in ml_screen_and_predict.py.
+
+CHANGES vs original:
+1. Reads ALL filter fields from learned_filters.json, not just 6 hard-coded ones.
+   New fields honoured: max_price, min_relative_volume, min_hv10/20, min_adx, min_atr14.
+2. Sorts screener results by relative_volume_10d_calc DESC instead of raw volume —
+   this surfaces stocks that are already acting unusual vs their own history.
+3. Logs a clean summary of which filters are active.
+4. Falls back gracefully if a filter key is None or missing.
+
+DEPLOYMENT: Replace the SmartScreener class definition inside ml_screen_and_predict.py
+with the class below (everything from `class SmartScreener:` to the end of the class).
+The rest of ml_screen_and_predict.py is unchanged.
+"""
+
+
 class SmartScreener:
-    """Intelligent screener that learns optimal filters over time"""
-    
-    def __init__(self, config: dict = None, logger: logging.Logger = None):
+    """Intelligent screener that uses model-derived filters from learned_filters.json"""
+
+    # TradingView column names for each filter key
+    TV_FILTER_MAP = {
+        "min_price":           ("close",                    "greater"),
+        "max_price":           ("close",                    "less"),
+        "min_volume":          ("volume",                   "greater"),
+        "min_rsi":             ("RSI",                      "greater"),
+        "max_rsi":             ("RSI",                      "less"),
+        "min_rsi7":            ("RSI[1]",                   "greater"),   # closest proxy
+        "max_rsi7":            ("RSI[1]",                   "less"),
+        "min_volume_ratio":    ("relative_volume_10d_calc", "greater"),
+        "min_relative_volume": ("relative_volume_10d_calc", "greater"),
+        "min_hv10":            ("Volatility.D",             "greater"),
+        "max_hv10":            ("Volatility.D",             "less"),
+        "min_hv20":            ("Volatility.D",             "greater"),
+        "max_hv20":            ("Volatility.D",             "less"),
+        "min_adx":             ("ADX",                      "greater"),
+        "min_atr14":           ("ATR",                      "greater"),
+    }
+
+    # Filter keys that should never produce duplicate TV columns
+    # (e.g. min_volume_ratio and min_relative_volume both map to relative_volume)
+    _DEDUP_TV_COL = {
+        "relative_volume_10d_calc": None,   # keep only the stronger bound
+        "Volatility.D":             None,
+    }
+
+    def __init__(self, config: dict = None, logger=None):
+        import logging
+        from pathlib import Path
+        import json
+
         self.logger = logger or logging.getLogger(__name__)
         self.config = config or {}
         self.filters = self._load_learned_filters()
-        
+
         if SCREENER_AVAILABLE:
             self.screener = Screener()
         else:
             self.screener = None
-    
+
     def _load_learned_filters(self) -> dict:
-        """Load learned filters from previous model training"""
+        """Load learned filters from ml_models/learned_filters.json."""
+        import json
+        from pathlib import Path
+
         defaults = {
-            'min_price': 0.50,
-            'max_price': 500.0,
-            'min_volume': 100000,
-            'min_rsi': None,
-            'max_rsi': None,
-            'min_volume_ratio': None,
-            'trend_filter': None,
+            "min_price":           1.00,
+            "max_price":           50.0,
+            "min_volume":          300_000,
+            "min_volume_ratio":    2.0,
+            "min_relative_volume": 2.0,
+            # RSI/HV/ADX start as None — only applied when model has derived them
+            "min_rsi":             None,
+            "max_rsi":             None,
+            "min_hv10":            None,
+            "max_hv10":            None,
+            "min_adx":             None,
+            "min_atr14":           None,
         }
-        
+
         try:
-            filter_path = Path('ml_models/learned_filters.json')
+            filter_path = Path("ml_models/learned_filters.json")
             if filter_path.exists():
-                with open(filter_path, 'r') as f:
+                with open(filter_path, "r") as f:
                     learned = json.load(f)
+                active = []
                 for key, value in learned.items():
+                    if key.startswith("_"):
+                        continue          # skip metadata/comment keys
                     if value is not None:
                         defaults[key] = value
-                self.logger.info("✓ Loaded learned screening filters")
+                        active.append(f"{key}={value}")
+                self.logger.info(f"✓ Loaded learned filters: {', '.join(active)}")
+            else:
+                self.logger.info("No learned_filters.json found — using conservative defaults")
         except Exception as e:
-            self.logger.debug(f"Using default filters: {e}")
-        
+            self.logger.warning(f"Could not load learned filters: {e} — using defaults")
+
         return defaults
-    
-    def screen_with_tradingview(self, max_results: int = 500) -> pd.DataFrame:
-        """Screen stocks using TradingView with learned filters"""
+
+    def screen_with_tradingview(self, max_results: int = 500) -> "pd.DataFrame":
+        """
+        Screen stocks using TradingView with model-derived filters.
+
+        Key change: sorts by relative_volume_10d_calc DESC, not raw volume.
+        This surfaces stocks that are already acting abnormally vs their history —
+        exactly the pre-explosion signature the model was trained to detect.
+        """
+        import pandas as pd
+
         if not SCREENER_AVAILABLE or self.screener is None:
             self.logger.error("TradingView screener not available!")
             return pd.DataFrame()
-        
-        self.logger.info("Screening stocks with learned filters...")
-        
-        try:
-            filters = [
-                {'left': 'close',  'operation': 'greater', 'right': self.filters['min_price']},
-                {'left': 'close',  'operation': 'less',    'right': self.filters['max_price']},
-                {'left': 'volume', 'operation': 'greater', 'right': self.filters['min_volume']},
-            ]
-            
-            if self.filters.get('min_rsi') is not None:
-                filters.append({'left': 'RSI', 'operation': 'greater', 'right': self.filters['min_rsi']})
-            
-            if self.filters.get('max_rsi') is not None:
-                filters.append({'left': 'RSI', 'operation': 'less', 'right': self.filters['max_rsi']})
-            
-            if self.filters.get('min_volume_ratio') is not None:
-                filters.append({
-                    'left': 'relative_volume_10d_calc',
-                    'operation': 'greater',
-                    'right': self.filters['min_volume_ratio']
+
+        self.logger.info("=" * 60)
+        self.logger.info("SMART SCREENER — applying model-driven filters")
+        self.logger.info("=" * 60)
+
+        # ── Build filter list ───────────────────────────────────────────────
+        # Track which TV columns we've already added bounds for to avoid dupes
+        tv_col_bounds: dict[str, dict] = {}   # tv_col → {"min": v, "max": v}
+        filter_log = []
+
+        for filter_key, (tv_col, operation) in self.TV_FILTER_MAP.items():
+            value = self.filters.get(filter_key)
+            if value is None:
+                continue
+
+            if tv_col not in tv_col_bounds:
+                tv_col_bounds[tv_col] = {}
+
+            if operation == "greater":
+                # Keep the largest min bound for each TV column
+                existing = tv_col_bounds[tv_col].get("min")
+                if existing is None or value > existing:
+                    tv_col_bounds[tv_col]["min"] = value
+                    filter_log.append(f"{tv_col} > {value}  [{filter_key}]")
+            elif operation == "less":
+                # Keep the smallest max bound for each TV column
+                existing = tv_col_bounds[tv_col].get("max")
+                if existing is None or value < existing:
+                    tv_col_bounds[tv_col]["max"] = value
+                    filter_log.append(f"{tv_col} < {value}  [{filter_key}]")
+
+        # Convert to TradingView filter dicts
+        tv_filters = []
+        for tv_col, bounds in tv_col_bounds.items():
+            if "min" in bounds:
+                tv_filters.append({
+                    "left": tv_col, "operation": "greater", "right": bounds["min"]
                 })
-            
-            self.logger.info(f"Applying {len(filters)} filters")
-            for f in filters:
-                self.logger.debug(f"  Filter: {f}")
-            
+            if "max" in bounds:
+                tv_filters.append({
+                    "left": tv_col, "operation": "less", "right": bounds["max"]
+                })
+
+        self.logger.info(f"Active filters ({len(tv_filters)}):")
+        for line in filter_log:
+            self.logger.info(f"  {line}")
+        self.logger.info(
+            "Sort: relative_volume_10d_calc DESC  "
+            "(stocks with highest relative activity come first)"
+        )
+
+        # ── Call TradingView screener ───────────────────────────────────────
+        try:
             result = self.screener.screen(
-                market='america',
-                filters=filters,
-                sort_by='volume',
-                sort_order='desc',
-                limit=max_results
+                market="america",
+                filters=tv_filters,
+                sort_by="relative_volume_10d_calc",   # KEY CHANGE: sort by rel vol
+                sort_order="desc",
+                limit=max_results,
             )
-            
-            if result['status'] == 'success' and result.get('data'):
-                df = pd.DataFrame(result['data'])
-                self.logger.info(f"✓ Screened {len(df)} stocks")
+
+            if result.get("status") == "success" and result.get("data"):
+                df = pd.DataFrame(result["data"])
+                self.logger.info(
+                    f"✓ Screened {len(df)} stocks "
+                    f"(sorted by relative volume, highest first)"
+                )
+
+                # Log top-5 for sanity check
+                if not df.empty and "symbol" in df.columns:
+                    rv_col = "relative_volume_10d_calc"
+                    rv_vals = df.get(rv_col, pd.Series([None] * len(df)))
+                    self.logger.info("  Top 5 by relative volume:")
+                    for i in range(min(5, len(df))):
+                        sym = df["symbol"].iloc[i]
+                        rv  = rv_vals.iloc[i] if rv_col in df.columns else "?"
+                        prc = df.get("close", pd.Series()).iloc[i] if "close" in df.columns else "?"
+                        self.logger.info(f"    {i+1}. {sym}  rel_vol={rv}  price={prc}")
+
                 return df
-            
+
+            self.logger.warning("Screener returned no data or error status")
             return pd.DataFrame()
-            
+
         except Exception as e:
             self.logger.error(f"Screening failed: {e}")
             return pd.DataFrame()
-
 
 def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict:
     """
