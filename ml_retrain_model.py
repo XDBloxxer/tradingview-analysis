@@ -445,10 +445,10 @@ def main():
         logger.info("✓ Using existing scaler (preserves original scale)")
         
         # ========================================
-        # STEP 7: FINE-TUNE MODEL
+        # STEP 7: FINE-TUNE CLASSIFIER
         # ========================================
         logger.info("\n" + "="*80)
-        logger.info("STEP 7: FINE-TUNE MODEL (CONTINUE TRAINING)")
+        logger.info("STEP 7: FINE-TUNE CLASSIFIER (CONTINUE TRAINING)")
         logger.info("="*80)
         
         # Calculate scale_pos_weight
@@ -484,7 +484,151 @@ def main():
             verbose=False
         )
         
-        logger.info("✓ Fine-tuning complete!")
+        logger.info("✓ Classifier fine-tuning complete!")
+
+        # ========================================
+        # STEP 7b: FINE-TUNE GAIN REGRESSOR
+        # ========================================
+        logger.info("\n" + "="*80)
+        logger.info("STEP 7b: FINE-TUNE GAIN REGRESSOR")
+        logger.info("="*80)
+        logger.info("Fetching actual change_pct from daily_winners to use as regression target...")
+
+        fine_tuned_regressor = None
+        regressor_path = model_dir / "gain_regressor.pkl"
+
+        if not regressor_path.exists():
+            logger.warning("⚠️  No existing gain_regressor.pkl found - skipping regressor fine-tuning")
+            logger.warning("   The regressor is created during initial training (train_dual_output.py)")
+        else:
+            try:
+                # Fetch actual gains from daily_winners for the same date range
+                logger.info("📥 Fetching actual gains from daily_winners table...")
+                winners_actual_df = supabase.get_daily_winners(
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat()
+                )
+                logger.info(f"  ✓ Loaded {len(winners_actual_df)} actual winner records")
+
+                if winners_actual_df.empty:
+                    logger.warning("⚠️  No actual winner data found - skipping regressor fine-tuning")
+                else:
+                    # Build regression dataset by matching T-1 indicators to actual gains
+                    # Match on symbol + detection_date → change_pct
+                    logger.info("Matching T-1 indicators to actual gains...")
+
+                    # Create lookup: (symbol, detection_date) -> change_pct
+                    gain_lookup = {}
+                    for _, row in winners_actual_df.iterrows():
+                        key = (row['symbol'], row['detection_date'])
+                        gain_lookup[key] = row['change_pct']
+
+                    # Build regression samples (winners only — non-winners don't have meaningful gain targets)
+                    reg_samples = []
+                    reg_targets = []
+
+                    for _, close_row in winners_t1_close_df.iterrows():
+                        key = (close_row['symbol'], close_row['detection_date'])
+                        if key in gain_lookup:
+                            change_pct = gain_lookup[key]
+
+                            # Build feature vector same way as classifier samples
+                            sample = {}
+                            for col in close_row.index:
+                                if col not in meta_cols:
+                                    sample[f't1_close_{col}'] = close_row[col]
+
+                            # Add T-1 open features if available
+                            if not winners_t1_open_df.empty:
+                                open_match = winners_t1_open_df[
+                                    (winners_t1_open_df['symbol'] == close_row['symbol']) &
+                                    (winners_t1_open_df['detection_date'] == close_row['detection_date'])
+                                ]
+                                if not open_match.empty:
+                                    for col in open_match.iloc[0].index:
+                                        if col not in meta_cols:
+                                            sample[f't1_open_{col}'] = open_match.iloc[0][col]
+
+                            # Fill missing features with defaults
+                            for feature in existing_features:
+                                if feature not in sample:
+                                    if 'rsi' in feature.lower() or 'stoch' in feature.lower():
+                                        sample[feature] = 50.0
+                                    elif 'volume' in feature.lower():
+                                        sample[feature] = 100000.0
+                                    elif 'price' in feature.lower() or 'close' in feature.lower():
+                                        sample[feature] = 50.0
+                                    else:
+                                        sample[feature] = 0.0
+
+                            reg_samples.append(sample)
+                            reg_targets.append(change_pct)
+
+                    logger.info(f"  ✓ Built {len(reg_samples)} regression samples with actual gain targets")
+
+                    if len(reg_samples) < 5:
+                        logger.warning(f"⚠️  Only {len(reg_samples)} regression samples — need at least 5, skipping")
+                    else:
+                        # Build feature matrix
+                        reg_df = pd.DataFrame(reg_samples)
+                        for feature in existing_features:
+                            if feature not in reg_df.columns:
+                                reg_df[feature] = 0.0
+                        X_reg = reg_df[existing_features].fillna(0)
+                        y_reg = np.array(reg_targets)
+
+                        # Train/test split (stratified not needed for regression)
+                        split_idx = int(len(X_reg) * (1 - args.test_size))
+                        X_reg_train = X_reg.iloc[:split_idx]
+                        X_reg_test = X_reg.iloc[split_idx:]
+                        y_reg_train = y_reg[:split_idx]
+                        y_reg_test = y_reg[split_idx:]
+
+                        # Scale using existing scaler
+                        X_reg_train_scaled = existing_scaler.transform(X_reg_train)
+                        X_reg_test_scaled = existing_scaler.transform(X_reg_test)
+
+                        # Load existing regressor and continue training
+                        existing_regressor = joblib.load(regressor_path)
+                        logger.info("✓ Loaded existing gain regressor")
+                        logger.info("🔄 Continuing regressor training from existing model...")
+
+                        fine_tuned_regressor = xgb.XGBRegressor(
+                            n_estimators=100,
+                            max_depth=6,
+                            learning_rate=0.01,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=42,
+                            eval_metric='rmse',
+                            early_stopping_rounds=10
+                        )
+
+                        fine_tuned_regressor.fit(
+                            X_reg_train_scaled,
+                            y_reg_train,
+                            eval_set=[(X_reg_train_scaled, y_reg_train), (X_reg_test_scaled, y_reg_test)],
+                            xgb_model=existing_regressor.get_booster(),  # 🔑 Continue from existing!
+                            verbose=False
+                        )
+
+                        # Evaluate regressor
+                        reg_pred_test = fine_tuned_regressor.predict(X_reg_test_scaled)
+                        from sklearn.metrics import mean_absolute_error, r2_score
+                        reg_mae = mean_absolute_error(y_reg_test, reg_pred_test) if len(y_reg_test) > 0 else None
+                        reg_r2 = r2_score(y_reg_test, reg_pred_test) if len(y_reg_test) > 1 else None
+
+                        if reg_mae is not None:
+                            logger.info(f"  Regressor Test MAE: {reg_mae:.4f}%")
+                        if reg_r2 is not None:
+                            logger.info(f"  Regressor Test R²: {reg_r2:.4f}")
+
+                        logger.info("✓ Gain regressor fine-tuning complete!")
+
+            except Exception as e:
+                logger.error(f"⚠️  Regressor fine-tuning failed: {e} — classifier was still saved successfully")
+                logger.error("    Gain predictions will continue using previous regressor")
+                fine_tuned_regressor = None
         
         # ========================================
         # STEP 8: EVALUATE
@@ -538,17 +682,29 @@ def main():
         # Archive old model
         archive_dir = model_dir / "archive"
         archive_dir.mkdir(exist_ok=True)
+        import shutil
         
         if model_path.exists():
             archive_model = archive_dir / f"best_model_{version}.pkl"
-            import shutil
             shutil.copy(model_path, archive_model)
             logger.info(f"✓ Archived old model to {archive_model}")
         
-        # Save fine-tuned model
+        # Save fine-tuned classifier
         joblib.dump(fine_tuned_model, model_path, protocol=4)
+        logger.info(f"✓ Saved fine-tuned classifier: {model_path}")
+
+        # Save fine-tuned regressor (if successfully trained)
+        if fine_tuned_regressor is not None:
+            archive_regressor = archive_dir / f"gain_regressor_{version}.pkl"
+            shutil.copy(regressor_path, archive_regressor)
+            logger.info(f"✓ Archived old regressor to {archive_regressor}")
+            joblib.dump(fine_tuned_regressor, regressor_path, protocol=4)
+            logger.info(f"✓ Saved fine-tuned regressor: {regressor_path}")
+        else:
+            logger.info("ℹ️  Regressor not updated — previous gain_regressor.pkl preserved")
+
         # Keep existing scaler (don't retrain it)
-        
+
         # Update metadata
         existing_metadata.update({
             'last_fine_tuned': datetime.now().isoformat(),
@@ -572,23 +728,25 @@ def main():
                 'precision': float(precision),
                 'recall': float(recall),
                 'f1_score': float(f1)
-            }
+            },
+            'regressor_fine_tuned': fine_tuned_regressor is not None,
+            'regressor_fine_tuning_version': version if fine_tuned_regressor is not None else None,
         })
-        
+
         with open(metadata_path, 'w') as f:
             json.dump(existing_metadata, f, indent=2)
-        
-        logger.info(f"✓ Saved fine-tuned model: {model_path}")
+
         logger.info(f"✓ Updated metadata: {metadata_path}")
-        
+
         logger.info("\n" + "="*80)
         logger.info("✅ FINE-TUNING COMPLETE")
         logger.info("="*80)
         logger.info(f"Model version: {version}")
         logger.info(f"Total features: {len(existing_features)}")
         logger.info(f"Test AUC: {test_auc:.4f}")
+        logger.info(f"Regressor updated: {'✅ Yes' if fine_tuned_regressor is not None else '⚠️  No (check logs)'}")
         logger.info("")
-        logger.info("Model now has BOTH old and new knowledge:")
+        logger.info("Models now have BOTH old and new knowledge:")
         logger.info("  ✅ T-3, T-5, T-10 patterns (preserved)")
         logger.info("  ✅ T-1 open/close patterns (improved)")
         
