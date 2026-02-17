@@ -366,94 +366,111 @@ class SmartScreener:
             self.logger.error(f"Screening failed: {e}")
             return pd.DataFrame()
 
-def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict:
+def fetch_stock_data_for_prediction(symbol: str, logger) -> dict:
     """
     Fetch stock data for prediction.
-    - T-3, T-5, T-10: DAILY charts
-    - T-1 open/close: 5-MINUTE intraday charts (matches training data)
+      - T-3, T-5, T-10 : DAILY charts   (matches ml_training_base CSV sources)
+      - T-1 open/close  : 5-MIN intraday (matches winners_day_prior_close/open snapshots)
+
+    Returns None if any required data cannot be fetched, so the stock is
+    excluded from the prediction batch rather than receiving a corrupted feature set.
     """
     import yfinance as yf
-    import ta
-    
+    from datetime import datetime, timedelta
+    from datetime import time as dt_time
+    import pandas as pd
+    import numpy as np
+    import pytz
+
     try:
         ticker = yf.Ticker(symbol)
-        
-        df_daily = ticker.history(period='90d', interval='1d')
-        
+
+        # ── Daily bars for T-3 / T-5 / T-10 ─────────────────────────────
+        df_daily = ticker.history(period="90d", interval="1d")
         if df_daily.empty or len(df_daily) < 20:
             logger.debug(f"{symbol}: Insufficient daily data")
             return None
-        
+
         df_indicators_daily = calculate_comprehensive_indicators_daily(df_daily)
-        
         if df_indicators_daily.empty:
             return None
-        
+
         available_dates = sorted(df_indicators_daily.index.date, reverse=True)
-        
         if len(available_dates) < 10:
-            logger.debug(f"{symbol}: Need at least 10 trading days, have {len(available_dates)}")
+            logger.debug(f"{symbol}: Need ≥10 trading days, have {len(available_dates)}")
             return None
-        
+
         t3_date  = available_dates[3]  if len(available_dates) > 3  else available_dates[-1]
         t5_date  = available_dates[5]  if len(available_dates) > 5  else available_dates[-1]
         t10_date = available_dates[10] if len(available_dates) > 10 else available_dates[-1]
-        
-        t3_data  = extract_features_with_prefix(df_indicators_daily, t3_date,  't3',  logger, symbol)
-        t5_data  = extract_features_with_prefix(df_indicators_daily, t5_date,  't5',  logger, symbol)
-        t10_data = extract_features_with_prefix(df_indicators_daily, t10_date, 't10', logger, symbol)
-        
+
+        t3_data  = extract_features_with_prefix(df_indicators_daily, t3_date,  "t3",  logger, symbol)
+        t5_data  = extract_features_with_prefix(df_indicators_daily, t5_date,  "t5",  logger, symbol)
+        t10_data = extract_features_with_prefix(df_indicators_daily, t10_date, "t10", logger, symbol)
+
         if not t3_data:
             logger.debug(f"{symbol}: Failed to extract T-3 data")
             return None
-        
-        df_intraday = ticker.history(period='60d', interval='5m')
-        
+
+        # ── 5-min intraday bars for T-1 ──────────────────────────────────
+        df_intraday = ticker.history(period="60d", interval="5m")
         if df_intraday.empty or len(df_intraday) < 200:
-            logger.debug(f"{symbol}: Insufficient intraday data for T-1 - SKIPPING STOCK")
+            # Do NOT fall back to daily bars — T-1 must match training interval.
+            logger.debug(
+                f"{symbol}: Insufficient 5-min intraday data for T-1 — skipping stock. "
+                "(Training used 5-min snapshots; daily bars would cause train/serve skew.)"
+            )
             return None
-        
+
         df_indicators_intraday = calculate_comprehensive_indicators_intraday(df_intraday)
-        
         if df_indicators_intraday.empty:
             logger.debug(f"{symbol}: Failed to calculate intraday indicators")
             return None
-        
+
+        # Localise to Eastern time (market timezone)
         if df_indicators_intraday.index.tz is None:
-            df_indicators_intraday.index = df_indicators_intraday.index.tz_localize('America/New_York')
+            df_indicators_intraday.index = df_indicators_intraday.index.tz_localize(
+                "America/New_York"
+            )
         else:
-            df_indicators_intraday.index = df_indicators_intraday.index.tz_convert('America/New_York')
-        
+            df_indicators_intraday.index = df_indicators_intraday.index.tz_convert(
+                "America/New_York"
+            )
+
         yesterday = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
-        
+
         t1_close_data = extract_intraday_snapshot(
-            df_indicators_intraday, yesterday, dt_time(16, 0), 't1_close', logger, symbol
+            df_indicators_intraday, yesterday, dt_time(16, 0), "t1_close", logger, symbol
         )
         t1_open_data = extract_intraday_snapshot(
-            df_indicators_intraday, yesterday, dt_time(9, 30), 't1_open', logger, symbol
+            df_indicators_intraday, yesterday, dt_time(9, 30), "t1_open", logger, symbol
         )
-        
+
         if not t1_close_data or not t1_open_data:
-            logger.debug(f"{symbol}: Failed to extract T-1 intraday snapshots, falling back to daily")
-            t1_date = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
-            t1_close_data = extract_features_with_prefix(df_indicators_daily, t1_date, 't1_close', logger, symbol)
-            t1_open_data  = extract_features_with_prefix(df_indicators_daily, t1_date, 't1_open',  logger, symbol)
-        
+            # Both T-1 snapshots are required — missing either means a degraded
+            # feature set that doesn't match training distribution.  Skip stock.
+            logger.debug(
+                f"{symbol}: Could not extract T-1 open or close snapshot from "
+                "5-min data — skipping stock. "
+                "(Fallback to daily bars removed to prevent train/serve skew.)"
+            )
+            return None
+
         result = {
-            'symbol': symbol,
-            'exchange': 'NASDAQ',
+            "symbol":   symbol,
+            "exchange": "NASDAQ",
             **t3_data,
             **t5_data,
             **t10_data,
             **t1_close_data,
-            **t1_open_data
+            **t1_open_data,
         }
-        
+
         logger.debug(f"{symbol}: {len(result)} total features assembled")
         return result
-        
+
     except Exception as e:
-        logger.debug(f"{symbol}: Error - {e}")
+        logger.debug(f"{symbol}: Error — {e}")
         return None
 
 
