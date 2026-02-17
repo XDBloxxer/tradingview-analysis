@@ -25,6 +25,13 @@ USAGE:
 # Keys are EXACTLY as they appear in the Supabase T-1 tables (lowercase).
 # Values are EXACTLY as they appear in model_metadata.json features list
 # (after stripping the t1_close_ / t1_open_ prefix).
+#
+# IMPORTANT — duplicate-target handling:
+#   Several source keys map to the same model name (e.g. "rsi" and "rsi14"
+#   both → "RSI_14").  rename_t1_columns() resolves this by keeping only the
+#   FIRST matching source column it encounters in the DataFrame (iterating in
+#   dict-insertion order) and dropping all subsequent ones.  This is safe
+#   because both source columns carry the same information; we only need one.
 
 INTRADAY_TO_MODEL: dict[str, str] = {
     # ── OHLCV ──────────────────────────────────────────────────────────────
@@ -70,29 +77,32 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "macds_fast":           "MACDs_Fast",
 
     # ── RSI ────────────────────────────────────────────────────────────────
+    # "rsi" is the canonical source; "rsi14" and "rsi[1]" are aliases.
+    # rename_t1_columns keeps whichever appears first in the DataFrame.
     "rsi":              "RSI_14",
+    "rsi14":            "RSI_14",       # alias — deduped at runtime
+    "rsi[1]":           "RSI_14",       # shifted bar — deduped at runtime
     "rsi7":             "RSI_7",
-    "rsi14":            "RSI_14",
     "rsi21":            "RSI_21",
     "rsi28":            "RSI_28",
     "rsi_14_slope":     "RSI_14_Slope",
-    "rsi[1]":           "RSI_14",   # shifted — map to same base feature
 
     # ── STOCHASTIC ─────────────────────────────────────────────────────────
-    "stoch.k":          "STOCHk_14_3_3",
-    "stoch.d":          "STOCHd_14_3_3",
-    "stochk_14_3_3":    "STOCHk_14_3_3",
-    "stochd_14_3_3":    "STOCHd_14_3_3",
-    "stochh_14_3_3":    "STOCHh_14_3_3",
-    "stochk_5_3_1":     "STOCHk_5_3_1",
-    "stochd_5_3_1":     "STOCHd_5_3_1",
-    "stochh_5_3_1":     "STOCHh_5_3_1",
+    # Short forms ("stoch.k/d") are canonical; long forms are aliases.
+    "stoch.k":              "STOCHk_14_3_3",
+    "stochk_14_3_3":        "STOCHk_14_3_3",   # alias — deduped at runtime
+    "stoch.d":              "STOCHd_14_3_3",
+    "stochd_14_3_3":        "STOCHd_14_3_3",   # alias — deduped at runtime
+    "stochh_14_3_3":        "STOCHh_14_3_3",
+    "stochk_5_3_1":         "STOCHk_5_3_1",
+    "stochd_5_3_1":         "STOCHd_5_3_1",
+    "stochh_5_3_1":         "STOCHh_5_3_1",
 
     # ── STOCH RSI ──────────────────────────────────────────────────────────
-    "stochrsi_k":       "STOCHRSIk_14_14_3_3",
-    "stochrsi_d":       "STOCHRSId_14_14_3_3",
-    "stochrsik_14_14_3_3": "STOCHRSIk_14_14_3_3",
-    "stochrsid_14_14_3_3": "STOCHRSId_14_14_3_3",
+    "stochrsi_k":           "STOCHRSIk_14_14_3_3",
+    "stochrsik_14_14_3_3":  "STOCHRSIk_14_14_3_3",  # alias — deduped at runtime
+    "stochrsi_d":           "STOCHRSId_14_14_3_3",
+    "stochrsid_14_14_3_3":  "STOCHRSId_14_14_3_3",  # alias — deduped at runtime
 
     # ── OSCILLATORS ────────────────────────────────────────────────────────
     "w.r":              "WILLR_14",
@@ -119,9 +129,10 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "donchian_upper":   "DCU_20_20",
 
     # ── ATR / VOLATILITY ───────────────────────────────────────────────────
+    # "atr" is canonical; "atr14" is an alias — deduped at runtime.
     "atr":              "ATR_14",
+    "atr14":            "ATR_14",       # alias — deduped at runtime
     "atr7":             "ATR_7",
-    "atr14":            "ATR_14",
     "atr20":            "ATR_20",
     "atr_pct":          "ATR_14_Slope",   # no exact match — closest
     "volatility_10d":   "HV_10",
@@ -137,11 +148,12 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "obv_sma20":        "OBV_SMA20",
 
     # ── TREND / ADX ────────────────────────────────────────────────────────
+    # "adx+di" / "adx-di" are canonical; "_pos" / "_neg" are aliases.
     "adx":              "ADX_14",
     "adx+di":           "DMP_14",
+    "adx_pos":          "DMP_14",       # alias — deduped at runtime
     "adx-di":           "DMN_14",
-    "adx_pos":          "DMP_14",
-    "adx_neg":          "DMN_14",
+    "adx_neg":          "DMN_14",       # alias — deduped at runtime
     "adxr":             "ADXR_14_2",
 
     # ── AROON ──────────────────────────────────────────────────────────────
@@ -156,17 +168,18 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "supert_s":         "SUPERTs_10_3",
 
     # ── MISC ───────────────────────────────────────────────────────────────
+    # "roc" / "roc10" and "mom" / "mom10" and "gap_%" / "gap_pct" are aliases.
     "vwap":             "VWAP",
     "cmf":              "CMF_20",
     "mfi":              "MFI_14",
     "roc":              "ROC_10",
-    "roc10":            "ROC_10",
+    "roc10":            "ROC_10",       # alias — deduped at runtime
     "roc20":            "ROC_20",
     "mom":              "MOM_10",
-    "mom10":            "MOM_10",
+    "mom10":            "MOM_10",       # alias — deduped at runtime
     "mom20":            "MOM_20",
     "gap_%":            "Gap_Pct",
-    "gap_pct":          "Gap_Pct",
+    "gap_pct":          "Gap_Pct",      # alias — deduped at runtime
 }
 
 # Columns that are metadata — never renamed, just preserved or dropped
@@ -184,16 +197,23 @@ def rename_t1_columns(df, prefix: str) -> "pd.DataFrame":
 
     Example:
         prefix = "t1_close"
-        "rsi" → "t1_close_RSI_14"
+        "rsi"  → "t1_close_RSI_14"
         "stoch.k" → "t1_close_STOCHk_14_3_3"
-        "volume" → "t1_close_Volume"
+        "volume"  → "t1_close_Volume"
 
     Metadata columns (symbol, detection_date, etc.) are left unchanged.
-    Columns with no mapping are silently dropped — they were never used
-    by the model anyway.
+
+    Duplicate-target resolution:
+        When two source columns map to the same model name (e.g. "rsi" and
+        "rsi14" both → "RSI_14"), only the first one found in the DataFrame
+        is kept; all subsequent aliases are dropped before renaming.  This
+        prevents pandas.errors.InvalidIndexError during pd.concat.
+
+    Columns with no mapping entry are silently dropped — they were never
+    used by the model.
 
     Args:
-        df:     DataFrame as loaded from Supabase T-1 table
+        df:     DataFrame as loaded from a Supabase T-1 table
         prefix: Column prefix to add ("t1_close" or "t1_open")
 
     Returns:
@@ -201,37 +221,54 @@ def rename_t1_columns(df, prefix: str) -> "pd.DataFrame":
     """
     import pandas as pd
 
-    rename_map = {}
-    drop_cols = []
+    rename_map: dict[str, str] = {}
+    drop_cols: list[str] = []
+    seen_targets: set[str] = set()   # tracks model-name targets already claimed
 
     for col in df.columns:
         if col in METADATA_COLS:
-            continue  # keep as-is
+            continue  # preserve metadata as-is
+
         col_lower = col.lower()
+
         if col_lower in INTRADAY_TO_MODEL:
-            new_name = f"{prefix}_{INTRADAY_TO_MODEL[col_lower]}"
-            rename_map[col] = new_name
+            model_name = INTRADAY_TO_MODEL[col_lower]
+            target = f"{prefix}_{model_name}"
+
+            if target in seen_targets:
+                # A prior column already claimed this target — drop the alias
+                drop_cols.append(col)
+            else:
+                rename_map[col] = target
+                seen_targets.add(target)
         else:
+            # No mapping exists — column is not used by the model
             drop_cols.append(col)
 
     result = df.drop(columns=drop_cols, errors="ignore")
     result = result.rename(columns=rename_map)
+
+    # Belt-and-suspenders: if any duplicates slipped through, keep first occurrence
+    if result.columns.duplicated().any():
+        result = result.loc[:, ~result.columns.duplicated(keep="first")]
+
     return result
 
 
 def get_t1_model_feature_names(prefix: str) -> list[str]:
     """
     Return the full list of model feature names this mapping can produce
-    for a given prefix. Useful for validating coverage.
+    for a given prefix.  Deduplicates targets so each model name appears
+    only once.  Useful for validating coverage.
 
     Args:
         prefix: "t1_close" or "t1_open"
 
     Returns:
-        List of expected model column names
+        List of expected model column names (unique, insertion-ordered)
     """
-    seen = set()
-    names = []
+    seen: set[str] = set()
+    names: list[str] = []
     for model_name in INTRADAY_TO_MODEL.values():
         full = f"{prefix}_{model_name}"
         if full not in seen:
