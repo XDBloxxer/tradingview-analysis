@@ -19,10 +19,10 @@ MISTAKE TYPES HANDLED:
 
 OUTPUT:
   Returns a DataFrame of training samples with:
-    - All T-1 open/close features (from the original database snapshots)
+    - All T-1 open/close features (renamed to model long-form names via t1_column_map)
     - label  (0 for false positive, 1 for false negative)
     - sample_weight  (higher than standard training samples)
-    - mistake_type   (for logging/analysis)
+    - mistake_type   (for logging/analysis — excluded from feature matrix by NON_FEATURE_COLS)
 """
 
 import logging
@@ -34,6 +34,16 @@ from typing import Optional
 import os
 
 from supabase import create_client, Client
+
+try:
+    from t1_column_map import rename_t1_columns
+    T1_MAP_AVAILABLE = True
+except ImportError:
+    T1_MAP_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "t1_column_map.py not found — T-1 features in mistake samples will use "
+        "raw intraday names and won't match model features."
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -180,18 +190,21 @@ def _fetch_t1_snapshots_for_symbols(
 ) -> pd.DataFrame:
     """
     Fetch T-1 indicator rows for a list of (symbol, detection_date) pairs.
-    Returns a DataFrame with columns prefixed by `prefix` (e.g. 't1_close_rsi').
+
+    Returns a DataFrame with columns renamed to model long-form names and
+    prefixed by `prefix` (e.g. 't1_close_RSI_14').  rename_t1_columns() is
+    applied so the feature names match what the model was trained on.
     """
     if not symbol_date_pairs:
         return pd.DataFrame()
 
-    # Supabase doesn't support compound OR filters cleanly for large sets,
-    # so we batch by date to keep queries efficient.
-    dates = list({pair[1] for pair in symbol_date_pairs})
+    # Batch queries by date to stay within URL-length limits.
+    # Each chunk sends ALL unique symbols for that date slice; since dates
+    # don't overlap between chunks there can be no duplicate rows.
+    dates   = list({pair[1] for pair in symbol_date_pairs})
     symbols = list({pair[0] for pair in symbol_date_pairs})
 
     rows = []
-    # Chunk to avoid URL-length limits
     for i in range(0, len(dates), 20):
         date_chunk = dates[i:i + 20]
         try:
@@ -212,24 +225,30 @@ def _fetch_t1_snapshots_for_symbols(
 
     df = pd.DataFrame(rows)
 
-    # Keep only matching (symbol, detection_date) pairs
+    # Keep only the (symbol, detection_date) pairs we actually asked for
     pair_set = set(symbol_date_pairs)
     if "detection_date" in df.columns and "symbol" in df.columns:
-        df = df[df.apply(lambda r: (r["symbol"], r["detection_date"]) in pair_set, axis=1)]
+        df = df[df.apply(
+            lambda r: (r["symbol"], r["detection_date"]) in pair_set, axis=1
+        )].copy()
 
-    # Drop metadata columns before prefixing
-    meta_cols = {"id", "created_at", "updated_at", "symbol", "exchange",
-                 "detection_date", "snapshot_type", "snapshot_time", "snapshot_date"}
-    feature_cols = [c for c in df.columns if c not in meta_cols]
+    if df.empty:
+        return pd.DataFrame()
 
-    # Rename features with prefix
-    rename_map = {c: f"{prefix}_{c}" for c in feature_cols}
-    df = df.rename(columns=rename_map)
+    # ── Rename intraday short-form columns to model long-form names ──────────
+    # This is the critical step that was previously missing:
+    # without it, features come out as "t1_close_rsi" instead of "t1_close_RSI_14"
+    # and every feature lookup in the model silently misses.
+    if T1_MAP_AVAILABLE:
+        df = rename_t1_columns(df, prefix=prefix)
+    else:
+        # Fallback: manual prefix on non-metadata columns (names won't match model)
+        meta_cols = {"id", "created_at", "updated_at", "symbol", "exchange",
+                     "detection_date", "snapshot_type", "snapshot_time", "snapshot_date"}
+        feature_cols = [c for c in df.columns if c not in meta_cols]
+        df = df.rename(columns={c: f"{prefix}_{c}" for c in feature_cols})
 
-    # Preserve key columns
-    keep = ["symbol", "detection_date"] + list(rename_map.values())
-    keep = [c for c in keep if c in df.columns]
-    return df[keep]
+    return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -246,14 +265,16 @@ def build_mistake_training_samples(
     Build a DataFrame of training samples derived from the model's own mistakes.
 
     Each row contains:
-      - All T-1 open/close indicator features (same schema as retrain_model.py)
+      - All T-1 open/close indicator features (same schema as retrain_model.py,
+        with model long-form names via t1_column_map)
       - label  (0 = false positive,  1 = false negative)
-      - sample_weight  (higher than standard samples)
-      - mistake_type   (string label for logging)
+      - sample_weight  (higher than standard samples — preserved by caller)
+      - mistake_type   (string label for logging — excluded from feature matrix
+                        by NON_FEATURE_COLS in ml_retrain_model.py)
 
     The caller (ml_retrain_model.py) should concatenate this with the
-    standard winners/non-winners training data, passing sample_weight
-    to XGBoost's fit() call.
+    standard combined_df AFTER combine_datasets() so that sample_weight
+    values (3.0 / 2.0) are NOT overwritten by T1_WEIGHT.
 
     Args:
         lookback_days:      How many days back to search for mistakes.
@@ -269,7 +290,7 @@ def build_mistake_training_samples(
     """
     client = _get_supabase_client()
 
-    end_date = datetime.now().date()
+    end_date   = datetime.now().date()
     start_date = end_date - timedelta(days=lookback_days)
 
     # ── 1. Fetch mistake records ──────────────────────────────────────────
@@ -289,52 +310,48 @@ def build_mistake_training_samples(
     logger.info(f"Total mistakes to learn from: {len(mistakes_df)} "
                 f"({len(fp_df)} FP, {len(fn_df)} FN)")
 
-    # ── 2. Build (symbol, date) lookup ───────────────────────────────────
-    # False positives: the prediction_date IS the date we want T-1 data for,
-    # because the prediction was made for that trading session, and the T-1
-    # data is what the model had access to at prediction time.
-    #
-    # False negatives: same logic — the winner was on prediction_date,
-    # and the model missed it despite having T-1 data available.
-    #
-    # IMPORTANT: For false positives, the stock is NOT in winners_day_prior_close
-    # (it wasn't a winner), so we must look in non_winners_day_prior_close,
-    # or fall back to fetching from yfinance if missing.
+    # ── 2. Build (symbol, date) lookup ────────────────────────────────────
+    # prediction_date from ml_accuracy_details == detection_date in T-1 tables
+    # (both refer to the same trading session).
+    fp_pairs = (
+        [(r.symbol, r.prediction_date) for r in fp_df.itertuples()]
+        if not fp_df.empty else []
+    )
+    fn_pairs = (
+        [(r.symbol, r.prediction_date) for r in fn_df.itertuples()]
+        if not fn_df.empty else []
+    )
 
-    fp_pairs  = [(r.symbol, r.prediction_date) for r in fp_df.itertuples()
-                 if not fp_df.empty and hasattr(r, "symbol")]
-    fn_pairs  = [(r.symbol, r.prediction_date) for r in fn_df.itertuples()
-                 if not fn_df.empty and hasattr(r, "symbol")]
-
-    # ── 3. Fetch T-1 snapshots ────────────────────────────────────────────
+    # ── 3. Fetch T-1 close snapshots ──────────────────────────────────────
     logger.info("Fetching T-1 close snapshots for mistakes...")
 
-    # False positives: look in non-winners tables first, then winners
+    # False positives: NOT in winners table → check non_winners first
     fp_close_df = pd.DataFrame()
     if fp_pairs:
         fp_close_df = _fetch_t1_snapshots_for_symbols(
             client, "non_winners_day_prior_close", fp_pairs, "t1_close"
         )
         if fp_close_df.empty:
-            logger.debug("  FP: not in non_winners, trying winners table...")
+            logger.debug("  FP: not in non_winners_close, trying winners_close...")
             fp_close_df = _fetch_t1_snapshots_for_symbols(
                 client, "winners_day_prior_close", fp_pairs, "t1_close"
             )
         logger.info(f"  FP T-1 close snapshots: {len(fp_close_df)}")
 
-    # False negatives: they ARE winners, so look there first
+    # False negatives: ARE winners → check winners table first
     fn_close_df = pd.DataFrame()
     if fn_pairs:
         fn_close_df = _fetch_t1_snapshots_for_symbols(
             client, "winners_day_prior_close", fn_pairs, "t1_close"
         )
         if fn_close_df.empty:
-            logger.debug("  FN: not in winners, trying non_winners table...")
+            logger.debug("  FN: not in winners_close, trying non_winners_close...")
             fn_close_df = _fetch_t1_snapshots_for_symbols(
                 client, "non_winners_day_prior_close", fn_pairs, "t1_close"
             )
         logger.info(f"  FN T-1 close snapshots: {len(fn_close_df)}")
 
+    # ── 4. Fetch T-1 open snapshots (optional) ────────────────────────────
     fp_open_df = pd.DataFrame()
     fn_open_df = pd.DataFrame()
     if use_all_timepoints:
@@ -350,7 +367,7 @@ def build_mistake_training_samples(
             )
             logger.info(f"  FN T-1 open snapshots: {len(fn_open_df)}")
 
-    # ── 4. Merge snapshots with mistake metadata ──────────────────────────
+    # ── 5. Merge snapshots with mistake metadata ───────────────────────────
     def _merge_mistake_with_snapshots(
         mistake_rows: pd.DataFrame,
         close_snapshots: pd.DataFrame,
@@ -361,35 +378,35 @@ def build_mistake_training_samples(
     ) -> list[dict]:
         """
         For each mistake row, combine its close + open snapshot into one
-        training sample dict.
+        training sample dict.  Skips rows where close data is missing.
         """
         if mistake_rows.empty or close_snapshots.empty:
             return []
 
         samples = []
-        meta_cols = {"id", "created_at", "updated_at", "snapshot_type",
+        # Columns that carry no signal and should not become features
+        skip_cols = {"id", "created_at", "updated_at", "snapshot_type",
                      "snapshot_time", "snapshot_date"}
 
         for _, mistake in mistake_rows.iterrows():
             symbol = mistake.get("symbol")
             date   = mistake.get("prediction_date")
 
-            # Match close snapshot
             close_match = close_snapshots[
                 (close_snapshots["symbol"] == symbol) &
                 (close_snapshots["detection_date"] == date)
             ]
             if close_match.empty:
-                continue  # Can't build a sample without close data
+                continue
 
-            sample = {}
+            sample: dict = {}
 
-            # Add T-1 close features
+            # T-1 close features (already renamed to model long-form names)
             for col in close_match.columns:
-                if col not in {"symbol", "detection_date"} and col not in meta_cols:
+                if col not in {"symbol", "detection_date"} and col not in skip_cols:
                     sample[col] = close_match.iloc[0][col]
 
-            # Add T-1 open features (optional)
+            # T-1 open features (optional)
             if not open_snapshots.empty:
                 open_match = open_snapshots[
                     (open_snapshots["symbol"] == symbol) &
@@ -397,31 +414,30 @@ def build_mistake_training_samples(
                 ]
                 if not open_match.empty:
                     for col in open_match.columns:
-                        if col not in {"symbol", "detection_date"} and col not in meta_cols:
+                        if col not in {"symbol", "detection_date"} and col not in skip_cols:
                             sample[col] = open_match.iloc[0][col]
 
-            # Labels
-            sample["symbol"]        = symbol
-            sample["detection_date"]= date
-            sample["label"]         = label
-            sample["sample_weight"] = weight
-            sample["mistake_type"]  = mistake_type
+            sample["symbol"]         = symbol
+            sample["detection_date"] = date
+            sample["label"]          = label
+            sample["sample_weight"]  = weight
+            sample["mistake_type"]   = mistake_type
             samples.append(sample)
 
         return samples
 
-    all_samples = []
+    all_samples: list[dict] = []
 
     fp_samples = _merge_mistake_with_snapshots(
         fp_df, fp_close_df, fp_open_df,
-        label=0, weight=WEIGHT_FALSE_POSITIVE, mistake_type="false_positive"
+        label=0, weight=WEIGHT_FALSE_POSITIVE, mistake_type="false_positive",
     )
     all_samples.extend(fp_samples)
     logger.info(f"Built {len(fp_samples)} false-positive training samples.")
 
     fn_samples = _merge_mistake_with_snapshots(
         fn_df, fn_close_df, fn_open_df,
-        label=1, weight=WEIGHT_FALSE_NEGATIVE, mistake_type="false_negative"
+        label=1, weight=WEIGHT_FALSE_NEGATIVE, mistake_type="false_negative",
     )
     all_samples.extend(fn_samples)
     logger.info(f"Built {len(fn_samples)} false-negative training samples.")
@@ -432,11 +448,11 @@ def build_mistake_training_samples(
 
     result = pd.DataFrame(all_samples)
 
-    # ── 5. Pad to full feature set ────────────────────────────────────────
+    # ── 6. Pad to full feature set ────────────────────────────────────────
+    # Only pads columns that are genuinely missing; never overwrites real data.
     if existing_features:
         for feat in existing_features:
             if feat not in result.columns:
-                # Intelligent default (same logic as retrain_model.py)
                 feat_lower = feat.lower()
                 if any(x in feat_lower for x in ["rsi", "stoch", "willr", "cci"]):
                     result[feat] = 50.0
@@ -473,16 +489,20 @@ def log_mistake_summary(mistake_df: pd.DataFrame) -> None:
         subset = mistake_df[mistake_df["mistake_type"] == mtype]
         if subset.empty:
             continue
-        label = "False Positives (model said BUY, stock didn't explode)" \
-                if mtype == "false_positive" \
-                else "False Negatives (model said SKIP, stock exploded)"
+        label = (
+            "False Positives (model said BUY, stock didn't explode)"
+            if mtype == "false_positive"
+            else "False Negatives (model said SKIP, stock exploded)"
+        )
         logger.info(f"\n  {label}")
         logger.info(f"  Count : {len(subset)}")
         logger.info(f"  Weight: {subset['sample_weight'].iloc[0]}x standard samples")
         if "symbol" in subset.columns:
             symbols = subset["symbol"].unique().tolist()
-            logger.info(f"  Symbols: {', '.join(symbols[:10])}"
-                        + (" ..." if len(symbols) > 10 else ""))
+            logger.info(
+                f"  Symbols: {', '.join(symbols[:10])}"
+                + (" ..." if len(symbols) > 10 else "")
+            )
 
     logger.info("")
     logger.info(f"  Total mistake samples: {len(mistake_df)}")
