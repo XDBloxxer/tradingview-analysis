@@ -1,8 +1,8 @@
 {
-  "trained_at": "2026-02-17T23:09:22.332741+00:00",
+  "trained_at": "2026-02-17T23:22:18.661461+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
-  "n_features": 414,
+  "n_features": 416,
   "features": [
     "event_date",
     "gain_pct",
@@ -301,6 +301,7 @@
     "t10_tsis_13_25_13",
     "t10_gap_pct",
     "exchange",
+    "detection_date_x",
     "snapshot_date",
     "snapshot_type",
     "snapshot_time",
@@ -417,7 +418,8 @@
     "t1_open_HV_20",
     "t1_open_HV_30",
     "t1_open_VWAP",
-    "t1_open_Gap_Pct"
+    "t1_open_Gap_Pct",
+    "detection_date_y"
   ],
   "feature_names_sample": [
     "event_date",
@@ -441,8 +443,8 @@
     "t3_ema_26",
     "t3_ema_50"
   ],
-  "best_iteration": 159,
-  "best_val_logloss": 0.00901762484343546,
+  "best_iteration": 164,
+  "best_val_logloss": 0.00873877024170227,
   "gain_regressor_trained": false,
   "n_total_samples": 5684,
   "n_base_samples": 5289,
@@ -451,7 +453,7 @@
   "n_positive": 3660,
   "n_negative": 2024,
   "positive_rate": 0.6439127375087966,
-  "val_auc_roc": 0.9999760329786215,
+  "val_auc_roc": 0.9999880164893107,
   "base_sample_weight": 1.5,
   "t1_sample_weight": 1.0,
   "equal_weight_applied": false
