@@ -50,6 +50,18 @@ from sklearn.preprocessing import StandardScaler
 from supabase import create_client, Client
 from xgboost import XGBClassifier
 
+# T-1 column name translator (intraday short names → model long names)
+try:
+    from t1_column_map import rename_t1_columns
+    T1_MAP_AVAILABLE = True
+except ImportError:
+    T1_MAP_AVAILABLE = False
+    logger_tmp = logging.getLogger(__name__)
+    logger_tmp.warning(
+        "t1_column_map.py not found — T-1 features will not be renamed. "
+        "Place t1_column_map.py alongside ml_retrain_model.py."
+    )
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -182,30 +194,54 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
 
 
 def load_t1_data(client: Client) -> pd.DataFrame:
-    """Load accumulated T-1 winner and non-winner samples."""
+    """
+    Load accumulated T-1 winner and non-winner samples.
+
+    Applies t1_column_map to rename intraday short-form column names
+    (rsi, stoch.k, ema20, …) to the model's expected long-form names
+    (RSI_14, STOCHk_14_3_3, EMA_20, …) with the correct prefix.
+
+    close tables → prefix "t1_close"
+    open  tables → prefix "t1_open"
+    """
     logger.info("Loading accumulated T-1 training data...")
+
+    # Map each table to (label, prefix)
+    TABLE_CONFIG = [
+        (TABLE_WINNERS_CLOSE,     1, "t1_close"),
+        (TABLE_WINNERS_OPEN,      1, "t1_open"),
+        (TABLE_NON_WINNERS_CLOSE, 0, "t1_close"),
+        (TABLE_NON_WINNERS_OPEN,  0, "t1_open"),
+    ]
 
     frames = []
 
-    # Winners (label = 1)
-    for table in [TABLE_WINNERS_CLOSE, TABLE_WINNERS_OPEN]:
+    for table, label, prefix in TABLE_CONFIG:
         try:
             df = fetch_table_paginated(client, table)
-            if not df.empty:
-                df["label"] = 1
-                df["source"] = table
-                frames.append(df)
-        except Exception as e:
-            logger.warning(f"Could not load '{table}': {e}")
+            if df.empty:
+                continue
 
-    # Non-winners (label = 0)
-    for table in [TABLE_NON_WINNERS_CLOSE, TABLE_NON_WINNERS_OPEN]:
-        try:
-            df = fetch_table_paginated(client, table)
-            if not df.empty:
-                df["label"] = 0
-                df["source"] = table
-                frames.append(df)
+            df["label"] = label
+            df["source"] = table
+
+            # Apply column name translation
+            if T1_MAP_AVAILABLE:
+                before = len(df.columns)
+                df = rename_t1_columns(df, prefix=prefix)
+                after = len([c for c in df.columns if c.startswith(prefix)])
+                logger.info(
+                    f"  {table}: renamed {after} feature columns "
+                    f"(had {before}, kept metadata + {after} features)"
+                )
+            else:
+                logger.warning(
+                    f"  {table}: column map unavailable — "
+                    "T-1 features will be NaN in model (not ideal but won't crash)"
+                )
+
+            frames.append(df)
+
         except Exception as e:
             logger.warning(f"Could not load '{table}': {e}")
 
@@ -213,12 +249,19 @@ def load_t1_data(client: Client) -> pd.DataFrame:
         logger.warning("No T-1 data found. Training on base data only.")
         return pd.DataFrame()
 
-    combined = pd.concat(frames, ignore_index=True)
+    combined = pd.concat(frames, ignore_index=True, sort=False)
     combined["sample_weight"] = T1_WEIGHT
+
+    # Count how many T-1 features actually landed correctly
+    t1_feature_cols = [c for c in combined.columns
+                       if c.startswith("t1_close_") or c.startswith("t1_open_")]
+    non_null_t1 = combined[t1_feature_cols].notna().any().sum() if t1_feature_cols else 0
 
     logger.info(f"T-1 data: {len(combined)} rows, "
                 f"pos={int((combined['label']==1).sum())}, "
                 f"neg={int((combined['label']==0).sum())}")
+    logger.info(f"T-1 feature columns populated: {non_null_t1}/{len(t1_feature_cols)}")
+
     return combined
 
 
