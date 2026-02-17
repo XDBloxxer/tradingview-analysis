@@ -1,8 +1,12 @@
 {
-  "min_price": 0.50,
-  "max_price": 500.0,
-  "min_volume": 100000,
-  "min_rsi": 30,
-  "max_rsi": 70,
-  "min_volume_ratio": 1.5
+  "min_price": 0.25,
+  "max_price": 50.0,
+  "min_volume": 50000,
+  "min_relative_volume": 2.0,
+  "min_hv10": null,
+  "max_hv10": null,
+  "min_rsi": null,
+  "max_rsi": null,
+  "min_volume_ratio": 2.0,
+  "_comment": "Tightened from defaults. max_price 50 and min_volume 500k target the small-cap explosive universe. min_relative_volume 2.0 requires stocks already showing above-normal activity. Model-driven thresholds (hv10, rsi) will be auto-populated by ml_track_comprehensive_accuracy.py after enough prediction history accumulates."
 }
