@@ -193,7 +193,7 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
     return df
 
 
-def load_t1_data(client: Client) -> pd.DataFrame:
+def load_t1_data(client):
     """
     Load accumulated T-1 winner and non-winner samples.
 
@@ -204,9 +204,24 @@ def load_t1_data(client: Client) -> pd.DataFrame:
     close tables → prefix "t1_close"
     open  tables → prefix "t1_open"
     """
+    import pandas as pd
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # These constants / helpers come from ml_retrain_model.py module scope
+    from ml_retrain_model import (
+        TABLE_WINNERS_CLOSE, TABLE_WINNERS_OPEN,
+        TABLE_NON_WINNERS_CLOSE, TABLE_NON_WINNERS_OPEN,
+        T1_WEIGHT, T1_MAP_AVAILABLE,
+        fetch_table_paginated,
+    )
+    try:
+        from t1_column_map import rename_t1_columns
+    except ImportError:
+        rename_t1_columns = None
+
     logger.info("Loading accumulated T-1 training data...")
 
-    # Map each table to (label, prefix)
     TABLE_CONFIG = [
         (TABLE_WINNERS_CLOSE,     1, "t1_close"),
         (TABLE_WINNERS_OPEN,      1, "t1_open"),
@@ -225,8 +240,7 @@ def load_t1_data(client: Client) -> pd.DataFrame:
             df["label"] = label
             df["source"] = table
 
-            # Apply column name translation
-            if T1_MAP_AVAILABLE:
+            if T1_MAP_AVAILABLE and rename_t1_columns is not None:
                 before = len(df.columns)
                 df = rename_t1_columns(df, prefix=prefix)
                 after = len([c for c in df.columns if c.startswith(prefix)])
@@ -234,6 +248,17 @@ def load_t1_data(client: Client) -> pd.DataFrame:
                     f"  {table}: renamed {after} feature columns "
                     f"(had {before}, kept metadata + {after} features)"
                 )
+
+                # ── GUARD: drop any duplicate column names that slipped through ──
+                dupes = df.columns[df.columns.duplicated()].tolist()
+                if dupes:
+                    logger.warning(
+                        f"  {table}: dropping {len(dupes)} duplicate column(s) "
+                        f"after rename: {dupes[:10]}"
+                    )
+                    df = df.loc[:, ~df.columns.duplicated(keep="first")]
+                # ─────────────────────────────────────────────────────────────────
+
             else:
                 logger.warning(
                     f"  {table}: column map unavailable — "
@@ -252,7 +277,6 @@ def load_t1_data(client: Client) -> pd.DataFrame:
     combined = pd.concat(frames, ignore_index=True, sort=False)
     combined["sample_weight"] = T1_WEIGHT
 
-    # Count how many T-1 features actually landed correctly
     t1_feature_cols = [c for c in combined.columns
                        if c.startswith("t1_close_") or c.startswith("t1_open_")]
     non_null_t1 = combined[t1_feature_cols].notna().any().sum() if t1_feature_cols else 0
@@ -263,7 +287,6 @@ def load_t1_data(client: Client) -> pd.DataFrame:
     logger.info(f"T-1 feature columns populated: {non_null_t1}/{len(t1_feature_cols)}")
 
     return combined
-
 
 # ---------------------------------------------------------------------------
 # Data preparation
