@@ -15,10 +15,20 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+from pandas.tseries.holiday import USFederalHolidayCalendar
+
 from src.daily_non_winners_detector import DailyNonWinnersDetector
 from src.intraday_data_collector import IntradayDataCollector
 from src.daily_non_winners_supabase_client import DailyNonWinnersSupabaseClient
 from src.utils import setup_logging, load_config
+
+
+def is_trading_day(d) -> bool:
+    """Return True if d is a NYSE trading day (not a weekend or US federal holiday)."""
+    if d.weekday() >= 5:  # Saturday=5, Sunday=6
+        return False
+    holidays = USFederalHolidayCalendar().holidays(start=str(d), end=str(d))
+    return len(holidays) == 0
 
 
 def main():
@@ -48,16 +58,16 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
-    
+
     # Setup logging
     log_level = "DEBUG" if args.verbose else config.get("logging", {}).get("level", "INFO")
     logger = setup_logging(log_level, config.get("logging", {}))
-    
+
     # Parse target date
     if args.date:
         try:
@@ -67,9 +77,23 @@ def main():
             return 1
     else:
         target_date = datetime.now()
-    
+
     target_date_str = target_date.date().isoformat()
-    
+
+    # ── Market holiday / weekend guard ──────────────────────────────────────
+    if not is_trading_day(target_date.date()):
+        if target_date.date().weekday() >= 5:
+            reason = "weekend"
+        else:
+            reason = "US market holiday"
+        logger.info("=" * 60)
+        logger.info("DAILY NON-WINNERS TRACKER — SKIPPED")
+        logger.info(f"  {target_date_str} is a {reason}.")
+        logger.info("  No market data to collect. Exiting cleanly.")
+        logger.info("=" * 60)
+        return 0
+    # ────────────────────────────────────────────────────────────────────────
+
     try:
         logger.info("=" * 60)
         logger.info("DAILY NON-WINNERS TRACKER")
@@ -80,30 +104,30 @@ def main():
         logger.info("PURPOSE: Collect NEGATIVE examples for ML training")
         logger.info("These are stocks that did NOT explode - essential for learning!")
         logger.info("")
-        
+
         # Step 1: Detect Non-Winners
         logger.info("=" * 60)
         logger.info("STEP 1: DETECT NON-WINNERS")
         logger.info("=" * 60)
         logger.info("Finding stocks that did NOT explode today")
-        
+
         detector = DailyNonWinnersDetector(config)
         non_winners = detector.detect_non_winners(top_n=args.top_n, target_date=target_date)
-        
+
         if not non_winners:
             logger.warning("No non-winners detected. Exiting.")
             return 0
-        
+
         logger.info(f"✓ Detected {len(non_winners)} non-winners")
         logger.info(f"  Sample: {non_winners[0]['symbol']} ({non_winners[0]['change_pct']:+.2f}%)")
         logger.info("")
         logger.info(f"  Non-winners: {', '.join([w['symbol'] for w in non_winners])}")
-        
+
         # Write non-winners to Supabase
         supabase = DailyNonWinnersSupabaseClient(config)
         count = supabase.write_non_winners(non_winners)
         logger.info(f"✓ Written {count} non-winners to Supabase")
-        
+
         # Step 2: Collect Indicator Data
         logger.info("")
         logger.info("=" * 60)
@@ -119,22 +143,22 @@ def main():
         logger.info("These will serve as NEGATIVE examples in training:")
         logger.info("  Label: 0 (did NOT explode)")
         logger.info("")
-        
+
         collector = IntradayDataCollector(config)
         intraday_data = collector.collect_intraday_data(non_winners, target_date)
-        
+
         logger.info(f"✓ Collected indicator data for {len(non_winners)} non-winners:")
         logger.info(f"  - Market Open (9:30am): {len(intraday_data['market_open'])} symbols")
         logger.info(f"  - Market Close (4pm): {len(intraday_data['market_close'])} symbols")
         logger.info(f"  - Day Prior Open (9:30am T-1): {len(intraday_data['day_prior_open'])} symbols")
         logger.info(f"  - Day Prior Close (4pm T-1): {len(intraday_data['day_prior_close'])} symbols")
-        
+
         # Write ALL intraday data to Supabase (all four timepoints)
         counts = supabase.write_intraday_data(intraday_data)
         logger.info(f"✓ Written intraday data to Supabase:")
         for data_type, count in counts.items():
             logger.info(f"  - {data_type}: {count} rows")
-        
+
         logger.info("")
         logger.info("=" * 60)
         logger.info("✓ DAILY NON-WINNERS TRACKER COMPLETED SUCCESSFULLY")
@@ -155,9 +179,9 @@ def main():
         logger.info("")
         logger.info("NOTE: According to your workflow, T-1 data (day_prior_close & day_prior_open)")
         logger.info("      is MOST important for training. Same-day data is supplementary.")
-        
+
         return 0
-        
+
     except Exception as e:
         logger.error(f"✗ Daily non-winners tracker failed: {str(e)}", exc_info=True)
         return 1
