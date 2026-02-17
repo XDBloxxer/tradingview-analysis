@@ -616,6 +616,23 @@ class IntradayDataCollector:
                 result[f'price_change_{days}d'] = df['Close'].pct_change(days) * 100
             except:
                 pass
+                # === ROLLING VOLATILITY ===
+        # Calculated on 5-min bars: 1 trading day ≈ 78 bars
+        # Annualisation factor: sqrt(252 * 78)
+        try:
+            log_returns = np.log(df['Close'] / df['Close'].shift(1))
+            BARS_PER_DAY = 78
+            ANNUALISE = np.sqrt(252 * BARS_PER_DAY)
+            for d in [10, 20, 30]:
+                bars = d * BARS_PER_DAY
+                result[f'volatility_{d}d'] = (
+                    log_returns
+                    .rolling(window=bars, min_periods=bars // 2)
+                    .std() * ANNUALISE * 100
+                )
+        except:
+            pass
+
         
         # === 52-WEEK HIGH/LOW ===
         # Note: On 5-min data, 252 periods = ~21 trading days, not 52 weeks
