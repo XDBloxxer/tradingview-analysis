@@ -1,6 +1,9 @@
 """
 Daily Winners Detector - DEBUG VERSION
 This version has extensive logging to diagnose why stale stocks pass validation
+
+FIX: All three fetch paths now populate high, low, open, close so the
+     daily_winners table is fully populated after the schema migration.
 """
 
 import logging
@@ -59,10 +62,8 @@ class DailyWinnersDetector:
         self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
         
         # Fetch MORE than we need initially to account for validation rejections
-        # We'll fetch 2x to have buffer for rejections
         initial_fetch_size = top_n * 2
         
-        # Fetch from TradingView
         candidates = self._fetch_from_tradingview(target_date, initial_fetch_size)
         
         # Supplement with yfinance if needed
@@ -72,7 +73,6 @@ class DailyWinnersDetector:
                 f"TradingView returned {len(candidates)}/{initial_fetch_size}. "
                 f"Fetching {needed} more from yfinance..."
             )
-            
             existing_symbols = {c['symbol'] for c in candidates}
             yf_candidates = self._fetch_from_yfinance_screener(target_date, needed * 2, existing_symbols)
             candidates.extend(yf_candidates[:needed])
@@ -81,11 +81,12 @@ class DailyWinnersDetector:
             self.logger.warning("⚠️ No winners found!")
             return []
         
+        # ── Backfill OHLC for any candidate missing it (TradingView path) ──
+        candidates = self._backfill_ohlc(candidates)
+        
         self.logger.info(f"Total candidates before validation: {len(candidates)}")
         
-        # Check skip validation config
         skip_validation = self.config.get('daily_winners', {}).get('skip_freshness_validation', False)
-        
         self.logger.info(f"🔍 skip_freshness_validation config: {skip_validation}")
         
         if skip_validation:
@@ -103,7 +104,7 @@ class DailyWinnersDetector:
         df_results = pd.DataFrame(validated_candidates)
         df_results = df_results.sort_values('change_pct', ascending=False)
         
-        # Check if we have enough after validation
+        # Backfill shortage
         if len(df_results) < top_n:
             shortage = top_n - len(df_results)
             self.logger.warning(
@@ -112,20 +113,15 @@ class DailyWinnersDetector:
             )
             self.logger.info("💡 Trying to backfill with additional candidates...")
             
-            # Get symbols we already have (both validated and rejected)
             existing_symbols = {c['symbol'] for c in candidates}
-            
-            # Fetch more candidates from yfinance
             additional_candidates = self._fetch_from_yfinance_screener(
-                target_date, 
-                shortage * 3,  # Fetch 3x to account for more rejections
-                existing_symbols
+                target_date, shortage * 3, existing_symbols
             )
             
             if additional_candidates:
-                self.logger.info(f"Fetched {len(additional_candidates)} additional candidates for backfill")
+                additional_candidates = self._backfill_ohlc(additional_candidates)
+                self.logger.info(f"Fetched {len(additional_candidates)} additional candidates")
                 
-                # Validate the new candidates
                 if not skip_validation:
                     additional_validated = self._batch_verify_freshness(additional_candidates, target_date)
                 else:
@@ -134,16 +130,9 @@ class DailyWinnersDetector:
                 if additional_validated:
                     self.logger.info(f"✅ {len(additional_validated)} additional candidates passed validation")
                     validated_candidates.extend(additional_validated)
-                    
-                    # Re-sort with new candidates
                     df_results = pd.DataFrame(validated_candidates)
                     df_results = df_results.sort_values('change_pct', ascending=False)
-                else:
-                    self.logger.warning("❌ No additional candidates passed validation")
-            else:
-                self.logger.warning("❌ Could not fetch additional candidates for backfill")
         
-        # Take top N
         top_winners = df_results.head(top_n).to_dict('records')
         
         for winner in top_winners:
@@ -161,24 +150,117 @@ class DailyWinnersDetector:
         
         if len(top_winners) < top_n:
             self.logger.warning(
-                f"⚠️ WARNING: Only found {len(top_winners)}/{top_n} winners after validation and backfill. "
-                f"Consider checking data sources or relaxing filters."
+                f"⚠️ WARNING: Only found {len(top_winners)}/{top_n} winners after validation."
             )
         
         return top_winners
     
+    # ─────────────────────────────────────────────────────────────────────
+    # OHLC backfill — fetches daily bar OHLC for any candidate that came
+    # in without it (mainly the TradingView MarketMovers path).
+    # Uses a single yf.download() batch call for efficiency.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _backfill_ohlc(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        For any candidate missing high/low/open/close, fetch from yfinance
+        daily bars (1d interval) and fill them in.
+
+        TradingView MarketMovers only returns close + change + volume.
+        yfinance Screener returns regularMarketPrice but not the full OHLC bar.
+        This method patches both.
+        """
+        missing = [c for c in candidates
+                   if any(c.get(f) is None for f in ('high', 'low', 'open', 'close'))]
+
+        if not missing:
+            return candidates
+
+        symbols = list({c['symbol'] for c in missing})
+        self.logger.info(f"Backfilling OHLC for {len(symbols)} candidates via yfinance daily bars...")
+
+        try:
+            data = yf.download(
+                symbols,
+                period='2d',
+                interval='1d',
+                group_by='ticker',
+                progress=False,
+                threads=True,
+                auto_adjust=True,
+            )
+
+            if data.empty:
+                self.logger.warning("yfinance returned no OHLC data for backfill")
+                return candidates
+
+            # Build a quick lookup: symbol → latest OHLC bar
+            ohlc_lookup: Dict[str, Dict[str, float]] = {}
+
+            if len(symbols) == 1:
+                # Single-symbol download: columns are Open/High/Low/Close/Volume (no ticker level)
+                if not data.empty:
+                    row = data.iloc[-1]
+                    ohlc_lookup[symbols[0]] = {
+                        'open':  float(row.get('Open',  row.get('open',  0))),
+                        'high':  float(row.get('High',  row.get('high',  0))),
+                        'low':   float(row.get('Low',   row.get('low',   0))),
+                        'close': float(row.get('Close', row.get('close', 0))),
+                    }
+            else:
+                # Multi-symbol: columns are MultiIndex (ticker, field)
+                for sym in symbols:
+                    try:
+                        if sym not in data.columns.get_level_values(0):
+                            continue
+                        sym_data = data[sym].dropna(how='all')
+                        if sym_data.empty:
+                            continue
+                        row = sym_data.iloc[-1]
+                        ohlc_lookup[sym] = {
+                            'open':  float(row.get('Open',  row.get('open',  0))),
+                            'high':  float(row.get('High',  row.get('high',  0))),
+                            'low':   float(row.get('Low',   row.get('low',   0))),
+                            'close': float(row.get('Close', row.get('close', 0))),
+                        }
+                    except Exception:
+                        continue
+
+        except Exception as e:
+            self.logger.warning(f"OHLC backfill failed: {e}")
+            return candidates
+
+        # Patch candidates in-place
+        patched = 0
+        for c in candidates:
+            sym = c.get('symbol')
+            if sym in ohlc_lookup:
+                bar = ohlc_lookup[sym]
+                for field in ('open', 'high', 'low', 'close'):
+                    if c.get(field) is None:
+                        c[field] = bar[field]
+                # Also align price with close if it was 0 / None
+                if not c.get('price') and bar['close']:
+                    c['price'] = bar['close']
+                patched += 1
+
+        self.logger.info(f"✓ OHLC backfilled for {patched}/{len(missing)} candidates")
+        return candidates
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Existing helpers (unchanged except _fetch_from_tradingview which now
+    # includes high/low/open when the scraper returns them)
+    # ─────────────────────────────────────────────────────────────────────
+
     def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
         if exchange == 'OTC':
             return True
-        
         symbol_upper = symbol.upper()
         for pattern in self.EXCLUDED_PATTERNS:
             if pattern in symbol_upper:
                 return True
-        
         if len(symbol) > 5:
             return True
-        
         return False
     
     def _fetch_from_tradingview(self, target_date: datetime, top_n: int) -> List[Dict[str, Any]]:
@@ -225,9 +307,9 @@ class DailyWinnersDetector:
                     
                     exchange_map = {
                         'NASDAQ': 'NASDAQ',
-                        'NYSE': 'NYSE',
-                        'AMEX': 'AMEX',
-                        'BATS': 'NASDAQ'
+                        'NYSE':   'NYSE',
+                        'AMEX':   'AMEX',
+                        'BATS':   'NASDAQ'
                     }
                     exchange = exchange_map.get(exchange_prefix, exchange_prefix)
                     
@@ -236,9 +318,9 @@ class DailyWinnersDetector:
                         self.logger.debug(f"🚫 Filtered (pattern): {exchange}:{symbol}")
                         continue
                     
-                    price = float(item.get('close', 0))
+                    price      = float(item.get('close', 0))
                     change_pct = float(item.get('change', 0))
-                    volume = int(item.get('volume', 0))
+                    volume     = int(item.get('volume', 0))
                     
                     if price < self.min_price:
                         filtered_counts['low_price'] += 1
@@ -254,28 +336,35 @@ class DailyWinnersDetector:
                         filtered_counts['no_change'] += 1
                         continue
                     
+                    # Capture OHLC from TradingView if available; None otherwise
+                    # (None fields are backfilled by _backfill_ohlc)
                     all_candidates.append({
-                        'symbol': symbol.strip().upper(),
-                        'exchange': exchange,
-                        'price': float(price),
+                        'symbol':     symbol.strip().upper(),
+                        'exchange':   exchange,
+                        'price':      float(price),
                         'change_pct': float(change_pct),
-                        'volume': int(volume),
-                        'source': 'tradingview'
+                        'volume':     int(volume),
+                        'high':       float(item['high'])  if item.get('high')  else None,
+                        'low':        float(item['low'])   if item.get('low')   else None,
+                        'open':       float(item['open'])  if item.get('open')  else None,
+                        'close':      float(item['close']) if item.get('close') else float(price),
+                        'source':     'tradingview',
                     })
                     
                     self.logger.debug(f"✅ Passed filters: {exchange}:{symbol} +{change_pct:.2f}%")
                     
-                except Exception as e:
+                except Exception:
                     filtered_counts['parse_error'] += 1
                     continue
             
-            self.logger.info(f"TradingView filtering:")
-            self.logger.info(f"  - Total: {len(data)}")
-            self.logger.info(f"  - Excluded patterns: {filtered_counts['excluded_pattern']}")
-            self.logger.info(f"  - Low price: {filtered_counts['low_price']}")
-            self.logger.info(f"  - Low volume: {filtered_counts['low_volume']}")
-            self.logger.info(f"  - No change: {filtered_counts['no_change']}")
-            self.logger.info(f"  - ✅ Passed: {len(all_candidates)}")
+            self.logger.info(
+                f"TradingView filtering: total={len(data)}, "
+                f"excluded={filtered_counts['excluded_pattern']}, "
+                f"low_price={filtered_counts['low_price']}, "
+                f"low_volume={filtered_counts['low_volume']}, "
+                f"no_change={filtered_counts['no_change']}, "
+                f"passed={len(all_candidates)}"
+            )
             
             return all_candidates
             
@@ -290,7 +379,7 @@ class DailyWinnersDetector:
         exclude_symbols: Set[str]
     ) -> List[Dict[str, Any]]:
         try:
-            self.logger.info(f"Fetching from yfinance screener...")
+            self.logger.info("Fetching from yfinance screener...")
             
             try:
                 from yfinance import Screener
@@ -306,27 +395,30 @@ class DailyWinnersDetector:
                 
                 for quote in quotes:
                     symbol = quote.get('symbol', '')
-                    
                     if not symbol or symbol in exclude_symbols:
                         continue
-                    
                     if self._is_excluded_symbol(symbol, 'NASDAQ'):
                         continue
                     
-                    price = quote.get('regularMarketPrice', 0)
+                    price      = quote.get('regularMarketPrice', 0)
                     change_pct = quote.get('regularMarketChangePercent', 0)
-                    volume = quote.get('regularMarketVolume', 0)
+                    volume     = quote.get('regularMarketVolume', 0)
                     
                     if price < self.min_price or volume < self.min_volume or change_pct <= 0:
                         continue
                     
+                    # yfinance Screener provides regularMarketDayHigh/Low/Open
                     candidates.append({
-                        'symbol': symbol.upper(),
-                        'exchange': quote.get('exchange', 'NASDAQ'),
-                        'price': float(price),
+                        'symbol':     symbol.upper(),
+                        'exchange':   quote.get('exchange', 'NASDAQ'),
+                        'price':      float(price),
                         'change_pct': float(change_pct),
-                        'volume': int(volume),
-                        'source': 'yfinance_screener'
+                        'volume':     int(volume),
+                        'high':       float(quote['regularMarketDayHigh'])  if quote.get('regularMarketDayHigh')  else None,
+                        'low':        float(quote['regularMarketDayLow'])   if quote.get('regularMarketDayLow')   else None,
+                        'open':       float(quote['regularMarketOpen'])     if quote.get('regularMarketOpen')     else None,
+                        'close':      float(price),
+                        'source':     'yfinance_screener',
                     })
                     
                     if len(candidates) >= limit:
@@ -350,7 +442,7 @@ class DailyWinnersDetector:
         exclude_symbols: Set[str]
     ) -> List[Dict[str, Any]]:
         try:
-            self.logger.info(f"Scanning liquid stocks...")
+            self.logger.info("Scanning liquid stocks...")
             
             candidates = []
             liquid_stocks = self._get_liquid_stocks_list()
@@ -358,7 +450,7 @@ class DailyWinnersDetector:
             
             batch_size = 50
             for i in range(0, len(liquid_stocks), batch_size):
-                batch = liquid_stocks[i:i+batch_size]
+                batch = liquid_stocks[i:i + batch_size]
                 
                 try:
                     data = yf.download(
@@ -367,7 +459,8 @@ class DailyWinnersDetector:
                         interval='1d',
                         group_by='ticker',
                         progress=False,
-                        threads=True
+                        threads=True,
+                        auto_adjust=True,
                     )
                     
                     if data.empty:
@@ -381,19 +474,19 @@ class DailyWinnersDetector:
                             if len(batch) == 1:
                                 stock_data = data
                             else:
-                                if symbol not in data.columns.levels[0]:
+                                if symbol not in data.columns.get_level_values(0):
                                     continue
                                 stock_data = data[symbol]
                             
                             if stock_data.empty or len(stock_data) < 2:
                                 continue
                             
-                            latest = stock_data.iloc[-1]
+                            latest   = stock_data.iloc[-1]
                             previous = stock_data.iloc[-2]
                             
-                            close = latest['Close']
-                            prev_close = previous['Close']
-                            volume = latest['Volume']
+                            close      = float(latest['Close'])
+                            prev_close = float(previous['Close'])
+                            volume     = int(latest['Volume'])
                             change_pct = ((close - prev_close) / prev_close) * 100
                             
                             if close < self.min_price or volume < self.min_volume or change_pct <= 0:
@@ -402,18 +495,23 @@ class DailyWinnersDetector:
                                 continue
                             
                             candidates.append({
-                                'symbol': symbol.upper(),
-                                'exchange': 'NASDAQ',
-                                'price': float(close),
+                                'symbol':     symbol.upper(),
+                                'exchange':   'NASDAQ',
+                                'price':      close,
                                 'change_pct': float(change_pct),
-                                'volume': int(volume),
-                                'source': 'yfinance_liquid'
+                                'volume':     volume,
+                                # Full OHLC available from daily bar
+                                'high':       float(latest['High']),
+                                'low':        float(latest['Low']),
+                                'open':       float(latest['Open']),
+                                'close':      close,
+                                'source':     'yfinance_liquid',
                             })
                             
-                        except Exception as e:
+                        except Exception:
                             continue
                 
-                except Exception as e:
+                except Exception:
                     continue
                 
                 if len(candidates) >= limit:
@@ -438,9 +536,7 @@ class DailyWinnersDetector:
         target_date: datetime,
         batch_size: int = 50
     ) -> List[Dict[str, Any]]:
-        """
-        ENHANCED DEBUG VERSION - Shows exactly why each symbol passes or fails
-        """
+        """Enhanced debug version — shows exactly why each symbol passes or fails."""
         if not candidates:
             return []
         
@@ -454,37 +550,35 @@ class DailyWinnersDetector:
         self.logger.info("=" * 80)
         
         for i in range(0, len(symbols), batch_size):
-            batch_symbols = symbols[i:i+batch_size]
-            batch_candidates = candidates[i:i+batch_size]
+            batch_symbols    = symbols[i:i + batch_size]
+            batch_candidates = candidates[i:i + batch_size]
             
             self.logger.info(f"📦 Batch {i//batch_size + 1}: Checking {len(batch_symbols)} symbols")
             
             try:
-                # Download batch data
                 data = yf.download(
                     batch_symbols,
                     period='5d',
                     interval='1d',
                     group_by='ticker',
                     progress=False,
-                    threads=True
+                    threads=True,
+                    auto_adjust=True,
                 )
                 
                 if data.empty:
                     self.logger.warning(f"⚠️ No data returned for batch {i//batch_size + 1}")
                     continue
                 
-                # Check each symbol
-                for idx, (symbol, candidate) in enumerate(zip(batch_symbols, batch_candidates)):
+                for symbol, candidate in zip(batch_symbols, batch_candidates):
                     self.logger.info(f"\n{'='*60}")
                     self.logger.info(f"🔍 Checking: {symbol}")
                     
                     try:
-                        # Get symbol data
                         if len(batch_symbols) == 1:
                             symbol_data = data
                         else:
-                            if symbol not in data.columns.levels[0]:
+                            if symbol not in data.columns.get_level_values(0):
                                 self.logger.warning(f"  ❌ {symbol}: Not in response data")
                                 continue
                             symbol_data = data[symbol]
@@ -493,78 +587,44 @@ class DailyWinnersDetector:
                             self.logger.warning(f"  ❌ {symbol}: Empty data frame")
                             continue
                         
-                        # Show all available dates and data quality
                         available_dates = symbol_data.index.date
                         self.logger.info(f"  📅 Available dates: {[str(d) for d in available_dates]}")
                         
-                        # Check data quality for each day
-                        nan_days = []
-                        for date_idx in range(len(symbol_data)):
-                            date = symbol_data.index[date_idx].date()
-                            close = symbol_data['Close'].iloc[date_idx]
-                            volume = symbol_data['Volume'].iloc[date_idx]
-                            if pd.isna(close) or pd.isna(volume):
-                                nan_days.append(str(date))
-                        
-                        if nan_days:
-                            self.logger.warning(f"  ⚠️  Days with NaN data: {nan_days}")
-                        
-                        # Get most recent date
-                        last_date = symbol_data.index[-1].date()
-                        last_close = symbol_data['Close'].iloc[-1]
+                        last_date   = symbol_data.index[-1].date()
+                        last_close  = symbol_data['Close'].iloc[-1]
                         last_volume = symbol_data['Volume'].iloc[-1]
                         
                         self.logger.info(f"  📊 Last trading day: {last_date}")
-                        if pd.isna(last_close):
-                            self.logger.warning(f"  💰 Last close: NaN (INVALID DATA)")
-                        else:
-                            self.logger.info(f"  💰 Last close: ${last_close:.2f}")
+                        self.logger.info(f"  💰 Last close: {'NaN' if pd.isna(last_close) else f'${last_close:.2f}'}")
+                        self.logger.info(f"  📈 Last volume: {'NaN' if pd.isna(last_volume) else f'{last_volume:,}'}")
                         
-                        if pd.isna(last_volume):
-                            self.logger.warning(f"  📈 Last volume: NaN (INVALID DATA)")
-                        else:
-                            self.logger.info(f"  📈 Last volume: {last_volume:,}")
-                        
-                        # Calculate age
                         days_diff = (target_date_obj - last_date).days
                         self.logger.info(f"  ⏱️  Age: {days_diff} days old")
                         
-                        # Check 1: Staleness
                         if days_diff > 5:
-                            self.logger.warning(
-                                f"  ❌ REJECTED: Data is {days_diff} days old (limit: 5 days)"
-                            )
+                            self.logger.warning(f"  ❌ REJECTED: Data is {days_diff} days old (limit: 5)")
                             continue
-                        else:
-                            self.logger.info(f"  ✅ PASS: Data age OK ({days_diff} <= 5 days)")
-                        
-                        # Check 2: NaN/Invalid data
                         if pd.isna(last_close) or pd.isna(last_volume):
-                            self.logger.warning(
-                                f"  ❌ REJECTED: Invalid data (NaN close or volume)"
-                            )
+                            self.logger.warning(f"  ❌ REJECTED: NaN close or volume")
                             continue
-                        else:
-                            self.logger.info(f"  ✅ PASS: Data validity OK (no NaN values)")
-                        
-                        # Check 3: Volume
                         if last_volume < self.min_volume:
-                            self.logger.warning(
-                                f"  ❌ REJECTED: Last volume {last_volume:,} < minimum {self.min_volume:,}"
-                            )
+                            self.logger.warning(f"  ❌ REJECTED: volume {last_volume:,} < {self.min_volume:,}")
                             continue
-                        else:
-                            self.logger.info(f"  ✅ PASS: Volume OK ({last_volume:,} >= {self.min_volume:,})")
                         
-                        # PASSED ALL CHECKS
+                        # ── Opportunistically fill OHLC from this validation fetch ──
+                        row = symbol_data.iloc[-1]
+                        for field, col in (('high', 'High'), ('low', 'Low'),
+                                           ('open', 'Open'), ('close', 'Close')):
+                            if candidate.get(field) is None and not pd.isna(row.get(col, float('nan'))):
+                                candidate[field] = float(row[col])
+                        
                         self.logger.info(f"  ✅✅ {symbol} PASSED ALL VALIDATION CHECKS")
                         valid_candidates.append(candidate)
                         
                     except Exception as e:
-                        self.logger.error(f"  ❌ {symbol}: Error during validation: {e}", exc_info=True)
+                        self.logger.error(f"  ❌ {symbol}: Error: {e}", exc_info=True)
                         continue
                 
-                # Delay between batches
                 if i + batch_size < len(symbols):
                     time.sleep(0.5)
                 
@@ -573,10 +633,10 @@ class DailyWinnersDetector:
                 continue
         
         self.logger.info("\n" + "=" * 80)
-        self.logger.info(f"📊 VALIDATION SUMMARY")
-        self.logger.info(f"  Total candidates: {len(candidates)}")
-        self.logger.info(f"  ✅ Passed: {len(valid_candidates)}")
-        self.logger.info(f"  ❌ Rejected: {len(candidates) - len(valid_candidates)}")
+        self.logger.info(f"📊 VALIDATION SUMMARY: "
+                         f"total={len(candidates)}, "
+                         f"passed={len(valid_candidates)}, "
+                         f"rejected={len(candidates)-len(valid_candidates)}")
         self.logger.info("=" * 80 + "\n")
         
         return valid_candidates
