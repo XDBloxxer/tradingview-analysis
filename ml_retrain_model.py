@@ -78,10 +78,11 @@ TABLE_WINNERS_OPEN     = "winners_day_prior_open"
 TABLE_NON_WINNERS_CLOSE = "non_winners_day_prior_close"
 TABLE_NON_WINNERS_OPEN  = "non_winners_day_prior_open"
 
-MODEL_DIR              = Path("ml_models")
-MODEL_PATH             = MODEL_DIR / "best_model.pkl"
-SCALER_PATH            = MODEL_DIR / "scaler.pkl"
-METADATA_PATH          = MODEL_DIR / "model_metadata.json"
+MODEL_DIR               = Path("ml_models")
+MODEL_PATH              = MODEL_DIR / "best_model.pkl"
+SCALER_PATH             = MODEL_DIR / "scaler.pkl"
+GAIN_REGRESSOR_PATH     = MODEL_DIR / "gain_regressor.pkl"
+METADATA_PATH           = MODEL_DIR / "model_metadata.json"
 FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 
 BASE_CSV_WEIGHT        = 1.5
@@ -496,6 +497,123 @@ def compute_feature_importance(
 
 
 # ---------------------------------------------------------------------------
+# Gain regressor
+# ---------------------------------------------------------------------------
+
+def train_gain_regressor(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    w_train: pd.Series,
+    combined_df: pd.DataFrame,
+    feature_names: list[str],
+) -> "Optional[XGBClassifier]":
+    """
+    Train a regression model to predict actual % gain for stocks the
+    classifier labels as winners.
+
+    WHY A SEPARATE REGRESSOR:
+      The classifier only outputs a probability (0–1). The gain regressor
+      takes the same features and predicts the actual % gain, so the predictor
+      can show realistic price targets instead of rigid rule-based estimates.
+
+    TRAINING DATA:
+      Only rows where label=1 (actual winners) are used — we can only measure
+      gain for stocks that actually exploded. Non-winners have gain=0 or
+      undefined, which would teach the regressor the wrong thing.
+
+    TARGET:
+      actual_gain_pct (% change from prior close to intraday high on explosion day).
+      Falls back to change_pct if actual_gain_pct is not in combined_df.
+
+    Returns:
+        Trained XGBRegressor, or None if not enough winner rows to train on.
+    """
+    from xgboost import XGBRegressor
+
+    # Find gain column — prefer actual_gain_pct, fall back to change_pct
+    gain_col = None
+    for candidate in ("actual_gain_pct", "change_pct"):
+        if candidate in combined_df.columns:
+            gain_col = candidate
+            break
+
+    if gain_col is None:
+        logger.warning("No gain column found (actual_gain_pct / change_pct) — "
+                       "skipping gain regressor training.")
+        return None
+
+    # Restrict to winner rows that have a real gain value
+    winner_mask  = (combined_df["label"] == 1) & combined_df[gain_col].notna()
+    n_winners    = int(winner_mask.sum())
+
+    if n_winners < 30:
+        logger.warning(f"Only {n_winners} winner rows with gain data — "
+                       "need ≥30 to train gain regressor. Skipping.")
+        return None
+
+    logger.info(f"\n── Training gain regressor on {n_winners} winner rows ──")
+
+    # Build aligned feature / target arrays using the same index as combined_df
+    X_reg = pd.DataFrame(index=combined_df.index, columns=feature_names)
+    for col in feature_names:
+        if col in combined_df.columns:
+            X_reg[col] = combined_df[col]
+    X_reg = X_reg.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+
+    y_reg = pd.to_numeric(combined_df[gain_col], errors="coerce")
+    w_reg = combined_df["sample_weight"].astype(float) \
+            if "sample_weight" in combined_df.columns \
+            else pd.Series(1.0, index=combined_df.index)
+
+    # Filter to winner rows
+    X_reg  = X_reg[winner_mask]
+    y_reg  = y_reg[winner_mask]
+    w_reg  = w_reg[winner_mask]
+
+    # Scale using the same column-mean fill approach as the classifier
+    col_means  = X_reg.mean()
+    X_reg_fill = X_reg.fillna(col_means)
+
+    from sklearn.model_selection import train_test_split
+    if len(X_reg) >= 10:
+        X_tr, X_va, y_tr, y_va, w_tr, _ = train_test_split(
+            X_reg_fill, y_reg, w_reg,
+            test_size=0.2, random_state=42,
+        )
+    else:
+        X_tr, X_va, y_tr, y_va, w_tr = X_reg_fill, X_reg_fill, y_reg, y_reg, w_reg
+
+    regressor = XGBRegressor(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=3,
+        objective="reg:squarederror",
+        eval_metric="rmse",
+        random_state=42,
+        n_jobs=-1,
+        early_stopping_rounds=20,
+    )
+    regressor.fit(
+        X_tr, y_tr,
+        sample_weight=w_tr.values,
+        eval_set=[(X_va, y_va)],
+        verbose=False,
+    )
+
+    val_pred = regressor.predict(X_va)
+    from sklearn.metrics import mean_absolute_error, r2_score
+    mae = mean_absolute_error(y_va, val_pred)
+    r2  = r2_score(y_va, val_pred) if len(y_va) > 1 else float("nan")
+    logger.info(f"  Gain regressor — val MAE: {mae:.2f}%  R²: {r2:.3f}")
+    logger.info(f"  Predicted gains range: {val_pred.min():.1f}% – {val_pred.max():.1f}%")
+
+    return regressor
+
+
+# ---------------------------------------------------------------------------
 # Save outputs
 # ---------------------------------------------------------------------------
 
@@ -505,31 +623,36 @@ def save_outputs(
     fi_df: pd.DataFrame,
     feature_names: list[str],
     training_stats: dict,
+    gain_regressor=None,
 ) -> None:
-    """Save model, scaler, feature importance, and metadata."""
+    """Save model, scaler, gain regressor, feature importance, and metadata."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Use joblib for both model and scaler (consistent, handles large arrays well)
     joblib.dump(model,  MODEL_PATH,  protocol=4)
     logger.info(f"Saved model  → {MODEL_PATH}")
 
     joblib.dump(scaler, SCALER_PATH, protocol=4)
     logger.info(f"Saved scaler → {SCALER_PATH}")
 
+    if gain_regressor is not None:
+        joblib.dump(gain_regressor, GAIN_REGRESSOR_PATH, protocol=4)
+        logger.info(f"Saved gain regressor → {GAIN_REGRESSOR_PATH}")
+    else:
+        logger.info("Gain regressor not trained this run — predictor will use rule-based gains")
+
     fi_df.to_csv(FEATURE_IMPORTANCE_PATH, index=False)
     logger.info(f"Saved feature importance → {FEATURE_IMPORTANCE_PATH}")
 
-    # Write full feature list under "features" key so explosion_predictor can load it.
-    # Also keep "feature_names_sample" for human inspection.
     metadata = {
         "trained_at":            datetime.now(timezone.utc).isoformat(),
         "source":                "ml_retrain_model.py",
         "training_approach":     "full_retrain_from_scratch",
         "n_features":            len(feature_names),
-        "features":              feature_names,           # FULL list — read by explosion_predictor
-        "feature_names_sample":  feature_names[:20],      # human-readable preview
+        "features":              feature_names,
+        "feature_names_sample":  feature_names[:20],
         "best_iteration":        int(model.best_iteration),
         "best_val_logloss":      float(model.best_score),
+        "gain_regressor_trained": gain_regressor is not None,
         **training_stats,
     }
     with open(METADATA_PATH, "w") as f:
@@ -606,7 +729,15 @@ def main() -> int:
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
+    # ── Train gain regressor ───────────────────────────────────────────────────
+    logger.info("\n" + "=" * 60)
+    logger.info("GAIN REGRESSOR TRAINING")
+    logger.info("=" * 60)
+    gain_regressor = train_gain_regressor(
+        X_train, y_train, w_train, combined_df, feature_names
+    )
+
+    # ── Evaluate classifier ───────────────────────────────────────────────────
     from sklearn.metrics import roc_auc_score, classification_report
 
     val_proba = model.predict_proba(X_val)[:, 1]
@@ -635,10 +766,11 @@ def main() -> int:
             len(t1_df) >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
             if not t1_df.empty else False
         ),
+        "gain_regressor_trained": gain_regressor is not None,
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    save_outputs(model, scaler, fi_df, feature_names, training_stats)
+    save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("")
@@ -653,10 +785,13 @@ def main() -> int:
     logger.info(f"  Validation AUC   : {auc:.4f}")
     logger.info(f"  Best iteration   : {model.best_iteration}")
     logger.info(f"  Features         : {len(feature_names)}")
+    logger.info(f"  Gain regressor   : {'✓ trained' if gain_regressor else '— skipped (not enough winner gain data)'}")
     logger.info("")
     logger.info("Files written:")
     logger.info(f"  {MODEL_PATH}")
     logger.info(f"  {SCALER_PATH}")
+    if gain_regressor is not None:
+        logger.info(f"  {GAIN_REGRESSOR_PATH}")
     logger.info(f"  {METADATA_PATH}")
     logger.info(f"  {FEATURE_IMPORTANCE_PATH}")
 
