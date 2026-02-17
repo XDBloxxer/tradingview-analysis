@@ -39,6 +39,30 @@ def setup_logging(verbose: bool = False):
     return logging.getLogger(__name__)
 
 
+def get_next_trading_day() -> str:
+    """
+    Get the next NYSE trading day that this prediction is FOR.
+
+    The workflow runs at 3 AM UTC = 10 PM EST (previous calendar day).
+    Predictions made overnight are for the NEXT trading session,
+    so we need tomorrow's date in EST.
+
+    Returns:
+        ISO date string (YYYY-MM-DD) of the next trading day
+    """
+    est = pytz.timezone('America/New_York')
+    now_est = datetime.now(est)
+
+    # Since we run at ~10 PM EST, add 1 day to get the trading day we're predicting for
+    prediction_day = now_est + timedelta(days=1)
+
+    # Skip weekends (Saturday=5, Sunday=6)
+    while prediction_day.weekday() >= 5:
+        prediction_day += timedelta(days=1)
+
+    return prediction_day.date().isoformat()
+
+
 class SmartScreener:
     """Intelligent screener that learns optimal filters over time"""
     
@@ -119,11 +143,6 @@ class SmartScreener:
                     'right': self.filters['min_volume_ratio']
                 })
             
-            # Trend filter - REMOVED
-            # TradingView API doesn't support field-to-field comparisons (e.g., close > EMA20)
-            # The 'right' parameter only accepts numeric values, not field names
-            # Trend filtering would need to be done post-screening if needed
-            
             self.logger.info(f"Applying {len(filters)} filters")
             for f in filters:
                 self.logger.debug(f"  Filter: {f}")
@@ -201,13 +220,9 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
         # ========================================
         # PART 2: 5-MINUTE INTRADAY DATA (T-1)
         # ========================================
-        # Fetch 60 days of 5-minute bars to get enough history for indicators
         df_intraday = ticker.history(period='60d', interval='5m')
         
         if df_intraday.empty or len(df_intraday) < 200:
-            # CRITICAL FIX: No fallback to daily data!
-            # Using daily data creates train/test distribution mismatch
-            # Training uses 5-min T-1 indicators, so predictions must too
             logger.debug(f"{symbol}: Insufficient intraday data for T-1 - SKIPPING STOCK")
             logger.debug(f"  Reason: Need 5-min data to match training distribution")
             logger.debug(f"  Available 5-min bars: {len(df_intraday) if not df_intraday.empty else 0}")
@@ -227,8 +242,7 @@ def fetch_stock_data_for_prediction(symbol: str, logger: logging.Logger) -> dict
             else:
                 df_indicators_intraday.index = df_indicators_intraday.index.tz_convert('America/New_York')
             
-            # Get yesterday's date (T-1)
-            from datetime import datetime, time as dt_time
+            # Get yesterday's date (T-1) - most recent trading day in the daily data
             yesterday = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
             
             # Extract T-1 CLOSE (4:00 PM yesterday)
@@ -310,20 +324,7 @@ def extract_intraday_snapshot(
     logger,
     symbol: str
 ) -> dict:
-    """
-    Extract indicators from 5-MINUTE intraday data at specific time
-    
-    Args:
-        df_intraday: DataFrame with 5-min bars and indicators
-        target_date: Target date (date object)
-        target_time: Target time (time object, e.g., time(16, 0) for 4pm)
-        prefix: Feature prefix (e.g., 't1_close', 't1_open')
-        logger: Logger
-        symbol: Stock symbol
-        
-    Returns:
-        Dictionary with prefixed features
-    """
+    """Extract indicators from 5-MINUTE intraday data at specific time"""
     
     # Filter to target date
     day_bars = df_intraday[df_intraday.index.date == target_date]
@@ -333,7 +334,6 @@ def extract_intraday_snapshot(
         return {}
     
     # Find bars within 30-minute window of target time
-    from datetime import datetime, timedelta
     window_start = (datetime.combine(target_date, target_time) - timedelta(minutes=5)).time()
     window_end = (datetime.combine(target_date, target_time) + timedelta(minutes=30)).time()
     
@@ -343,7 +343,6 @@ def extract_intraday_snapshot(
     ]
     
     if target_bars.empty:
-        # Fallback: get closest bar from the day
         target_bars = day_bars
         logger.debug(f"{symbol}: No bars near {target_time}, using closest available")
     
@@ -367,92 +366,67 @@ def extract_intraday_snapshot(
 
 
 def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate indicators on DAILY bars
-    This should match what was in your CSV training data
-    """
+    """Calculate indicators on DAILY bars"""
     import ta
     
     result = pd.DataFrame(index=df.index)
     
-    # Basic OHLCV (matching CSV names exactly)
     result['Close'] = df['Close']
     result['Open'] = df['Open']
     result['High'] = df['High']
     result['Low'] = df['Low']
     result['Volume'] = df['Volume']
     
-    # SMAs
     for period in [5, 10, 20, 50]:
         try:
             result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # EMAs
     for period in [5, 10, 12, 20, 26, 50]:
         try:
             result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # WMAs
     try:
         result['WMA_10'] = ta.trend.wma_indicator(df['Close'], window=10)
         result['WMA_20'] = ta.trend.wma_indicator(df['Close'], window=20)
-    except:
-        pass
+    except: pass
     
-    # HMA
     try:
         result['HMA_9'] = ta.trend.wma_indicator(df['Close'], window=9)
         result['HMA_20'] = ta.trend.wma_indicator(df['Close'], window=20)
-    except:
-        pass
+    except: pass
     
-    # VWMA
     try:
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         result['VWMA_20'] = (typical_price * df['Volume']).rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
-    except:
-        pass
+    except: pass
     
-    # Price vs MAs
     try:
         result['Price_vs_SMA20'] = (df['Close'] / result['SMA_20'] - 1) * 100
         result['Price_vs_SMA50'] = (df['Close'] / result['SMA_50'] - 1) * 100
         result['Price_vs_EMA20'] = (df['Close'] / result['EMA_20'] - 1) * 100
-    except:
-        pass
+    except: pass
     
-    # MA differences
     try:
         result['SMA_20_50_Diff'] = result['SMA_20'] - result['SMA_50']
         result['EMA_12_26_Diff'] = result['EMA_12'] - result['EMA_26']
-    except:
-        pass
+    except: pass
     
-    # MA slopes
     try:
         result['SMA_20_Slope'] = result['SMA_20'].diff(5)
         result['EMA_20_Slope'] = result['EMA_20'].diff(5)
-    except:
-        pass
+    except: pass
     
-    # RSI variants
     for period in [7, 14, 21, 28]:
         try:
             result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # RSI slope
     try:
         result['RSI_14_Slope'] = result['RSI_14'].diff(3)
-    except:
-        pass
+    except: pass
     
-    # Stochastic
     try:
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
         result['STOCHk_14_3_3'] = stoch.stoch()
@@ -463,61 +437,44 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         result['STOCHk_5_3_1'] = stoch_fast.stoch()
         result['STOCHd_5_3_1'] = stoch_fast.stoch_signal()
         result['STOCHh_5_3_1'] = result['STOCHk_5_3_1'] - result['STOCHd_5_3_1']
-    except:
-        pass
+    except: pass
     
-    # Stochastic RSI
     try:
         stoch_rsi = ta.momentum.StochRSIIndicator(df['Close'], window=14, smooth1=3, smooth2=3)
         result['STOCHRSIk_14_14_3_3'] = stoch_rsi.stochrsi_k()
         result['STOCHRSId_14_14_3_3'] = stoch_rsi.stochrsi_d()
-    except:
-        pass
+    except: pass
     
-    # Williams %R
     try:
         result['WILLR_14'] = ta.momentum.williams_r(df['High'], df['Low'], df['Close'], lbp=14)
-    except:
-        pass
+    except: pass
     
-    # CCI
     for period in [14, 20]:
         try:
             result[f'CCI_{period}'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # Ultimate Oscillator
     try:
         result['UO'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
-    except:
-        pass
+    except: pass
     
-    # Awesome Oscillator
     try:
         result['AO'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
-    except:
-        pass
+    except: pass
     
-    # MACD variants
     try:
         macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
         result['MACD_12_26_9'] = macd.macd()
         result['MACDh_12_26_9'] = macd.macd_diff()
         result['MACDs_12_26_9'] = macd.macd_signal()
-        
-        # MACD ROC
         result['MACD_ROC'] = result['MACD_12_26_9'].pct_change(5) * 100
         
-        # Fast MACD
         macd_fast = ta.trend.MACD(df['Close'], window_slow=12, window_fast=6, window_sign=5)
         result['MACD_Fast'] = macd_fast.macd()
         result['MACDh_Fast'] = macd_fast.macd_diff()
         result['MACDs_Fast'] = macd_fast.macd_signal()
-    except:
-        pass
+    except: pass
     
-    # Bollinger Bands
     try:
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         result['BBL_20_2.0_2.0'] = bb.bollinger_lband()
@@ -525,216 +482,157 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         result['BBU_20_2.0_2.0'] = bb.bollinger_hband()
         result['BBB_20_2.0_2.0'] = bb.bollinger_wband()
         result['BBP_20_2.0_2.0'] = bb.bollinger_pband()
-    except:
-        pass
+    except: pass
     
-    # Keltner Channel
     try:
         keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
         result['KCLe_20_2'] = keltner.keltner_channel_lband()
         result['KCBe_20_2'] = keltner.keltner_channel_mband()
         result['KCUe_20_2'] = keltner.keltner_channel_hband()
-    except:
-        pass
+    except: pass
     
-    # Donchian Channel
     try:
         donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
         result['DCL_20_20'] = donchian.donchian_channel_lband()
         result['DCM_20_20'] = donchian.donchian_channel_mband()
         result['DCU_20_20'] = donchian.donchian_channel_hband()
-    except:
-        pass
+    except: pass
     
-    # ATR
     for period in [7, 14, 20]:
         try:
             result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # ATR slope
     try:
         result['ATR_14_Slope'] = result['ATR_14'].diff(5)
-    except:
-        pass
+    except: pass
     
-    # Historical Volatility
     for period in [10, 20, 30]:
         try:
             result[f'HV_{period}'] = df['Close'].pct_change().rolling(window=period).std() * 100
-        except:
-            pass
+        except: pass
     
-    # Volume indicators
     try:
         result['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         result['OBV_SMA20'] = result['OBV'].rolling(window=20).mean()
-    except:
-        pass
+    except: pass
     
-    # Volume MAs
     for period in [5, 10, 20]:
         try:
             result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
-        except:
-            pass
+        except: pass
     
     try:
         result['Volume_Ratio'] = df['Volume'] / result['Volume_MA20']
-    except:
-        pass
+    except: pass
     
-    # ADX
     try:
         adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'], window=14)
         result['ADX_14'] = adx.adx()
-        result['ADXR_14_2'] = adx.adx()  # Simplified
+        result['ADXR_14_2'] = adx.adx()
         result['DMP_14'] = adx.adx_pos()
         result['DMN_14'] = adx.adx_neg()
-    except:
-        pass
+    except: pass
     
-    # Aroon
     try:
         aroon = ta.trend.AroonIndicator(df['Close'], window=25)
         result['AROONU_25'] = aroon.aroon_up()
         result['AROOND_25'] = aroon.aroon_down()
         result['AROONOSC_25'] = aroon.aroon_indicator()
-    except:
-        pass
+    except: pass
     
-    # SuperTrend (simplified)
     try:
-        result['SUPERT_10_3'] = df['Close']  # Placeholder
+        result['SUPERT_10_3'] = df['Close']
         result['SUPERTd_10_3'] = 0
         result['SUPERTl_10_3'] = df['Low']
         result['SUPERTs_10_3'] = 1
-    except:
-        pass
+    except: pass
     
-    # VWAP
     try:
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         result['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
-    except:
-        pass
+    except: pass
     
-    # MFI
     try:
         result['MFI_14'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
-    except:
-        pass
+    except: pass
     
-    # CMF
     try:
         result['CMF_20'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20)
-    except:
-        pass
+    except: pass
     
-    # ROC
     for period in [10, 20]:
         try:
             result[f'ROC_{period}'] = ta.momentum.roc(df['Close'], window=period)
-        except:
-            pass
+        except: pass
     
-    # Momentum
     for period in [10, 20]:
         try:
             result[f'MOM_{period}'] = df['Close'].diff(period)
-        except:
-            pass
+        except: pass
     
-    # TSI
     try:
         tsi = ta.momentum.TSIIndicator(df['Close'], window_slow=25, window_fast=13)
         result['TSI_13_25_13'] = tsi.tsi()
-        result['TSIs_13_25_13'] = tsi.tsi()  # Simplified
-    except:
-        pass
+        result['TSIs_13_25_13'] = tsi.tsi()
+    except: pass
     
-    # Gap
     try:
         result['Gap_Pct'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
-    except:
-        pass
+    except: pass
     
     return result
 
 
 def calculate_comprehensive_indicators_intraday(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate indicators on 5-MINUTE intraday bars
-    Same indicators as daily, but calculated on intraday frequency
-    
-    Note: On 5-min bars, periods have different meanings:
-    - 14-period RSI = 70 minutes (not 14 days)
-    - 200-period SMA = ~17 trading hours on 5-min data
-    """
+    """Calculate indicators on 5-MINUTE intraday bars"""
     import ta
     
     result = pd.DataFrame(index=df.index)
     
-    # Just reuse the same calculation logic as daily
-    # The indicators adapt to whatever frequency you give them
     result['Close'] = df['Close']
     result['Open'] = df['Open']
     result['High'] = df['High']
     result['Low'] = df['Low']
     result['Volume'] = df['Volume']
     
-    # Use same indicator logic as daily version
-    # Copy all the indicator calculations from calculate_comprehensive_indicators_daily
-    # (They work on any timeframe)
-    
     try:
         for period in [5, 10, 20, 50]:
             result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
-    except:
-        pass
+    except: pass
     
     try:
         for period in [5, 10, 12, 20, 26, 50]:
             result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
-    except:
-        pass
+    except: pass
     
     try:
         for period in [7, 14, 21, 28]:
             result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
-    except:
-        pass
+    except: pass
     
     try:
         macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
         result['MACD_12_26_9'] = macd.macd()
         result['MACDh_12_26_9'] = macd.macd_diff()
         result['MACDs_12_26_9'] = macd.macd_signal()
-    except:
-        pass
+    except: pass
     
     try:
         for period in [7, 14, 20]:
             result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
-    except:
-        pass
+    except: pass
     
     try:
         result['OBV'] = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         result['OBV_SMA20'] = result['OBV'].rolling(window=20).mean()
-    except:
-        pass
+    except: pass
     
     try:
         for period in [5, 10, 20]:
             result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
         result['Volume_Ratio'] = df['Volume'] / result['Volume_MA20']
-    except:
-        pass
-    
-    # Add all other indicators following the same pattern...
-    # For brevity, I'm showing the key ones. Add the rest from daily version.
+    except: pass
     
     return result
 
@@ -748,9 +646,17 @@ def main():
     args = parser.parse_args()
     logger = setup_logging(args.verbose)
     
+    # ========================================
+    # DETERMINE PREDICTION DATE
+    # ========================================
+    # We run at ~3 AM UTC = ~10 PM EST (previous calendar day)
+    # Predictions are FOR the next trading session, so stamp with that date
+    prediction_date = get_next_trading_day()
+    
     logger.info("="*80)
     logger.info("ML SCREENING & PREDICTION - FIXED VERSION")
     logger.info("="*80)
+    logger.info(f"Prediction date (trading session): {prediction_date}")
     logger.info("Using DAILY charts to fetch T-3, T-5, T-10 with prefixes")
     logger.info("="*80)
     
@@ -785,7 +691,7 @@ def main():
         logger.error("No symbol column")
         return 1
     
-    # STEP 2: FETCH STOCK DATA (T-3, T-5, T-10 WITH PREFIXES)
+    # STEP 2: FETCH STOCK DATA
     logger.info("\n" + "="*80)
     logger.info("STEP 2: FETCH STOCK DATA (T-3, T-5, T-10 FROM DAILY CHARTS)")
     logger.info("="*80)
@@ -814,7 +720,7 @@ def main():
     
     # STEP 3: PREPARE FEATURES
     logger.info("\n" + "="*80)
-    logger.info("STEP 3: PREPARE FEATURES (WITH T3, T5, T10 PREFIXES)")
+    logger.info("STEP 3: PREPARE FEATURES")
     logger.info("="*80)
     
     features_df = pd.DataFrame(enriched_stocks)
@@ -843,14 +749,13 @@ def main():
     
     top_predictions = predictions_df.head(args.top_n)
     
-    logger.info(f"\nTop {min(20, len(top_predictions))} Predictions:")
+    logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
     logger.info("-" * 100)
     logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8}")
     logger.info("-" * 100)
     
     for idx, row in top_predictions.head(20).iterrows():
         current_price = row.get('current_price', 0)
-        
         logger.info(
             f"{idx+1:<4} {row['symbol']:<8} {row['signal']:<13} "
             f"{row['explosion_probability']*100:>6.2f}%  "
@@ -864,7 +769,6 @@ def main():
     logger.info("STEP 6: STORE PREDICTIONS")
     logger.info("="*80)
     
-    prediction_date = datetime.now().date().isoformat()
     predictions_list = []
     
     for _, row in top_predictions.iterrows():
@@ -873,7 +777,7 @@ def main():
         prediction_record = {
             'symbol': row['symbol'],
             'exchange': row.get('exchange', 'NASDAQ'),
-            'prediction_date': prediction_date,
+            'prediction_date': prediction_date,  # Correct: date of trading session
             'explosion_probability': float(row['explosion_probability']),
             'prediction': int(row['prediction']),
             'signal': row['signal'],
@@ -890,7 +794,7 @@ def main():
     
     if predictions_list:
         count = supabase.write_predictions(predictions_list)
-        logger.info(f"✓ Wrote {count} predictions")
+        logger.info(f"✓ Wrote {count} predictions for trading session: {prediction_date}")
     
     # STEP 7: LOG STATISTICS
     screening_log = {
@@ -916,7 +820,7 @@ def main():
     logger.info("\n" + "="*80)
     logger.info("✓ PREDICTION COMPLETE")
     logger.info("="*80)
-    logger.info(f"Predictions for: {prediction_date}")
+    logger.info(f"Predictions for trading session: {prediction_date}")
     logger.info(f"Model type: CSV-trained (T-3, T-5, T-10 with prefixes)")
     
     return 0
