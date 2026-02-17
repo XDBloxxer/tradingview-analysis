@@ -418,9 +418,9 @@ def train_model(
         logger.info(f"  scale_pos_weight set to {params['scale_pos_weight']:.3f} "
                     f"(neg={n_neg} / pos={n_pos})")
 
-    model = XGBClassifier(
-        **{k: v for k, v in params.items() if k != "early_stopping_rounds"}
-    )
+    early_stopping = params.pop("early_stopping_rounds", 30)
+
+    model = XGBClassifier(**params, early_stopping_rounds=early_stopping)
 
     logger.info("Training XGBoost model from scratch...")
     logger.info(f"  Train: {len(X_train)} rows")
@@ -431,7 +431,6 @@ def train_model(
         y_train,
         sample_weight=w_train.values,
         eval_set=[(X_val, y_val)],
-        early_stopping_rounds=XGBOOST_PARAMS.get("early_stopping_rounds", 30),
         verbose=False,
     )
 
