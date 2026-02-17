@@ -7,13 +7,12 @@ Replaces the previous fine-tuning approach with a complete retrain every week.
 DATA SOURCES (combined into one training dataset):
   1. ml_training_base    — original CSV data pivoted to wide format, both classes
                            Feature prefixes: t3_, t5_, t10_ only
-                           (same_day excluded = leakage; day_before excluded = t1
-                            comes from Supabase daily tables instead)
-                           Uploaded once via upload_base_training_data.py
   2. winners_day_prior_close / winners_day_prior_open
                          — accumulating T-1 winner samples from daily runs (label=1)
   3. non_winners_day_prior_close / non_winners_day_prior_open
                          — accumulating T-1 non-winner samples from daily runs (label=0)
+  4. ml_mistake_learner  — high-weight samples from the model's own past errors
+                           (false positives: weight 3x, false negatives: weight 2x)
 
 NOTE ON CLASS BALANCE:
   ml_training_base contains ONLY winners (label=1). Non-winners (label=0) come
@@ -26,8 +25,6 @@ WHY FULL RETRAIN (not fine-tuning):
   - Fine-tuning with dummy-default T-3/T-7/T-14 values was corrupting new trees
   - NaN for genuinely missing columns is correct; XGBoost handles it natively
   - feature_importance.csv is regenerated each run — always accurate and current
-  - Sample weights: base CSV rows weighted 1.5x initially (tapers automatically
-    once T-1 data reaches >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT)
 
 OUTPUTS (same paths as before, drop-in compatible with ml_weekly_retrain.yml):
   ml_models/best_model.pkl
@@ -39,11 +36,11 @@ OUTPUTS (same paths as before, drop-in compatible with ml_weekly_retrain.yml):
 import json
 import logging
 import os
-import pickle
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
@@ -56,64 +53,69 @@ try:
     T1_MAP_AVAILABLE = True
 except ImportError:
     T1_MAP_AVAILABLE = False
-    logger_tmp = logging.getLogger(__name__)
-    logger_tmp.warning(
+    logging.getLogger(__name__).warning(
         "t1_column_map.py not found — T-1 features will not be renamed. "
         "Place t1_column_map.py alongside ml_retrain_model.py."
+    )
+
+# Mistake learner — high-signal training samples from past prediction errors
+try:
+    from ml_mistake_learner import build_mistake_training_samples, log_mistake_summary
+    MISTAKE_LEARNER_AVAILABLE = True
+except ImportError:
+    MISTAKE_LEARNER_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "ml_mistake_learner.py not found — mistake-learning step will be skipped."
     )
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Supabase table names
-TABLE_BASE = "ml_training_base"
-TABLE_WINNERS_CLOSE = "winners_day_prior_close"
-TABLE_WINNERS_OPEN = "winners_day_prior_open"
+TABLE_BASE             = "ml_training_base"
+TABLE_WINNERS_CLOSE    = "winners_day_prior_close"
+TABLE_WINNERS_OPEN     = "winners_day_prior_open"
 TABLE_NON_WINNERS_CLOSE = "non_winners_day_prior_close"
-TABLE_NON_WINNERS_OPEN = "non_winners_day_prior_open"
+TABLE_NON_WINNERS_OPEN  = "non_winners_day_prior_open"
 
-# Output paths (relative to repo root)
-MODEL_DIR = Path("ml_models")
-MODEL_PATH = MODEL_DIR / "best_model.pkl"
-SCALER_PATH = MODEL_DIR / "scaler.pkl"
-METADATA_PATH = MODEL_DIR / "model_metadata.json"
+MODEL_DIR              = Path("ml_models")
+MODEL_PATH             = MODEL_DIR / "best_model.pkl"
+SCALER_PATH            = MODEL_DIR / "scaler.pkl"
+METADATA_PATH          = MODEL_DIR / "model_metadata.json"
 FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 
-# Sample weighting
-BASE_CSV_WEIGHT = 1.5       # Weight for original CSV rows
-T1_WEIGHT = 1.0             # Weight for accumulated T-1 rows
-# Once T-1 data reaches this many rows, switch to equal weighting (1.0 / 1.0)
+BASE_CSV_WEIGHT        = 1.5
+T1_WEIGHT              = 1.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
-# XGBoost hyperparameters (keep same as original training unless you tune)
 XGBOOST_PARAMS = {
-    "n_estimators": 300,
-    "max_depth": 6,
-    "learning_rate": 0.05,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "min_child_weight": 3,
-    "gamma": 0.1,
-    "reg_alpha": 0.1,
-    "reg_lambda": 1.0,
-    "scale_pos_weight": 1,   # Will be overridden by sample_weight
-    "objective": "binary:logistic",
-    "eval_metric": "logloss",
-    "use_label_encoder": False,
-    "random_state": 42,
-    "n_jobs": -1,
+    "n_estimators":       300,
+    "max_depth":          6,
+    "learning_rate":      0.05,
+    "subsample":          0.8,
+    "colsample_bytree":   0.8,
+    "min_child_weight":   3,
+    "gamma":              0.1,
+    "reg_alpha":          0.1,
+    "reg_lambda":         1.0,
+    "scale_pos_weight":   1,   # overridden at train time
+    "objective":          "binary:logistic",
+    "eval_metric":        "logloss",
+    "use_label_encoder":  False,
+    "random_state":       42,
+    "n_jobs":             -1,
     "early_stopping_rounds": 30,
 }
 
-# Columns to exclude from feature matrix (metadata / label columns)
+# Columns excluded from the feature matrix X.
+# "mistake_type" must be here — it's a string column added by ml_mistake_learner
+# that would otherwise be coerced to NaN silently by pd.to_numeric.
 NON_FEATURE_COLS = {
     "id", "created_at", "updated_at", "date", "symbol", "ticker",
     "label", "source", "sample_weight", "detection_date", "explosion_date",
-    "change_pct", "rank", "notes",
+    "change_pct", "rank", "notes", "mistake_type",
 }
 
-# Columns that are T-1 specific (not present in base CSV)
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
 
 
@@ -142,7 +144,7 @@ def get_supabase_client() -> Client:
 
 def fetch_table_paginated(client: Client, table: str, page_size: int = 1000) -> pd.DataFrame:
     """Fetch all rows from a Supabase table using pagination."""
-    rows = []
+    rows   = []
     offset = 0
     while True:
         resp = (
@@ -177,12 +179,10 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
         )
         sys.exit(1)
 
-    # Ensure label column exists
     if "label" not in df.columns:
         logger.error(f"'{TABLE_BASE}' has no 'label' column.")
         sys.exit(1)
 
-    # Preserve sample_weight if present, otherwise assign default
     if "sample_weight" not in df.columns:
         df["sample_weight"] = BASE_CSV_WEIGHT
     df["source"] = df.get("source", "base_csv")
@@ -193,7 +193,7 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
     return df
 
 
-def load_t1_data(client):
+def load_t1_data(client: Client) -> pd.DataFrame:
     """
     Load accumulated T-1 winner and non-winner samples.
 
@@ -204,29 +204,13 @@ def load_t1_data(client):
     close tables → prefix "t1_close"
     open  tables → prefix "t1_open"
     """
-    import pandas as pd
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # These constants / helpers come from ml_retrain_model.py module scope
-    from ml_retrain_model import (
-        TABLE_WINNERS_CLOSE, TABLE_WINNERS_OPEN,
-        TABLE_NON_WINNERS_CLOSE, TABLE_NON_WINNERS_OPEN,
-        T1_WEIGHT, T1_MAP_AVAILABLE,
-        fetch_table_paginated,
-    )
-    try:
-        from t1_column_map import rename_t1_columns
-    except ImportError:
-        rename_t1_columns = None
-
     logger.info("Loading accumulated T-1 training data...")
 
     TABLE_CONFIG = [
-        (TABLE_WINNERS_CLOSE,     1, "t1_close"),
-        (TABLE_WINNERS_OPEN,      1, "t1_open"),
-        (TABLE_NON_WINNERS_CLOSE, 0, "t1_close"),
-        (TABLE_NON_WINNERS_OPEN,  0, "t1_open"),
+        (TABLE_WINNERS_CLOSE,      1, "t1_close"),
+        (TABLE_WINNERS_OPEN,       1, "t1_open"),
+        (TABLE_NON_WINNERS_CLOSE,  0, "t1_close"),
+        (TABLE_NON_WINNERS_OPEN,   0, "t1_open"),
     ]
 
     frames = []
@@ -237,19 +221,19 @@ def load_t1_data(client):
             if df.empty:
                 continue
 
-            df["label"] = label
+            df["label"]  = label
             df["source"] = table
 
-            if T1_MAP_AVAILABLE and rename_t1_columns is not None:
+            if T1_MAP_AVAILABLE:
                 before = len(df.columns)
-                df = rename_t1_columns(df, prefix=prefix)
-                after = len([c for c in df.columns if c.startswith(prefix)])
+                df     = rename_t1_columns(df, prefix=prefix)
+                after  = len([c for c in df.columns if c.startswith(prefix)])
                 logger.info(
                     f"  {table}: renamed {after} feature columns "
                     f"(had {before}, kept metadata + {after} features)"
                 )
 
-                # ── GUARD: drop any duplicate column names that slipped through ──
+                # Belt-and-suspenders: drop any surviving duplicate column names
                 dupes = df.columns[df.columns.duplicated()].tolist()
                 if dupes:
                     logger.warning(
@@ -257,8 +241,6 @@ def load_t1_data(client):
                         f"after rename: {dupes[:10]}"
                     )
                     df = df.loc[:, ~df.columns.duplicated(keep="first")]
-                # ─────────────────────────────────────────────────────────────────
-
             else:
                 logger.warning(
                     f"  {table}: column map unavailable — "
@@ -288,6 +270,7 @@ def load_t1_data(client):
 
     return combined
 
+
 # ---------------------------------------------------------------------------
 # Data preparation
 # ---------------------------------------------------------------------------
@@ -299,15 +282,13 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     Columns present only in base → NaN in T-1 rows (XGBoost handles natively)
     Columns present only in T-1  → NaN in base rows (XGBoost handles natively)
 
-    This is intentional and correct. NaN tells the model "this feature was
-    genuinely not observed for this sample", which is different from a dummy
-    value of 0.0 or 50.0 that implies a specific measurement.
+    NOTE: mistake samples should be added AFTER this function returns,
+    so their custom sample_weights (3.0 / 2.0) are not overwritten here.
     """
     if t1_df.empty:
         logger.info("Combining: base data only (no T-1 data yet)")
         return base_df.copy()
 
-    # Adjust sample weights based on T-1 data volume
     t1_count = len(t1_df)
     if t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT:
         logger.info(
@@ -359,24 +340,23 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
         y: Series of labels (0/1)
         w: Series of sample weights
     """
-    # Extract labels and weights before dropping non-feature cols
     y = df["label"].astype(int)
-    w = df["sample_weight"].astype(float) if "sample_weight" in df.columns else pd.Series(1.0, index=df.index)
+    w = (
+        df["sample_weight"].astype(float)
+        if "sample_weight" in df.columns
+        else pd.Series(1.0, index=df.index)
+    )
 
-    # Build feature columns: exclude all metadata/label/source columns
     feature_cols = [
         c for c in df.columns
-        if c not in NON_FEATURE_COLS
-        and not c.startswith("Unnamed")
+        if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
     ]
 
     X = df[feature_cols].copy()
 
-    # Convert all feature columns to numeric; non-numeric → NaN
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    # Replace inf values with NaN (XGBoost handles NaN, not inf)
     X = X.replace([np.inf, -np.inf], np.nan)
 
     logger.info(f"Feature matrix: {X.shape[0]} rows × {X.shape[1]} features")
@@ -394,22 +374,19 @@ def build_scaler(X: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     """
     Fit scaler on non-NaN values per column. Returns scaler + scaled DataFrame.
 
-    Important: We fill NaN with column mean ONLY for scaling purposes.
-    The scaled DataFrame retains NaN so XGBoost can use its missing-value
-    routing logic correctly.
+    NaN positions are PRESERVED after scaling so XGBoost can use its native
+    missing-value routing.  We fill NaN with column mean only for the purpose
+    of fitting and applying the scaler, then immediately restore NaN.
     """
-    scaler = StandardScaler()
-
-    # Fit on column means (ignoring NaN) — this gives a meaningful scale
+    scaler    = StandardScaler()
     col_means = X.mean()
-    X_filled_for_fit = X.fillna(col_means)
-    scaler.fit(X_filled_for_fit)
+    X_filled  = X.fillna(col_means)
+    scaler.fit(X_filled)
 
-    # Apply scaling but PRESERVE NaN positions
-    nan_mask = X.isna()
-    X_scaled_values = scaler.transform(X_filled_for_fit)
-    X_scaled = pd.DataFrame(X_scaled_values, columns=X.columns, index=X.index)
-    X_scaled[nan_mask] = np.nan  # Restore NaN positions
+    nan_mask       = X.isna()
+    X_scaled_vals  = scaler.transform(X_filled)
+    X_scaled       = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+    X_scaled[nan_mask] = np.nan   # restore NaN so XGBoost routes correctly
 
     return scaler, X_scaled
 
@@ -426,11 +403,8 @@ def train_model(
     y_val: pd.Series,
 ) -> XGBClassifier:
     """Train XGBClassifier from scratch with early stopping."""
-
     params = XGBOOST_PARAMS.copy()
 
-    # Auto-compute scale_pos_weight from training class balance
-    # This compensates for the fact that base CSV is winners-only
     n_pos = int((y_train == 1).sum())
     n_neg = int((y_train == 0).sum())
     if n_pos > 0 and n_neg > 0:
@@ -438,7 +412,9 @@ def train_model(
         logger.info(f"  scale_pos_weight set to {params['scale_pos_weight']:.3f} "
                     f"(neg={n_neg} / pos={n_pos})")
 
-    model = XGBClassifier(**{k: v for k, v in params.items() if k != "early_stopping_rounds"})
+    model = XGBClassifier(
+        **{k: v for k, v in params.items() if k != "early_stopping_rounds"}
+    )
 
     logger.info("Training XGBoost model from scratch...")
     logger.info(f"  Train: {len(X_train)} rows")
@@ -453,10 +429,8 @@ def train_model(
         verbose=False,
     )
 
-    best_iteration = model.best_iteration
-    val_score = model.best_score
-    logger.info(f"  Best iteration: {best_iteration}")
-    logger.info(f"  Best val logloss: {val_score:.4f}")
+    logger.info(f"  Best iteration: {model.best_iteration}")
+    logger.info(f"  Best val logloss: {model.best_score:.4f}")
 
     return model
 
@@ -494,30 +468,22 @@ def compute_feature_importance(
     model: XGBClassifier,
     feature_names: list[str],
 ) -> pd.DataFrame:
-    """
-    Generate feature_importance.csv from freshly trained model.
-    Uses 'gain' importance type — most informative for XGBoost.
-    """
+    """Generate feature_importance.csv using gain importance."""
     booster = model.get_booster()
-    scores = booster.get_score(importance_type="gain")
+    scores  = booster.get_score(importance_type="gain")
 
-    # Map internal fN names back to actual feature names
-    # XGBoost uses f0, f1, ... internally when feature names aren't set
-    # Since we pass a DataFrame, names should be preserved — but handle both cases
     importance_list = []
     for feat, score in scores.items():
         if feat.startswith("f") and feat[1:].isdigit():
-            idx = int(feat[1:])
+            idx  = int(feat[1:])
             name = feature_names[idx] if idx < len(feature_names) else feat
         else:
             name = feat
         importance_list.append({"feature": name, "importance": round(score, 6)})
 
-    fi_df = pd.DataFrame(importance_list)
-    fi_df = fi_df.sort_values("importance", ascending=False).reset_index(drop=True)
-
-    # Normalize to sum to 1.0
-    total = fi_df["importance"].sum()
+    fi_df  = pd.DataFrame(importance_list)
+    fi_df  = fi_df.sort_values("importance", ascending=False).reset_index(drop=True)
+    total  = fi_df["importance"].sum()
     if total > 0:
         fi_df["importance"] = (fi_df["importance"] / total).round(6)
 
@@ -543,29 +509,27 @@ def save_outputs(
     """Save model, scaler, feature importance, and metadata."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Model
-    with open(MODEL_PATH, "wb") as f:
-        pickle.dump(model, f)
-    logger.info(f"Saved model → {MODEL_PATH}")
+    # Use joblib for both model and scaler (consistent, handles large arrays well)
+    joblib.dump(model,  MODEL_PATH,  protocol=4)
+    logger.info(f"Saved model  → {MODEL_PATH}")
 
-    # Scaler
-    with open(SCALER_PATH, "wb") as f:
-        pickle.dump(scaler, f)
+    joblib.dump(scaler, SCALER_PATH, protocol=4)
     logger.info(f"Saved scaler → {SCALER_PATH}")
 
-    # Feature importance
     fi_df.to_csv(FEATURE_IMPORTANCE_PATH, index=False)
     logger.info(f"Saved feature importance → {FEATURE_IMPORTANCE_PATH}")
 
-    # Metadata
+    # Write full feature list under "features" key so explosion_predictor can load it.
+    # Also keep "feature_names_sample" for human inspection.
     metadata = {
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "source": "ml_retrain_model.py",
-        "training_approach": "full_retrain_from_scratch",
-        "n_features": len(feature_names),
-        "feature_names_sample": feature_names[:20],
-        "best_iteration": int(model.best_iteration),
-        "best_val_logloss": float(model.best_score),
+        "trained_at":            datetime.now(timezone.utc).isoformat(),
+        "source":                "ml_retrain_model.py",
+        "training_approach":     "full_retrain_from_scratch",
+        "n_features":            len(feature_names),
+        "features":              feature_names,           # FULL list — read by explosion_predictor
+        "feature_names_sample":  feature_names[:20],      # human-readable preview
+        "best_iteration":        int(model.best_iteration),
+        "best_val_logloss":      float(model.best_score),
         **training_stats,
     }
     with open(METADATA_PATH, "w") as f:
@@ -585,10 +549,45 @@ def main() -> int:
     # ── Connect ──────────────────────────────────────────────────────────────
     client = get_supabase_client()
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    base_df = load_base_training_data(client)
-    t1_df = load_t1_data(client)
+    # ── Load standard training data ───────────────────────────────────────────
+    base_df     = load_base_training_data(client)
+    t1_df       = load_t1_data(client)
     combined_df = combine_datasets(base_df, t1_df)
+
+    # ── Load mistake samples and append AFTER combine_datasets ───────────────
+    # Crucial: appending here preserves the high sample_weights (3.0 / 2.0)
+    # assigned by ml_mistake_learner.  If mistake samples were passed into
+    # combine_datasets(), their weights would be overwritten with T1_WEIGHT.
+    if MISTAKE_LEARNER_AVAILABLE:
+        logger.info("\n" + "=" * 60)
+        logger.info("MISTAKE LEARNING STEP")
+        logger.info("=" * 60)
+
+        # Derive the feature list from what we've assembled so far so the
+        # mistake learner can pad missing columns with sensible defaults.
+        proto_features = [
+            c for c in combined_df.columns
+            if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
+        ]
+
+        mistake_df = build_mistake_training_samples(
+            lookback_days=90,
+            use_all_timepoints=True,
+            existing_features=proto_features,
+        )
+
+        if not mistake_df.empty:
+            log_mistake_summary(mistake_df)
+            combined_df = pd.concat([combined_df, mistake_df],
+                                    ignore_index=True, sort=False)
+            logger.info(
+                f"Dataset after adding mistakes: {len(combined_df)} rows "
+                f"(+{len(mistake_df)} mistake samples)"
+            )
+        else:
+            logger.info("No mistake samples to add this run.")
+    else:
+        logger.warning("ml_mistake_learner not available — skipping mistake-learning step.")
 
     # ── Prepare features ──────────────────────────────────────────────────────
     X, y, w = prepare_features(combined_df)
@@ -611,8 +610,8 @@ def main() -> int:
     from sklearn.metrics import roc_auc_score, classification_report
 
     val_proba = model.predict_proba(X_val)[:, 1]
-    val_pred = (val_proba >= 0.5).astype(int)
-    auc = roc_auc_score(y_val, val_proba)
+    val_pred  = (val_proba >= 0.5).astype(int)
+    auc       = roc_auc_score(y_val, val_proba)
     logger.info(f"Validation AUC-ROC: {auc:.4f}")
     logger.info("Classification report (val):")
     for line in classification_report(y_val, val_pred).split("\n"):
@@ -620,17 +619,22 @@ def main() -> int:
             logger.info(f"  {line}")
 
     # ── Training stats for metadata ───────────────────────────────────────────
+    n_mistakes = len(mistake_df) if (MISTAKE_LEARNER_AVAILABLE and "mistake_df" in dir()) else 0
     training_stats = {
-        "n_total_samples": len(combined_df),
-        "n_base_samples": len(base_df),
-        "n_t1_samples": len(t1_df) if not t1_df.empty else 0,
-        "n_positive": int((y == 1).sum()),
-        "n_negative": int((y == 0).sum()),
-        "positive_rate": float((y == 1).mean()),
-        "val_auc_roc": float(auc),
-        "base_sample_weight": BASE_CSV_WEIGHT,
-        "t1_sample_weight": T1_WEIGHT,
-        "equal_weight_applied": len(t1_df) >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT if not t1_df.empty else False,
+        "n_total_samples":      len(combined_df),
+        "n_base_samples":       len(base_df),
+        "n_t1_samples":         len(t1_df) if not t1_df.empty else 0,
+        "n_mistake_samples":    n_mistakes,
+        "n_positive":           int((y == 1).sum()),
+        "n_negative":           int((y == 0).sum()),
+        "positive_rate":        float((y == 1).mean()),
+        "val_auc_roc":          float(auc),
+        "base_sample_weight":   BASE_CSV_WEIGHT,
+        "t1_sample_weight":     T1_WEIGHT,
+        "equal_weight_applied": (
+            len(t1_df) >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
+            if not t1_df.empty else False
+        ),
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -644,6 +648,7 @@ def main() -> int:
     logger.info(f"  Total samples    : {training_stats['n_total_samples']}")
     logger.info(f"  Base CSV samples : {training_stats['n_base_samples']}")
     logger.info(f"  T-1 samples      : {training_stats['n_t1_samples']}")
+    logger.info(f"  Mistake samples  : {training_stats['n_mistake_samples']}")
     logger.info(f"  Positive rate    : {training_stats['positive_rate']:.1%}")
     logger.info(f"  Validation AUC   : {auc:.4f}")
     logger.info(f"  Best iteration   : {model.best_iteration}")
