@@ -709,6 +709,10 @@ def main() -> int:
     
                 if symbol_col and date_col:
                     logger.info(f"Joining gain data on {symbol_col} + {date_col}")
+                    logger.info(f"combined_df columns with date: {[c for c in combined_df.columns if 'date' in c.lower()]}")
+                    logger.info(f"combined_df shape before merge: {combined_df.shape}")
+                    logger.info(f"winners_gain sample:\n{winners_gain[['symbol','detection_date','actual_gain_pct']].head()}")
+                    logger.info(f"combined_df symbol+date sample:\n{combined_df[[symbol_col, date_col]].head()}")
                     combined_df = combined_df.merge(
                         winners_gain[["symbol", "detection_date", "actual_gain_pct"]],
                         left_on=[symbol_col, date_col],
@@ -726,10 +730,6 @@ def main() -> int:
             logger.warning("daily_winners table is empty — gain regressor will be skipped")
     except Exception as e:
         logger.warning(f"Could not fetch gain data: {e} — gain regressor will be skipped")
-    logger.info(f"combined_df columns with 'date': {[c for c in combined_df.columns if 'date' in c.lower()]}")
-    logger.info(f"combined_df shape before merge: {combined_df.shape}")
-    logger.info(f"winners_gain sample:\n{winners_gain[['symbol','detection_date','actual_gain_pct']].head()}")
-    logger.info(f"combined_df symbol+date sample:\n{combined_df[['symbol', date_col]].head() if date_col else 'NO DATE COL FOUND'}")
 
     # ── Load mistake samples and append AFTER combine_datasets ───────────────
     # Crucial: appending here preserves the high sample_weights (3.0 / 2.0)
