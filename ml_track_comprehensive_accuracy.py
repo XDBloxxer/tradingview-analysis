@@ -9,6 +9,17 @@ IMPROVEMENTS over previous version:
 4. ✅ MODEL-DRIVEN filter learning from feature_importance.csv + winner stats
 5. ✅ Tightens screening population (price/volume/volatility) using actual winner data
 6. ✅ Computes percentile ranges of top features across historical winners
+7. ✅ Fetches actual_gain_pct via yfinance for ALL predicted symbols (not just winners)
+     so the accuracy table is always fully populated regardless of outcome.
+
+HOW ACTUAL GAIN FETCHING WORKS:
+  - For every symbol the model predicted, we look up the OHLCV bar from yfinance
+    for the prediction date.
+  - actual_gain_pct = (close - prev_close) / prev_close * 100  (day's % change)
+  - actual_high_pct = (day_high  - prev_close) / prev_close * 100  (intraday peak)
+  - This runs in a thread pool so even 50+ symbols complete in a few seconds.
+  - If yfinance returns no data for a symbol the fields stay None (not 0) so
+    downstream queries can distinguish "no data" from "flat day".
 
 HOW FILTER LEARNING WORKS:
   - Load feature_importance.csv to find the top non-t1 features
@@ -17,19 +28,12 @@ HOW FILTER LEARNING WORKS:
     (HV_10, Volume_Ratio, RSI_14, price range, etc.)
   - Write those as hard filters to learned_filters.json
   - SmartScreener reads learned_filters.json at startup — no other changes needed
-
-WHY THIS MATTERS:
-  The original learned_filters.json had only 6 fields and never updated
-  meaningfully. A stock screened with min_volume=100k and max_price=500
-  returns thousands of large-caps that look NOTHING like the training data
-  (small-cap, high-vol, elevated relative volume). This fix makes the
-  screened population match the distribution the model was actually
-  trained on.
 """
 
 import argparse
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 import sys
@@ -60,9 +64,10 @@ FILTER_LOOKBACK_DAYS = 90
 # Minimum winner samples needed before we trust the derived filters
 MIN_SAMPLES_FOR_FILTER = 20
 
+# Max parallel workers for yfinance fetches
+YFINANCE_MAX_WORKERS = 10
+
 # Features in the model that map directly to TradingView screener fields.
-# Key   = model feature base name (without t3_/t5_/t10_ prefix)
-# Value = learned_filters.json key that SmartScreener reads
 SCREENER_FEATURE_MAP = {
     "HV_10":        ("min_hv10",        "max_hv10"),
     "HV_20":        ("min_hv20",        "max_hv20"),
@@ -93,6 +98,123 @@ def setup_logging(level: str = "INFO"):
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     return logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# yfinance actual-gain fetcher
+# ---------------------------------------------------------------------------
+
+def _fetch_actual_gain_for_symbol(symbol: str, prediction_date: str) -> dict:
+    """
+    Fetch actual gain data for a single symbol on prediction_date via yfinance.
+
+    Returns a dict:
+        {
+            "symbol":           str,
+            "actual_gain_pct":  float | None,   # (close - prev_close) / prev_close * 100
+            "actual_high_pct":  float | None,   # (day_high  - prev_close) / prev_close * 100
+            "actual_close":     float | None,
+            "actual_open":      float | None,
+            "actual_high":      float | None,
+            "actual_low":       float | None,
+            "actual_volume":    int   | None,
+        }
+    """
+    try:
+        import yfinance as yf
+
+        target = datetime.strptime(prediction_date, "%Y-%m-%d").date()
+        # Fetch a small window: 5 calendar days before and after the target
+        # to handle weekends / holidays on either side.
+        start = (target - timedelta(days=5)).isoformat()
+        end   = (target + timedelta(days=2)).isoformat()
+
+        ticker = yf.Ticker(symbol)
+        hist   = ticker.history(start=start, end=end, interval="1d", auto_adjust=True)
+
+        if hist.empty or len(hist) < 2:
+            return {"symbol": symbol}
+
+        # Align index to date only for easy lookup
+        hist.index = pd.to_datetime(hist.index).date
+
+        if target not in hist.index:
+            return {"symbol": symbol}
+
+        target_idx  = list(hist.index).index(target)
+        if target_idx == 0:
+            return {"symbol": symbol}   # no previous close available
+
+        today_bar  = hist.iloc[target_idx]
+        prev_close = float(hist.iloc[target_idx - 1]["Close"])
+
+        if prev_close == 0:
+            return {"symbol": symbol}
+
+        close      = float(today_bar["Close"])
+        day_high   = float(today_bar["High"])
+        day_low    = float(today_bar["Low"])
+        day_open   = float(today_bar["Open"])
+        day_volume = int(today_bar["Volume"])
+
+        actual_gain_pct = (close    - prev_close) / prev_close * 100
+        actual_high_pct = (day_high - prev_close) / prev_close * 100
+
+        return {
+            "symbol":          symbol,
+            "actual_gain_pct": round(actual_gain_pct, 4),
+            "actual_high_pct": round(actual_high_pct, 4),
+            "actual_close":    close,
+            "actual_open":     day_open,
+            "actual_high":     day_high,
+            "actual_low":      day_low,
+            "actual_volume":   day_volume,
+        }
+
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            f"yfinance fetch failed for {symbol} on {prediction_date}: {e}"
+        )
+        return {"symbol": symbol}
+
+
+def fetch_actual_gains_for_all_symbols(
+    symbols: list,
+    prediction_date: str,
+    logger: logging.Logger,
+    max_workers: int = YFINANCE_MAX_WORKERS,
+) -> dict:
+    """
+    Fetch actual OHLCV + gain data for all symbols on prediction_date in parallel.
+
+    Returns:
+        dict keyed by symbol → result dict from _fetch_actual_gain_for_symbol
+    """
+    logger.info(
+        f"Fetching actual gain data from yfinance for {len(symbols)} symbols "
+        f"on {prediction_date} (max_workers={max_workers})..."
+    )
+
+    results: dict = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_sym = {
+            executor.submit(_fetch_actual_gain_for_symbol, sym, prediction_date): sym
+            for sym in symbols
+        }
+        for future in as_completed(future_to_sym):
+            sym = future_to_sym[future]
+            try:
+                result = future.result()
+                results[sym] = result
+            except Exception as e:
+                logger.warning(f"Unexpected error fetching {sym}: {e}")
+                results[sym] = {"symbol": sym}
+
+    found = sum(1 for r in results.values() if r.get("actual_gain_pct") is not None)
+    logger.info(
+        f"✓ yfinance fetch complete: {found}/{len(symbols)} symbols returned gain data"
+    )
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +275,8 @@ def validate_data_exists(tracker, check_date: str) -> dict:
 
         if not result["winners_exist"]:
             tracker.logger.warning(f"⚠️ No winners found for {check_date}")
+            # We can still proceed — we'll get actual gains via yfinance
+            result["should_proceed"] = True
             return result
 
         tracker.logger.info(f"✓ Found {result['winner_count']} winners for {check_date}")
@@ -165,14 +289,10 @@ def validate_data_exists(tracker, check_date: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Model-driven filter learning
+# Model-driven filter learning (unchanged from previous version)
 # ---------------------------------------------------------------------------
 
-def load_feature_importance(path: Path, top_n: int = 30) -> list[str]:
-    """
-    Load feature_importance.csv and return the top-N non-t1 feature base names.
-    Strips the t3_/t5_/t10_ prefix so we get base names like 'HV_10', 'EMA_10'.
-    """
+def load_feature_importance(path: Path, top_n: int = 30) -> list:
     if not path.exists():
         return []
     try:
@@ -182,12 +302,10 @@ def load_feature_importance(path: Path, top_n: int = 30) -> list[str]:
         base_names = []
         seen = set()
         for feat in fi["feature"]:
-            # Strip time prefix
             for prefix in ("t3_", "t5_", "t10_", "t1_close_", "t1_open_"):
                 if feat.startswith(prefix):
                     feat = feat[len(prefix):]
                     break
-            # Skip t1 features — they're training features, not screener features
             if feat.startswith("t1_"):
                 continue
             if feat not in seen:
@@ -202,11 +320,6 @@ def load_feature_importance(path: Path, top_n: int = 30) -> list[str]:
 
 
 def fetch_winner_t1_snapshots(client, lookback_days: int) -> pd.DataFrame:
-    """
-    Fetch winners_day_prior_close rows for the last `lookback_days` days.
-    These are T-1 snapshots of stocks that actually exploded — the ground-truth
-    population we want to screen for.
-    """
     logger = logging.getLogger(__name__)
     start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
 
@@ -241,7 +354,6 @@ def fetch_winner_t1_snapshots(client, lookback_days: int) -> pd.DataFrame:
 
 
 def fetch_non_winner_t1_snapshots(client, lookback_days: int) -> pd.DataFrame:
-    """Fetch non_winners_day_prior_close for comparison."""
     logger = logging.getLogger(__name__)
     start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
 
@@ -269,18 +381,12 @@ def fetch_non_winner_t1_snapshots(client, lookback_days: int) -> pd.DataFrame:
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
-def _col_variants(base: str) -> list[str]:
-    """
-    Return all column name variants to try for a given base feature name.
-    The T-1 Supabase tables use intraday short names (lowercase).
-    We try several forms to find the column.
-    """
+def _col_variants(base: str) -> list:
     variants = [
-        base,                            # RSI_14
-        base.lower(),                    # rsi_14
-        base.replace("_", "").lower(),   # rsi14
+        base,
+        base.lower(),
+        base.replace("_", "").lower(),
     ]
-    # Special overrides for known mismatches
     special = {
         "HV_10":        ["volatility_10d", "hv_10", "hv10"],
         "HV_20":        ["volatility_20d", "hv_20", "hv20"],
@@ -300,7 +406,6 @@ def _col_variants(base: str) -> list[str]:
 
 
 def find_col(df: pd.DataFrame, base: str) -> Optional[str]:
-    """Find the actual column name in df for a base feature name."""
     for v in _col_variants(base):
         if v in df.columns:
             return v
@@ -310,21 +415,9 @@ def find_col(df: pd.DataFrame, base: str) -> Optional[str]:
 def compute_model_driven_filters(
     winner_df: pd.DataFrame,
     non_winner_df: pd.DataFrame,
-    top_features: list[str],
+    top_features: list,
     logger: logging.Logger,
 ) -> dict:
-    """
-    Core filter learning logic.
-
-    For each screener-relevant feature (from SCREENER_FEATURE_MAP),
-    compute percentile ranges across winner snapshots. Then compare
-    to non-winners to confirm the filter is discriminative.
-
-    Also derives price/volume ranges from the winner distribution.
-
-    Returns:
-        dict of learned_filters ready to write to JSON
-    """
     filters = {}
 
     if winner_df.empty or len(winner_df) < MIN_SAMPLES_FOR_FILTER:
@@ -334,14 +427,13 @@ def compute_model_driven_filters(
         )
         return _conservative_defaults()
 
-    # ── 1. Price range from actual winners ─────────────────────────────────
+    # Price range
     price_col = find_col(winner_df, "Close")
     if price_col:
         prices = pd.to_numeric(winner_df[price_col], errors="coerce").dropna()
         if len(prices) >= MIN_SAMPLES_FOR_FILTER:
             p10 = float(prices.quantile(LOWER_PCT / 100))
             p90 = float(prices.quantile(UPPER_PCT / 100))
-            # Apply hard caps
             filters["min_price"] = max(HARD_CAPS["min_price"], round(p10 * 0.8, 2))
             filters["max_price"] = min(HARD_CAPS["max_price"], round(p90 * 1.2, 2))
             logger.info(
@@ -350,7 +442,7 @@ def compute_model_driven_filters(
                 f"filters: ${filters['min_price']}–${filters['max_price']}"
             )
 
-    # ── 2. Volume range from actual winners ────────────────────────────────
+    # Volume range
     vol_col = find_col(winner_df, "Volume")
     if vol_col:
         vols = pd.to_numeric(winner_df[vol_col], errors="coerce").dropna()
@@ -358,16 +450,15 @@ def compute_model_driven_filters(
             p10_vol = float(vols.quantile(LOWER_PCT / 100))
             filters["min_volume"] = max(
                 HARD_CAPS["min_volume"],
-                int(round(p10_vol * 0.7, -3))  # round to nearest 1000
+                int(round(p10_vol * 0.7, -3))
             )
             logger.info(
                 f"  Volume 10th pct from winners: {p10_vol:,.0f} → "
                 f"min_volume filter: {filters['min_volume']:,}"
             )
 
-    # ── 3. Screener-relevant features (HV, RSI, Volume_Ratio, etc.) ────────
+    # Screener-relevant features
     for base_feat, (min_key, max_key) in SCREENER_FEATURE_MAP.items():
-        # Only derive if this feature is in the top-N important
         if base_feat not in top_features:
             continue
 
@@ -383,7 +474,6 @@ def compute_model_driven_filters(
         p10_w = float(w_vals.quantile(LOWER_PCT / 100))
         p90_w = float(w_vals.quantile(UPPER_PCT / 100))
 
-        # Compare to non-winners — only use filter if there's real separation
         discriminative = True
         if not non_winner_df.empty:
             nw_col = find_col(non_winner_df, base_feat)
@@ -392,7 +482,6 @@ def compute_model_driven_filters(
                 if len(nw_vals) >= MIN_SAMPLES_FOR_FILTER:
                     nw_median = float(nw_vals.median())
                     w_median  = float(w_vals.median())
-                    # If medians are within 10% of each other, feature isn't discriminative
                     if nw_median != 0 and abs(w_median - nw_median) / abs(nw_median) < 0.10:
                         discriminative = False
                         logger.debug(
@@ -403,10 +492,7 @@ def compute_model_driven_filters(
         if not discriminative:
             continue
 
-        # Write min filter
         filters[min_key] = round(p10_w, 4)
-
-        # Write max filter if defined and meaningful
         if max_key and p90_w > p10_w:
             filters[max_key] = round(p90_w, 4)
 
@@ -416,7 +502,7 @@ def compute_model_driven_filters(
             + (f", {max_key}={filters.get(max_key)}" if max_key else "")
         )
 
-    # ── 4. Relative volume (high-importance proxy) ─────────────────────────
+    # Relative volume
     rv_col = find_col(winner_df, "Volume_Ratio")
     if rv_col:
         rv_vals = pd.to_numeric(winner_df[rv_col], errors="coerce").dropna()
@@ -424,13 +510,12 @@ def compute_model_driven_filters(
             p10_rv = float(rv_vals.quantile(LOWER_PCT / 100))
             min_rv = max(HARD_CAPS["min_relative_volume"], round(p10_rv * 0.8, 2))
             filters["min_relative_volume"] = min_rv
-            filters["min_volume_ratio"]    = min_rv   # SmartScreener reads this key
+            filters["min_volume_ratio"]    = min_rv
             logger.info(
                 f"  Volume_Ratio 10th pct from winners: {p10_rv:.2f} → "
                 f"min_relative_volume filter: {min_rv}"
             )
 
-    # ── 5. Metadata ────────────────────────────────────────────────────────
     filters["_derived_from_n_winners"] = int(len(winner_df))
     filters["_derived_at"] = datetime.now().isoformat()
     filters["_lookback_days"] = FILTER_LOOKBACK_DAYS
@@ -439,7 +524,6 @@ def compute_model_driven_filters(
 
 
 def _conservative_defaults() -> dict:
-    """Fallback filters when not enough data to derive from winners."""
     return {
         "min_price":           1.00,
         "max_price":           50.0,
@@ -453,17 +537,11 @@ def _conservative_defaults() -> dict:
 
 
 def learn_and_write_filters(client, logger: logging.Logger) -> dict:
-    """
-    Full pipeline: load importance → fetch snapshots → derive filters → write JSON.
-
-    Returns the filter dict that was written.
-    """
     logger.info("")
     logger.info("=" * 60)
     logger.info("MODEL-DRIVEN FILTER LEARNING")
     logger.info("=" * 60)
 
-    # 1. Top features from importance file
     top_features = load_feature_importance(FEATURE_IMPORTANCE_PATH, top_n=40)
     if top_features:
         logger.info(f"Top features (first 10): {top_features[:10]}")
@@ -473,30 +551,23 @@ def learn_and_write_filters(client, logger: logging.Logger) -> dict:
         _write_filters(filters, logger)
         return filters
 
-    # 2. Winner T-1 snapshots
-    winner_df = fetch_winner_t1_snapshots(client, FILTER_LOOKBACK_DAYS)
-
-    # 3. Non-winner T-1 snapshots (for discrimination check)
+    winner_df     = fetch_winner_t1_snapshots(client, FILTER_LOOKBACK_DAYS)
     non_winner_df = fetch_non_winner_t1_snapshots(client, FILTER_LOOKBACK_DAYS)
 
-    # 4. Compute filters
     logger.info(f"\nComputing filters from {len(winner_df)} winners, "
                 f"{len(non_winner_df)} non-winners...")
     filters = compute_model_driven_filters(winner_df, non_winner_df, top_features, logger)
 
-    # 5. Merge with any existing non-derived fields (preserve manual overrides)
     if LEARNED_FILTERS_PATH.exists():
         try:
             with open(LEARNED_FILTERS_PATH) as f:
                 existing = json.load(f)
-            # Only preserve fields that start with _ (manual notes) or aren't computed
             for k, v in existing.items():
                 if k.startswith("_") and k not in filters:
                     filters[k] = v
         except Exception:
             pass
 
-    # 6. Write
     _write_filters(filters, logger)
     return filters
 
@@ -510,7 +581,7 @@ def _write_filters(filters: dict, logger: logging.Logger) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Accuracy tracker (existing logic, minimally changed)
+# Accuracy tracker
 # ---------------------------------------------------------------------------
 
 class ComprehensiveAccuracyTracker:
@@ -560,16 +631,42 @@ class ComprehensiveAccuracyTracker:
         return pd.DataFrame(response.data)
 
     def analyze_prediction_accuracy(
-        self, predictions_df: pd.DataFrame, winners_df: pd.DataFrame
+        self,
+        predictions_df: pd.DataFrame,
+        winners_df: pd.DataFrame,
+        yfinance_gains: dict,
     ) -> tuple:
+        """
+        Analyse prediction accuracy.
+
+        Args:
+            predictions_df: All ML predictions for the date.
+            winners_df:     Stocks that became daily winners (ground truth).
+            yfinance_gains: dict[symbol -> result dict] from fetch_actual_gains_for_all_symbols.
+                            Contains actual_gain_pct, actual_high_pct, actual_close, etc.
+                            for EVERY predicted symbol, populated via yfinance regardless
+                            of whether the stock became a winner.
+        """
         self.logger.info("\n" + "=" * 60)
         self.logger.info("ANALYZING PREDICTION ACCURACY")
         self.logger.info("=" * 60)
 
         if not winners_df.empty:
-          self.logger.info(f"Winner columns: {winners_df.columns.tolist()}")
-          self.logger.info(f"Sample winner: {winners_df.iloc[0].to_dict()}")
+            self.logger.info(f"Winner columns: {winners_df.columns.tolist()}")
+            self.logger.info(f"Sample winner: {winners_df.iloc[0].to_dict()}")
+
         winners_set = set(winners_df["symbol"].tolist())
+
+        # How many symbols have yfinance data
+        yf_populated = sum(
+            1 for r in yfinance_gains.values()
+            if r.get("actual_gain_pct") is not None
+        )
+        self.logger.info(
+            f"yfinance gain data available for {yf_populated}/{len(yfinance_gains)} "
+            "predicted symbols"
+        )
+
         accuracy_records = []
         details_records = []
         true_positives = false_positives = true_negatives = 0
@@ -579,25 +676,40 @@ class ComprehensiveAccuracyTracker:
             predicted_positive = pred["prediction"] == 1
             became_winner = symbol in winners_set
 
-            if became_winner:
-                winner_data = winners_df[winners_df["symbol"] == symbol].iloc[0]
-                actual_gain = winner_data["change_pct"]
-                actual_price = winner_data["price"]
-                actual_high = winner_data.get("high", actual_price)
+            # ── Actual gain: prefer daily_winners table for confirmed winners
+            #    (it has high/low from the actual session), fall back to yfinance
+            #    for everything else.  This means actual_gain_pct is ALWAYS
+            #    populated as long as yfinance returned data. ──────────────
+            yf_data = yfinance_gains.get(symbol, {})
+
+            if became_winner and not winners_df.empty:
+                winner_row  = winners_df[winners_df["symbol"] == symbol].iloc[0]
+                actual_gain = float(winner_row["change_pct"])
+                actual_price = float(winner_row["price"])
+                w_high = winner_row.get("high", actual_price)
                 actual_high_pct = (
-                    ((actual_high / actual_price) - 1) * 100 if actual_price > 0 else 0
+                    ((float(w_high) / actual_price) - 1) * 100
+                    if actual_price and actual_price > 0 else None
+                )
+                # Fill any missing OHLCV from yfinance as a backup
+                actual_volume = (
+                    int(winner_row["volume"])
+                    if pd.notna(winner_row.get("volume"))
+                    else yf_data.get("actual_volume")
                 )
             else:
-                actual_gain = 0
-                actual_price = pred.get("current_price", 0)
-                actual_high_pct = 0
+                # Non-winner (or winner not in our winners table): use yfinance
+                actual_gain  = yf_data.get("actual_gain_pct")   # float | None
+                actual_price = yf_data.get("actual_close") or pred.get("current_price", 0)
+                actual_high_pct = yf_data.get("actual_high_pct")  # float | None
+                actual_volume   = yf_data.get("actual_volume")     # int   | None
 
             prediction_correct = (predicted_positive and became_winner) or (
                 not predicted_positive and not became_winner
             )
 
             predicted_gain = pred.get("target_gain_pct", 0)
-            if became_winner and predicted_gain and predicted_gain > 0:
+            if became_winner and predicted_gain and predicted_gain > 0 and actual_gain is not None:
                 gain_error = abs(predicted_gain - actual_gain)
                 gain_error_ratio = gain_error / actual_gain if actual_gain != 0 else 0
             else:
@@ -617,50 +729,41 @@ class ComprehensiveAccuracyTracker:
 
             accuracy_records.append(
                 {
-                    "symbol": symbol,
-                    "prediction_date": pred["prediction_date"],
-                    "predicted_probability": pred["explosion_probability"],
-                    "predicted_signal": pred["signal"],
-                    "predicted_target_gain": pred.get("target_gain_pct"),
+                    "symbol":                 symbol,
+                    "prediction_date":        pred["prediction_date"],
+                    "predicted_probability":  pred["explosion_probability"],
+                    "predicted_signal":       pred["signal"],
+                    "predicted_target_gain":  pred.get("target_gain_pct"),
                     "predicted_target_price": pred.get("target_price"),
-                    "became_winner": became_winner,
-                    "actual_gain_pct": actual_gain if became_winner else None,
-                    "actual_high_pct": actual_high_pct if became_winner else None,
-                    "actual_price": actual_price,
-                    "prediction_correct": prediction_correct,
-                    "gain_error_pct": gain_error,
-                    "gain_error_ratio": gain_error_ratio,
-                    "actual_recorded_at": datetime.now().isoformat(),
+                    "became_winner":          became_winner,
+                    # actual_gain_pct is now populated for ALL symbols via yfinance
+                    "actual_gain_pct":        actual_gain,
+                    "actual_high_pct":        actual_high_pct,
+                    "actual_price":           actual_price,
+                    "prediction_correct":     prediction_correct,
+                    "gain_error_pct":         gain_error,
+                    "gain_error_ratio":       gain_error_ratio,
+                    "actual_recorded_at":     datetime.now().isoformat(),
                 }
             )
 
-            # Safely extract volume — int(NaN) throws ValueError which would
-            # silently abort the entire loop and leave all remaining records null.
-            actual_volume = None
-            if became_winner:
-                try:
-                    vol_series = winners_df[winners_df["symbol"] == symbol]["volume"]
-                    if not vol_series.empty and pd.notna(vol_series.iloc[0]):
-                        actual_volume = int(vol_series.iloc[0])
-                except (ValueError, TypeError, IndexError) as e:
-                    self.logger.warning(f"Could not extract volume for {symbol}: {e}")
-            
             details_records.append(
                 {
-                    "symbol": symbol,
-                    "prediction_date": pred["prediction_date"],
+                    "symbol":                symbol,
+                    "prediction_date":       pred["prediction_date"],
                     "predicted_probability": pred["explosion_probability"],
-                    "predicted_signal": pred["signal"],
-                    "outcome_type": outcome_type,
-                    "became_winner": became_winner,
-                    "actual_gain_pct": actual_gain if became_winner else None,
-                    "actual_high_pct": actual_high_pct if became_winner else None,
-                    "actual_volume": actual_volume,
-                    "failure_reason": None,
+                    "predicted_signal":      pred["signal"],
+                    "outcome_type":          outcome_type,
+                    "became_winner":         became_winner,
+                    # same here — always populated from yfinance
+                    "actual_gain_pct":       actual_gain,
+                    "actual_high_pct":       actual_high_pct,
+                    "actual_volume":         actual_volume,
+                    "failure_reason":        None,
                 }
             )
 
-        total = len(predictions_df)
+        total   = len(predictions_df)
         correct = true_positives + true_negatives
         accuracy_pct = (correct / total * 100) if total > 0 else 0
         predicted_winners = true_positives + false_positives
@@ -668,13 +771,21 @@ class ComprehensiveAccuracyTracker:
             (true_positives / predicted_winners * 100) if predicted_winners > 0 else 0
         )
 
+        # Summary of gain data coverage
+        gain_populated = sum(
+            1 for r in accuracy_records if r.get("actual_gain_pct") is not None
+        )
         self.logger.info(f"\nPrediction Accuracy:")
-        self.logger.info(f"  Total:           {total}")
-        self.logger.info(f"  True Positives:  {true_positives}")
-        self.logger.info(f"  False Positives: {false_positives}")
-        self.logger.info(f"  True Negatives:  {true_negatives}")
-        self.logger.info(f"  Accuracy:        {accuracy_pct:.2f}%")
-        self.logger.info(f"  Precision:       {precision:.2f}%")
+        self.logger.info(f"  Total:                {total}")
+        self.logger.info(f"  True Positives:       {true_positives}")
+        self.logger.info(f"  False Positives:      {false_positives}")
+        self.logger.info(f"  True Negatives:       {true_negatives}")
+        self.logger.info(f"  Accuracy:             {accuracy_pct:.2f}%")
+        self.logger.info(f"  Precision:            {precision:.2f}%")
+        self.logger.info(
+            f"  actual_gain_pct populated: {gain_populated}/{total} "
+            f"({gain_populated/total*100:.1f}%)"
+        )
 
         return accuracy_records, details_records
 
@@ -699,20 +810,20 @@ class ComprehensiveAccuracyTracker:
             winner_data = winners_df[winners_df["symbol"] == symbol].iloc[0]
             missed_records.append(
                 {
-                    "symbol": symbol,
-                    "detection_date": check_date,
-                    "exchange": winner_data.get("exchange", "UNKNOWN"),
-                    "actual_gain_pct": winner_data["change_pct"],
+                    "symbol":                    symbol,
+                    "detection_date":            check_date,
+                    "exchange":                  winner_data.get("exchange", "UNKNOWN"),
+                    "actual_gain_pct":           winner_data["change_pct"],
                     "actual_high_pct": (
                         (winner_data.get("high", winner_data["price"]) / winner_data["price"] - 1)
                         * 100
                     ),
-                    "actual_price": winner_data["price"],
-                    "actual_volume": int(winner_data["volume"]),
-                    "was_screened": False,
-                    "screening_failure_reason": self._determine_screening_failure(winner_data),
-                    "predicted_probability": None,
-                    "predicted_signal": None,
+                    "actual_price":              winner_data["price"],
+                    "actual_volume":             int(winner_data["volume"]),
+                    "was_screened":              False,
+                    "screening_failure_reason":  self._determine_screening_failure(winner_data),
+                    "predicted_probability":     None,
+                    "predicted_signal":          None,
                 }
             )
 
@@ -778,12 +889,18 @@ def main():
         action="store_true",
         help="Skip accuracy analysis — only recompute learned_filters.json",
     )
+    parser.add_argument(
+        "--yfinance-workers",
+        type=int,
+        default=YFINANCE_MAX_WORKERS,
+        help=f"Parallel workers for yfinance fetches (default: {YFINANCE_MAX_WORKERS})",
+    )
 
     args = parser.parse_args()
 
-    config   = load_config(args.config)
+    config    = load_config(args.config)
     log_level = "DEBUG" if args.verbose else "INFO"
-    logger   = setup_logging(log_level)
+    logger    = setup_logging(log_level)
 
     logger.info("=" * 80)
     logger.info("COMPREHENSIVE ML ACCURACY TRACKING WITH MODEL-DRIVEN LEARNING")
@@ -792,8 +909,6 @@ def main():
     tracker = ComprehensiveAccuracyTracker(config)
 
     # ── MODEL-DRIVEN FILTER LEARNING (runs every time) ─────────────────────
-    # Even if accuracy analysis is skipped, filters are always refreshed
-    # so the screener population stays aligned with the model.
     learned_filters = learn_and_write_filters(tracker.client, logger)
 
     if args.filters_only:
@@ -813,18 +928,36 @@ def main():
 
     validation = validate_data_exists(tracker, check_date)
     if not validation["should_proceed"]:
-        logger.warning("DATA VALIDATION FAILED — exiting early (no egress wasted).")
+        logger.warning("DATA VALIDATION FAILED — no predictions found, exiting.")
         logger.warning(
             f"  predictions_exist={validation['predictions_exist']}, "
             f"winners_exist={validation['winners_exist']}"
         )
         return 0
 
-    predictions_df  = tracker.get_predictions_for_date(check_date)
-    winners_df      = tracker.get_actual_winners_for_date(check_date)
+    predictions_df = tracker.get_predictions_for_date(check_date)
+    winners_df     = tracker.get_actual_winners_for_date(check_date)
 
+    # ── FETCH ACTUAL GAINS VIA YFINANCE FOR ALL PREDICTED SYMBOLS ──────────
+    # This is the key new step: regardless of whether a stock became a winner,
+    # we fetch its actual OHLCV bar for prediction_date from yfinance so that
+    # actual_gain_pct is populated for every row in the accuracy tables.
+    all_symbols = predictions_df["symbol"].tolist() if not predictions_df.empty else []
+
+    yfinance_gains: dict = {}
+    if all_symbols:
+        yfinance_gains = fetch_actual_gains_for_all_symbols(
+            symbols=all_symbols,
+            prediction_date=check_date,
+            logger=logger,
+            max_workers=args.yfinance_workers,
+        )
+    else:
+        logger.warning("No predicted symbols found — skipping yfinance fetch.")
+
+    # ── ANALYSE ACCURACY ───────────────────────────────────────────────────
     accuracy_records, details_records = tracker.analyze_prediction_accuracy(
-        predictions_df, winners_df
+        predictions_df, winners_df, yfinance_gains
     )
 
     missed_records = tracker.analyze_missed_opportunities(
@@ -834,15 +967,19 @@ def main():
     tracker.write_all_records(accuracy_records, details_records, missed_records)
 
     # ── FINAL SUMMARY ──────────────────────────────────────────────────────
+    gain_populated = sum(
+        1 for r in accuracy_records if r.get("actual_gain_pct") is not None
+    )
     logger.info("\n" + "=" * 80)
     logger.info("✓ COMPREHENSIVE ANALYSIS COMPLETE")
     logger.info("=" * 80)
-    logger.info(f"  Accuracy records written : {len(accuracy_records)}")
-    logger.info(f"  Detail records written   : {len(details_records)}")
-    logger.info(f"  Missed records written   : {len(missed_records)}")
-    logger.info(f"\n  Learned filters updated  : {LEARNED_FILTERS_PATH}")
+    logger.info(f"  Accuracy records written      : {len(accuracy_records)}")
+    logger.info(f"  actual_gain_pct populated     : {gain_populated}/{len(accuracy_records)}")
+    logger.info(f"  Detail records written        : {len(details_records)}")
+    logger.info(f"  Missed records written        : {len(missed_records)}")
+    logger.info(f"\n  Learned filters updated       : {LEARNED_FILTERS_PATH}")
     derived_fields = [k for k in learned_filters if not k.startswith("_")]
-    logger.info(f"  Filter fields derived    : {derived_fields}")
+    logger.info(f"  Filter fields derived         : {derived_fields}")
     logger.info(
         "\n  These filters will be applied by SmartScreener at next prediction run."
     )
