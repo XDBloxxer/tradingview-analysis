@@ -3,11 +3,11 @@ Explosion Predictor - HYBRID MODEL VERSION
 
 KEY FIXES:
 1. Case-normalises feature lookup: model trained with lowercase (t3_close, t3_sma_5)
-   but fetcher produces mixed-case (t3_Close, t3_SMA_5).  A case-insensitive lookup
-   map is built once at load time so all 413 features resolve correctly.
-2. Scaler column-count fix: if the scaler has one extra column that is a known
-   meta/string column (e.g. 'exchange'), it is kept in the matrix as 0.0 so the
-   count always matches — it is never stripped.
+   but fetcher produces mixed-case (t3_Close, t3_SMA_5).
+2. Scaler column-count fix: meta/string columns kept as 0.0 so count matches.
+3. Regressor feature mismatch: regressor may have been trained on a different
+   (larger) feature set than the classifier/scaler. If feature counts differ,
+   fall back to rule-based gain estimates gracefully instead of crashing.
 """
 
 import json
@@ -19,8 +19,6 @@ from typing import Dict, List, Optional
 
 import joblib
 
-# Columns that are metadata, not numeric features.
-# If they appear in the scaler they will be filled with 0.0.
 _META_COLS = {"symbol", "exchange"}
 
 
@@ -32,11 +30,11 @@ class ExplosionPredictor:
         self.model         = None
         self.regressor     = None
         self.scaler        = None
-        self.feature_names: List[str] = []   # exact names the scaler expects
+        self.feature_names: List[str] = []
         self.metadata:      dict = {}
-
-        # Built in _build_lookup(): lowercase(feature) -> exact feature name
         self._lower_to_feature: Dict[str, str] = {}
+        # Expected feature count for regressor (may differ from classifier)
+        self._regressor_n_features: Optional[int] = None
 
         self._load_model()
 
@@ -58,7 +56,17 @@ class ExplosionPredictor:
 
         if regressor_path.exists():
             self.regressor = joblib.load(regressor_path)
-            self.logger.info("✓ Loaded classifier + regressor (dual-output mode)")
+            # Record how many features the regressor expects
+            try:
+                self._regressor_n_features = self.regressor.n_features_in_
+            except AttributeError:
+                try:
+                    self._regressor_n_features = self.regressor.get_booster().num_features()
+                except Exception:
+                    self._regressor_n_features = None
+            self.logger.info(
+                f"✓ Loaded regressor (expects {self._regressor_n_features} features)"
+            )
         else:
             self.regressor = None
             self.logger.warning("⚠ Regressor not found — will use rule-based gain estimates")
@@ -67,22 +75,31 @@ class ExplosionPredictor:
             with open(metadata_path) as f:
                 self.metadata = json.load(f)
 
-        # ── Feature list: scaler is ground truth ─────────────────────────
+        # Scaler is ground truth for classifier feature list
         if hasattr(self.scaler, "feature_names_in_"):
             self.feature_names = list(self.scaler.feature_names_in_)
         else:
             self.feature_names = [f"feature_{i}" for i in range(self.scaler.n_features_in_)]
-            self.logger.warning(
-                "Scaler has no feature_names_in_ — using positional names. "
-                "Column order must match training exactly."
-            )
+            self.logger.warning("Scaler has no feature_names_in_ — using positional names.")
 
         self._build_lookup()
 
+        classifier_n = self.scaler.n_features_in_
         self.logger.info(
-            f"✓ Model expects {len(self.feature_names)} features "
-            f"(scaler n_features_in_={self.scaler.n_features_in_})"
+            f"✓ Classifier/scaler expects {classifier_n} features; "
+            f"regressor expects {self._regressor_n_features} features"
         )
+
+        # Warn if regressor was trained on a different feature set
+        if (self._regressor_n_features is not None
+                and self._regressor_n_features != classifier_n):
+            self.logger.warning(
+                f"⚠ Regressor feature count ({self._regressor_n_features}) differs from "
+                f"classifier/scaler ({classifier_n}). "
+                f"Regressor will be SKIPPED — rule-based gain estimates will be used instead. "
+                f"Re-train the regressor with the same feature set to fix this."
+            )
+            self.regressor = None   # disable mismatched regressor
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
         has_flat = any(f.lower() in {"close", "rsi_14", "macd_12_26_9"} for f in self.feature_names)
@@ -99,13 +116,7 @@ class ExplosionPredictor:
             )
 
     def _build_lookup(self):
-        """
-        Build a case-insensitive lookup: lowercase(model_feature) -> model_feature.
-
-        The model was trained on lowercase column names (t3_close, t3_sma_5, …)
-        but fetch_stock_data_for_prediction produces mixed-case names
-        (t3_Close, t3_SMA_5, …).  This map lets us resolve both.
-        """
+        """lowercase(model_feature) -> model_feature for case-insensitive matching."""
         self._lower_to_feature = {f.lower(): f for f in self.feature_names}
 
     # ─────────────────────────────────────────────────────────────────────
@@ -115,48 +126,34 @@ class ExplosionPredictor:
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
         """
         Align input data_df to the model's expected feature schema.
-
-        Uses a case-insensitive lookup so t3_Close matches t3_close, etc.
-        Builds all columns at once via pd.DataFrame(dict) to avoid the
-        fragmentation PerformanceWarning.
+        Uses case-insensitive lookup so t3_Close matches t3_close etc.
         """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
-        # Build a lowercase → actual-column-name map for the INPUT data
         input_lower: Dict[str, str] = {c.lower(): c for c in data_df.columns}
 
         feature_data: dict = {}
-        matched      = 0
+        matched       = 0
         missing_names: List[str] = []
 
         for feature in self.feature_names:
             feature_lower = feature.lower()
 
-            # 1. Exact match
             if feature in data_df.columns:
                 feature_data[feature] = data_df[feature].values
                 matched += 1
-
-            # 2. Case-insensitive match
             elif feature_lower in input_lower:
-                src_col = input_lower[feature_lower]
-                feature_data[feature] = data_df[src_col].values
+                feature_data[feature] = data_df[input_lower[feature_lower]].values
                 matched += 1
-
-            # 3. Known meta column — fill with 0.0 (keeps scaler count correct)
             elif feature_lower in _META_COLS:
+                # Keep in matrix as 0.0 so column count matches scaler
                 feature_data[feature] = 0.0
-                # Don't count as missing — it's intentionally numeric-zeroed
-
-            # 4. Truly missing — use intelligent default
             else:
                 feature_data[feature] = self._get_default_value(feature, data_df)
                 missing_names.append(feature)
 
-        # Build all columns at once (avoids fragmentation warning)
         feature_df = pd.DataFrame(feature_data, index=data_df.index)
 
-        # Re-attach metadata as extra columns (never fed to the scaler)
         for col in ("symbol", "exchange"):
             if col in data_df.columns:
                 feature_df[col] = data_df[col].values
@@ -165,29 +162,24 @@ class ExplosionPredictor:
         self.logger.info(
             f"Feature coverage: {coverage:.1f}% ({matched}/{len(self.feature_names)})"
         )
-
         if missing_names:
             self.logger.debug(f"Missing {len(missing_names)} features — using intelligent defaults")
-
         if coverage < 50:
             self.logger.warning(
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
             )
-            sample_missing   = missing_names[:20]
-            sample_available = [c for c in data_df.columns if c not in _META_COLS][:20]
-            self.logger.warning(f"   Sample MISSING  features : {sample_missing}")
-            self.logger.warning(f"   Sample AVAILABLE columns : {sample_available}")
+            self.logger.warning(f"   Sample MISSING  features : {missing_names[:20]}")
+            sample_avail = [c for c in data_df.columns if c not in _META_COLS][:20]
+            self.logger.warning(f"   Sample AVAILABLE columns : {sample_avail}")
 
         return feature_df
 
     def _get_default_value(self, feature: str, data: pd.DataFrame):
-        """Return an intelligent scalar default for a missing feature."""
         f = feature.lower()
         for pfx in ("t1_open_", "t1_close_", "t3_", "t5_", "t10_"):
             if f.startswith(pfx):
                 f = f[len(pfx):]
                 break
-
         if any(x in f for x in ("rsi", "stoch", "willr", "cci")):
             return 50.0
         if any(x in f for x in ("change", "pct", "ratio", "slope", "diff", "roc", "mom", "macd", "ao")):
@@ -219,10 +211,7 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _scale_features(self, X: pd.DataFrame) -> pd.DataFrame:
-        """
-        Apply the stored scaler while preserving NaN positions.
-        X must contain exactly self.feature_names columns (no extra meta cols).
-        """
+        """Apply the stored scaler while preserving NaN positions."""
         expected_n = self.scaler.n_features_in_
         if X.shape[1] != expected_n:
             raise ValueError(
@@ -230,7 +219,6 @@ class ExplosionPredictor:
                 f"{expected_n}. len(feature_names)={len(self.feature_names)}."
             )
 
-        # Coerce any non-numeric columns to NaN
         non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
         if non_numeric:
             self.logger.warning(f"Coercing non-numeric columns to NaN: {non_numeric}")
@@ -240,7 +228,6 @@ class ExplosionPredictor:
 
         nan_mask = X.isna()
 
-        # Build mean Series aligned to X.columns
         if hasattr(self.scaler, "feature_names_in_"):
             mean_series = (
                 pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
@@ -252,7 +239,7 @@ class ExplosionPredictor:
         X_filled      = X.fillna(mean_series)
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-        X_scaled[nan_mask] = np.nan   # restore NaN for XGBoost missing-value routing
+        X_scaled[nan_mask] = np.nan
 
         return X_scaled
 
@@ -262,10 +249,8 @@ class ExplosionPredictor:
 
     def predict(self, data_df: pd.DataFrame) -> pd.DataFrame:
         features_df = self.prepare_features(data_df)
-
-        # Feed ONLY the model feature columns to the scaler
-        X        = features_df[self.feature_names].copy()
-        X_scaled = self._scale_features(X)
+        X           = features_df[self.feature_names].copy()
+        X_scaled    = self._scale_features(X)
 
         predictions   = self.model.predict(X_scaled)
         probabilities = self.model.predict_proba(X_scaled)[:, 1]
@@ -296,43 +281,51 @@ class ExplosionPredictor:
 
         # ── Gain prediction ───────────────────────────────────────────────
         if self.regressor is not None:
-            self.logger.info("Using LEARNED gain predictions from regressor")
-            predicted_gains = self.regressor.predict(X_scaled)
-            predictions["target_gain_pct"]  = predicted_gains
-            predictions["target_gain_low"]   = predicted_gains * 0.8
-            predictions["target_gain_high"]  = predicted_gains * 1.2
+            # Double-check at call time (in case somehow not caught at load)
+            try:
+                predicted_gains = self.regressor.predict(X_scaled)
+                self.logger.info("Using LEARNED gain predictions from regressor")
+                predictions["target_gain_pct"]  = predicted_gains
+                predictions["target_gain_low"]   = predicted_gains * 0.8
+                predictions["target_gain_high"]  = predicted_gains * 1.2
+            except Exception as e:
+                self.logger.warning(
+                    f"Regressor predict failed ({e}) — falling back to rule-based estimates"
+                )
+                self.regressor = None   # disable for remainder of session
 
-        elif historical_gains_df is not None and not historical_gains_df.empty:
-            self.logger.info("Using historical calibration for gain predictions")
-            gain_buckets = historical_gains_df.copy()
-            gain_buckets["prob_bucket"] = pd.cut(
-                gain_buckets["predicted_probability"],
-                bins=[0, 0.5, 0.7, 0.9, 1.0],
-                labels=["Low", "Medium", "High", "Very High"],
-            )
-            avg_gains = gain_buckets.groupby("prob_bucket")["actual_gain_pct"].agg(
-                ["mean", "median", "std"]
-            )
-            predictions["prob_bucket"] = pd.cut(
-                predictions["explosion_probability"],
-                bins=[0, 0.5, 0.7, 0.9, 1.0],
-                labels=["Low", "Medium", "High", "Very High"],
-            )
-            predictions = predictions.merge(
-                avg_gains, left_on="prob_bucket", right_index=True, how="left"
-            )
-            predictions["target_gain_pct"]  = predictions["median"]
-            predictions["target_gain_low"]   = predictions["median"] - predictions["std"]
-            predictions["target_gain_high"]  = predictions["median"] + predictions["std"]
-            predictions = predictions.drop(["prob_bucket", "mean", "median", "std"], axis=1)
+        if self.regressor is None:
+            if historical_gains_df is not None and not historical_gains_df.empty:
+                self.logger.info("Using historical calibration for gain predictions")
+                gain_buckets = historical_gains_df.copy()
+                gain_buckets["prob_bucket"] = pd.cut(
+                    gain_buckets["predicted_probability"],
+                    bins=[0, 0.5, 0.7, 0.9, 1.0],
+                    labels=["Low", "Medium", "High", "Very High"],
+                )
+                avg_gains = gain_buckets.groupby("prob_bucket")["actual_gain_pct"].agg(
+                    ["mean", "median", "std"]
+                )
+                predictions["prob_bucket"] = pd.cut(
+                    predictions["explosion_probability"],
+                    bins=[0, 0.5, 0.7, 0.9, 1.0],
+                    labels=["Low", "Medium", "High", "Very High"],
+                )
+                predictions = predictions.merge(
+                    avg_gains, left_on="prob_bucket", right_index=True, how="left"
+                )
+                predictions["target_gain_pct"]  = predictions["median"]
+                predictions["target_gain_low"]   = predictions["median"] - predictions["std"]
+                predictions["target_gain_high"]  = predictions["median"] + predictions["std"]
+                predictions = predictions.drop(["prob_bucket", "mean", "median", "std"], axis=1)
 
-        else:
-            self.logger.warning("Using rule-based gain estimates (no regressor or history)")
-            predictions["target_gain_pct"] = predictions["explosion_probability"].apply(
-                self._estimate_target_gain
-            )
-            predictions["target_gain_low"]  = predictions["target_gain_pct"] * 0.5
-            predictions["target_gain_high"] = predictions["target_gain_pct"] * 1.5
+            else:
+                self.logger.warning("Using rule-based gain estimates (no regressor or history)")
+                predictions["target_gain_pct"] = predictions["explosion_probability"].apply(
+                    self._estimate_target_gain
+                )
+                predictions["target_gain_low"]  = predictions["target_gain_pct"] * 0.5
+                predictions["target_gain_high"] = predictions["target_gain_pct"] * 1.5
 
         # Fill any remaining NaN gains
         nan_gain = predictions["target_gain_pct"].isna()
