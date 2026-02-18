@@ -14,6 +14,9 @@ from typing import Dict, List, Optional
 
 import joblib
 
+# Columns that must never be treated as model features
+_META_COLS = {"symbol", "exchange"}
+
 
 class ExplosionPredictor:
     """
@@ -60,8 +63,6 @@ class ExplosionPredictor:
             with open(metadata_path, "r") as f:
                 self.metadata = json.load(f)
 
-            # "features" holds the full list written by ml_retrain_model.save_outputs().
-            # Fall back to "feature_names_sample" only if "features" is missing (old models).
             self.feature_names = (
                 self.metadata.get("features")
                 or self.metadata.get("feature_names_sample")
@@ -69,7 +70,6 @@ class ExplosionPredictor:
             )
 
             if not self.feature_names:
-                # Last resort: infer from scaler
                 if hasattr(self.scaler, "feature_names_in_"):
                     self.feature_names = list(self.scaler.feature_names_in_)
                 else:
@@ -80,7 +80,6 @@ class ExplosionPredictor:
                     f"inferred {len(self.feature_names)} feature names from scaler"
                 )
         else:
-            # No metadata at all — infer from scaler
             if hasattr(self.scaler, "feature_names_in_"):
                 self.feature_names = list(self.scaler.feature_names_in_)
             else:
@@ -90,10 +89,22 @@ class ExplosionPredictor:
                 f"No metadata file — inferred {len(self.feature_names)} features from scaler"
             )
 
+        # ── GUARD: strip metadata columns from feature list ───────────────
+        # If "symbol" or "exchange" somehow ended up in the saved feature list
+        # (e.g. from a bug in a previous training run), remove them now so they
+        # never reach scaler.transform().
+        cleaned = [f for f in self.feature_names if f not in _META_COLS]
+        if len(cleaned) != len(self.feature_names):
+            removed = set(self.feature_names) - set(cleaned)
+            self.logger.warning(
+                f"Removed non-numeric columns from feature list: {removed}"
+            )
+            self.feature_names = cleaned
+
         self.logger.info(f"✓ Model expects {len(self.feature_names)} features")
 
-        has_t1     = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
-        has_flat   = any(f in {"Close", "RSI_14", "MACD_12_26_9"} for f in self.feature_names)
+        has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
+        has_flat = any(f in {"Close", "RSI_14", "MACD_12_26_9"} for f in self.feature_names)
         if has_flat and has_t1:
             self.logger.info("✓ Model type: HYBRID (T-3/T-5/T-10 + T-1 open/close)")
         elif has_flat:
@@ -112,12 +123,16 @@ class ExplosionPredictor:
         Missing features receive intelligent defaults (not 0.0 for everything)
         to avoid systematic bias.  NaN is NOT filled here — XGBoost's native
         missing-value routing handles it correctly and should be preserved.
+
+        NOTE: 'symbol' and 'exchange' are carried alongside the feature matrix
+        as separate columns but are NEVER included in self.feature_names, so
+        they never reach scaler.transform().
         """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
         feature_df = pd.DataFrame(index=data_df.index)
 
-        # Preserve metadata columns
+        # Preserve metadata columns alongside (not as features)
         for col in ("symbol", "exchange"):
             if col in data_df.columns:
                 feature_df[col] = data_df[col]
@@ -125,6 +140,9 @@ class ExplosionPredictor:
         matched = 0
         missing = 0
         for feature in self.feature_names:
+            # Paranoia check: skip any metadata column that slipped into feature_names
+            if feature in _META_COLS:
+                continue
             if feature in data_df.columns:
                 feature_df[feature] = data_df[feature]
                 matched += 1
@@ -143,17 +161,11 @@ class ExplosionPredictor:
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
             )
 
-        # Do NOT call fillna() here.
-        # NaN in feature columns means "not observed" — XGBoost routes those rows
-        # down the missing-value branch it learned during training.  Replacing NaN
-        # with 0.0 (or any constant) would send them down the wrong branch.
-
         return feature_df
 
     def _get_default_value(self, feature: str, data: pd.DataFrame):
         """Return an intelligent scalar default for a feature not present in data."""
         f = feature.lower()
-        # Strip timepoint prefix for analysis
         for pfx in ("t1_open_", "t1_close_", "t3_", "t5_", "t10_"):
             if f.startswith(pfx):
                 f = f[len(pfx):]
@@ -167,7 +179,7 @@ class ExplosionPredictor:
             return 0.0
         if "volume" in f or "obv" in f:
             for col in data.columns:
-                if "volume" in col.lower() and col not in ("symbol", "exchange"):
+                if "volume" in col.lower() and col not in _META_COLS:
                     try:
                         return float(data[col].median())
                     except Exception:
@@ -175,7 +187,7 @@ class ExplosionPredictor:
             return 100_000.0
         if any(x in f for x in ("price", "close", "open", "high", "low", "ema", "sma", "wma", "vwap")):
             for col in data.columns:
-                if "close" in col.lower() and col not in ("symbol", "exchange"):
+                if "close" in col.lower() and col not in _META_COLS:
                     try:
                         return float(data[col].median())
                     except Exception:
@@ -186,28 +198,43 @@ class ExplosionPredictor:
         return 0.0
 
     # ─────────────────────────────────────────────────────────────────────
-    # NaN-safe scaling (mirrors ml_retrain_model.build_scaler)
+    # NaN-safe scaling
     # ─────────────────────────────────────────────────────────────────────
 
     def _scale_features(self, X: pd.DataFrame) -> pd.DataFrame:
         """
         Apply the stored scaler while preserving NaN positions.
 
-        StandardScaler.transform() cannot handle NaN, so we:
-          1. Fill NaN with the column mean ONLY for the scaling step.
-          2. Transform.
-          3. Restore NaN at its original positions.
-        XGBoost then routes NaN rows through its learned missing-value branches.
+        Defensive: drop any non-numeric / metadata columns that may have
+        leaked into X before calling scaler.transform().
         """
+        # ── Drop any metadata / non-numeric columns that must not be scaled ──
+        cols_to_drop = [c for c in X.columns if c in _META_COLS]
+        if cols_to_drop:
+            self.logger.warning(
+                f"_scale_features: dropping non-feature columns before scaling: "
+                f"{cols_to_drop}"
+            )
+            X = X.drop(columns=cols_to_drop)
+
+        # Ensure all remaining columns are numeric; coerce if needed
+        for col in X.columns:
+            if not pd.api.types.is_numeric_dtype(X[col]):
+                self.logger.warning(
+                    f"_scale_features: column '{col}' is non-numeric "
+                    f"(dtype={X[col].dtype}), coercing to NaN"
+                )
+                X = X.copy()
+                X[col] = pd.to_numeric(X[col], errors="coerce")
+
         nan_mask = X.isna()
 
-        # Use scaler's own mean_ for filling (consistent with how it was fitted)
         col_means = pd.Series(self.scaler.mean_, index=X.columns)
         X_filled  = X.fillna(col_means)
 
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-        X_scaled[nan_mask] = np.nan   # restore NaN
+        X_scaled[nan_mask] = np.nan   # restore NaN for XGBoost missing-value routing
 
         return X_scaled
 
@@ -219,16 +246,14 @@ class ExplosionPredictor:
         """
         Make explosion predictions on data_df.
 
-        Args:
-            data_df: Input data with flat features (from yfinance / screener)
-
         Returns:
-            DataFrame sorted by explosion_probability descending, with columns:
-              symbol, exchange, explosion_probability, prediction, signal
+            DataFrame sorted by explosion_probability descending.
         """
         features_df = self.prepare_features(data_df)
-        X           = features_df[self.feature_names].copy()
-        X_scaled    = self._scale_features(X)
+
+        # Select ONLY the model feature columns (never symbol/exchange)
+        X        = features_df[self.feature_names].copy()
+        X_scaled = self._scale_features(X)
 
         predictions   = self.model.predict(X_scaled)
         probabilities = self.model.predict_proba(X_scaled)[:, 1]
@@ -300,7 +325,7 @@ class ExplosionPredictor:
             predictions["target_gain_low"]  = predictions["target_gain_pct"] * 0.5
             predictions["target_gain_high"] = predictions["target_gain_pct"] * 1.5
 
-        # Fill any remaining NaN gains (e.g. from empty probability buckets)
+        # Fill any remaining NaN gains
         nan_gain = predictions["target_gain_pct"].isna()
         if nan_gain.any():
             predictions.loc[nan_gain, "target_gain_pct"] = (
@@ -317,7 +342,8 @@ class ExplosionPredictor:
         # ── Attach current price and target prices ────────────────────────
         if "symbol" in predictions.columns:
             close_col = next(
-                (c for c in features_df.columns if "close" in c.lower()),
+                (c for c in features_df.columns
+                 if "close" in c.lower() and c not in _META_COLS),
                 None,
             )
             if close_col:
