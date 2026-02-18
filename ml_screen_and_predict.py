@@ -933,7 +933,6 @@ def main():
         'avg_probability':    float(predictions_df['explosion_probability'].mean()),
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
-        'median_probability': float(predictions_df['explosion_probability'].median()),
         'model_version':      'csv_trained_with_t3_t5_t10_prefixes'
     }
     supabase.write_screening_log(screening_log)
