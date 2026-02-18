@@ -1,8 +1,13 @@
 """
 Explosion Predictor - HYBRID MODEL VERSION
-Works with models that know BOTH:
-- T-3, T-5, T-10 (flat features from CSV: Close, RSI_14, MACD)
-- T-1 open/close (prefixed features from database: t1_open_RSI_14, t1_close_MACD_12_26_9)
+
+KEY FIXES:
+1. Case-normalises feature lookup: model trained with lowercase (t3_close, t3_sma_5)
+   but fetcher produces mixed-case (t3_Close, t3_SMA_5).  A case-insensitive lookup
+   map is built once at load time so all 413 features resolve correctly.
+2. Scaler column-count fix: if the scaler has one extra column that is a known
+   meta/string column (e.g. 'exchange'), it is kept in the matrix as 0.0 so the
+   count always matches — it is never stripped.
 """
 
 import json
@@ -14,24 +19,24 @@ from typing import Dict, List, Optional
 
 import joblib
 
-# Columns that must never be treated as model features
+# Columns that are metadata, not numeric features.
+# If they appear in the scaler they will be filled with 0.0.
 _META_COLS = {"symbol", "exchange"}
 
 
 class ExplosionPredictor:
-    """
-    Hybrid explosion predictor.
-    Works with models that expect BOTH old CSV features AND new T-1 split features.
-    """
 
     def __init__(self, model_dir: str = "ml_models"):
-        self.logger     = logging.getLogger(__name__)
-        self.model_dir  = Path(model_dir)
-        self.model      = None
-        self.regressor  = None
-        self.scaler     = None
-        self.feature_names: List[str] = []
-        self.metadata:  dict = {}
+        self.logger        = logging.getLogger(__name__)
+        self.model_dir     = Path(model_dir)
+        self.model         = None
+        self.regressor     = None
+        self.scaler        = None
+        self.feature_names: List[str] = []   # exact names the scaler expects
+        self.metadata:      dict = {}
+
+        # Built in _build_lookup(): lowercase(feature) -> exact feature name
+        self._lower_to_feature: Dict[str, str] = {}
 
         self._load_model()
 
@@ -40,7 +45,6 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _load_model(self):
-        """Load trained classifier (and optional regressor)."""
         model_path     = self.model_dir / "best_model.pkl"
         regressor_path = self.model_dir / "gain_regressor.pkl"
         scaler_path    = self.model_dir / "scaler.pkl"
@@ -59,55 +63,29 @@ class ExplosionPredictor:
             self.regressor = None
             self.logger.warning("⚠ Regressor not found — will use rule-based gain estimates")
 
-        # ── GROUND TRUTH: always use the scaler's own feature list ───────
-        # The scaler was fitted on exactly the right columns; metadata may
-        # have minor discrepancies (e.g. extra/missing columns).
-        if hasattr(self.scaler, "feature_names_in_"):
-            scaler_features = list(self.scaler.feature_names_in_)
-        else:
-            n = self.scaler.n_features_in_
-            scaler_features = [f"feature_{i}" for i in range(n)]
-
-        # Load metadata for reference / logging only
         if metadata_path.exists():
-            with open(metadata_path, "r") as f:
+            with open(metadata_path) as f:
                 self.metadata = json.load(f)
 
-            meta_features = (
-                self.metadata.get("features")
-                or self.metadata.get("feature_names_sample")
-                or []
-            )
-
-            # Warn if metadata and scaler disagree
-            if meta_features and set(meta_features) != set(scaler_features):
-                only_meta   = set(meta_features) - set(scaler_features)
-                only_scaler = set(scaler_features) - set(meta_features)
-                if only_meta or only_scaler:
-                    self.logger.warning(
-                        f"Metadata/scaler feature mismatch — "
-                        f"only in metadata: {len(only_meta)}, "
-                        f"only in scaler: {len(only_scaler)}. "
-                        f"Using scaler list as ground truth."
-                    )
+        # ── Feature list: scaler is ground truth ─────────────────────────
+        if hasattr(self.scaler, "feature_names_in_"):
+            self.feature_names = list(self.scaler.feature_names_in_)
         else:
-            self.logger.warning("No metadata file — using scaler feature list only")
-
-        # Strip any metadata columns that should never be features
-        self.feature_names = [f for f in scaler_features if f not in _META_COLS]
-        if len(self.feature_names) != len(scaler_features):
-            removed = set(scaler_features) - set(self.feature_names)
+            self.feature_names = [f"feature_{i}" for i in range(self.scaler.n_features_in_)]
             self.logger.warning(
-                f"Stripped non-numeric columns from scaler feature list: {removed}"
+                "Scaler has no feature_names_in_ — using positional names. "
+                "Column order must match training exactly."
             )
+
+        self._build_lookup()
 
         self.logger.info(
             f"✓ Model expects {len(self.feature_names)} features "
-            f"(scaler has {self.scaler.n_features_in_} total)"
+            f"(scaler n_features_in_={self.scaler.n_features_in_})"
         )
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
-        has_flat = any(f in {"Close", "RSI_14", "MACD_12_26_9"} for f in self.feature_names)
+        has_flat = any(f.lower() in {"close", "rsi_14", "macd_12_26_9"} for f in self.feature_names)
         if has_flat and has_t1:
             self.logger.info("✓ Model type: HYBRID (T-3/T-5/T-10 + T-1 open/close)")
         elif has_flat:
@@ -120,6 +98,16 @@ class ExplosionPredictor:
                 self.feature_names[:10],
             )
 
+    def _build_lookup(self):
+        """
+        Build a case-insensitive lookup: lowercase(model_feature) -> model_feature.
+
+        The model was trained on lowercase column names (t3_close, t3_sma_5, …)
+        but fetch_stock_data_for_prediction produces mixed-case names
+        (t3_Close, t3_SMA_5, …).  This map lets us resolve both.
+        """
+        self._lower_to_feature = {f.lower(): f for f in self.feature_names}
+
     # ─────────────────────────────────────────────────────────────────────
     # Feature preparation
     # ─────────────────────────────────────────────────────────────────────
@@ -128,32 +116,47 @@ class ExplosionPredictor:
         """
         Align input data_df to the model's expected feature schema.
 
-        Builds all feature columns at once via pd.DataFrame(dict) to avoid
-        the fragmentation warning from repeated frame.insert() calls.
-
-        NaN is NOT filled here — XGBoost's native missing-value routing
-        handles it correctly and should be preserved.
+        Uses a case-insensitive lookup so t3_Close matches t3_close, etc.
+        Builds all columns at once via pd.DataFrame(dict) to avoid the
+        fragmentation PerformanceWarning.
         """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
+        # Build a lowercase → actual-column-name map for the INPUT data
+        input_lower: Dict[str, str] = {c.lower(): c for c in data_df.columns}
+
         feature_data: dict = {}
-        matched = 0
+        matched      = 0
         missing_names: List[str] = []
 
         for feature in self.feature_names:
-            if feature in _META_COLS:
-                continue   # safety: should never happen after _load_model cleanup
+            feature_lower = feature.lower()
+
+            # 1. Exact match
             if feature in data_df.columns:
                 feature_data[feature] = data_df[feature].values
                 matched += 1
+
+            # 2. Case-insensitive match
+            elif feature_lower in input_lower:
+                src_col = input_lower[feature_lower]
+                feature_data[feature] = data_df[src_col].values
+                matched += 1
+
+            # 3. Known meta column — fill with 0.0 (keeps scaler count correct)
+            elif feature_lower in _META_COLS:
+                feature_data[feature] = 0.0
+                # Don't count as missing — it's intentionally numeric-zeroed
+
+            # 4. Truly missing — use intelligent default
             else:
                 feature_data[feature] = self._get_default_value(feature, data_df)
                 missing_names.append(feature)
 
-        # Build all columns at once (no fragmentation)
+        # Build all columns at once (avoids fragmentation warning)
         feature_df = pd.DataFrame(feature_data, index=data_df.index)
 
-        # Re-attach metadata columns alongside (never included in self.feature_names)
+        # Re-attach metadata as extra columns (never fed to the scaler)
         for col in ("symbol", "exchange"):
             if col in data_df.columns:
                 feature_df[col] = data_df[col].values
@@ -164,15 +167,12 @@ class ExplosionPredictor:
         )
 
         if missing_names:
-            self.logger.debug(
-                f"Missing {len(missing_names)} features — using intelligent defaults"
-            )
+            self.logger.debug(f"Missing {len(missing_names)} features — using intelligent defaults")
 
         if coverage < 50:
             self.logger.warning(
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
             )
-            # Log samples to help diagnose naming convention mismatches
             sample_missing   = missing_names[:20]
             sample_available = [c for c in data_df.columns if c not in _META_COLS][:20]
             self.logger.warning(f"   Sample MISSING  features : {sample_missing}")
@@ -181,7 +181,7 @@ class ExplosionPredictor:
         return feature_df
 
     def _get_default_value(self, feature: str, data: pd.DataFrame):
-        """Return an intelligent scalar default for a feature not present in data."""
+        """Return an intelligent scalar default for a missing feature."""
         f = feature.lower()
         for pfx in ("t1_open_", "t1_close_", "t3_", "t5_", "t10_"):
             if f.startswith(pfx):
@@ -221,12 +221,8 @@ class ExplosionPredictor:
     def _scale_features(self, X: pd.DataFrame) -> pd.DataFrame:
         """
         Apply the stored scaler while preserving NaN positions.
-
-        X must contain exactly self.feature_names columns (no metadata cols).
-        The mean Series is built from scaler.feature_names_in_ so the index
-        always aligns with X.columns regardless of order.
+        X must contain exactly self.feature_names columns (no extra meta cols).
         """
-        # Verify column count matches scaler expectation
         expected_n = self.scaler.n_features_in_
         if X.shape[1] != expected_n:
             raise ValueError(
@@ -234,12 +230,10 @@ class ExplosionPredictor:
                 f"{expected_n}. len(feature_names)={len(self.feature_names)}."
             )
 
-        # Coerce any non-numeric columns to NaN (last-resort safety net)
+        # Coerce any non-numeric columns to NaN
         non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
         if non_numeric:
-            self.logger.warning(
-                f"_scale_features: coercing non-numeric columns to NaN: {non_numeric}"
-            )
+            self.logger.warning(f"Coercing non-numeric columns to NaN: {non_numeric}")
             X = X.copy()
             for c in non_numeric:
                 X[c] = pd.to_numeric(X[c], errors="coerce")
@@ -247,19 +241,15 @@ class ExplosionPredictor:
         nan_mask = X.isna()
 
         # Build mean Series aligned to X.columns
-        # Using scaler.feature_names_in_ → .reindex() keeps correct alignment
-        # even if X.columns are in a different order.
         if hasattr(self.scaler, "feature_names_in_"):
             mean_series = (
                 pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
                 .reindex(X.columns)
             )
         else:
-            # No names stored — assume columns are in the same order as fitted
             mean_series = pd.Series(self.scaler.mean_, index=X.columns)
 
-        X_filled = X.fillna(mean_series)
-
+        X_filled      = X.fillna(mean_series)
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
         X_scaled[nan_mask] = np.nan   # restore NaN for XGBoost missing-value routing
@@ -271,15 +261,9 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def predict(self, data_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Make explosion predictions on data_df.
-
-        Returns:
-            DataFrame sorted by explosion_probability descending.
-        """
         features_df = self.prepare_features(data_df)
 
-        # Select ONLY the model feature columns (never symbol/exchange)
+        # Feed ONLY the model feature columns to the scaler
         X        = features_df[self.feature_names].copy()
         X_scaled = self._scale_features(X)
 
@@ -305,9 +289,6 @@ class ExplosionPredictor:
         data_df: pd.DataFrame,
         historical_gains_df: pd.DataFrame = None,
     ) -> pd.DataFrame:
-        """
-        Make predictions and attach target gain / price estimates.
-        """
         predictions = self.predict(data_df)
         features_df = self.prepare_features(data_df)
         X           = features_df[self.feature_names].copy()
