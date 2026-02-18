@@ -77,6 +77,7 @@ jobs:
           # Add model files
           git add ml_models/best_model.pkl || true
           git add ml_models/scaler.pkl || true
+          git add ml_models/gain_regressor.pkl || true
           git add ml_models/model_metadata.json || true
           git add ml_models/feature_importance.csv || true
           
