@@ -59,49 +59,52 @@ class ExplosionPredictor:
             self.regressor = None
             self.logger.warning("⚠ Regressor not found — will use rule-based gain estimates")
 
+        # ── GROUND TRUTH: always use the scaler's own feature list ───────
+        # The scaler was fitted on exactly the right columns; metadata may
+        # have minor discrepancies (e.g. extra/missing columns).
+        if hasattr(self.scaler, "feature_names_in_"):
+            scaler_features = list(self.scaler.feature_names_in_)
+        else:
+            n = self.scaler.n_features_in_
+            scaler_features = [f"feature_{i}" for i in range(n)]
+
+        # Load metadata for reference / logging only
         if metadata_path.exists():
             with open(metadata_path, "r") as f:
                 self.metadata = json.load(f)
 
-            self.feature_names = (
+            meta_features = (
                 self.metadata.get("features")
                 or self.metadata.get("feature_names_sample")
                 or []
             )
 
-            if not self.feature_names:
-                if hasattr(self.scaler, "feature_names_in_"):
-                    self.feature_names = list(self.scaler.feature_names_in_)
-                else:
-                    n = self.scaler.n_features_in_
-                    self.feature_names = [f"feature_{i}" for i in range(n)]
-                self.logger.warning(
-                    f"'features' key missing from metadata — "
-                    f"inferred {len(self.feature_names)} feature names from scaler"
-                )
+            # Warn if metadata and scaler disagree
+            if meta_features and set(meta_features) != set(scaler_features):
+                only_meta   = set(meta_features) - set(scaler_features)
+                only_scaler = set(scaler_features) - set(meta_features)
+                if only_meta or only_scaler:
+                    self.logger.warning(
+                        f"Metadata/scaler feature mismatch — "
+                        f"only in metadata: {len(only_meta)}, "
+                        f"only in scaler: {len(only_scaler)}. "
+                        f"Using scaler list as ground truth."
+                    )
         else:
-            if hasattr(self.scaler, "feature_names_in_"):
-                self.feature_names = list(self.scaler.feature_names_in_)
-            else:
-                n = self.scaler.n_features_in_
-                self.feature_names = [f"feature_{i}" for i in range(n)]
+            self.logger.warning("No metadata file — using scaler feature list only")
+
+        # Strip any metadata columns that should never be features
+        self.feature_names = [f for f in scaler_features if f not in _META_COLS]
+        if len(self.feature_names) != len(scaler_features):
+            removed = set(scaler_features) - set(self.feature_names)
             self.logger.warning(
-                f"No metadata file — inferred {len(self.feature_names)} features from scaler"
+                f"Stripped non-numeric columns from scaler feature list: {removed}"
             )
 
-        # ── GUARD: strip metadata columns from feature list ───────────────
-        # If "symbol" or "exchange" somehow ended up in the saved feature list
-        # (e.g. from a bug in a previous training run), remove them now so they
-        # never reach scaler.transform().
-        cleaned = [f for f in self.feature_names if f not in _META_COLS]
-        if len(cleaned) != len(self.feature_names):
-            removed = set(self.feature_names) - set(cleaned)
-            self.logger.warning(
-                f"Removed non-numeric columns from feature list: {removed}"
-            )
-            self.feature_names = cleaned
-
-        self.logger.info(f"✓ Model expects {len(self.feature_names)} features")
+        self.logger.info(
+            f"✓ Model expects {len(self.feature_names)} features "
+            f"(scaler has {self.scaler.n_features_in_} total)"
+        )
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
         has_flat = any(f in {"Close", "RSI_14", "MACD_12_26_9"} for f in self.feature_names)
@@ -111,6 +114,11 @@ class ExplosionPredictor:
             self.logger.info("✓ Model type: CSV-ONLY (T-3/T-5/T-10)")
         elif has_t1:
             self.logger.info("✓ Model type: DATABASE-ONLY (T-1 open/close)")
+        else:
+            self.logger.warning(
+                "⚠ Could not identify model type. First 10 features: %s",
+                self.feature_names[:10],
+            )
 
     # ─────────────────────────────────────────────────────────────────────
     # Feature preparation
@@ -120,46 +128,55 @@ class ExplosionPredictor:
         """
         Align input data_df to the model's expected feature schema.
 
-        Missing features receive intelligent defaults (not 0.0 for everything)
-        to avoid systematic bias.  NaN is NOT filled here — XGBoost's native
-        missing-value routing handles it correctly and should be preserved.
+        Builds all feature columns at once via pd.DataFrame(dict) to avoid
+        the fragmentation warning from repeated frame.insert() calls.
 
-        NOTE: 'symbol' and 'exchange' are carried alongside the feature matrix
-        as separate columns but are NEVER included in self.feature_names, so
-        they never reach scaler.transform().
+        NaN is NOT filled here — XGBoost's native missing-value routing
+        handles it correctly and should be preserved.
         """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
-        feature_df = pd.DataFrame(index=data_df.index)
-
-        # Preserve metadata columns alongside (not as features)
-        for col in ("symbol", "exchange"):
-            if col in data_df.columns:
-                feature_df[col] = data_df[col]
-
+        feature_data: dict = {}
         matched = 0
-        missing = 0
+        missing_names: List[str] = []
+
         for feature in self.feature_names:
-            # Paranoia check: skip any metadata column that slipped into feature_names
             if feature in _META_COLS:
-                continue
+                continue   # safety: should never happen after _load_model cleanup
             if feature in data_df.columns:
-                feature_df[feature] = data_df[feature]
+                feature_data[feature] = data_df[feature].values
                 matched += 1
             else:
-                feature_df[feature] = self._get_default_value(feature, data_df)
-                missing += 1
+                feature_data[feature] = self._get_default_value(feature, data_df)
+                missing_names.append(feature)
+
+        # Build all columns at once (no fragmentation)
+        feature_df = pd.DataFrame(feature_data, index=data_df.index)
+
+        # Re-attach metadata columns alongside (never included in self.feature_names)
+        for col in ("symbol", "exchange"):
+            if col in data_df.columns:
+                feature_df[col] = data_df[col].values
 
         coverage = (matched / len(self.feature_names) * 100) if self.feature_names else 0
         self.logger.info(
             f"Feature coverage: {coverage:.1f}% ({matched}/{len(self.feature_names)})"
         )
-        if missing:
-            self.logger.debug(f"Missing {missing} features — using intelligent defaults")
+
+        if missing_names:
+            self.logger.debug(
+                f"Missing {len(missing_names)} features — using intelligent defaults"
+            )
+
         if coverage < 50:
             self.logger.warning(
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
             )
+            # Log samples to help diagnose naming convention mismatches
+            sample_missing   = missing_names[:20]
+            sample_available = [c for c in data_df.columns if c not in _META_COLS][:20]
+            self.logger.warning(f"   Sample MISSING  features : {sample_missing}")
+            self.logger.warning(f"   Sample AVAILABLE columns : {sample_available}")
 
         return feature_df
 
@@ -205,32 +222,43 @@ class ExplosionPredictor:
         """
         Apply the stored scaler while preserving NaN positions.
 
-        Defensive: drop any non-numeric / metadata columns that may have
-        leaked into X before calling scaler.transform().
+        X must contain exactly self.feature_names columns (no metadata cols).
+        The mean Series is built from scaler.feature_names_in_ so the index
+        always aligns with X.columns regardless of order.
         """
-        # ── Drop any metadata / non-numeric columns that must not be scaled ──
-        cols_to_drop = [c for c in X.columns if c in _META_COLS]
-        if cols_to_drop:
-            self.logger.warning(
-                f"_scale_features: dropping non-feature columns before scaling: "
-                f"{cols_to_drop}"
+        # Verify column count matches scaler expectation
+        expected_n = self.scaler.n_features_in_
+        if X.shape[1] != expected_n:
+            raise ValueError(
+                f"_scale_features: X has {X.shape[1]} columns but scaler expects "
+                f"{expected_n}. len(feature_names)={len(self.feature_names)}."
             )
-            X = X.drop(columns=cols_to_drop)
 
-        # Ensure all remaining columns are numeric; coerce if needed
-        for col in X.columns:
-            if not pd.api.types.is_numeric_dtype(X[col]):
-                self.logger.warning(
-                    f"_scale_features: column '{col}' is non-numeric "
-                    f"(dtype={X[col].dtype}), coercing to NaN"
-                )
-                X = X.copy()
-                X[col] = pd.to_numeric(X[col], errors="coerce")
+        # Coerce any non-numeric columns to NaN (last-resort safety net)
+        non_numeric = [c for c in X.columns if not pd.api.types.is_numeric_dtype(X[c])]
+        if non_numeric:
+            self.logger.warning(
+                f"_scale_features: coercing non-numeric columns to NaN: {non_numeric}"
+            )
+            X = X.copy()
+            for c in non_numeric:
+                X[c] = pd.to_numeric(X[c], errors="coerce")
 
         nan_mask = X.isna()
 
-        col_means = pd.Series(self.scaler.mean_, index=X.columns)
-        X_filled  = X.fillna(col_means)
+        # Build mean Series aligned to X.columns
+        # Using scaler.feature_names_in_ → .reindex() keeps correct alignment
+        # even if X.columns are in a different order.
+        if hasattr(self.scaler, "feature_names_in_"):
+            mean_series = (
+                pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
+                .reindex(X.columns)
+            )
+        else:
+            # No names stored — assume columns are in the same order as fitted
+            mean_series = pd.Series(self.scaler.mean_, index=X.columns)
+
+        X_filled = X.fillna(mean_series)
 
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
