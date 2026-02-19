@@ -86,6 +86,7 @@ HARD_CAPS = {
     "min_relative_volume": 1.0,
 }
 
+INTRADAY_WIN_THRESHOLD = 15.0  # % intraday high threshold to count as correct pick
 
 def load_config(config_path: str) -> dict:
     with open(config_path, "r") as f:
@@ -639,13 +640,15 @@ class ComprehensiveAccuracyTracker:
         """
         Analyse prediction accuracy.
 
-        Args:
-            predictions_df: All ML predictions for the date.
-            winners_df:     Stocks that became daily winners (ground truth).
-            yfinance_gains: dict[symbol -> result dict] from fetch_actual_gains_for_all_symbols.
-                            Contains actual_gain_pct, actual_high_pct, actual_close, etc.
-                            for EVERY predicted symbol, populated via yfinance regardless
-                            of whether the stock became a winner.
+        FIXES:
+          1. actual_high_pct now uses yfinance value (correct: uses prev_close as
+             denominator) instead of daily_winners table value (wrong: uses same-day
+             price which gives (high/close) ≈ 1.0 → near-zero % for all winners).
+
+          2. intraday_winner outcome type: predicted stocks that hit INTRADAY_WIN_THRESHOLD
+             intraday but didn't close as daily winners are classified as "intraday_winner"
+             instead of "false_positive". The model was correct — the stock moved. The
+             close-based winner label just missed it.
         """
         self.logger.info("\n" + "=" * 60)
         self.logger.info("ANALYZING PREDICTION ACCURACY")
@@ -657,7 +660,6 @@ class ComprehensiveAccuracyTracker:
 
         winners_set = set(winners_df["symbol"].tolist())
 
-        # How many symbols have yfinance data
         yf_populated = sum(
             1 for r in yfinance_gains.values()
             if r.get("actual_gain_pct") is not None
@@ -668,41 +670,55 @@ class ComprehensiveAccuracyTracker:
         )
 
         accuracy_records = []
-        details_records = []
-        true_positives = false_positives = true_negatives = 0
+        details_records  = []
+        true_positives   = false_positives = true_negatives = 0
+        intraday_winners = 0
 
         for _, pred in predictions_df.iterrows():
-            symbol = pred["symbol"]
+            symbol             = pred["symbol"]
             predicted_positive = pred["prediction"] == 1
-            became_winner = symbol in winners_set
+            became_winner      = symbol in winners_set
 
-            # ── Actual gain: prefer daily_winners table for confirmed winners
-            #    (it has high/low from the actual session), fall back to yfinance
-            #    for everything else.  This means actual_gain_pct is ALWAYS
-            #    populated as long as yfinance returned data. ──────────────
             yf_data = yfinance_gains.get(symbol, {})
 
             if became_winner and not winners_df.empty:
-                winner_row  = winners_df[winners_df["symbol"] == symbol].iloc[0]
-                actual_gain = float(winner_row["change_pct"])
+                winner_row   = winners_df[winners_df["symbol"] == symbol].iloc[0]
+                actual_gain  = float(winner_row["change_pct"])
                 actual_price = float(winner_row["price"])
-                w_high = winner_row.get("high", actual_price)
-                actual_high_pct = (
-                    ((float(w_high) / actual_price) - 1) * 100
-                    if actual_price and actual_price > 0 else None
-                )
-                # Fill any missing OHLCV from yfinance as a backup
+
+                # FIX 1: Prefer yfinance actual_high_pct — correct denominator is prev_close.
+                # daily_winners["price"] is same-day price, so (high/price - 1) ≈ 0 for
+                # most stocks, hiding the real intraday move.
+                if yf_data.get("actual_high_pct") is not None:
+                    actual_high_pct = yf_data["actual_high_pct"]
+                else:
+                    w_high = winner_row.get("high", actual_price)
+                    actual_high_pct = (
+                        ((float(w_high) / actual_price) - 1) * 100
+                        if actual_price and actual_price > 0 else None
+                    )
+                    if actual_high_pct is not None:
+                        self.logger.debug(
+                            f"{symbol}: fallback actual_high_pct (no yfinance) — "
+                            "denominator is same-day price, not prev_close"
+                        )
+
                 actual_volume = (
                     int(winner_row["volume"])
                     if pd.notna(winner_row.get("volume"))
                     else yf_data.get("actual_volume")
                 )
             else:
-                # Non-winner (or winner not in our winners table): use yfinance
-                actual_gain  = yf_data.get("actual_gain_pct")   # float | None
-                actual_price = yf_data.get("actual_close") or pred.get("current_price", 0)
-                actual_high_pct = yf_data.get("actual_high_pct")  # float | None
-                actual_volume   = yf_data.get("actual_volume")     # int   | None
+                actual_gain     = yf_data.get("actual_gain_pct")
+                actual_price    = yf_data.get("actual_close") or pred.get("current_price", 0)
+                actual_high_pct = yf_data.get("actual_high_pct")
+                actual_volume   = yf_data.get("actual_volume")
+
+            # FIX 2: Was the intraday move significant even if it didn't close as winner?
+            intraday_hit = (
+                actual_high_pct is not None
+                and actual_high_pct >= INTRADAY_WIN_THRESHOLD
+            )
 
             prediction_correct = (predicted_positive and became_winner) or (
                 not predicted_positive and not became_winner
@@ -710,7 +726,7 @@ class ComprehensiveAccuracyTracker:
 
             predicted_gain = pred.get("target_gain_pct", 0)
             if became_winner and predicted_gain and predicted_gain > 0 and actual_gain is not None:
-                gain_error = abs(predicted_gain - actual_gain)
+                gain_error       = abs(predicted_gain - actual_gain)
                 gain_error_ratio = gain_error / actual_gain if actual_gain != 0 else 0
             else:
                 gain_error = gain_error_ratio = None
@@ -718,6 +734,11 @@ class ComprehensiveAccuracyTracker:
             if predicted_positive and became_winner:
                 outcome_type = "true_positive"
                 true_positives += 1
+            elif predicted_positive and not became_winner and intraday_hit:
+                # FIX 2: model correctly identified an explosive stock; close-based label missed it
+                outcome_type       = "intraday_winner"
+                intraday_winners  += 1
+                prediction_correct = True   # count as correct
             elif predicted_positive and not became_winner:
                 outcome_type = "false_positive"
                 false_positives += 1
@@ -727,65 +748,60 @@ class ComprehensiveAccuracyTracker:
             else:
                 outcome_type = "false_negative"
 
-            accuracy_records.append(
-                {
-                    "symbol":                 symbol,
-                    "prediction_date":        pred["prediction_date"],
-                    "predicted_probability":  pred["explosion_probability"],
-                    "predicted_signal":       pred["signal"],
-                    "predicted_target_gain":  pred.get("target_gain_pct"),
-                    "predicted_target_price": pred.get("target_price"),
-                    "became_winner":          became_winner,
-                    # actual_gain_pct is now populated for ALL symbols via yfinance
-                    "actual_gain_pct":        actual_gain,
-                    "actual_high_pct":        actual_high_pct,
-                    "actual_price":           actual_price,
-                    "prediction_correct":     prediction_correct,
-                    "gain_error_pct":         gain_error,
-                    "gain_error_ratio":       gain_error_ratio,
-                    "actual_recorded_at":     datetime.now().isoformat(),
-                }
-            )
+            accuracy_records.append({
+                "symbol":                 symbol,
+                "prediction_date":        pred["prediction_date"],
+                "predicted_probability":  pred["explosion_probability"],
+                "predicted_signal":       pred["signal"],
+                "predicted_target_gain":  pred.get("target_gain_pct"),
+                "predicted_target_price": pred.get("target_price"),
+                "became_winner":          became_winner,
+                "actual_gain_pct":        actual_gain,
+                "actual_high_pct":        actual_high_pct,
+                "actual_price":           actual_price,
+                "prediction_correct":     prediction_correct,
+                "gain_error_pct":         gain_error,
+                "gain_error_ratio":       gain_error_ratio,
+                "actual_recorded_at":     datetime.now().isoformat(),
+            })
 
-            details_records.append(
-                {
-                    "symbol":                symbol,
-                    "prediction_date":       pred["prediction_date"],
-                    "predicted_probability": pred["explosion_probability"],
-                    "predicted_signal":      pred["signal"],
-                    "outcome_type":          outcome_type,
-                    "became_winner":         became_winner,
-                    # same here — always populated from yfinance
-                    "actual_gain_pct":       actual_gain,
-                    "actual_high_pct":       actual_high_pct,
-                    "actual_volume":         actual_volume,
-                    "failure_reason":        None,
-                }
-            )
+            details_records.append({
+                "symbol":                symbol,
+                "prediction_date":       pred["prediction_date"],
+                "predicted_probability": pred["explosion_probability"],
+                "predicted_signal":      pred["signal"],
+                "outcome_type":          outcome_type,
+                "became_winner":         became_winner,
+                "actual_gain_pct":       actual_gain,
+                "actual_high_pct":       actual_high_pct,
+                "actual_volume":         actual_volume,
+                "failure_reason":        None,
+            })
 
-        total   = len(predictions_df)
-        correct = true_positives + true_negatives
-        accuracy_pct = (correct / total * 100) if total > 0 else 0
-        predicted_winners = true_positives + false_positives
-        precision = (
-            (true_positives / predicted_winners * 100) if predicted_winners > 0 else 0
-        )
+        total               = len(predictions_df)
+        predicted_buys      = true_positives + false_positives + intraday_winners
+        strict_correct      = true_positives + true_negatives
+        adjusted_correct    = strict_correct + intraday_winners
+        strict_accuracy     = (strict_correct   / total * 100) if total > 0 else 0
+        adjusted_accuracy   = (adjusted_correct / total * 100) if total > 0 else 0
+        strict_precision    = (true_positives / predicted_buys * 100) if predicted_buys > 0 else 0
+        adjusted_precision  = ((true_positives + intraday_winners) / predicted_buys * 100) if predicted_buys > 0 else 0
 
-        # Summary of gain data coverage
-        gain_populated = sum(
-            1 for r in accuracy_records if r.get("actual_gain_pct") is not None
-        )
+        gain_populated = sum(1 for r in accuracy_records if r.get("actual_gain_pct") is not None)
+        high_populated = sum(1 for r in accuracy_records if r.get("actual_high_pct") is not None)
+
         self.logger.info(f"\nPrediction Accuracy:")
-        self.logger.info(f"  Total:                {total}")
-        self.logger.info(f"  True Positives:       {true_positives}")
-        self.logger.info(f"  False Positives:      {false_positives}")
-        self.logger.info(f"  True Negatives:       {true_negatives}")
-        self.logger.info(f"  Accuracy:             {accuracy_pct:.2f}%")
-        self.logger.info(f"  Precision:            {precision:.2f}%")
-        self.logger.info(
-            f"  actual_gain_pct populated: {gain_populated}/{total} "
-            f"({gain_populated/total*100:.1f}%)"
-        )
+        self.logger.info(f"  Total:                     {total}")
+        self.logger.info(f"  True Positives (closed):   {true_positives}")
+        self.logger.info(f"  Intraday Winners:          {intraday_winners}  ← hit {INTRADAY_WIN_THRESHOLD}%+ intraday but not top close")
+        self.logger.info(f"  False Positives (strict):  {false_positives}")
+        self.logger.info(f"  True Negatives:            {true_negatives}")
+        self.logger.info(f"  Accuracy  (strict):        {strict_accuracy:.2f}%")
+        self.logger.info(f"  Accuracy  (w/ intraday):   {adjusted_accuracy:.2f}%")
+        self.logger.info(f"  Precision (strict):        {strict_precision:.2f}%")
+        self.logger.info(f"  Precision (w/ intraday):   {adjusted_precision:.2f}%")
+        self.logger.info(f"  actual_gain_pct populated: {gain_populated}/{total} ({gain_populated/total*100:.1f}%)")
+        self.logger.info(f"  actual_high_pct populated: {high_populated}/{total} ({high_populated/total*100:.1f}%)")
 
         return accuracy_records, details_records
 
