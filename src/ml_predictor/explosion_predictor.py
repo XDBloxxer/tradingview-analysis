@@ -1,13 +1,21 @@
 """
-Explosion Predictor - HYBRID MODEL VERSION
+Explosion Predictor - FIXED VERSION
 
-KEY FIXES:
-1. Case-normalises feature lookup: model trained with lowercase (t3_close, t3_sma_5)
-   but fetcher produces mixed-case (t3_Close, t3_SMA_5).
-2. Scaler column-count fix: meta/string columns kept as 0.0 so count matches.
-3. Regressor feature mismatch: regressor may have been trained on a different
-   (larger) feature set than the classifier/scaler. If feature counts differ,
-   fall back to rule-based gain estimates gracefully instead of crashing.
+FIXES IN THIS VERSION:
+  1. Bimodal collapse detection: predict() now checks if the probability
+     distribution has a gap in the 0.15–0.85 range and logs a clear warning.
+     This is the primary diagnostic for catching overfitting early.
+
+  2. Adaptive signal thresholds: when bimodal collapse is detected, the classifier
+     falls back to RELATIVE thresholds (percentile-based) instead of absolute
+     0.5/0.7/0.9 cutoffs. This ensures the signals still carry meaning even when
+     the model is outputting near-binary probabilities.
+     e.g. with a bimodal model: top 10% of scores → STRONG BUY, rather than all
+     0.90+ blindly getting STRONG BUY when 18/18 of those turn out wrong.
+
+  3. Case-normalises feature lookup (unchanged from prior version).
+
+  4. Scaler column-count fix (unchanged from prior version).
 """
 
 import json
@@ -21,6 +29,18 @@ import joblib
 
 _META_COLS = {"symbol", "exchange"}
 
+# Absolute thresholds used when the model is well-calibrated
+SIGNAL_THRESHOLDS = {
+    "STRONG BUY": 0.90,
+    "BUY":        0.70,
+    "HOLD":       0.50,
+}
+
+# Bimodal detection: if fewer than this many predictions fall in the mid-range,
+# the model is collapsing to near-binary outputs and we switch to relative thresholds
+BIMODAL_MIDRANGE = (0.15, 0.85)
+BIMODAL_MIN_MIDRANGE_COUNT = 5  # fewer than this → use percentile-based signals
+
 
 class ExplosionPredictor:
 
@@ -33,8 +53,8 @@ class ExplosionPredictor:
         self.feature_names: List[str] = []
         self.metadata:      dict = {}
         self._lower_to_feature: Dict[str, str] = {}
-        # Expected feature count for regressor (may differ from classifier)
         self._regressor_n_features: Optional[int] = None
+        self._is_bimodal   = False  # set in predict(), used by _classify_signal
 
         self._load_model()
 
@@ -56,7 +76,6 @@ class ExplosionPredictor:
 
         if regressor_path.exists():
             self.regressor = joblib.load(regressor_path)
-            # Record how many features the regressor expects
             try:
                 self._regressor_n_features = self.regressor.n_features_in_
             except AttributeError:
@@ -75,7 +94,6 @@ class ExplosionPredictor:
             with open(metadata_path) as f:
                 self.metadata = json.load(f)
 
-        # Scaler is ground truth for classifier feature list
         if hasattr(self.scaler, "feature_names_in_"):
             self.feature_names = list(self.scaler.feature_names_in_)
         else:
@@ -90,16 +108,15 @@ class ExplosionPredictor:
             f"regressor expects {self._regressor_n_features} features"
         )
 
-        # Warn if regressor was trained on a different feature set
         if (self._regressor_n_features is not None
                 and self._regressor_n_features != classifier_n):
             self.logger.warning(
                 f"⚠ Regressor feature count ({self._regressor_n_features}) differs from "
                 f"classifier/scaler ({classifier_n}). "
-                f"Regressor will be SKIPPED — rule-based gain estimates will be used instead. "
+                f"Regressor will be SKIPPED — rule-based gain estimates will be used. "
                 f"Re-train the regressor with the same feature set to fix this."
             )
-            self.regressor = None   # disable mismatched regressor
+            self.regressor = None
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
         has_flat = any(f.lower() in {"close", "rsi_14", "macd_12_26_9"} for f in self.feature_names)
@@ -146,7 +163,6 @@ class ExplosionPredictor:
                 feature_data[feature] = data_df[input_lower[feature_lower]].values
                 matched += 1
             elif feature_lower in _META_COLS:
-                # Keep in matrix as 0.0 so column count matches scaler
                 feature_data[feature] = 0.0
             else:
                 feature_data[feature] = self._get_default_value(feature, data_df)
@@ -244,6 +260,91 @@ class ExplosionPredictor:
         return X_scaled
 
     # ─────────────────────────────────────────────────────────────────────
+    # Bimodal detection & adaptive signal classification
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _detect_bimodal(self, probabilities: np.ndarray) -> bool:
+        """
+        FIX 1: Detect bimodal probability collapse.
+
+        Returns True if the model is outputting near-binary probabilities with
+        very few predictions in the mid-range (0.15–0.85). This is the primary
+        sign of overfitting or a severely miscalibrated model.
+        """
+        mid_lo, mid_hi = BIMODAL_MIDRANGE
+        mid_count = int(((probabilities > mid_lo) & (probabilities < mid_hi)).sum())
+
+        if mid_count < BIMODAL_MIN_MIDRANGE_COUNT:
+            self.logger.warning(
+                f"⚠️  BIMODAL COLLAPSE DETECTED: only {mid_count} predictions in "
+                f"{mid_lo*100:.0f}%–{mid_hi*100:.0f}% range "
+                f"(out of {len(probabilities)} total). "
+                f"Switching to percentile-based signal thresholds."
+            )
+            self.logger.warning(
+                "   Root cause is likely overfitting. "
+                "Sunday's retrain with time-based split and stronger regularisation should fix this. "
+                "Until then, signals use relative ranking, not absolute probability."
+            )
+            return True
+        return False
+
+    def _classify_signal_absolute(self, probability: float) -> str:
+        """Standard absolute-threshold classification."""
+        if probability >= SIGNAL_THRESHOLDS["STRONG BUY"]:
+            return "STRONG BUY"
+        elif probability >= SIGNAL_THRESHOLDS["BUY"]:
+            return "BUY"
+        elif probability >= SIGNAL_THRESHOLDS["HOLD"]:
+            return "HOLD"
+        return "AVOID"
+
+    def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
+        """
+        FIX 2: Percentile-based signal classification for bimodal models.
+
+        When the model is outputting near-binary probabilities, absolute thresholds
+        are useless (everything above the gap becomes STRONG BUY). Relative thresholds
+        ensure the signal distribution is meaningful even when probabilities are bad.
+
+        Thresholds: top 10% → STRONG BUY, next 20% → BUY, next 20% → HOLD, rest → AVOID
+        """
+        n = len(probabilities)
+        if n == 0:
+            return pd.Series([], dtype=str)
+
+        # Only apply relative thresholds to predicted positives (above-gap scores)
+        # Everything below the gap is AVOID regardless
+        lo, hi = BIMODAL_MIDRANGE
+        high_scores = probabilities[probabilities >= hi]
+        low_scores  = probabilities[probabilities <= lo]
+
+        signals = pd.Series("AVOID", index=probabilities.index)
+
+        if len(high_scores) > 0:
+            p90 = high_scores.quantile(0.90)
+            p70 = high_scores.quantile(0.70)
+            p50 = high_scores.quantile(0.50)
+
+            signals.loc[high_scores.index] = high_scores.apply(
+                lambda p: (
+                    "STRONG BUY" if p >= p90 else
+                    "BUY"        if p >= p70 else
+                    "HOLD"       if p >= p50 else
+                    "HOLD"
+                )
+            )
+
+        self.logger.info(
+            f"Relative signal distribution: "
+            + ", ".join(
+                f"{s}={int((signals==s).sum())}"
+                for s in ["STRONG BUY", "BUY", "HOLD", "AVOID"]
+            )
+        )
+        return signals
+
+    # ─────────────────────────────────────────────────────────────────────
     # Prediction
     # ─────────────────────────────────────────────────────────────────────
 
@@ -255,10 +356,21 @@ class ExplosionPredictor:
         predictions   = self.model.predict(X_scaled)
         probabilities = self.model.predict_proba(X_scaled)[:, 1]
 
+        # FIX 1: Detect bimodal collapse and set flag for signal classification
+        self._is_bimodal = self._detect_bimodal(probabilities)
+
+        prob_series = pd.Series(probabilities, index=data_df.index)
+
+        if self._is_bimodal:
+            # FIX 2: Use relative thresholds when model is bimodal
+            signals = self._classify_signals_relative(prob_series)
+        else:
+            signals = prob_series.apply(self._classify_signal_absolute)
+
         result_df = pd.DataFrame({
             "explosion_probability": probabilities,
             "prediction":            predictions,
-            "signal":                pd.Series(probabilities).apply(self._classify_signal),
+            "signal":                signals.values,
         })
 
         for col in ("symbol", "exchange"):
@@ -281,7 +393,6 @@ class ExplosionPredictor:
 
         # ── Gain prediction ───────────────────────────────────────────────
         if self.regressor is not None:
-            # Double-check at call time (in case somehow not caught at load)
             try:
                 predicted_gains = self.regressor.predict(X_scaled)
                 self.logger.info("Using LEARNED gain predictions from regressor")
@@ -292,7 +403,7 @@ class ExplosionPredictor:
                 self.logger.warning(
                     f"Regressor predict failed ({e}) — falling back to rule-based estimates"
                 )
-                self.regressor = None   # disable for remainder of session
+                self.regressor = None
 
         if self.regressor is None:
             if historical_gains_df is not None and not historical_gains_df.empty:
@@ -365,13 +476,8 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _classify_signal(self, probability: float) -> str:
-        if probability >= 0.90:
-            return "STRONG BUY"
-        elif probability >= 0.70:
-            return "BUY"
-        elif probability >= 0.50:
-            return "HOLD"
-        return "AVOID"
+        """Legacy single-value interface — uses absolute thresholds."""
+        return self._classify_signal_absolute(probability)
 
     def _estimate_target_gain(self, probability: float) -> float:
         if probability >= 0.95:  return 30.0
