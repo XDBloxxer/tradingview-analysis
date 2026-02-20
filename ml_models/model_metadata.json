@@ -1,10 +1,9 @@
 {
-  "trained_at": "2026-02-20T15:19:02.201956+00:00",
+  "trained_at": "2026-02-20T15:31:38.378931+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
-  "n_features": 406,
+  "n_features": 405,
   "features": [
-    "exchange",
     "t1_close_Close",
     "t1_close_Open",
     "t1_close_High",
@@ -412,7 +411,6 @@
     "t10_gap_pct"
   ],
   "feature_names_sample": [
-    "exchange",
     "t1_close_Close",
     "t1_close_Open",
     "t1_close_High",
@@ -431,10 +429,11 @@
     "t1_close_MACDs_12_26_9",
     "t1_close_MACDh_12_26_9",
     "t1_close_ADX_14",
-    "t1_close_DMP_14"
+    "t1_close_DMP_14",
+    "t1_close_DMN_14"
   ],
-  "best_iteration": 6,
-  "best_val_logloss": 0.6530453724921366,
+  "best_iteration": 8,
+  "best_val_logloss": 0.652183239345025,
   "gain_regressor_trained": true,
   "n_total_samples": 5803,
   "n_base_samples": 5289,
@@ -443,7 +442,7 @@
   "n_positive": 3718,
   "n_negative": 2085,
   "positive_rate": 0.6407030846114079,
-  "val_auc_roc": 0.7297841954934942,
+  "val_auc_roc": 0.7319131492647837,
   "base_sample_weight": 1.5,
   "t1_sample_weight": 1.0,
   "intraday_win_threshold": 15.0,
