@@ -471,12 +471,23 @@ def _calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     except: pass
 
     # ── Aroon ──────────────────────────────────────────────────────────────
+    # Newer ta versions require (high, low, window); older used (close, window).
+    # Try new signature first, fall back to old to stay version-agnostic.
     try:
-        aroon = ta.trend.AroonIndicator(df['Close'], window=25)
+        aroon = ta.trend.AroonIndicator(high=df['High'], low=df['Low'], window=25)
         result['AROONU_25']   = aroon.aroon_up()
         result['AROOND_25']   = aroon.aroon_down()
         result['AROONOSC_25'] = aroon.aroon_indicator()
-    except: pass
+    except TypeError:
+        try:
+            aroon = ta.trend.AroonIndicator(df['Close'], window=25)
+            result['AROONU_25']   = aroon.aroon_up()
+            result['AROOND_25']   = aroon.aroon_down()
+            result['AROONOSC_25'] = aroon.aroon_indicator()
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # ── TSI ────────────────────────────────────────────────────────────────
     try:
