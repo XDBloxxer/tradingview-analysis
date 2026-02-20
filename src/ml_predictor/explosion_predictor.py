@@ -1,21 +1,24 @@
 """
-Explosion Predictor - FIXED VERSION
+Explosion Predictor
 
-FIXES IN THIS VERSION:
-  1. Bimodal collapse detection: predict() now checks if the probability
-     distribution has a gap in the 0.15–0.85 range and logs a clear warning.
-     This is the primary diagnostic for catching overfitting early.
+FIXES:
+  1. Dot-normalization in feature lookup: the model was trained with column names
+     like t3_bbl_20_2_0_2_0 (dots replaced with underscores, lowercase) but the
+     indicator calculator produces t3_BBL_20_2.0_2.0 (dots kept, uppercase).
+     The previous case-insensitive lookup caught the case difference but NOT the
+     dot→underscore difference, so all BB columns silently got neutral defaults.
+     Fix: _build_lookup and prepare_features now normalize with .replace('.','_')
+     in addition to .lower() so t3_BBL_20_2.0_2.0 correctly maps to t3_bbl_20_2_0_2_0.
 
-  2. Adaptive signal thresholds: when bimodal collapse is detected, the classifier
-     falls back to RELATIVE thresholds (percentile-based) instead of absolute
-     0.5/0.7/0.9 cutoffs. This ensures the signals still carry meaning even when
-     the model is outputting near-binary probabilities.
-     e.g. with a bimodal model: top 10% of scores → STRONG BUY, rather than all
-     0.90+ blindly getting STRONG BUY when 18/18 of those turn out wrong.
+  2. Bimodal collapse detection: predict() checks if the probability distribution
+     has a gap in the 0.15–0.85 range and logs a clear warning.
 
-  3. Case-normalises feature lookup (unchanged from prior version).
+  3. Adaptive signal thresholds: when bimodal collapse is detected, the classifier
+     falls back to RELATIVE thresholds (percentile-based).
 
-  4. Scaler column-count fix (unchanged from prior version).
+  4. Case-normalises feature lookup (retained from prior version).
+
+  5. Scaler column-count fix (retained from prior version).
 """
 
 import json
@@ -36,10 +39,18 @@ SIGNAL_THRESHOLDS = {
     "HOLD":       0.50,
 }
 
-# Bimodal detection: if fewer than this many predictions fall in the mid-range,
-# the model is collapsing to near-binary outputs and we switch to relative thresholds
 BIMODAL_MIDRANGE = (0.15, 0.85)
-BIMODAL_MIN_MIDRANGE_COUNT = 5  # fewer than this → use percentile-based signals
+BIMODAL_MIN_MIDRANGE_COUNT = 5
+
+
+def _norm(s: str) -> str:
+    """Normalize a feature name for matching: lowercase + dots→underscores.
+
+    This is the single source of truth for normalization so that column names
+    produced by the indicator calculator (e.g. t3_BBL_20_2.0_2.0) correctly
+    match what the model was trained on (e.g. t3_bbl_20_2_0_2_0).
+    """
+    return s.lower().replace(".", "_")
 
 
 class ExplosionPredictor:
@@ -52,9 +63,9 @@ class ExplosionPredictor:
         self.scaler        = None
         self.feature_names: List[str] = []
         self.metadata:      dict = {}
-        self._lower_to_feature: Dict[str, str] = {}
+        self._norm_to_feature: Dict[str, str] = {}   # normalized → original model feature name
         self._regressor_n_features: Optional[int] = None
-        self._is_bimodal   = False  # set in predict(), used by _classify_signal
+        self._is_bimodal   = False
 
         self._load_model()
 
@@ -133,8 +144,15 @@ class ExplosionPredictor:
             )
 
     def _build_lookup(self):
-        """lowercase(model_feature) -> model_feature for case-insensitive matching."""
-        self._lower_to_feature = {f.lower(): f for f in self.feature_names}
+        """
+        Build normalized(model_feature) → model_feature lookup for matching.
+
+        FIX: Previously used only .lower() so t3_BBL_20_2.0_2.0 would NOT match
+        t3_bbl_20_2_0_2_0 (dots vs underscores). Now uses _norm() which does
+        both .lower() AND .replace('.','_'), fixing all Bollinger Band columns
+        and any other indicator names with dots in them.
+        """
+        self._norm_to_feature = {_norm(f): f for f in self.feature_names}
 
     # ─────────────────────────────────────────────────────────────────────
     # Feature preparation
@@ -143,26 +161,35 @@ class ExplosionPredictor:
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
         """
         Align input data_df to the model's expected feature schema.
-        Uses case-insensitive lookup so t3_Close matches t3_close etc.
+
+        Lookup order:
+          1. Direct exact match (fastest, handles already-correct names)
+          2. Normalized match via _norm() — handles case + dot differences
+             e.g. t3_BBL_20_2.0_2.0 → t3_bbl_20_2_0_2_0
+          3. Metadata columns (symbol/exchange) → 0.0
+          4. Intelligent default based on indicator type
         """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
-        input_lower: Dict[str, str] = {c.lower(): c for c in data_df.columns}
+        # Build normalized lookup for input columns
+        input_norm_to_col: Dict[str, str] = {_norm(c): c for c in data_df.columns}
 
         feature_data: dict = {}
         matched       = 0
         missing_names: List[str] = []
 
         for feature in self.feature_names:
-            feature_lower = feature.lower()
+            feature_norm = _norm(feature)
 
             if feature in data_df.columns:
+                # 1. Exact match
                 feature_data[feature] = data_df[feature].values
                 matched += 1
-            elif feature_lower in input_lower:
-                feature_data[feature] = data_df[input_lower[feature_lower]].values
+            elif feature_norm in input_norm_to_col:
+                # 2. Normalized match (handles case + dot→underscore differences)
+                feature_data[feature] = data_df[input_norm_to_col[feature_norm]].values
                 matched += 1
-            elif feature_lower in _META_COLS:
+            elif feature_norm in _META_COLS:
                 feature_data[feature] = 0.0
             else:
                 feature_data[feature] = self._get_default_value(feature, data_df)
@@ -186,14 +213,11 @@ class ExplosionPredictor:
             self.logger.warning(
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
             )
-            self.logger.warning(f"   Sample MISSING  features : {missing_names[:20]}")
-            sample_avail = [c for c in data_df.columns if c not in _META_COLS][:20]
-            self.logger.warning(f"   Sample AVAILABLE columns : {sample_avail}")
 
         return feature_df
 
     def _get_default_value(self, feature: str, data: pd.DataFrame):
-        f = feature.lower()
+        f = _norm(feature)
         for pfx in ("t1_open_", "t1_close_", "t3_", "t5_", "t10_"):
             if f.startswith(pfx):
                 f = f[len(pfx):]
@@ -266,16 +290,8 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _detect_bimodal(self, probabilities: np.ndarray) -> bool:
-        """
-        FIX 1: Detect bimodal probability collapse.
-
-        Returns True if the model is outputting near-binary probabilities with
-        very few predictions in the mid-range (0.15–0.85). This is the primary
-        sign of overfitting or a severely miscalibrated model.
-        """
         mid_lo, mid_hi = BIMODAL_MIDRANGE
         mid_count = int(((probabilities > mid_lo) & (probabilities < mid_hi)).sum())
-
         if mid_count < BIMODAL_MIN_MIDRANGE_COUNT:
             self.logger.warning(
                 f"⚠️  BIMODAL COLLAPSE DETECTED: only {mid_count} predictions in "
@@ -283,16 +299,10 @@ class ExplosionPredictor:
                 f"(out of {len(probabilities)} total). "
                 f"Switching to percentile-based signal thresholds."
             )
-            self.logger.warning(
-                "   Root cause is likely overfitting. "
-                "Sunday's retrain with time-based split and stronger regularisation should fix this. "
-                "Until then, signals use relative ranking, not absolute probability."
-            )
             return True
         return False
 
     def _classify_signal_absolute(self, probability: float) -> str:
-        """Standard absolute-threshold classification."""
         if probability >= SIGNAL_THRESHOLDS["STRONG BUY"]:
             return "STRONG BUY"
         elif probability >= SIGNAL_THRESHOLDS["BUY"]:
@@ -302,24 +312,12 @@ class ExplosionPredictor:
         return "AVOID"
 
     def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
-        """
-        FIX 2: Percentile-based signal classification for bimodal models.
-
-        When the model is outputting near-binary probabilities, absolute thresholds
-        are useless (everything above the gap becomes STRONG BUY). Relative thresholds
-        ensure the signal distribution is meaningful even when probabilities are bad.
-
-        Thresholds: top 10% → STRONG BUY, next 20% → BUY, next 20% → HOLD, rest → AVOID
-        """
         n = len(probabilities)
         if n == 0:
             return pd.Series([], dtype=str)
 
-        # Only apply relative thresholds to predicted positives (above-gap scores)
-        # Everything below the gap is AVOID regardless
         lo, hi = BIMODAL_MIDRANGE
         high_scores = probabilities[probabilities >= hi]
-        low_scores  = probabilities[probabilities <= lo]
 
         signals = pd.Series("AVOID", index=probabilities.index)
 
@@ -332,13 +330,12 @@ class ExplosionPredictor:
                 lambda p: (
                     "STRONG BUY" if p >= p90 else
                     "BUY"        if p >= p70 else
-                    "HOLD"       if p >= p50 else
                     "HOLD"
                 )
             )
 
         self.logger.info(
-            f"Relative signal distribution: "
+            "Relative signal distribution: "
             + ", ".join(
                 f"{s}={int((signals==s).sum())}"
                 for s in ["STRONG BUY", "BUY", "HOLD", "AVOID"]
@@ -358,13 +355,11 @@ class ExplosionPredictor:
         predictions   = self.model.predict(X_scaled)
         probabilities = self.model.predict_proba(X_scaled)[:, 1]
 
-        # FIX 1: Detect bimodal collapse and set flag for signal classification
         self._is_bimodal = self._detect_bimodal(probabilities)
 
         prob_series = pd.Series(probabilities, index=data_df.index)
 
         if self._is_bimodal:
-            # FIX 2: Use relative thresholds when model is bimodal
             signals = self._classify_signals_relative(prob_series)
         else:
             signals = prob_series.apply(self._classify_signal_absolute)
@@ -478,7 +473,6 @@ class ExplosionPredictor:
     # ─────────────────────────────────────────────────────────────────────
 
     def _classify_signal(self, probability: float) -> str:
-        """Legacy single-value interface — uses absolute thresholds."""
         return self._classify_signal_absolute(probability)
 
     def _estimate_target_gain(self, probability: float) -> float:
@@ -489,4 +483,3 @@ class ExplosionPredictor:
         if probability >= 0.60:  return 10.0
         if probability >= 0.50:  return 7.0
         return 3.0
-
