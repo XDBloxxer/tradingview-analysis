@@ -519,7 +519,7 @@ def extract_intraday_snapshot(
     }
 
 
-def calculate_comprehensive_indicators_intraday(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
     """
     Calculate indicators on 5-MINUTE intraday bars.
     Must produce the same indicator set as calculate_comprehensive_indicators_daily()
