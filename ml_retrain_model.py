@@ -20,6 +20,12 @@ FIXES IN THIS VERSION:
      model sees the market regime in both train and val, producing fake 0.9999 AUC.
      A time-based split forces the model to generalise across time periods.
 
+     IMPORTANT: Uses a unified sort_date column (detection_date ?? event_date) so
+     that base CSV rows (which have event_date but no detection_date) sort correctly
+     alongside T-1 rows (which have detection_date). Without this, base CSV rows
+     sort to the front as NaT and the val set ends up being entirely T-1 non-winners
+     → 0 positives in val → degenerate model.
+
   2. Stronger regularisation — min_child_weight raised from 3→10, max_depth 6→5,
      gamma 0.1→1.0, reg_alpha 0.1→0.5. These prevent the model from memorising
      individual stocks.
@@ -33,8 +39,9 @@ FIXES IN THIS VERSION:
      but the close-based label called it a false positive.
 
   5. Duplicate-date deduplication — the same (symbol, date) can appear in both the
-     base CSV and T-1 tables. We now deduplicate after combine_datasets() so the
-     model doesn't overfit to repeated rows.
+     base CSV and T-1 tables, causing the model to overfit to repeated examples. We
+     now deduplicate after combine_datasets() so the model doesn't overfit to
+     repeated rows.
 
 NOTE ON CLASS BALANCE:
   ml_training_base contains both winners (label=1) and non-winners (label=0) from
@@ -144,6 +151,7 @@ NON_FEATURE_COLS = {
     "label", "source", "sample_weight", "detection_date", "explosion_date",
     "change_pct", "rank", "notes", "mistake_type", "actual_gain_pct",
     "actual_high_pct",  # FIX 4: exclude target-leaking column
+    "_sort_date",       # internal column used for time-based split only
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
@@ -344,7 +352,7 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     """
     Concatenate base + T-1 data.
 
-    FIX 5 (NEW): Deduplicate by (symbol, date) after concatenation.
+    FIX 5: Deduplicate by (symbol, date) after concatenation.
     The same stock+date can appear in both the base CSV and T-1 tables,
     causing the model to overfit to repeated examples. We keep the T-1
     version (which has richer features) when duplicates exist.
@@ -373,21 +381,13 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     # T-1 first so it takes priority in dedup
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
-    # FIX 5: Deduplicate on (symbol, detection_date) — keep first (T-1) occurrence
-    sym_col  = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    date_col = next((c for c in ["detection_date", "event_date"] if c in combined.columns), None)
-
-    # Safe dedup: only deduplicate if BOTH date columns are the same column name
+    # Safe dedup: only deduplicate if BOTH sources use the same date column name.
     # Base CSV uses event_date, T-1 data uses detection_date — these are different
-    # columns and should NOT be deduped against each other
-    sym_col  = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    
-    # Only deduplicate within the same source type, not across base CSV and T-1
-    # Check if there's a single unified date column (only present if tables were already merged)
+    # columns and should NOT be deduped against each other.
+    sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
     date_cols_present = [c for c in ["detection_date", "event_date"] if c in combined.columns]
-    
+
     if sym_col and len(date_cols_present) == 1:
-        # Both sources use the same date column — safe to dedup
         date_col = date_cols_present[0]
         before_dedup = len(combined)
         combined = combined.drop_duplicates(subset=[sym_col, date_col], keep="first")
@@ -395,8 +395,6 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         if n_dropped > 0:
             logger.info(f"Deduplication: removed {n_dropped} duplicate rows ({before_dedup} → {len(combined)})")
     elif sym_col and len(date_cols_present) == 2:
-        # Base CSV and T-1 data use different date columns — skip dedup entirely
-        # to avoid accidentally dropping valid rows from either source
         logger.info(
             "Skipping deduplication: base CSV (event_date) and T-1 data (detection_date) "
             "use different date columns — no cross-source duplicates possible"
@@ -565,13 +563,41 @@ def train_val_split(
 
     A time-based split forces the model to validate on the MOST RECENT data,
     which is the honest test of whether it generalises across time.
+
+    KEY FIX: We build a unified _sort_date column that takes detection_date
+    for T-1 rows and falls back to event_date for base CSV rows. Without this,
+    base CSV rows (which have no detection_date) sort as NaT and float to the
+    front, putting the entire val set in the T-1 non-winner rows → 0 positives
+    in val → degenerate model that outputs a constant probability.
     """
-    # Find the best date column to sort on
-    date_col = next(
-        (c for c in ["detection_date", "event_date", "date"]
-         if c in df_with_dates.columns),
-        None
-    )
+    df_work = df_with_dates.copy()
+
+    # Build unified sort date: prefer detection_date, fall back to event_date
+    has_detection = "detection_date" in df_work.columns
+    has_event     = "event_date" in df_work.columns
+
+    if has_detection or has_event:
+        sort_date = pd.Series(pd.NaT, index=df_work.index)
+        if has_detection:
+            sort_date = pd.to_datetime(df_work["detection_date"], errors="coerce")
+        if has_event:
+            # Fill any NaT (base CSV rows) with event_date
+            event_parsed = pd.to_datetime(df_work["event_date"], errors="coerce")
+            sort_date = sort_date.fillna(event_parsed)
+
+        df_work["_sort_date"] = sort_date
+        date_col = "_sort_date"
+
+        n_base_dates = sort_date.notna().sum()
+        n_nat        = sort_date.isna().sum()
+        logger.info(
+            f"Unified sort_date: {n_base_dates} rows have a valid date, "
+            f"{n_nat} rows have NaT (will sort to front — investigate if large)"
+        )
+    else:
+        date_col = next(
+            (c for c in ["date"] if c in df_work.columns), None
+        )
 
     if date_col is None:
         logger.warning(
@@ -587,8 +613,8 @@ def train_val_split(
         w_train = w.iloc[:split_idx]
         w_val   = w.iloc[split_idx:]
     else:
-        # Sort by date, take most recent val_fraction as validation set
-        dates = pd.to_datetime(df_with_dates[date_col], errors="coerce")
+        # Sort by unified date, take most recent val_fraction as validation set
+        dates      = pd.to_datetime(df_work[date_col], errors="coerce")
         sorted_idx = dates.sort_values().index
         split_pos  = int(len(sorted_idx) * (1 - val_fraction))
 
@@ -922,8 +948,14 @@ def main() -> int:
 
     val_proba = model.predict_proba(X_val)[:, 1]
     val_pred  = (val_proba >= 0.5).astype(int)
-    auc       = roc_auc_score(y_val, val_proba)
-    logger.info(f"Validation AUC-ROC: {auc:.4f}")
+
+    try:
+        auc = roc_auc_score(y_val, val_proba)
+        logger.info(f"Validation AUC-ROC: {auc:.4f}")
+    except Exception:
+        auc = float("nan")
+        logger.warning("Validation AUC-ROC: nan (only one class in val set)")
+
     logger.info("Classification report (val):")
     for line in classification_report(y_val, val_pred).split("\n"):
         if line.strip():
