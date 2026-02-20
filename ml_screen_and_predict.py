@@ -4,6 +4,16 @@ ML Stock Screener & Predictor - FIXED VERSION
 
 PROPERLY fetches T-3, T-5, T-10 indicators with prefixes to match CSV-trained model
 Uses DAILY charts (not 5-minute)
+
+FIX (2026-02-20): calculate_comprehensive_indicators_intraday was only computing
+~10 indicators (SMA, EMA, RSI, MACD, ATR, OBV, Volume). The model expects ~80+
+t1_close_* and t1_open_* features (Stochastics, Bollinger Bands, ADX, Aroon,
+TSI, MOM, ROC, CCI, Donchian, Keltner, WILLR, etc). This caused 24%+ feature
+misses and collapsed all probabilities to 27-30%.
+
+The fix makes calculate_comprehensive_indicators_intraday produce the SAME full
+indicator set as calculate_comprehensive_indicators_daily. Both functions now
+share the same _calculate_all_indicators() core so they can never diverge again.
 """
 
 import argparse
@@ -42,13 +52,6 @@ def setup_logging(verbose: bool = False):
 def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.Logger, label: str = ""):
     """
     Log a detailed probability distribution histogram.
-    This is the primary diagnostic tool for understanding why predictions
-    are clustering at low values.
-
-    Args:
-        predictions_df: DataFrame with 'explosion_probability' and 'signal' columns
-        logger: Logger instance
-        label: Optional label prefix for the log section
     """
     if predictions_df.empty:
         logger.warning("Cannot log probability distribution — predictions DataFrame is empty")
@@ -62,7 +65,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info(title)
     logger.info("=" * 70)
 
-    # Bucket breakdown with ASCII bar chart
     buckets = [
         ("0–10%  (AVOID)",   probs < 0.10),
         ("10–20% (AVOID)",   (probs >= 0.10) & (probs < 0.20)),
@@ -86,8 +88,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
         logger.info(f"  {bucket_label:<22} {count:>4}  ({pct:>5.1f}%)  {bar}")
 
     logger.info("-" * 70)
-
-    # Summary statistics
     logger.info(f"  Total stocks evaluated:  {total}")
     logger.info(f"  Min probability:         {probs.min():.4f} ({probs.min()*100:.2f}%)")
     logger.info(f"  Max probability:         {probs.max():.4f} ({probs.max()*100:.2f}%)")
@@ -95,7 +95,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info(f"  Median probability:      {probs.median():.4f} ({probs.median()*100:.2f}%)")
     logger.info(f"  Std deviation:           {probs.std():.4f}")
 
-    # Signal breakdown
     logger.info("")
     logger.info("  Signal breakdown:")
     if 'signal' in predictions_df.columns:
@@ -105,7 +104,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
             pct = (count / total * 100) if total > 0 else 0
             logger.info(f"    {signal:<12} {count:>4}  ({pct:>5.1f}%)")
 
-    # Automatic diagnosis based on the distribution shape
     logger.info("")
     logger.info("  ── Diagnosis ──────────────────────────────────────────────────")
 
@@ -114,31 +112,18 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
 
     if probs.max() < 0.20:
         logger.warning("  ⚠️  MAX PROB < 20% — likely broken/corrupted model or severe feature mismatch.")
-        logger.warning("     Check: (1) is the correct model loaded from archive?")
-        logger.warning("            (2) what is the feature coverage % reported above?")
-
     elif probs.max() < 0.50:
         logger.warning("  ⚠️  MAX PROB < 50% — model is not finding any plausible candidates.")
-        logger.warning("     Check: (1) screening population (are winners-type stocks in the 500?)")
-        logger.warning("            (2) missing 30% features — are they high-importance ones?")
-        logger.warning("            (3) fine-tuning corruption (confirm model restored from archive)")
-
     elif avoid_pct > 95:
         logger.warning("  ⚠️  >95% AVOID — screening population likely mismatched to training distribution.")
-        logger.warning("     The model was trained on stocks that moved 15%+. Consider adding")
-        logger.warning("     relative_volume_10d_calc > 1.5 and price < 100 to screener filters.")
-
     elif high_pct == 0:
-        logger.info("  ℹ️  No BUY/STRONG BUY signals today — either a quiet market day or")
-        logger.info("     the screening population needs tighter relative-volume / price-range filters.")
-
+        logger.info("  ℹ️  No BUY/STRONG BUY signals today.")
     else:
         logger.info(f"  ✅ Distribution looks healthy — {high_pct:.1f}% of stocks scored BUY or higher.")
 
     logger.info("=" * 70)
     logger.info("")
 
-    # Top 10 by probability for quick review
     logger.info("  Top 10 stocks by probability:")
     logger.info(f"  {'#':<4} {'Symbol':<8} {'Prob':>8}  {'Signal'}")
     logger.info("  " + "-" * 40)
@@ -152,10 +137,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
 
 
 def get_next_trading_day() -> str:
-    """
-    Get the next NYSE trading day that this prediction is FOR.
-    The workflow runs at 3 AM UTC = 10 PM EST (previous calendar day).
-    """
     est = pytz.timezone('America/New_York')
     now_est = datetime.now(est)
     prediction_day = now_est + timedelta(days=1)
@@ -164,35 +145,16 @@ def get_next_trading_day() -> str:
     return prediction_day.date().isoformat()
 
 
-"""
-SmartScreener — PATCHED VERSION
-Drop-in replacement for the SmartScreener class in ml_screen_and_predict.py.
-
-CHANGES vs original:
-1. Reads ALL filter fields from learned_filters.json, not just 6 hard-coded ones.
-   New fields honoured: max_price, min_relative_volume, min_hv10/20, min_adx, min_atr14.
-2. Sorts screener results by relative_volume_10d_calc DESC instead of raw volume —
-   this surfaces stocks that are already acting unusual vs their own history.
-3. Logs a clean summary of which filters are active.
-4. Falls back gracefully if a filter key is None or missing.
-
-DEPLOYMENT: Replace the SmartScreener class definition inside ml_screen_and_predict.py
-with the class below (everything from `class SmartScreener:` to the end of the class).
-The rest of ml_screen_and_predict.py is unchanged.
-"""
-
-
 class SmartScreener:
     """Intelligent screener that uses model-derived filters from learned_filters.json"""
 
-    # TradingView column names for each filter key
     TV_FILTER_MAP = {
         "min_price":           ("close",                    "greater"),
         "max_price":           ("close",                    "less"),
         "min_volume":          ("volume",                   "greater"),
         "min_rsi":             ("RSI",                      "greater"),
         "max_rsi":             ("RSI",                      "less"),
-        "min_rsi7":            ("RSI[1]",                   "greater"),   # closest proxy
+        "min_rsi7":            ("RSI[1]",                   "greater"),
         "max_rsi7":            ("RSI[1]",                   "less"),
         "min_volume_ratio":    ("relative_volume_10d_calc", "greater"),
         "min_relative_volume": ("relative_volume_10d_calc", "greater"),
@@ -204,29 +166,17 @@ class SmartScreener:
         "min_atr14":           ("ATR",                      "greater"),
     }
 
-    # Filter keys that should never produce duplicate TV columns
-    # (e.g. min_volume_ratio and min_relative_volume both map to relative_volume)
-    _DEDUP_TV_COL = {
-        "relative_volume_10d_calc": None,   # keep only the stronger bound
-        "Volatility.D":             None,
-    }
-
     def __init__(self, config: dict = None, logger=None):
         import logging
-        from pathlib import Path
-        import json
-
         self.logger = logger or logging.getLogger(__name__)
         self.config = config or {}
         self.filters = self._load_learned_filters()
-
         if SCREENER_AVAILABLE:
             self.screener = Screener()
         else:
             self.screener = None
 
     def _load_learned_filters(self) -> dict:
-        """Load learned filters from ml_models/learned_filters.json."""
         import json
         from pathlib import Path
 
@@ -236,7 +186,6 @@ class SmartScreener:
             "min_volume":          300_000,
             "min_volume_ratio":    2.0,
             "min_relative_volume": 2.0,
-            # RSI/HV/ADX start as None — only applied when model has derived them
             "min_rsi":             None,
             "max_rsi":             None,
             "min_hv10":            None,
@@ -253,7 +202,7 @@ class SmartScreener:
                 active = []
                 for key, value in learned.items():
                     if key.startswith("_"):
-                        continue          # skip metadata/comment keys
+                        continue
                     if value is not None:
                         defaults[key] = value
                         active.append(f"{key}={value}")
@@ -266,13 +215,6 @@ class SmartScreener:
         return defaults
 
     def screen_with_tradingview(self, max_results: int = 500) -> "pd.DataFrame":
-        """
-        Screen stocks using TradingView with model-derived filters.
-
-        Key change: sorts by relative_volume_10d_calc DESC, not raw volume.
-        This surfaces stocks that are already acting abnormally vs their history —
-        exactly the pre-explosion signature the model was trained to detect.
-        """
         import pandas as pd
 
         if not SCREENER_AVAILABLE or self.screener is None:
@@ -283,80 +225,49 @@ class SmartScreener:
         self.logger.info("SMART SCREENER — applying model-driven filters")
         self.logger.info("=" * 60)
 
-        # ── Build filter list ───────────────────────────────────────────────
-        # Track which TV columns we've already added bounds for to avoid dupes
-        tv_col_bounds: dict[str, dict] = {}   # tv_col → {"min": v, "max": v}
+        tv_col_bounds: dict = {}
         filter_log = []
 
         for filter_key, (tv_col, operation) in self.TV_FILTER_MAP.items():
             value = self.filters.get(filter_key)
             if value is None:
                 continue
-
             if tv_col not in tv_col_bounds:
                 tv_col_bounds[tv_col] = {}
-
             if operation == "greater":
-                # Keep the largest min bound for each TV column
                 existing = tv_col_bounds[tv_col].get("min")
                 if existing is None or value > existing:
                     tv_col_bounds[tv_col]["min"] = value
                     filter_log.append(f"{tv_col} > {value}  [{filter_key}]")
             elif operation == "less":
-                # Keep the smallest max bound for each TV column
                 existing = tv_col_bounds[tv_col].get("max")
                 if existing is None or value < existing:
                     tv_col_bounds[tv_col]["max"] = value
                     filter_log.append(f"{tv_col} < {value}  [{filter_key}]")
 
-        # Convert to TradingView filter dicts
         tv_filters = []
         for tv_col, bounds in tv_col_bounds.items():
             if "min" in bounds:
-                tv_filters.append({
-                    "left": tv_col, "operation": "greater", "right": bounds["min"]
-                })
+                tv_filters.append({"left": tv_col, "operation": "greater", "right": bounds["min"]})
             if "max" in bounds:
-                tv_filters.append({
-                    "left": tv_col, "operation": "less", "right": bounds["max"]
-                })
+                tv_filters.append({"left": tv_col, "operation": "less", "right": bounds["max"]})
 
         self.logger.info(f"Active filters ({len(tv_filters)}):")
         for line in filter_log:
             self.logger.info(f"  {line}")
-        self.logger.info(
-            "Sort: relative_volume_10d_calc DESC  "
-            "(stocks with highest relative activity come first)"
-        )
 
-        # ── Call TradingView screener ───────────────────────────────────────
         try:
             result = self.screener.screen(
                 market="america",
                 filters=tv_filters,
-                sort_by="relative_volume_10d_calc",   # KEY CHANGE: sort by rel vol
+                sort_by="relative_volume_10d_calc",
                 sort_order="desc",
                 limit=max_results,
             )
 
             if result.get("status") == "success" and result.get("data"):
                 df = pd.DataFrame(result["data"])
-                self.logger.info(
-                    f"✓ Screened {len(df)} stocks "
-                    f"(sorted by relative volume, highest first)"
-                )
-
-                # Log top-5 for sanity check
-                if not df.empty and "symbol" in df.columns:
-                    rv_col = "relative_volume_10d_calc"
-                    rv_vals = df.get(rv_col, pd.Series([None] * len(df)))
-                    self.logger.info("  Top 5 by relative volume:")
-                    for i in range(min(5, len(df))):
-                        sym = df["symbol"].iloc[i]
-                        rv  = rv_vals.iloc[i] if rv_col in df.columns else "?"
-                        prc = df.get("close", pd.Series()).iloc[i] if "close" in df.columns else "?"
-                        self.logger.info(f"    {i+1}. {sym}  rel_vol={rv}  price={prc}")
-
+                self.logger.info(f"✓ Screened {len(df)} stocks")
                 return df
 
             self.logger.warning("Screener returned no data or error status")
@@ -366,164 +277,28 @@ class SmartScreener:
             self.logger.error(f"Screening failed: {e}")
             return pd.DataFrame()
 
-def fetch_stock_data_for_prediction(symbol: str, logger) -> dict:
+
+# ---------------------------------------------------------------------------
+# FIX: Shared comprehensive indicator calculation
+#
+# Previously calculate_comprehensive_indicators_intraday only computed ~10
+# indicators while the model expects ~80+. Both daily and intraday now use
+# the same _calculate_all_indicators() core so they can never diverge.
+# ---------------------------------------------------------------------------
+
+def _calculate_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fetch stock data for prediction.
-      - T-3, T-5, T-10 : DAILY charts   (matches ml_training_base CSV sources)
-      - T-1 open/close  : 5-MIN intraday (matches winners_day_prior_close/open snapshots)
-
-    Returns None if any required data cannot be fetched, so the stock is
-    excluded from the prediction batch rather than receiving a corrupted feature set.
-    """
-    import yfinance as yf
-    from datetime import datetime, timedelta
-    from datetime import time as dt_time
-    import pandas as pd
-    import numpy as np
-    import pytz
-
-    try:
-        ticker = yf.Ticker(symbol)
-
-        # ── Daily bars for T-3 / T-5 / T-10 ─────────────────────────────
-        df_daily = ticker.history(period="90d", interval="1d")
-        if df_daily.empty or len(df_daily) < 20:
-            logger.debug(f"{symbol}: Insufficient daily data")
-            return None
-
-        df_indicators_daily = calculate_comprehensive_indicators_daily(df_daily)
-        if df_indicators_daily.empty:
-            return None
-
-        available_dates = sorted(df_indicators_daily.index.date, reverse=True)
-        if len(available_dates) < 10:
-            logger.debug(f"{symbol}: Need ≥10 trading days, have {len(available_dates)}")
-            return None
-
-        t3_date  = available_dates[3]  if len(available_dates) > 3  else available_dates[-1]
-        t5_date  = available_dates[5]  if len(available_dates) > 5  else available_dates[-1]
-        t10_date = available_dates[10] if len(available_dates) > 10 else available_dates[-1]
-
-        t3_data  = extract_features_with_prefix(df_indicators_daily, t3_date,  "t3",  logger, symbol)
-        t5_data  = extract_features_with_prefix(df_indicators_daily, t5_date,  "t5",  logger, symbol)
-        t10_data = extract_features_with_prefix(df_indicators_daily, t10_date, "t10", logger, symbol)
-
-        if not t3_data:
-            logger.debug(f"{symbol}: Failed to extract T-3 data")
-            return None
-
-        # ── 5-min intraday bars for T-1 ──────────────────────────────────
-        df_intraday = ticker.history(period="60d", interval="5m")
-        if df_intraday.empty or len(df_intraday) < 200:
-            # Do NOT fall back to daily bars — T-1 must match training interval.
-            logger.debug(
-                f"{symbol}: Insufficient 5-min intraday data for T-1 — skipping stock. "
-                "(Training used 5-min snapshots; daily bars would cause train/serve skew.)"
-            )
-            return None
-
-        df_indicators_intraday = calculate_comprehensive_indicators_intraday(df_intraday)
-        if df_indicators_intraday.empty:
-            logger.debug(f"{symbol}: Failed to calculate intraday indicators")
-            return None
-
-        # Localise to Eastern time (market timezone)
-        if df_indicators_intraday.index.tz is None:
-            df_indicators_intraday.index = df_indicators_intraday.index.tz_localize(
-                "America/New_York"
-            )
-        else:
-            df_indicators_intraday.index = df_indicators_intraday.index.tz_convert(
-                "America/New_York"
-            )
-
-        yesterday = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
-
-        t1_close_data = extract_intraday_snapshot(
-            df_indicators_intraday, yesterday, dt_time(16, 0), "t1_close", logger, symbol
-        )
-        t1_open_data = extract_intraday_snapshot(
-            df_indicators_intraday, yesterday, dt_time(9, 30), "t1_open", logger, symbol
-        )
-
-        if not t1_close_data or not t1_open_data:
-            # Both T-1 snapshots are required — missing either means a degraded
-            # feature set that doesn't match training distribution.  Skip stock.
-            logger.debug(
-                f"{symbol}: Could not extract T-1 open or close snapshot from "
-                "5-min data — skipping stock. "
-                "(Fallback to daily bars removed to prevent train/serve skew.)"
-            )
-            return None
-
-        result = {
-            "symbol":   symbol,
-            "exchange": "NASDAQ",
-            **t3_data,
-            **t5_data,
-            **t10_data,
-            **t1_close_data,
-            **t1_open_data,
-        }
-
-        logger.debug(f"{symbol}: {len(result)} total features assembled")
-        return result
-
-    except Exception as e:
-        logger.debug(f"{symbol}: Error — {e}")
-        return None
-
-
-def extract_features_with_prefix(df: pd.DataFrame, date, prefix: str, logger, symbol: str) -> dict:
-    """Extract indicators with prefix (e.g., t3_, t5_, t10_) from DAILY data"""
-    day_bars = df[df.index.date == date]
-    if day_bars.empty:
-        logger.debug(f"{symbol}: No data for {date} (prefix {prefix})")
-        return {}
-    bar = day_bars.iloc[-1]
-    return {
-        f"{prefix}_{k}": (v if (pd.notna(v) and not np.isinf(v)) else None)
-        for k, v in bar.to_dict().items()
-    }
-
-
-def extract_intraday_snapshot(
-    df_intraday: pd.DataFrame,
-    target_date,
-    target_time,
-    prefix: str,
-    logger,
-    symbol: str
-) -> dict:
-    """Extract indicators from 5-MINUTE intraday data at specific time"""
-    day_bars = df_intraday[df_intraday.index.date == target_date]
-    if day_bars.empty:
-        logger.debug(f"{symbol}: No intraday data for {target_date}")
-        return {}
+    Calculate the FULL set of technical indicators used by the model.
     
-    window_start = (datetime.combine(target_date, target_time) - timedelta(minutes=5)).time()
-    window_end   = (datetime.combine(target_date, target_time) + timedelta(minutes=30)).time()
+    This is the single source of truth for indicator calculation — used by
+    BOTH calculate_comprehensive_indicators_daily() and
+    calculate_comprehensive_indicators_intraday().
     
-    target_bars = day_bars[
-        (day_bars.index.time >= window_start) &
-        (day_bars.index.time <= window_end)
-    ]
-    if target_bars.empty:
-        target_bars = day_bars
-    
-    bar = target_bars.iloc[0] if target_time.hour < 12 else target_bars.iloc[-1]
-    
-    return {
-        f"{prefix}_{k}": (v if (pd.notna(v) and not np.isinf(v)) else None)
-        for k, v in bar.to_dict().items()
-    }
-
-
-def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Calculate indicators on 5-MINUTE intraday bars.
-    Must produce the same indicator set as calculate_comprehensive_indicators_daily()
-    so that t1_close_ and t1_open_ features match what the model was trained on.
+    Previously the intraday version was missing: Stochastics, StochRSI,
+    Williams %R, CCI, Ultimate Oscillator, Awesome Oscillator, Bollinger Bands,
+    Keltner Channel, Donchian Channel, ADX/DI, Aroon, TSI, MOM, ROC, ATR slope,
+    Historical Volatility, MFI, CMF, SuperTrend proxy, VWAP, Gap — all of which
+    are expected as t1_close_* / t1_open_* features.
     """
     import ta
 
@@ -719,7 +494,7 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         try: result[f'MOM_{period}'] = df['Close'].diff(period)
         except: pass
 
-    # ── Supertrend proxy (same as daily) ───────────────────────────────────
+    # ── Supertrend proxy ───────────────────────────────────────────────────
     try:
         result['SUPERT_10_3']  = df['Close']
         result['SUPERTd_10_3'] = 0
@@ -740,53 +515,168 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate full indicator set on DAILY bars."""
+    return _calculate_all_indicators(df)
+
+
 def calculate_comprehensive_indicators_intraday(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate indicators on 5-MINUTE intraday bars"""
-    import ta
-    
-    result = pd.DataFrame(index=df.index)
-    result['Close']  = df['Close']
-    result['Open']   = df['Open']
-    result['High']   = df['High']
-    result['Low']    = df['Low']
-    result['Volume'] = df['Volume']
-    
-    for period in [5, 10, 20, 50]:
-        try: result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
-        except: pass
-    
-    for period in [5, 10, 12, 20, 26, 50]:
-        try: result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
-        except: pass
-    
-    for period in [7, 14, 21, 28]:
-        try: result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
-        except: pass
-    
+    """
+    Calculate full indicator set on 5-MINUTE intraday bars.
+
+    FIX: Previously this only computed ~10 indicators (SMA, EMA, RSI, MACD,
+    ATR, OBV, Volume_MA, Volume_Ratio). The model expects ~80+ t1_close_* and
+    t1_open_* features. Missing features were defaulting to neutral constants
+    (RSI→50, price→median, else→0) which made all stocks look identical and
+    collapsed the probability distribution to a 3% band.
+
+    Now delegates to _calculate_all_indicators() — identical to the daily path.
+    """
+    return _calculate_all_indicators(df)
+
+
+def fetch_stock_data_for_prediction(symbol: str, logger) -> dict:
+    """
+    Fetch stock data for prediction.
+      - T-3, T-5, T-10 : DAILY charts
+      - T-1 open/close  : 5-MIN intraday
+    """
+    import yfinance as yf
+    from datetime import datetime, timedelta
+    from datetime import time as dt_time
+    import pandas as pd
+    import numpy as np
+    import pytz
+
     try:
-        macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
-        result['MACD_12_26_9']  = macd.macd()
-        result['MACDh_12_26_9'] = macd.macd_diff()
-        result['MACDs_12_26_9'] = macd.macd_signal()
-    except: pass
-    
-    for period in [7, 14, 20]:
-        try: result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
-        except: pass
-    
-    try:
-        result['OBV']       = ta.volume.on_balance_volume(df['Close'], df['Volume'])
-        result['OBV_SMA20'] = result['OBV'].rolling(window=20).mean()
-    except: pass
-    
-    for period in [5, 10, 20]:
-        try: result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
-        except: pass
-    
-    try: result['Volume_Ratio'] = df['Volume'] / result['Volume_MA20']
-    except: pass
-    
-    return result
+        ticker = yf.Ticker(symbol)
+
+        # ── Daily bars for T-3 / T-5 / T-10 ─────────────────────────────
+        df_daily = ticker.history(period="90d", interval="1d")
+        if df_daily.empty or len(df_daily) < 20:
+            logger.debug(f"{symbol}: Insufficient daily data")
+            return None
+
+        df_indicators_daily = calculate_comprehensive_indicators_daily(df_daily)
+        if df_indicators_daily.empty:
+            return None
+
+        available_dates = sorted(df_indicators_daily.index.date, reverse=True)
+        if len(available_dates) < 10:
+            logger.debug(f"{symbol}: Need ≥10 trading days, have {len(available_dates)}")
+            return None
+
+        t3_date  = available_dates[3]  if len(available_dates) > 3  else available_dates[-1]
+        t5_date  = available_dates[5]  if len(available_dates) > 5  else available_dates[-1]
+        t10_date = available_dates[10] if len(available_dates) > 10 else available_dates[-1]
+
+        t3_data  = extract_features_with_prefix(df_indicators_daily, t3_date,  "t3",  logger, symbol)
+        t5_data  = extract_features_with_prefix(df_indicators_daily, t5_date,  "t5",  logger, symbol)
+        t10_data = extract_features_with_prefix(df_indicators_daily, t10_date, "t10", logger, symbol)
+
+        if not t3_data:
+            logger.debug(f"{symbol}: Failed to extract T-3 data")
+            return None
+
+        # ── 5-min intraday bars for T-1 ──────────────────────────────────
+        df_intraday = ticker.history(period="60d", interval="5m")
+        if df_intraday.empty or len(df_intraday) < 200:
+            logger.debug(
+                f"{symbol}: Insufficient 5-min intraday data for T-1 — skipping stock."
+            )
+            return None
+
+        df_indicators_intraday = calculate_comprehensive_indicators_intraday(df_intraday)
+        if df_indicators_intraday.empty:
+            logger.debug(f"{symbol}: Failed to calculate intraday indicators")
+            return None
+
+        # Localise to Eastern time
+        if df_indicators_intraday.index.tz is None:
+            df_indicators_intraday.index = df_indicators_intraday.index.tz_localize(
+                "America/New_York"
+            )
+        else:
+            df_indicators_intraday.index = df_indicators_intraday.index.tz_convert(
+                "America/New_York"
+            )
+
+        yesterday = available_dates[1] if len(available_dates) > 1 else available_dates[-1]
+
+        t1_close_data = extract_intraday_snapshot(
+            df_indicators_intraday, yesterday, dt_time(16, 0), "t1_close", logger, symbol
+        )
+        t1_open_data = extract_intraday_snapshot(
+            df_indicators_intraday, yesterday, dt_time(9, 30), "t1_open", logger, symbol
+        )
+
+        if not t1_close_data or not t1_open_data:
+            logger.debug(
+                f"{symbol}: Could not extract T-1 open or close snapshot — skipping stock."
+            )
+            return None
+
+        result = {
+            "symbol":   symbol,
+            "exchange": "NASDAQ",
+            **t3_data,
+            **t5_data,
+            **t10_data,
+            **t1_close_data,
+            **t1_open_data,
+        }
+
+        logger.debug(f"{symbol}: {len(result)} total features assembled")
+        return result
+
+    except Exception as e:
+        logger.debug(f"{symbol}: Error — {e}")
+        return None
+
+
+def extract_features_with_prefix(df: pd.DataFrame, date, prefix: str, logger, symbol: str) -> dict:
+    """Extract indicators with prefix (e.g., t3_, t5_, t10_) from DAILY data"""
+    day_bars = df[df.index.date == date]
+    if day_bars.empty:
+        logger.debug(f"{symbol}: No data for {date} (prefix {prefix})")
+        return {}
+    bar = day_bars.iloc[-1]
+    return {
+        f"{prefix}_{k}": (v if (pd.notna(v) and not np.isinf(v)) else None)
+        for k, v in bar.to_dict().items()
+    }
+
+
+def extract_intraday_snapshot(
+    df_intraday: pd.DataFrame,
+    target_date,
+    target_time,
+    prefix: str,
+    logger,
+    symbol: str
+) -> dict:
+    """Extract indicators from 5-MINUTE intraday data at specific time"""
+    day_bars = df_intraday[df_intraday.index.date == target_date]
+    if day_bars.empty:
+        logger.debug(f"{symbol}: No intraday data for {target_date}")
+        return {}
+
+    window_start = (datetime.combine(target_date, target_time) - timedelta(minutes=5)).time()
+    window_end   = (datetime.combine(target_date, target_time) + timedelta(minutes=30)).time()
+
+    target_bars = day_bars[
+        (day_bars.index.time >= window_start) &
+        (day_bars.index.time <= window_end)
+    ]
+    if target_bars.empty:
+        target_bars = day_bars
+
+    bar = target_bars.iloc[0] if target_time.hour < 12 else target_bars.iloc[-1]
+
+    return {
+        f"{prefix}_{k}": (v if (pd.notna(v) and not np.isinf(v)) else None)
+        for k, v in bar.to_dict().items()
+    }
 
 
 def main():
@@ -794,53 +684,53 @@ def main():
     parser.add_argument("--max-results", type=int, default=500)
     parser.add_argument("--top-n", type=int, default=50)
     parser.add_argument("--verbose", "-v", action="store_true")
-    
+
     args = parser.parse_args()
     logger = setup_logging(args.verbose)
-    
+
     prediction_date = get_next_trading_day()
-    
+
     logger.info("=" * 80)
     logger.info("ML SCREENING & PREDICTION")
     logger.info("=" * 80)
     logger.info(f"Prediction date (trading session): {prediction_date}")
     logger.info("=" * 80)
-    
+
     screener = SmartScreener(logger=logger)
-    
+
     try:
         predictor = ExplosionPredictor()
         supabase  = MLPredictionSupabaseClient({})
     except Exception as e:
         logger.error(f"Failed to initialize: {e}")
         return 1
-    
+
     # STEP 1: SCREENING
     logger.info("\n" + "=" * 80)
     logger.info("STEP 1: INTELLIGENT SCREENING")
     logger.info("=" * 80)
-    
+
     screened_df = screener.screen_with_tradingview(max_results=args.max_results)
     if screened_df.empty:
         logger.error("No stocks passed screening")
         return 1
     logger.info(f"✓ Screened {len(screened_df)} stocks")
-    
+
     symbols = []
     if 'symbol' in screened_df.columns:
         symbols = screened_df['symbol'].str.split(':').str[-1].tolist()
     else:
         logger.error("No symbol column in screened results")
         return 1
-    
+
     # STEP 2: FETCH STOCK DATA
     logger.info("\n" + "=" * 80)
     logger.info("STEP 2: FETCH STOCK DATA")
     logger.info("=" * 80)
     logger.info(f"Fetching data for {len(symbols)} stocks...")
-    
+
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    
+
     enriched_stocks = []
     failed_count = 0
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -854,28 +744,28 @@ def main():
                 enriched_stocks.append(result)
             else:
                 failed_count += 1
-    
+
     logger.info(f"✓ Fetched {len(enriched_stocks)} stocks ({failed_count} failed/skipped)")
-    
+
     if not enriched_stocks:
         logger.error("Failed to fetch data for any stocks")
         return 1
-    
+
     # STEP 3: PREPARE FEATURES
     logger.info("\n" + "=" * 80)
     logger.info("STEP 3: PREPARE FEATURES")
     logger.info("=" * 80)
-    
+
     features_df = pd.DataFrame(enriched_stocks)
     logger.info(f"✓ Feature matrix: {len(features_df)} stocks × {len(features_df.columns)} raw columns")
-    
+
     # STEP 4: ML PREDICTION
     logger.info("\n" + "=" * 80)
     logger.info("STEP 4: ML PREDICTION")
     logger.info("=" * 80)
-    
+
     historical_gains = supabase.get_historical_prediction_accuracy(days_back=30)
-    
+
     try:
         predictions_df = predictor.predict_with_targets(features_df, historical_gains)
         logger.info(f"✓ Generated {len(predictions_df)} predictions")
@@ -884,26 +774,24 @@ def main():
         import traceback
         traceback.print_exc()
         return 1
-    
-    # ── PROBABILITY DISTRIBUTION ─────────────────────────────────────────────
+
     log_probability_distribution(
         predictions_df, logger,
         label=f"All {len(predictions_df)} screened stocks"
     )
-    # ─────────────────────────────────────────────────────────────────────────
-    
+
     # STEP 5: TOP PREDICTIONS
     logger.info("\n" + "=" * 80)
     logger.info(f"STEP 5: TOP {args.top_n} PREDICTIONS")
     logger.info("=" * 80)
-    
+
     top_predictions = predictions_df.head(args.top_n)
-    
+
     logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
     logger.info("-" * 100)
     logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8}")
     logger.info("-" * 100)
-    
+
     for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
         current_price = row.get('current_price', 0)
         logger.info(
@@ -913,12 +801,12 @@ def main():
             f"${row.get('target_price', 0):>8.2f}  "
             f"+{row.get('target_gain_pct', 0):>5.1f}%"
         )
-    
+
     # STEP 6: STORE PREDICTIONS
     logger.info("\n" + "=" * 80)
     logger.info("STEP 6: STORE PREDICTIONS")
     logger.info("=" * 80)
-    
+
     predictions_list = [
         {
             'symbol':               row['symbol'],
@@ -937,11 +825,11 @@ def main():
         }
         for _, row in top_predictions.iterrows()
     ]
-    
+
     if predictions_list:
         count = supabase.write_predictions(predictions_list)
         logger.info(f"✓ Wrote {count} predictions for trading session: {prediction_date}")
-    
+
     # STEP 7: SCREENING LOG
     screening_log = {
         'screening_date':             prediction_date,
@@ -959,14 +847,14 @@ def main():
         'model_version':      'csv_trained_with_t3_t5_t10_prefixes'
     }
     supabase.write_screening_log(screening_log)
-    
+
     csv_path = Path(f"ml_screening_results_{prediction_date}.csv")
     top_predictions.to_csv(csv_path, index=False)
-    
+
     logger.info("\n" + "=" * 80)
     logger.info("✓ PREDICTION COMPLETE")
     logger.info("=" * 80)
-    
+
     return 0
 
 
