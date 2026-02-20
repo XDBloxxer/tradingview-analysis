@@ -377,15 +377,30 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     sym_col  = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
     date_col = next((c for c in ["detection_date", "event_date"] if c in combined.columns), None)
 
-    if sym_col and date_col:
+    # Safe dedup: only deduplicate if BOTH date columns are the same column name
+    # Base CSV uses event_date, T-1 data uses detection_date — these are different
+    # columns and should NOT be deduped against each other
+    sym_col  = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
+    
+    # Only deduplicate within the same source type, not across base CSV and T-1
+    # Check if there's a single unified date column (only present if tables were already merged)
+    date_cols_present = [c for c in ["detection_date", "event_date"] if c in combined.columns]
+    
+    if sym_col and len(date_cols_present) == 1:
+        # Both sources use the same date column — safe to dedup
+        date_col = date_cols_present[0]
         before_dedup = len(combined)
         combined = combined.drop_duplicates(subset=[sym_col, date_col], keep="first")
         n_dropped = before_dedup - len(combined)
         if n_dropped > 0:
-            logger.info(
-                f"Deduplication: removed {n_dropped} duplicate (symbol, date) rows "
-                f"({before_dedup} → {len(combined)})"
-            )
+            logger.info(f"Deduplication: removed {n_dropped} duplicate rows ({before_dedup} → {len(combined)})")
+    elif sym_col and len(date_cols_present) == 2:
+        # Base CSV and T-1 data use different date columns — skip dedup entirely
+        # to avoid accidentally dropping valid rows from either source
+        logger.info(
+            "Skipping deduplication: base CSV (event_date) and T-1 data (detection_date) "
+            "use different date columns — no cross-source duplicates possible"
+        )
 
     n_pos = int((combined["label"] == 1).sum())
     n_neg = int((combined["label"] == 0).sum())
