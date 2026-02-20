@@ -150,8 +150,12 @@ NON_FEATURE_COLS = {
     "id", "created_at", "updated_at", "date", "symbol", "ticker",
     "label", "source", "sample_weight", "detection_date", "explosion_date",
     "change_pct", "rank", "notes", "mistake_type", "actual_gain_pct",
-    "actual_high_pct",  # FIX 4: exclude target-leaking column
-    "_sort_date",       # internal column used for time-based split only
+    "actual_high_pct", "_sort_date",
+    # Label-leaking columns: present in training tables but unavailable at prediction time
+    "gain_pct", "volume_spike",
+    # Training metadata: table bookkeeping columns, not predictive signals
+    "snapshot_date", "snapshot_type", "snapshot_time",
+    "event_date", "days_since_event", "interval",
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
