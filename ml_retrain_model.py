@@ -446,9 +446,10 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
         else pd.Series(1.0, index=df.index)
     )
 
+    FEATURE_PREFIXES = ("t1_close_", "t1_open_", "t3_", "t5_", "t10_")
     feature_cols = [
         c for c in df.columns
-        if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
+        if any(c.startswith(pfx) for pfx in FEATURE_PREFIXES)
     ]
 
     X = df[feature_cols].copy()
