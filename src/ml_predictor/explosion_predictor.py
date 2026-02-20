@@ -179,7 +179,9 @@ class ExplosionPredictor:
             f"Feature coverage: {coverage:.1f}% ({matched}/{len(self.feature_names)})"
         )
         if missing_names:
-            self.logger.debug(f"Missing {len(missing_names)} features — using intelligent defaults")
+            self.logger.info(f"First 30 MISSING features: {missing_names[:30]}")
+            sample_avail = [c for c in data_df.columns if c not in _META_COLS][:30]
+            self.logger.info(f"First 30 AVAILABLE columns: {sample_avail}")
         if coverage < 50:
             self.logger.warning(
                 f"⚠️  LOW feature coverage ({coverage:.1f}%) — predictions may be unreliable"
@@ -487,3 +489,4 @@ class ExplosionPredictor:
         if probability >= 0.60:  return 10.0
         if probability >= 0.50:  return 7.0
         return 3.0
+
