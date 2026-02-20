@@ -519,63 +519,70 @@ def extract_intraday_snapshot(
     }
 
 
-def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate indicators on DAILY bars"""
+def calculate_comprehensive_indicators_intraday(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculate indicators on 5-MINUTE intraday bars.
+    Must produce the same indicator set as calculate_comprehensive_indicators_daily()
+    so that t1_close_ and t1_open_ features match what the model was trained on.
+    """
     import ta
-    
+
     result = pd.DataFrame(index=df.index)
     result['Close']  = df['Close']
     result['Open']   = df['Open']
     result['High']   = df['High']
     result['Low']    = df['Low']
     result['Volume'] = df['Volume']
-    
+
+    # ── Moving averages ────────────────────────────────────────────────────
     for period in [5, 10, 20, 50]:
         try: result[f'SMA_{period}'] = ta.trend.sma_indicator(df['Close'], window=period)
         except: pass
-    
+
     for period in [5, 10, 12, 20, 26, 50]:
         try: result[f'EMA_{period}'] = ta.trend.ema_indicator(df['Close'], window=period)
         except: pass
-    
+
     try:
         result['WMA_10'] = ta.trend.wma_indicator(df['Close'], window=10)
         result['WMA_20'] = ta.trend.wma_indicator(df['Close'], window=20)
     except: pass
-    
+
     try:
         result['HMA_9']  = ta.trend.wma_indicator(df['Close'], window=9)
         result['HMA_20'] = ta.trend.wma_indicator(df['Close'], window=20)
     except: pass
-    
+
     try:
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         result['VWMA_20'] = (typical_price * df['Volume']).rolling(20).sum() / df['Volume'].rolling(20).sum()
     except: pass
-    
+
     try:
         result['Price_vs_SMA20'] = (df['Close'] / result['SMA_20'] - 1) * 100
         result['Price_vs_SMA50'] = (df['Close'] / result['SMA_50'] - 1) * 100
         result['Price_vs_EMA20'] = (df['Close'] / result['EMA_20'] - 1) * 100
     except: pass
-    
+
     try:
         result['SMA_20_50_Diff'] = result['SMA_20'] - result['SMA_50']
         result['EMA_12_26_Diff'] = result['EMA_12'] - result['EMA_26']
     except: pass
-    
+
     try:
         result['SMA_20_Slope'] = result['SMA_20'].diff(5)
         result['EMA_20_Slope'] = result['EMA_20'].diff(5)
     except: pass
-    
+
+    # ── RSI ────────────────────────────────────────────────────────────────
     for period in [7, 14, 21, 28]:
         try: result[f'RSI_{period}'] = ta.momentum.rsi(df['Close'], window=period)
         except: pass
-    
+
     try: result['RSI_14_Slope'] = result['RSI_14'].diff(3)
     except: pass
-    
+
+    # ── Stochastics ────────────────────────────────────────────────────────
     try:
         stoch = ta.momentum.StochasticOscillator(df['High'], df['Low'], df['Close'], window=14, smooth_window=3)
         result['STOCHk_14_3_3'] = stoch.stoch()
@@ -586,26 +593,29 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         result['STOCHd_5_3_1'] = stoch_fast.stoch_signal()
         result['STOCHh_5_3_1'] = result['STOCHk_5_3_1'] - result['STOCHd_5_3_1']
     except: pass
-    
+
     try:
         stoch_rsi = ta.momentum.StochRSIIndicator(df['Close'], window=14, smooth1=3, smooth2=3)
         result['STOCHRSIk_14_14_3_3'] = stoch_rsi.stochrsi_k()
         result['STOCHRSId_14_14_3_3'] = stoch_rsi.stochrsi_d()
     except: pass
-    
+
     try: result['WILLR_14'] = ta.momentum.williams_r(df['High'], df['Low'], df['Close'], lbp=14)
     except: pass
-    
+
+    # ── CCI ────────────────────────────────────────────────────────────────
     for period in [14, 20]:
         try: result[f'CCI_{period}'] = ta.trend.cci(df['High'], df['Low'], df['Close'], window=period)
         except: pass
-    
+
+    # ── Oscillators ────────────────────────────────────────────────────────
     try: result['UO'] = ta.momentum.ultimate_oscillator(df['High'], df['Low'], df['Close'])
     except: pass
-    
+
     try: result['AO'] = ta.momentum.awesome_oscillator(df['High'], df['Low'], window1=5, window2=34)
     except: pass
-    
+
+    # ── MACD ───────────────────────────────────────────────────────────────
     try:
         macd = ta.trend.MACD(df['Close'], window_slow=26, window_fast=12, window_sign=9)
         result['MACD_12_26_9']  = macd.macd()
@@ -617,7 +627,8 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         result['MACDh_Fast'] = macd_fast.macd_diff()
         result['MACDs_Fast'] = macd_fast.macd_signal()
     except: pass
-    
+
+    # ── Bollinger Bands ────────────────────────────────────────────────────
     try:
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         result['BBL_20_2.0_2.0'] = bb.bollinger_lband()
@@ -626,94 +637,106 @@ def calculate_comprehensive_indicators_daily(df: pd.DataFrame) -> pd.DataFrame:
         result['BBB_20_2.0_2.0'] = bb.bollinger_wband()
         result['BBP_20_2.0_2.0'] = bb.bollinger_pband()
     except: pass
-    
+
+    # ── Keltner Channel ────────────────────────────────────────────────────
     try:
         keltner = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
         result['KCLe_20_2'] = keltner.keltner_channel_lband()
         result['KCBe_20_2'] = keltner.keltner_channel_mband()
         result['KCUe_20_2'] = keltner.keltner_channel_hband()
     except: pass
-    
+
+    # ── Donchian Channel ───────────────────────────────────────────────────
     try:
         donchian = ta.volatility.DonchianChannel(df['High'], df['Low'], df['Close'], window=20)
         result['DCL_20_20'] = donchian.donchian_channel_lband()
         result['DCM_20_20'] = donchian.donchian_channel_mband()
         result['DCU_20_20'] = donchian.donchian_channel_hband()
     except: pass
-    
+
+    # ── ATR ────────────────────────────────────────────────────────────────
     for period in [7, 14, 20]:
         try: result[f'ATR_{period}'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=period)
         except: pass
-    
+
     try: result['ATR_14_Slope'] = result['ATR_14'].diff(5)
     except: pass
-    
+
+    # ── Historical Volatility ──────────────────────────────────────────────
     for period in [10, 20, 30]:
         try: result[f'HV_{period}'] = df['Close'].pct_change().rolling(window=period).std() * 100
         except: pass
-    
+
+    # ── Volume indicators ──────────────────────────────────────────────────
     try:
-        result['OBV']      = ta.volume.on_balance_volume(df['Close'], df['Volume'])
+        result['OBV']       = ta.volume.on_balance_volume(df['Close'], df['Volume'])
         result['OBV_SMA20'] = result['OBV'].rolling(window=20).mean()
     except: pass
-    
+
     for period in [5, 10, 20]:
         try: result[f'Volume_MA{period}'] = df['Volume'].rolling(window=period).mean()
         except: pass
-    
+
     try: result['Volume_Ratio'] = df['Volume'] / result['Volume_MA20']
     except: pass
-    
+
+    try: result['MFI_14'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
+    except: pass
+
+    try: result['CMF_20'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20)
+    except: pass
+
+    # ── ADX / Directional Movement ─────────────────────────────────────────
     try:
         adx = ta.trend.ADXIndicator(df['High'], df['Low'], df['Close'], window=14)
-        result['ADX_14']   = adx.adx()
+        result['ADX_14']    = adx.adx()
         result['ADXR_14_2'] = adx.adx()
-        result['DMP_14']   = adx.adx_pos()
-        result['DMN_14']   = adx.adx_neg()
+        result['DMP_14']    = adx.adx_pos()
+        result['DMN_14']    = adx.adx_neg()
     except: pass
-    
+
+    # ── Aroon ──────────────────────────────────────────────────────────────
     try:
         aroon = ta.trend.AroonIndicator(df['Close'], window=25)
         result['AROONU_25']   = aroon.aroon_up()
         result['AROOND_25']   = aroon.aroon_down()
         result['AROONOSC_25'] = aroon.aroon_indicator()
     except: pass
-    
+
+    # ── TSI ────────────────────────────────────────────────────────────────
+    try:
+        tsi = ta.momentum.TSIIndicator(df['Close'], window_slow=25, window_fast=13)
+        result['TSI_13_25_13']  = tsi.tsi()
+        result['TSIs_13_25_13'] = tsi.tsi()
+    except: pass
+
+    # ── Momentum / ROC ─────────────────────────────────────────────────────
+    for period in [10, 20]:
+        try: result[f'ROC_{period}'] = ta.momentum.roc(df['Close'], window=period)
+        except: pass
+
+    for period in [10, 20]:
+        try: result[f'MOM_{period}'] = df['Close'].diff(period)
+        except: pass
+
+    # ── Supertrend proxy (same as daily) ───────────────────────────────────
     try:
         result['SUPERT_10_3']  = df['Close']
         result['SUPERTd_10_3'] = 0
         result['SUPERTl_10_3'] = df['Low']
         result['SUPERTs_10_3'] = 1
     except: pass
-    
+
+    # ── VWAP ───────────────────────────────────────────────────────────────
     try:
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3
         result['VWAP'] = (typical_price * df['Volume']).cumsum() / df['Volume'].cumsum()
     except: pass
-    
-    try: result['MFI_14'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
-    except: pass
-    
-    try: result['CMF_20'] = ta.volume.chaikin_money_flow(df['High'], df['Low'], df['Close'], df['Volume'], window=20)
-    except: pass
-    
-    for period in [10, 20]:
-        try: result[f'ROC_{period}'] = ta.momentum.roc(df['Close'], window=period)
-        except: pass
-    
-    for period in [10, 20]:
-        try: result[f'MOM_{period}'] = df['Close'].diff(period)
-        except: pass
-    
-    try:
-        tsi = ta.momentum.TSIIndicator(df['Close'], window_slow=25, window_fast=13)
-        result['TSI_13_25_13']  = tsi.tsi()
-        result['TSIs_13_25_13'] = tsi.tsi()
-    except: pass
-    
+
+    # ── Gap ────────────────────────────────────────────────────────────────
     try: result['Gap_Pct'] = ((df['Open'] - df['Close'].shift(1)) / df['Close'].shift(1)) * 100
     except: pass
-    
+
     return result
 
 
