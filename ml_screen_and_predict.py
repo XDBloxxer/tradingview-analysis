@@ -139,7 +139,7 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
 def get_next_trading_day() -> str:
     est = pytz.timezone('America/New_York')
     now_est = datetime.now(est)
-    prediction_day = now_est + timedelta(days=1)
+    prediction_day = now_est
     while prediction_day.weekday() >= 5:
         prediction_day += timedelta(days=1)
     return prediction_day.date().isoformat()
