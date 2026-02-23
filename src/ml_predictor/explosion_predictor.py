@@ -113,7 +113,10 @@ class ExplosionPredictor:
             self.regressor = None
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
-        has_flat = any(_norm(f) in {"close", "rsi_14", "macd_12_26_9"} for f in self.feature_names)
+        has_flat = any(
+            f.startswith("t3_") or f.startswith("t5_") or f.startswith("t10_")
+            for f in self.feature_names
+        )
         if has_flat and has_t1:
             self.logger.info("Model type: HYBRID (T-3/T-5/T-10 + T-1 open/close)")
         elif has_flat:
@@ -528,3 +531,4 @@ class ExplosionPredictor:
         if probability >= 0.60: return 10.0
         if probability >= 0.50: return 7.0
         return 3.0
+
