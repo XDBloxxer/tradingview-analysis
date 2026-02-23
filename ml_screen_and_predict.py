@@ -214,7 +214,7 @@ class SmartScreener:
 
         return defaults
 
-    def screen_with_tradingview(self, max_results: int = 500) -> "pd.DataFrame":
+    def screen_with_tradingview(self, max_results: int = 1000) -> "pd.DataFrame":
         import pandas as pd
 
         if not SCREENER_AVAILABLE or self.screener is None:
