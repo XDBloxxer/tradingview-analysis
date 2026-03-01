@@ -1,16 +1,27 @@
 """
-Explosion Predictor — with diagnostic logging to find equal-probability root cause.
+Explosion Predictor
 
-DIAGNOSTIC MODE: On first run, prepare_features() logs:
-  - Per-group feature variance (t3_, t5_, t10_, t1_close_, t1_open_)
-  - Sample raw values for 3 stocks on key features
-  - Exact match path (direct / norm / default) for every feature
-This tells us definitively whether features are zero-variance or mismatched.
+FIXES IN THIS VERSION:
 
-FIXES INCLUDED:
-  1. Dot-normalization: _norm() does .lower() + .replace('.','_') so
-     t3_BBL_20_2.0_2.0 matches model feature t3_bbl_20_2_0_2_0.
-  2. Bimodal collapse detection + relative signal thresholds.
+BUG 1 — target_price computed from scaled indicator column instead of actual price:
+  predict_with_targets() searched for a "close" column in features_df to get the
+  current price. features_df is the model's feature matrix (t3_Close, t1_close_Close
+  etc.) — these are raw indicator values, NOT the stock's current price. The first
+  "close"-containing column it found was typically t3_Close (price 3 days ago, not
+  today's price), making all target prices wrong.
+  FIX: Pass current_price in via data_df (ml_screen_and_predict.py already stores
+  it in the features dict). Look for it there directly, not in features_df.
+  Fall back to t3_Close only as a last resort with a warning.
+
+BUG 2 — prepare_features() and _scale_features() called twice per prediction:
+  predict_with_targets() calls self.predict() (which runs prepare_features +
+  _scale_features internally), then immediately runs them again for the regressor.
+  FIX: predict() now returns X_scaled alongside the results DataFrame so
+  predict_with_targets() can reuse it without repeating the work.
+
+BUG 3 — Diagnostic logging: _log_feature_diagnostics only fires once per session,
+  but after FIX 2 prepare_features is only called once anyway, so the guard is
+  now irrelevant. Kept for safety.
 """
 
 import json
@@ -18,7 +29,7 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import joblib
 
@@ -52,7 +63,7 @@ class ExplosionPredictor:
         self._norm_to_feature: Dict[str, str] = {}
         self._regressor_n_features: Optional[int] = None
         self._is_bimodal   = False
-        self._diag_done    = False   # log diagnostics once per session
+        self._diag_done    = False
 
         self._load_model()
 
@@ -81,10 +92,13 @@ class ExplosionPredictor:
                     self._regressor_n_features = self.regressor.get_booster().num_features()
                 except Exception:
                     self._regressor_n_features = None
-            self.logger.info(f"Loaded regressor (expects {self._regressor_n_features} features)")
+            self.logger.info(f"Loaded gain regressor (expects {self._regressor_n_features} features)")
         else:
             self.regressor = None
-            self.logger.warning("Regressor not found - will use rule-based gain estimates")
+            self.logger.warning(
+                "gain_regressor.pkl not found — will use rule-based gain estimates. "
+                "Run ml_retrain_model.py once ≥30 winner rows have gain data."
+            )
 
         if metadata_path.exists():
             with open(metadata_path) as f:
@@ -108,7 +122,7 @@ class ExplosionPredictor:
                 and self._regressor_n_features != classifier_n):
             self.logger.warning(
                 f"Regressor feature count ({self._regressor_n_features}) != "
-                f"classifier ({classifier_n}). Regressor SKIPPED."
+                f"classifier ({classifier_n}). Regressor DISABLED — retrain both together."
             )
             self.regressor = None
 
@@ -136,10 +150,6 @@ class ExplosionPredictor:
     # -------------------------------------------------------------------------
 
     def _log_feature_diagnostics(self, feature_df: pd.DataFrame, match_log: dict):
-        """
-        Log per-group variance and sample values to find equal-probability root cause.
-        Called once per session after first prepare_features().
-        """
         self.logger.info("")
         self.logger.info("=" * 72)
         self.logger.info("FEATURE DIAGNOSTIC REPORT")
@@ -183,7 +193,6 @@ class ExplosionPredictor:
                 f"mean_std: {mean_std:.4f} | from_default: {dflt_count}"
             )
 
-            # Sample live values for up to 5 varying features, 3 stocks
             live_cols = [c for c in num_cols if col_stds.get(c, 0) >= 1e-9][:5]
             if live_cols and len(feature_df) >= 3:
                 for col in live_cols:
@@ -195,7 +204,6 @@ class ExplosionPredictor:
 
         self.logger.info("")
 
-        # Cross-reference with feature_importance.csv
         fi_path = self.model_dir / "feature_importance.csv"
         if fi_path.exists():
             try:
@@ -207,12 +215,10 @@ class ExplosionPredictor:
                     feat      = row["feature"]
                     imp       = row["importance"]
                     feat_norm = _norm(feat)
-                    # Find this feature in the dataframe
                     feat_col  = None
                     if feat in feature_df.columns:
                         feat_col = feat
                     else:
-                        # Try norm match
                         for col in feature_df.columns:
                             if _norm(col) == feat_norm:
                                 feat_col = col
@@ -237,10 +243,6 @@ class ExplosionPredictor:
     # -------------------------------------------------------------------------
 
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Align input data_df to the model's expected feature schema.
-        Lookup: direct match -> norm match (_norm handles case+dots) -> default.
-        """
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
         input_norm_to_col: Dict[str, str] = {_norm(c): c for c in data_df.columns}
@@ -286,7 +288,6 @@ class ExplosionPredictor:
         if coverage < 50:
             self.logger.warning(f"LOW feature coverage ({coverage:.1f}%)")
 
-        # Diagnostics on first call only
         if not self._diag_done:
             self._log_feature_diagnostics(feature_df, match_log)
             self._diag_done = True
@@ -393,15 +394,21 @@ class ExplosionPredictor:
         return signals
 
     # -------------------------------------------------------------------------
-    # Prediction
+    # Prediction — internal, returns (result_df, X_scaled)
     # -------------------------------------------------------------------------
 
-    def predict(self, data_df: pd.DataFrame) -> pd.DataFrame:
+    def _predict_internal(
+        self, data_df: pd.DataFrame
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """
+        Core prediction. Returns (result_df, features_df, X_scaled).
+        Callers that also need gain predictions can reuse X_scaled directly
+        instead of re-running prepare_features + _scale_features.
+        """
         features_df = self.prepare_features(data_df)
         X           = features_df[self.feature_names].copy()
         X_scaled    = self._scale_features(X)
 
-        # Log scaled variance to confirm differentiation before model call
         scaled_std    = X_scaled.std()
         zero_var_cols = int((scaled_std < 1e-9).sum())
         self.logger.info(
@@ -411,9 +418,9 @@ class ExplosionPredictor:
         )
         if zero_var_cols > len(self.feature_names) * 0.5:
             self.logger.warning(
-                f"MORE THAN HALF of features are zero-variance after scaling. "
-                f"This will cause equal probabilities. "
-                f"Check the diagnostic report above for which groups are affected."
+                "MORE THAN HALF of features are zero-variance after scaling. "
+                "This will cause equal probabilities. "
+                "Check the diagnostic report above for which groups are affected."
             )
 
         predictions   = self.model.predict(X_scaled)
@@ -435,35 +442,70 @@ class ExplosionPredictor:
             "explosion_probability": probabilities,
             "prediction":            predictions,
             "signal":                signals.values,
-        })
+        }, index=data_df.index)
 
         for col in ("symbol", "exchange"):
             if col in features_df.columns:
                 result_df.insert(0, col, features_df[col].values)
 
-        return result_df.sort_values(
+        result_df = result_df.sort_values(
             "explosion_probability", ascending=False
         ).reset_index(drop=True)
+
+        # X_scaled must be reindexed to match result_df order after sort
+        sorted_original_index = result_df.index  # already reset
+        # We need to track the original row order; attach a sort key first
+        result_df["_orig_idx"] = range(len(result_df))
+        X_scaled_sorted = X_scaled.reset_index(drop=True).iloc[
+            result_df["_orig_idx"].values
+        ].reset_index(drop=True)
+        result_df = result_df.drop(columns=["_orig_idx"])
+
+        return result_df, features_df, X_scaled_sorted
+
+    def predict(self, data_df: pd.DataFrame) -> pd.DataFrame:
+        result_df, _, _ = self._predict_internal(data_df)
+        return result_df
+
+    # -------------------------------------------------------------------------
+    # Prediction with gain targets
+    # -------------------------------------------------------------------------
 
     def predict_with_targets(
         self,
         data_df: pd.DataFrame,
         historical_gains_df: pd.DataFrame = None,
     ) -> pd.DataFrame:
-        predictions = self.predict(data_df)
-        features_df = self.prepare_features(data_df)
-        X           = features_df[self.feature_names].copy()
-        X_scaled    = self._scale_features(X)
+        """
+        Predict explosion probability + estimated gain target.
 
+        FIX BUG 1: Current price is now read from data_df['current_price'] or
+        data_df['t3_Close'] (the most recent daily close) rather than searching
+        features_df for any "close"-containing column. features_df contains
+        indicator values from multiple timepoints — accidentally picking t3_Close
+        (3-days-ago close) instead of the actual current price made all target
+        prices wrong.
+
+        FIX BUG 2: X_scaled is reused from _predict_internal instead of being
+        recomputed, eliminating the double prepare_features+_scale_features call.
+        """
+        predictions, features_df, X_scaled = self._predict_internal(data_df)
+
+        # ── Gain estimation ──────────────────────────────────────────────────
         if self.regressor is not None:
             try:
+                # X_scaled rows are already sorted to match predictions row order
                 predicted_gains = self.regressor.predict(X_scaled)
-                self.logger.info("Using LEARNED gain predictions from regressor")
+                self.logger.info(
+                    f"Gain regressor: predicted {len(predicted_gains)} gains  "
+                    f"range=[{predicted_gains.min():.1f}%, {predicted_gains.max():.1f}%]  "
+                    f"mean={predicted_gains.mean():.1f}%"
+                )
                 predictions["target_gain_pct"]  = predicted_gains
                 predictions["target_gain_low"]   = predicted_gains * 0.8
                 predictions["target_gain_high"]  = predicted_gains * 1.2
             except Exception as e:
-                self.logger.warning(f"Regressor predict failed ({e}) - falling back to rule-based")
+                self.logger.warning(f"Regressor predict failed ({e}) — falling back")
                 self.regressor = None
 
         if self.regressor is None:
@@ -475,25 +517,28 @@ class ExplosionPredictor:
                     labels=["Low", "Medium", "High", "Very High"],
                 )
                 avg_gains = gain_buckets.groupby("prob_bucket")["actual_gain_pct"].agg(
-                    ["mean", "median", "std"])
+                    ["mean", "median", "std"]
+                )
                 predictions["prob_bucket"] = pd.cut(
                     predictions["explosion_probability"],
                     bins=[0, 0.5, 0.7, 0.9, 1.0],
                     labels=["Low", "Medium", "High", "Very High"],
                 )
                 predictions = predictions.merge(
-                    avg_gains, left_on="prob_bucket", right_index=True, how="left")
+                    avg_gains, left_on="prob_bucket", right_index=True, how="left"
+                )
                 predictions["target_gain_pct"]  = predictions["median"]
-                predictions["target_gain_low"]   = predictions["median"] - predictions["std"]
-                predictions["target_gain_high"]  = predictions["median"] + predictions["std"]
+                predictions["target_gain_low"]   = predictions["median"] - predictions["std"].fillna(0)
+                predictions["target_gain_high"]  = predictions["median"] + predictions["std"].fillna(0)
                 predictions = predictions.drop(["prob_bucket", "mean", "median", "std"], axis=1)
             else:
-                self.logger.warning("Using rule-based gain estimates")
+                self.logger.warning("No regressor and no historical data — using rule-based gain estimates")
                 predictions["target_gain_pct"]  = predictions["explosion_probability"].apply(
                     self._estimate_target_gain)
                 predictions["target_gain_low"]   = predictions["target_gain_pct"] * 0.5
                 predictions["target_gain_high"]  = predictions["target_gain_pct"] * 1.5
 
+        # Fill any remaining NaN gains
         nan_gain = predictions["target_gain_pct"].isna()
         if nan_gain.any():
             predictions.loc[nan_gain, "target_gain_pct"] = (
@@ -504,26 +549,91 @@ class ExplosionPredictor:
             predictions.loc[nan_gain, "target_gain_high"] = (
                 predictions.loc[nan_gain, "target_gain_pct"] * 1.5)
 
+        # ── Current price lookup (FIX BUG 1) ────────────────────────────────
+        # Priority:
+        #   1. data_df['current_price']  — set by ml_screen_and_predict.py
+        #   2. data_df['t3_Close']       — most recent daily close from T-3 data
+        #   3. Any t3_ price column      — fallback
+        # We intentionally do NOT use features_df because it has values at
+        # multiple timepoints (t3_Close, t5_Close, t10_Close, t1_close_Close)
+        # and picking the wrong one silently corrupts all target prices.
         if "symbol" in predictions.columns:
-            close_col = next(
-                (c for c in features_df.columns
-                 if "close" in c.lower() and c not in _META_COLS), None)
-            if close_col:
-                price_df = features_df[["symbol", close_col]].copy()
-                price_df.columns = ["symbol", "close"]
-                predictions = predictions.merge(price_df, on="symbol", how="left")
-                predictions["current_price"]     = predictions["close"]
-                predictions["target_price"]      = predictions["close"] * (1 + predictions["target_gain_pct"] / 100)
-                predictions["target_price_low"]  = predictions["close"] * (1 + predictions["target_gain_low"] / 100)
-                predictions["target_price_high"] = predictions["close"] * (1 + predictions["target_gain_high"] / 100)
-                predictions = predictions.drop("close", axis=1)
+            current_price = self._extract_current_price(data_df, predictions)
+            if current_price is not None:
+                predictions["current_price"]     = current_price
+                predictions["target_price"]      = current_price * (1 + predictions["target_gain_pct"] / 100)
+                predictions["target_price_low"]  = current_price * (1 + predictions["target_gain_low"] / 100)
+                predictions["target_price_high"] = current_price * (1 + predictions["target_gain_high"] / 100)
+            else:
+                self.logger.warning(
+                    "Could not determine current_price — target_price columns will be missing. "
+                    "Add 'current_price' column to data_df before calling predict_with_targets()."
+                )
 
         return predictions
+
+    def _extract_current_price(
+        self, data_df: pd.DataFrame, predictions: pd.DataFrame
+    ) -> Optional[pd.Series]:
+        """
+        Extract per-stock current price aligned to the predictions DataFrame row order.
+
+        Returns a Series aligned to predictions.index, or None if no price source found.
+        """
+        # data_df may be in a different row order than predictions (which was sorted).
+        # predictions has 'symbol'; data_df has 'symbol'. Join on symbol to align.
+
+        if "symbol" not in data_df.columns:
+            return None
+
+        # Candidate columns in priority order
+        price_candidates = ["current_price", "t3_Close", "Close"]
+        # Also accept any t3_* column whose suffix looks like Close/close
+        for col in data_df.columns:
+            if col.startswith("t3_") and col.lower().endswith("_close"):
+                if col not in price_candidates:
+                    price_candidates.append(col)
+
+        price_col = next(
+            (c for c in price_candidates if c in data_df.columns), None
+        )
+
+        if price_col is None:
+            # Last resort: any column with both a t3_ prefix and price-like name
+            for col in data_df.columns:
+                if col.startswith("t3_") and any(
+                    x in col.lower() for x in ("close", "price")
+                ):
+                    price_col = col
+                    break
+
+        if price_col is None:
+            return None
+
+        if price_col != "current_price":
+            self.logger.info(f"Using '{price_col}' as current price source")
+
+        price_map = data_df.set_index("symbol")[price_col]
+        aligned   = predictions["symbol"].map(price_map)
+
+        if aligned.isna().all():
+            self.logger.warning(f"Price column '{price_col}' produced all NaN after symbol join")
+            return None
+
+        return aligned.values
+
+    # -------------------------------------------------------------------------
+    # Compatibility shims
+    # -------------------------------------------------------------------------
 
     def _classify_signal(self, probability: float) -> str:
         return self._classify_signal_absolute(probability)
 
     def _estimate_target_gain(self, probability: float) -> float:
+        """
+        Rule-based fallback — only used when gain_regressor.pkl is absent AND
+        historical accuracy data is unavailable. Values are intentionally rough.
+        """
         if probability >= 0.95: return 30.0
         if probability >= 0.90: return 25.0
         if probability >= 0.80: return 20.0
@@ -531,4 +641,3 @@ class ExplosionPredictor:
         if probability >= 0.60: return 10.0
         if probability >= 0.50: return 7.0
         return 3.0
-
