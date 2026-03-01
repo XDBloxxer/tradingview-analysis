@@ -625,9 +625,17 @@ def fetch_stock_data_for_prediction(symbol: str, logger) -> dict:
             logger.debug(f"{symbol}: Failed to extract T-3 data")
             return None
 
+        # current_price = today's most recent close (available_dates[0] = most recent)
+        # Stored explicitly so ExplosionPredictor can use it for target price calculation
+        # without accidentally picking an older timepoint like t3_Close (3 days ago).
+        today_date = available_dates[0]
+        today_bars = df_indicators_daily[df_indicators_daily.index.date == today_date]
+        current_price = float(today_bars['Close'].iloc[-1]) if not today_bars.empty else None
+
         result = {
-            "symbol":   symbol,
-            "exchange": "NASDAQ",
+            'symbol':        symbol,
+            'exchange':      'NASDAQ',
+            'current_price': current_price,
             **t3_data,
             **(t5_data or {}),
             **(t10_data or {}),
