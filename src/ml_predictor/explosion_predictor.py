@@ -343,8 +343,14 @@ class ExplosionPredictor:
             for c in non_numeric:
                 X[c] = pd.to_numeric(X[c], errors="coerce")
 
-        nan_mask = X.isna()
-
+        # Fill NaN with scaler training means, then scale.
+        # IMPORTANT: do NOT restore NaN after scaling.
+        # During training (build_scaler), missing T-1 features were also filled
+        # with column means before scaling -> those rows got 0.0 (scaled mean).
+        # Restoring NaN here creates a train/predict mismatch: model learned
+        # "T-1 missing = 0" but would receive NaN at prediction time, following
+        # a different XGBoost split path -> all stocks without T-1 get identical
+        # probability (the bimodal collapse / equal-probability bug).
         if hasattr(self.scaler, "feature_names_in_"):
             mean_series = (
                 pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
@@ -356,7 +362,6 @@ class ExplosionPredictor:
         X_filled      = X.fillna(mean_series)
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-        X_scaled[nan_mask] = np.nan
 
         return X_scaled
 
