@@ -1006,8 +1006,6 @@ def main():
         'screening_date':               prediction_date,
         'total_symbols_attempted':      args.max_results,
         'symbols_fetched_successfully': len(enriched_stocks),
-        'symbols_with_t1_data':         t1_count,
-        'symbols_daily_only':           daily_only_count,
         'symbols_after_all_filters':    len(features_df),
         'total_predictions':            len(predictions_df),
         'strong_buy_count':  len(predictions_df[predictions_df['signal'] == 'STRONG BUY']),
