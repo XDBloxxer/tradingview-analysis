@@ -368,16 +368,27 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 # ---------------------------------------------------------------------------
 
 def build_scaler(X: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
-    """Fit scaler on non-NaN values per column. Preserves NaN positions."""
+    """Fit scaler and return scaled X with NaN filled by column means.
+
+    NaN values (e.g. missing T-1 features for base-CSV rows) are filled with
+    column means BEFORE scaling, producing 0.0 after StandardScaler transform.
+    We do NOT restore NaN after scaling — this is intentional.
+
+    At prediction time, _scale_features() applies the same mean-fill before
+    scaling. This ensures the model sees exactly the same representation for
+    'missing T-1 data' during training and prediction (both get 0.0 = scaled mean).
+
+    If NaN were restored after scaling, XGBoost would receive NaN at prediction
+    time but 0.0 at training time — different split paths -> equal probabilities
+    for all stocks lacking T-1 data (the bimodal collapse bug).
+    """
     scaler    = StandardScaler()
     col_means = X.mean()
     X_filled  = X.fillna(col_means)
     scaler.fit(X_filled)
 
-    nan_mask       = X.isna()
-    X_scaled_vals  = scaler.transform(X_filled)
-    X_scaled       = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-    X_scaled[nan_mask] = np.nan
+    X_scaled_vals = scaler.transform(X_filled)
+    X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
 
     return scaler, X_scaled
 
