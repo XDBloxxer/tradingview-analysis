@@ -926,6 +926,25 @@ def main() -> int:
     # ── Save ──────────────────────────────────────────────────────────────────
     save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor)
 
+    # ── Verify gain regressor round-trips correctly ───────────────────────────
+    if gain_regressor is not None:
+        try:
+            loaded = joblib.load(GAIN_REGRESSOR_PATH)
+            test_input = pd.DataFrame(
+                np.zeros((1, len(feature_names))), columns=feature_names
+            )
+            test_pred = loaded.predict(test_input)
+            logger.info(
+                f"  ✅ Gain regressor verified loadable — "
+                f"test prediction: {test_pred[0]:.2f}%"
+            )
+            logger.info(
+                f"     ExplosionPredictor should load from: "
+                f"{GAIN_REGRESSOR_PATH.resolve()}"
+            )
+        except Exception as e:
+            logger.error(f"  ❌ Gain regressor verification FAILED after save: {e}")
+
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("")
     logger.info("=" * 60)
