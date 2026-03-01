@@ -598,7 +598,12 @@ def fetch_stock_data_for_prediction(symbol: str, logger) -> dict:
         ticker = yf.Ticker(symbol)
 
         # ── Daily bars for T-3 / T-5 / T-10 (REQUIRED) ───────────────────
+        # Retry once — yfinance silently returns empty under concurrent load
+        import time as _time
         df_daily = ticker.history(period="90d", interval="1d")
+        if df_daily.empty:
+            _time.sleep(1.5)
+            df_daily = ticker.history(period="90d", interval="1d")
         if df_daily.empty or len(df_daily) < 10:
             logger.debug(f"{symbol}: Insufficient daily data ({len(df_daily)} bars)")
             return None
@@ -830,15 +835,24 @@ def main():
     logger.info("  Stocks without T-1 intraday data will still be scored on T-3/T-5/T-10 features")
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    import time, random
 
     enriched_stocks = []
     failed_count = 0
     t1_count = 0
     daily_only_count = 0
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_stock_data_for_prediction, sym, logger): sym
-                   for sym in symbols}
+    # yfinance has no official API and throttles aggressively under concurrent load.
+    # 3 workers + small per-request jitter keeps us well under rate limits.
+    # More workers = more empty responses = fewer stocks making it through.
+    MAX_WORKERS = 3
+
+    def fetch_with_jitter(sym):
+        time.sleep(random.uniform(0.1, 0.4))
+        return fetch_stock_data_for_prediction(sym, logger)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(fetch_with_jitter, sym): sym for sym in symbols}
         for i, future in enumerate(as_completed(futures), 1):
             if i % 50 == 0:
                 logger.info(f"  Progress: {i}/{len(symbols)} | successful: {len(enriched_stocks)}")
