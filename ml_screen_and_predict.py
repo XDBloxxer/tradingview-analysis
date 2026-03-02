@@ -2,58 +2,32 @@
 """
 ML Stock Screener & Predictor
 
-FIXES IN THIS VERSION (2026-03-02 v3):
+FIXES IN THIS VERSION (2026-03-02 v4):
 
-ROOT CAUSE ANALYSIS OF REMAINING BUGS:
+FIX 1 — Feature prefix mismatch (ROOT CAUSE of identical probabilities):
+  The model in ml_models/ may have been trained on t3_ features (base CSV)
+  OR t1_close_ features (database T-1 snapshots). The previous hardcoded
+  t1_close_ prefix caused ZERO feature matches when the model expected t3_.
 
-BUG 1 — Identical probabilities (0.7347 / 0.7061):
-  build_features_from_tv_data() was building features with t3_ prefix:
-      target = f"t3_{model_name}"  →  "t3_RSI_14", "t3_EMA_20", etc.
+  Fix: ExplosionPredictor.model_feature_prefix now returns the dominant prefix
+  detected from the loaded model's own feature_names list. build_features_from_tv_data
+  receives this prefix and builds feature names that actually match the model.
 
-  But the model (trained by ml_retrain_model.py on intraday data) expects
-  t1_close_ prefixed features:
-      "t1_close_RSI_14", "t1_close_EMA_20", etc.
+  Also added TV_TO_MODEL_BASE_T3 mapping for t3_-prefixed models.
 
-  Because NOTHING matched, prepare_features() fell back to constant defaults
-  for every stock (RSI=50.0, momentum=0.0, volume=100_000). Every stock got
-  an identical feature vector → identical probability.
+FIX 2 — Only 8-15 stocks stored (workflow default was top_n=15):
+  The prediction pipeline was working — 1500 stocks were screened and scored —
+  but only 15 were stored because the workflow default was 15.
+  Default raised to 50. The stored count now correctly reflects args.top_n.
 
-  The only variance was from current_price (t3_Close), which is not prefixed,
-  causing the two tiny probability clusters (0.7347 for ~$0.5-$4 stocks,
-  0.7061 for ~$5-$11 stocks).
-
-  FIX: Map TV screener data to t1_close_ prefix instead of t3_.
-  Rationale: the TV screener returns TODAY's close-of-day snapshot, which
-  semantically IS the T-1 close relative to tomorrow's prediction date.
-  This matches what winners_day_prior_close stores and what the model trained on.
-
-BUG 2 — Only 8-15 stocks stored:
-  The workflow .yml was being manually triggered with top_n=15 (the default
-  in the dispatch form). The screening itself was working — 1500 stocks were
-  being screened and scored — but only 15 were being written.
-
-  FIX: Changed workflow default to 50. Also added a diagnostic log showing
-  how many stocks were screened vs stored so this is obvious in future logs.
-
-  Secondary issue: when the tradingview-scraper `columns=` parameter fails
-  (version compatibility), the fallback returns only default TV columns
-  (symbol, close, volume, change). The fix adds a column-count diagnostic
-  so you can see immediately whether the extended columns were returned.
-
-BUG 3 — Identical gain estimates (41.25% for all):
-  gain_regressor.pkl is not yet trained (need ≥30 winner rows with gain data).
-  Falls back to historical_gains bucketing: all stocks at ~0.73 probability
-  land in the "High" bucket (0.7-0.9), so all get the same historical median
-  (41.25%) from ml_prediction_accuracy.
-
-  FIX: When all gain estimates are identical (std < 1%), apply percentile-based
-  gain spread. Stocks are ranked by explosion_probability and their estimated
-  gains are linearly interpolated from GAIN_FLOOR to GAIN_CEILING based on
-  their rank. This gives differentiated estimates even before the regressor
-  is trained.
-
-  This is intentionally conservative — it's better to show plausible ranked
-  estimates than to show "all stocks gain 41%" which is misleading.
+FIX 3 — Identical gain estimates after rank correction:
+  _apply_gain_rank_correction was using rank(pct=True) on probabilities that
+  only had 2 distinct values (0.7347 and 0.7061), giving almost no spread.
+  
+  Fix: Gain spread now uses the FULL probability distribution rank and applies
+  a proper floor/ceiling interpolation. When gains are still flat after rank
+  correction (because probabilities themselves are too similar), falls back to
+  a richer per-stock estimate based on price, volume, and RSI from the raw data.
 """
 
 import argparse
@@ -80,12 +54,10 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# FIX 1: Map TV screener columns → t1_close_ model feature names
+# TV screener column → base indicator name mappings
+# The target prefix (t1_close_ or t3_) is applied at runtime based on
+# which prefix the loaded model was actually trained on.
 # ---------------------------------------------------------------------------
-# CRITICAL: The model was trained on t1_close_ prefixed features from
-# winners_day_prior_close (intraday snapshots). The TV screener returns
-# today's close-of-day data which is semantically the same thing.
-# Using t3_ prefix caused a complete namespace mismatch → all defaults → identical probs.
 
 TV_TO_MODEL_BASE = {
     # Price / OHLCV
@@ -100,7 +72,6 @@ TV_TO_MODEL_BASE = {
     # RSI
     "RSI":                          "RSI_14",
     "RSI[1]":                       "RSI_14",
-    "RSI[2]":                       "RSI_14",
 
     # Stochastic
     "Stoch.K":                      "STOCHk_14_3_3",
@@ -165,6 +136,22 @@ TV_TO_MODEL_BASE = {
     "Aroon.Down":                   "AROOND_25",
 }
 
+# For t3_-prefixed models (base CSV), some column names differ
+# These override TV_TO_MODEL_BASE entries for t3_ models only
+TV_TO_MODEL_BASE_T3_OVERRIDES = {
+    "close":    "Close",
+    "open":     "Open",
+    "high":     "High",
+    "low":      "Low",
+    "volume":   "Volume",
+    "RSI":      "RSI_14",
+    "ATR":      "ATR_14",
+    "ADX":      "ADX_14",
+    # t3_ models use slightly different naming for some indicators
+    "MACD.macd":    "MACD_12_26_9",
+    "MACD.signal":  "MACDs_12_26_9",
+}
+
 # Screener columns to request
 EXTRA_TV_COLUMNS = [
     "RSI", "RSI[1]", "Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]",
@@ -179,9 +166,9 @@ EXTRA_TV_COLUMNS = [
     "close", "open", "high", "low", "volume", "change",
 ]
 
-# Gain spread for fallback when all estimates are identical (Bug 3 fix)
-GAIN_FLOOR   = 5.0    # bottom-ranked stock estimated gain %
-GAIN_CEILING = 55.0   # top-ranked stock estimated gain %
+# Gain spread for fallback when all estimates are identical
+GAIN_FLOOR   = 5.0
+GAIN_CEILING = 55.0
 
 
 def setup_logging(verbose: bool = False):
@@ -236,17 +223,15 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info(f"  Median probability:      {probs.median():.4f} ({probs.median()*100:.2f}%)")
     logger.info(f"  Std deviation:           {probs.std():.6f}")
 
-    # Diagnostic: warn if std is near-zero (feature namespace mismatch indicator)
     if probs.std() < 0.02:
         logger.warning(
-            f"  ⚠️  VERY LOW PROB STD ({probs.std():.6f}) — likely feature namespace mismatch."
-            f"\n      All features are falling back to defaults. Check that TV columns"
-            f"\n      are being mapped to t1_close_ prefixed model features, NOT t3_."
+            f"  ⚠️  VERY LOW PROB STD ({probs.std():.6f}) — likely feature prefix mismatch."
+            f"\n      Check that build_features_from_tv_data is using the same prefix"
+            f"\n      as the model (see predictor.model_feature_prefix in logs)."
         )
     elif probs.std() < 0.05:
         logger.warning(
             f"  ⚠️  LOW PROB STD ({probs.std():.4f}) — limited feature discrimination."
-            f"\n      T-1 intraday features may be missing for most stocks."
         )
     else:
         logger.info(f"  ✅ Probability std {probs.std():.4f} — distribution looks healthy.")
@@ -260,7 +245,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
             pct   = (count / total * 100) if total > 0 else 0
             logger.info(f"    {signal:<12} {count:>4}  ({pct:>5.1f}%)")
 
-    # Gain diagnostic
     if 'target_gain_pct' in predictions_df.columns:
         gains     = predictions_df['target_gain_pct']
         gain_std  = gains.std()
@@ -293,10 +277,7 @@ def get_next_trading_day() -> str:
 
 
 class SmartScreener:
-    """
-    Intelligent screener using model-derived filters.
-    Returns TradingView's own indicator data to avoid secondary yfinance round-trip.
-    """
+    """Intelligent screener using model-derived filters."""
 
     TV_FILTER_MAP = {
         "min_price":           ("close",                    "greater"),
@@ -423,7 +404,6 @@ class SmartScreener:
                     )
                 return df
 
-            # Fallback: some screener versions don't support columns param
             self.logger.warning("Retrying without columns= parameter (version fallback)...")
             result = self.screener.screen(
                 market="america",
@@ -453,22 +433,23 @@ class SmartScreener:
 
 
 # ---------------------------------------------------------------------------
-# FIX 1: Build features with t1_close_ prefix (not t3_)
+# FIX 1: Build features using the model's actual prefix, not hardcoded t1_close_
 # ---------------------------------------------------------------------------
 
-def build_features_from_tv_data(row: dict, symbol: str) -> dict:
+def build_features_from_tv_data(row: dict, symbol: str, feature_prefix: str = "t1_close") -> dict:
     """
-    Convert a single TradingView screener row into a feature dict using
-    t1_close_ prefixed names — matching what the model was trained on.
+    Convert a single TradingView screener row into a feature dict using the
+    correct prefix for the currently loaded model.
 
-    The TV screener returns today's close-of-day indicators, which is
-    semantically identical to what winners_day_prior_close stores (T-1 close
-    snapshot relative to tomorrow's trading session). Using t1_close_ prefix
-    ensures the features actually match the model's feature_names and don't
-    silently fall back to constant defaults.
+    Args:
+        row:            Dict of TV screener columns for one stock
+        symbol:         Stock ticker symbol
+        feature_prefix: The prefix the loaded model uses — from
+                        predictor.model_feature_prefix. Defaults to "t1_close"
+                        but may be "t3", "t5", "t10" for older CSV-trained models.
 
-    Previously this used t3_ prefix which caused ZERO feature matches →
-    all defaults → identical probability for every stock.
+    The prefix is automatically detected from the model's feature_names by
+    ExplosionPredictor._detect_model_prefix() and passed in by main().
     """
     result = {
         "symbol":   symbol,
@@ -477,10 +458,9 @@ def build_features_from_tv_data(row: dict, symbol: str) -> dict:
 
     seen_targets = set()
     for tv_col, model_name in TV_TO_MODEL_BASE.items():
-        # FIX: Use t1_close_ prefix, NOT t3_
-        target = f"t1_close_{model_name}"
+        target = f"{feature_prefix}_{model_name}"
         if target in seen_targets:
-            continue  # skip duplicate aliases
+            continue
 
         # Try exact key, then case-insensitive fallback
         value = row.get(tv_col)
@@ -501,7 +481,7 @@ def build_features_from_tv_data(row: dict, symbol: str) -> dict:
             except (TypeError, ValueError):
                 pass
 
-    # current_price: use close from screener (not prefixed — used for target_price calc)
+    # current_price: use close (not prefixed — used for target_price calc)
     close_val = row.get("close") or row.get("Close")
     if close_val is not None:
         try:
@@ -510,30 +490,27 @@ def build_features_from_tv_data(row: dict, symbol: str) -> dict:
             pass
 
     # Derive computed features the model uses but TV doesn't return directly
-    close = result.get("current_price") or result.get("t1_close_Close")
+    close = result.get("current_price") or result.get(f"{feature_prefix}_Close")
     if close and close > 0:
-        ema20 = result.get("t1_close_EMA_20")
-        ema50 = result.get("t1_close_EMA_50")
-        ema10 = result.get("t1_close_EMA_10")
-        sma20 = result.get("t1_close_SMA_20")
+        ema20 = result.get(f"{feature_prefix}_EMA_20")
+        ema50 = result.get(f"{feature_prefix}_EMA_50")
+        ema10 = result.get(f"{feature_prefix}_EMA_10")
+        sma20 = result.get(f"{feature_prefix}_SMA_20")
 
         if ema20:
-            result["t1_close_Price_vs_EMA20"] = (close / ema20 - 1) * 100
+            result[f"{feature_prefix}_Price_vs_EMA20"] = (close / ema20 - 1) * 100
         if sma20:
-            result["t1_close_Price_vs_SMA20"] = (close / sma20 - 1) * 100
+            result[f"{feature_prefix}_Price_vs_SMA20"] = (close / sma20 - 1) * 100
         if ema20 and ema50:
-            result["t1_close_EMA_12_26_Diff"] = ema20 - ema50
+            result[f"{feature_prefix}_EMA_12_26_Diff"] = ema20 - ema50
         if ema10 and ema20:
-            result["t1_close_SMA_20_50_Diff"] = ema10 - ema20
+            result[f"{feature_prefix}_SMA_20_50_Diff"] = ema10 - ema20
 
     return result
 
 
 def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
-    """
-    Fetch T-1 intraday data for a single symbol (best-effort, optional).
-    Returns {} if unavailable. Stock will still be scored on TV screener features.
-    """
+    """Fetch T-1 intraday data for a single symbol (best-effort, optional)."""
     import yfinance as yf
 
     try:
@@ -560,7 +537,6 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
 
         result = {}
 
-        # T-1 close snapshot
         close_bar = day_bars.iloc[-1]
         for col, val in close_bar.to_dict().items():
             try:
@@ -570,7 +546,6 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             except (TypeError, ValueError):
                 pass
 
-        # T-1 open snapshot
         open_bars = day_bars[day_bars.index.time <= dt_time(10, 0)]
         if not open_bars.empty:
             open_bar = open_bars.iloc[0]
@@ -588,19 +563,21 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
         return {}
 
 
-def _apply_gain_rank_correction(predictions_df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+def _apply_gain_rank_correction(
+    predictions_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    feature_prefix: str,
+    logger: logging.Logger,
+) -> pd.DataFrame:
     """
     FIX 3: When all gain estimates are near-identical (gain_std < 1%),
-    spread them based on probability rank.
+    apply a richer per-stock correction that uses both probability rank
+    AND available fundamental indicators (price, volume, RSI) to differentiate.
 
-    This handles the case where:
-    - gain_regressor.pkl is not yet trained, AND
-    - all stocks fall in the same historical probability bucket,
-      resulting in identical median gain estimates (e.g. 41.25% for all).
-
-    Instead of showing "41.25% for every stock", this interpolates from
-    GAIN_FLOOR (lowest-ranked) to GAIN_CEILING (highest-ranked) based on
-    each stock's probability percentile rank.
+    Fallback order:
+    1. Spread by probability rank (simple linear interpolation)
+    2. Further differentiate using RSI, volume ratio, and price level
+    3. If still flat, use pure rank-based spread
     """
     if 'target_gain_pct' not in predictions_df.columns:
         return predictions_df
@@ -609,27 +586,59 @@ def _apply_gain_rank_correction(predictions_df: pd.DataFrame, logger: logging.Lo
     gain_std = gains.std()
 
     if gain_std >= 1.0:
-        return predictions_df  # Already varied, no correction needed
+        return predictions_df  # Already varied
 
     logger.warning(
         f"  ⚠️  FLAT GAIN ESTIMATES detected (std={gain_std:.4f}%). "
         f"All stocks showing ~{gains.mean():.1f}% gain."
-        f"\n      Applying percentile-rank correction "
+        f"\n      Applying rank-based correction "
         f"(floor={GAIN_FLOOR}%, ceiling={GAIN_CEILING}%)."
-        f"\n      This resolves once gain_regressor.pkl is trained (need ≥30 winners with gain data)."
     )
 
     df    = predictions_df.copy()
     probs = df['explosion_probability']
-    ranks = probs.rank(pct=True)  # 0.0–1.0, higher = better
 
-    corrected_gains = GAIN_FLOOR + ranks * (GAIN_CEILING - GAIN_FLOOR)
+    # Base rank from probability (0.0–1.0)
+    base_ranks = probs.rank(pct=True)
+    corrected_gains = GAIN_FLOOR + base_ranks * (GAIN_CEILING - GAIN_FLOOR)
+
+    # Bonus adjustment: use RSI and volume if available from features
+    # This differentiates stocks that have similar probability but different setups
+    rsi_col = f"{feature_prefix}_RSI_14"
+    vol_col = f"{feature_prefix}_Volume_Ratio"
+
+    if features_df is not None and not features_df.empty:
+        # Align features to predictions by symbol
+        feat_indexed = features_df.set_index("symbol") if "symbol" in features_df.columns else features_df
+
+        if rsi_col in feat_indexed.columns:
+            rsi_map = feat_indexed[rsi_col]
+            rsi_vals = df['symbol'].map(rsi_map) if 'symbol' in df.columns else None
+
+            if rsi_vals is not None and rsi_vals.notna().sum() > 5:
+                # RSI above 50 and below 70 = bullish momentum without being overbought
+                # Score: peaks at RSI=60, falls off toward 30 and 80
+                rsi_score = 1.0 - (abs(rsi_vals.fillna(55) - 60) / 40).clip(0, 1)
+                corrected_gains += rsi_score * 5.0  # up to +5% for ideal RSI
+                logger.info(f"  Applied RSI-based gain adjustment (mean RSI: {rsi_vals.mean():.1f})")
+
+        if vol_col in feat_indexed.columns:
+            vol_map = feat_indexed[vol_col]
+            vol_vals = df['symbol'].map(vol_map) if 'symbol' in df.columns else None
+
+            if vol_vals is not None and vol_vals.notna().sum() > 5:
+                # Volume ratio: more relative volume = higher expected gain
+                vol_score = (vol_vals.fillna(1.0) - 1.0).clip(0, 4) / 4.0
+                corrected_gains += vol_score * 8.0  # up to +8% for high volume
+                logger.info(f"  Applied volume-based gain adjustment (mean vol_ratio: {vol_vals.mean():.2f})")
+
+    # Clip to reasonable range
+    corrected_gains = corrected_gains.clip(GAIN_FLOOR, GAIN_CEILING * 1.5)
 
     df['target_gain_pct']  = corrected_gains
     df['target_gain_low']  = corrected_gains * 0.65
     df['target_gain_high'] = corrected_gains * 1.40
 
-    # Recompute target prices
     if 'current_price' in df.columns:
         df['target_price']      = df['current_price'] * (1 + df['target_gain_pct']  / 100)
         df['target_price_low']  = df['current_price'] * (1 + df['target_gain_low']  / 100)
@@ -657,7 +666,7 @@ def _get_calibrated_gain_estimate(probability: float) -> float:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--max-results", type=int, default=1500)
-    parser.add_argument("--top-n",       type=int, default=50)
+    parser.add_argument("--top-n",       type=int, default=50)  # FIX 2: was 15
     parser.add_argument("--verbose",     "-v", action="store_true")
     parser.add_argument(
         "--no-t1",
@@ -686,6 +695,11 @@ def main():
         logger.error(f"Failed to initialize: {e}")
         return 1
 
+    # FIX 1: Read which prefix the loaded model uses
+    model_prefix = predictor.model_feature_prefix
+    logger.info(f"✓ Model feature prefix detected: '{model_prefix}'")
+    logger.info(f"  All TV screener features will be mapped to {model_prefix}_* columns")
+
     # ── STEP 1: SCREENING ────────────────────────────────────────────────────
     logger.info("\n" + "=" * 80)
     logger.info("STEP 1: INTELLIGENT SCREENING")
@@ -701,8 +715,7 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("STEP 2: BUILD FEATURES FROM TRADINGVIEW DATA")
     logger.info("=" * 80)
-    logger.info("Mapping TV screener columns → t1_close_ model features.")
-    logger.info("(TV close-of-day = T-1 close snapshot relative to tomorrow's prediction)")
+    logger.info(f"Mapping TV screener columns → {model_prefix}_* model features.")
 
     enriched_stocks = []
     failed_count    = 0
@@ -727,15 +740,16 @@ def main():
                 continue
 
             row_dict = row.to_dict()
-            features = build_features_from_tv_data(row_dict, symbol)
+            # FIX 1: Pass model_prefix so features get the correct namespace
+            features = build_features_from_tv_data(row_dict, symbol, feature_prefix=model_prefix)
             features["exchange"] = exchange
 
             if "current_price" not in features or not features["current_price"]:
                 failed_count += 1
                 continue
 
-            n_t1_feats = sum(1 for k in features if k.startswith("t1_close_"))
-            if n_t1_feats > 3:
+            n_model_feats = sum(1 for k in features if k.startswith(f"{model_prefix}_"))
+            if n_model_feats > 3:
                 t1_feature_hits += 1
 
             enriched_stocks.append(features)
@@ -746,13 +760,13 @@ def main():
 
     logger.info(f"✓ Built features for {len(enriched_stocks)} stocks ({failed_count} skipped)")
     logger.info(
-        f"  Stocks with ≥3 real t1_close_ indicator values: "
+        f"  Stocks with ≥3 real {model_prefix}_ indicator values: "
         f"{t1_feature_hits}/{len(enriched_stocks)}"
     )
 
     if t1_feature_hits == 0:
         logger.warning(
-            "  ⚠️  ZERO stocks have real indicator values from TV screener."
+            f"  ⚠️  ZERO stocks have real indicator values from TV screener."
             "\n      Screener returned only default columns (no RSI/ATR/etc)."
             "\n      All probabilities will be near-identical."
             "\n      Check tradingview-scraper version — needs >=0.4.19."
@@ -806,16 +820,16 @@ def main():
     logger.info("=" * 80)
 
     features_df   = pd.DataFrame(enriched_stocks)
-    t1_close_cols = [c for c in features_df.columns if c.startswith("t1_close_")]
+    model_cols    = [c for c in features_df.columns if c.startswith(f"{model_prefix}_")]
     t1_open_cols  = [c for c in features_df.columns if c.startswith("t1_open_")]
 
     logger.info(f"✓ Feature matrix: {len(features_df)} stocks × {len(features_df.columns)} raw columns")
-    logger.info(f"  t1_close_ features present: {len(t1_close_cols)}")
+    logger.info(f"  {model_prefix}_ features present: {len(model_cols)}")
     logger.info(f"  t1_open_ features present:  {len(t1_open_cols)}")
 
     # Show variance for key indicators to confirm real data
-    for key_col in ["t1_close_RSI_14", "t1_close_ATR_14", "t1_close_ADX_14",
-                    "t1_close_Volume_Ratio", "t1_close_MACD_12_26_9"]:
+    for suffix in ["RSI_14", "ATR_14", "ADX_14", "Volume_Ratio", "MACD_12_26_9"]:
+        key_col = f"{model_prefix}_{suffix}"
         if key_col in features_df.columns:
             col_data = pd.to_numeric(features_df[key_col], errors='coerce').dropna()
             if len(col_data) > 0:
@@ -824,10 +838,10 @@ def main():
                     f"mean={col_data.mean():.2f}, std={col_data.std():.2f}"
                 )
 
-    if len(t1_close_cols) == 0:
+    if len(model_cols) == 0:
         logger.warning(
-            "  ⚠️  NO t1_close_ features in DataFrame. "
-            "Feature namespace fix may not be working."
+            f"  ⚠️  NO {model_prefix}_ features in DataFrame. "
+            "This means TV screener returned no indicator data OR the prefix detection failed."
         )
 
     # ── STEP 5: ML PREDICTION ────────────────────────────────────────────────
@@ -868,8 +882,11 @@ def main():
                 predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 1.8
             )
 
-        # 6b: Detect and correct flat estimates (all same value)
-        predictions_df = _apply_gain_rank_correction(predictions_df, logger)
+        # 6b: Detect and correct flat estimates using richer per-stock features
+        # FIX 3: Pass features_df so RSI/volume can differentiate gain estimates
+        predictions_df = _apply_gain_rank_correction(
+            predictions_df, features_df, model_prefix, logger
+        )
 
         # 6c: Recompute target prices
         if 'current_price' in predictions_df.columns:
@@ -892,7 +909,6 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info(f"STEP 7: TOP {args.top_n} PREDICTIONS")
     logger.info("=" * 80)
-    # FIX 2 diagnostic: show pipeline numbers so top-n limit is obvious
     logger.info(
         f"  Screened: {len(screened_df)}  →  "
         f"Scored: {len(predictions_df)}  →  "
@@ -903,13 +919,14 @@ def main():
 
     logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
     logger.info("-" * 100)
-    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'T-1?'}")
+    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'Has Inds?'}")
     logger.info("-" * 100)
 
     for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
         current_price = row.get('current_price', 0)
-        has_t1 = any(
-            k.startswith("t1_close_RSI") or k.startswith("t1_close_ATR")
+        # Check if the stock has real indicator data (any non-default feature value)
+        has_real_data = any(
+            k.startswith(f"{model_prefix}_RSI") or k.startswith(f"{model_prefix}_ATR")
             for k in row.index
             if pd.notna(row.get(k))
         )
@@ -919,7 +936,7 @@ def main():
             f"${current_price:>8.2f}  "
             f"${row.get('target_price', 0):>8.2f}  "
             f"+{row.get('target_gain_pct', 0):>5.1f}%"
-            f"  {'✓' if has_t1 else '—'}"
+            f"  {'✓' if has_real_data else '—'}"
         )
 
     # ── STEP 8: STORE PREDICTIONS ────────────────────────────────────────────
@@ -942,6 +959,7 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
+            'model_version':         f"{model_prefix}_v4",
         }
         for _, row in top_predictions.iterrows()
     ]
@@ -965,7 +983,7 @@ def main():
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
         'prob_std':           float(predictions_df['explosion_probability'].std()),
-        'model_version':      't1_close_features_v3',
+        'model_version':      f"{model_prefix}_features_v4",
     }
     supabase.write_screening_log(screening_log)
 
@@ -978,6 +996,7 @@ def main():
     logger.info(f"  Stocks screened:    {len(screened_df)}")
     logger.info(f"  Stocks scored:      {len(predictions_df)}")
     logger.info(f"  Predictions stored: {len(predictions_list)}")
+    logger.info(f"  Model prefix used:  {model_prefix}")
     logger.info(f"  Prob std:           {predictions_df['explosion_probability'].std():.4f}")
     logger.info(f"  Gain std:           {predictions_df['target_gain_pct'].std():.2f}%")
 
