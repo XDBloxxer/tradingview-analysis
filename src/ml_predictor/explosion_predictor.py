@@ -1,27 +1,35 @@
 """
 Explosion Predictor
 
-FIXES IN THIS VERSION:
+FIXES IN THIS VERSION (2026-03-02):
 
-BUG 1 — target_price computed from scaled indicator column instead of actual price:
-  predict_with_targets() searched for a "close" column in features_df to get the
-  current price. features_df is the model's feature matrix (t3_Close, t1_close_Close
-  etc.) — these are raw indicator values, NOT the stock's current price. The first
-  "close"-containing column it found was typically t3_Close (price 3 days ago, not
-  today's price), making all target prices wrong.
-  FIX: Pass current_price in via data_df (ml_screen_and_predict.py already stores
-  it in the features dict). Look for it there directly, not in features_df.
-  Fall back to t3_Close only as a last resort with a warning.
+FIX 1 — Bimodal fallback never fires for the low-probability compression case:
+  The previous _detect_bimodal() only checked whether predictions in the
+  0.15–0.85 mid-range were sparse. This catches the *bimodal* failure mode
+  (everything near 0 or 1) but not the *compression* failure mode (everything
+  compressed into 0.25–0.35). When using only t3_ features (no T-1), all
+  stocks get very similar probabilities well below 0.5, so _is_bimodal was
+  never set to True and the relative ranking fallback never activated.
 
-BUG 2 — prepare_features() and _scale_features() called twice per prediction:
-  predict_with_targets() calls self.predict() (which runs prepare_features +
-  _scale_features internally), then immediately runs them again for the regressor.
-  FIX: predict() now returns X_scaled alongside the results DataFrame so
-  predict_with_targets() can reuse it without repeating the work.
+  Fix: _detect_bimodal now also fires when >85% of predictions are below 0.50
+  (the compression case). This makes the relative-ranking fallback activate
+  for both failure modes.
 
-BUG 3 — Diagnostic logging: _log_feature_diagnostics only fires once per session,
-  but after FIX 2 prepare_features is only called once anyway, so the guard is
-  now irrelevant. Kept for safety.
+FIX 2 — _classify_signals_relative only classified stocks >= 0.85:
+  The old code separated probs into "high" (>= 0.85) and everything else,
+  then only reclassified the high bucket. When the max probability is 0.35,
+  zero stocks enter that bucket and all remain AVOID.
+
+  Fix: _classify_signals_relative now works on the FULL sorted distribution.
+  Top 2% → STRONG BUY, next 8% → BUY, next 15% → HOLD, rest → AVOID.
+  This gives actionable ranked signals regardless of absolute probability values.
+  The percentile thresholds are intentionally conservative to avoid over-signalling.
+
+FIX 3 (carried forward) — target_price computed from correct current_price:
+  Unchanged from previous version. current_price is read from data_df directly.
+
+FIX 4 (carried forward) — X_scaled reused between classifier and regressor:
+  Unchanged from previous version. No double prepare_features call.
 """
 
 import json
@@ -41,6 +49,20 @@ SIGNAL_THRESHOLDS = {
     "HOLD":       0.50,
 }
 
+# Relative-ranking percentile thresholds (used when _is_bimodal = True)
+# Top 2% of the distribution → STRONG BUY
+# Top 2–10% → BUY
+# Top 10–25% → HOLD
+# Bottom 75% → AVOID
+RELATIVE_STRONG_BUY_PCT = 0.98   # top 2%
+RELATIVE_BUY_PCT        = 0.90   # top 2-10%
+RELATIVE_HOLD_PCT       = 0.75   # top 10-25%
+
+# Compression detection: if this fraction of predictions is below 0.50,
+# the model is in low-probability compression mode → use relative ranking
+COMPRESSION_THRESHOLD = 0.85
+
+# Original mid-range sparsity check (bimodal toward extremes)
 BIMODAL_MIDRANGE = (0.15, 0.85)
 BIMODAL_MIN_MIDRANGE_COUNT = 5
 
@@ -142,7 +164,6 @@ class ExplosionPredictor:
                                 self.feature_names[:10])
 
     def _build_lookup(self):
-        """normalized(model_feature) -> model_feature. Handles case + dot differences."""
         self._norm_to_feature = {_norm(f): f for f in self.feature_names}
 
     # -------------------------------------------------------------------------
@@ -343,14 +364,6 @@ class ExplosionPredictor:
             for c in non_numeric:
                 X[c] = pd.to_numeric(X[c], errors="coerce")
 
-        # Fill NaN with scaler training means, then scale.
-        # IMPORTANT: do NOT restore NaN after scaling.
-        # During training (build_scaler), missing T-1 features were also filled
-        # with column means before scaling -> those rows got 0.0 (scaled mean).
-        # Restoring NaN here creates a train/predict mismatch: model learned
-        # "T-1 missing = 0" but would receive NaN at prediction time, following
-        # a different XGBoost split path -> all stocks without T-1 get identical
-        # probability (the bimodal collapse / equal-probability bug).
         if hasattr(self.scaler, "feature_names_in_"):
             mean_series = (
                 pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
@@ -366,18 +379,43 @@ class ExplosionPredictor:
         return X_scaled
 
     # -------------------------------------------------------------------------
-    # Bimodal detection & adaptive signals
+    # FIX 1 & 2: Bimodal detection and relative signal classification
     # -------------------------------------------------------------------------
 
     def _detect_bimodal(self, probabilities: np.ndarray) -> bool:
+        """
+        Detect whether the model's output distribution is degenerate and
+        requires relative (percentile-based) signal classification.
+
+        Two failure modes:
+          A) Compression: >85% of predictions below 0.50 (the T3-only case
+             where all stocks look similarly unlikely)
+          B) Bimodal collapse toward extremes: sparse mid-range predictions
+             (the original failure mode)
+        """
+        n = len(probabilities)
+
+        # Mode A: Low-probability compression (most common when T1 missing)
+        below_half = int((probabilities < 0.50).sum())
+        compression_rate = below_half / n if n > 0 else 0
+        if compression_rate > COMPRESSION_THRESHOLD:
+            self.logger.warning(
+                f"LOW-PROB COMPRESSION: {compression_rate:.1%} of predictions below 0.50 "
+                f"(threshold: {COMPRESSION_THRESHOLD:.0%}). "
+                f"Switching to percentile-based signals."
+            )
+            return True
+
+        # Mode B: Bimodal toward extremes (sparse mid-range)
         mid_lo, mid_hi = BIMODAL_MIDRANGE
         mid_count = int(((probabilities > mid_lo) & (probabilities < mid_hi)).sum())
         if mid_count < BIMODAL_MIN_MIDRANGE_COUNT:
             self.logger.warning(
-                f"BIMODAL COLLAPSE: only {mid_count} predictions in mid-range. "
-                f"Switching to percentile-based signals."
+                f"BIMODAL COLLAPSE: only {mid_count} predictions in mid-range "
+                f"({mid_lo:.0%}–{mid_hi:.0%}). Switching to percentile-based signals."
             )
             return True
+
         return False
 
     def _classify_signal_absolute(self, probability: float) -> str:
@@ -387,29 +425,55 @@ class ExplosionPredictor:
         return "AVOID"
 
     def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
-        lo, hi      = BIMODAL_MIDRANGE
-        high_scores = probabilities[probabilities >= hi]
-        signals     = pd.Series("AVOID", index=probabilities.index)
-        if len(high_scores) > 0:
-            p90 = high_scores.quantile(0.90)
-            p70 = high_scores.quantile(0.70)
-            signals.loc[high_scores.index] = high_scores.apply(
-                lambda p: "STRONG BUY" if p >= p90 else "BUY" if p >= p70 else "HOLD"
-            )
+        """
+        FIX 2: Rank-based signal classification operating on the FULL distribution.
+
+        Assigns signals based on where each stock falls in the probability
+        distribution, regardless of absolute values. This gives actionable
+        BUY/STRONG BUY signals even when all probabilities are in the 0.25-0.35
+        range due to T1 feature absence.
+
+        Percentile thresholds:
+          Top 2%   → STRONG BUY  (very best candidates)
+          2–10%    → BUY         (strong candidates)
+          10–25%   → HOLD        (watch list)
+          Bottom 75% → AVOID
+        """
+        n = len(probabilities)
+        signals = pd.Series("AVOID", index=probabilities.index)
+
+        if n == 0:
+            return signals
+
+        # Compute percentile rank for each prediction (higher rank = higher probability)
+        ranks = probabilities.rank(pct=True)
+
+        signals[ranks >= RELATIVE_STRONG_BUY_PCT] = "STRONG BUY"
+        signals[(ranks >= RELATIVE_BUY_PCT) & (ranks < RELATIVE_STRONG_BUY_PCT)] = "BUY"
+        signals[(ranks >= RELATIVE_HOLD_PCT) & (ranks < RELATIVE_BUY_PCT)] = "HOLD"
+
+        strong_buy_n = (signals == "STRONG BUY").sum()
+        buy_n        = (signals == "BUY").sum()
+        hold_n       = (signals == "HOLD").sum()
+
+        self.logger.info(
+            f"Relative signals: STRONG BUY={strong_buy_n}, BUY={buy_n}, "
+            f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n}"
+        )
+        self.logger.info(
+            f"  (top 2%: {n*0.02:.0f} stocks, top 10%: {n*0.10:.0f} stocks, "
+            f"top 25%: {n*0.25:.0f} stocks)"
+        )
+
         return signals
 
     # -------------------------------------------------------------------------
-    # Prediction — internal, returns (result_df, X_scaled)
+    # Prediction — internal, returns (result_df, features_df, X_scaled)
     # -------------------------------------------------------------------------
 
     def _predict_internal(
         self, data_df: pd.DataFrame
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-        """
-        Core prediction. Returns (result_df, features_df, X_scaled).
-        Callers that also need gain predictions can reuse X_scaled directly
-        instead of re-running prepare_features + _scale_features.
-        """
         features_df = self.prepare_features(data_df)
         X           = features_df[self.feature_names].copy()
         X_scaled    = self._scale_features(X)
@@ -457,9 +521,6 @@ class ExplosionPredictor:
             "explosion_probability", ascending=False
         ).reset_index(drop=True)
 
-        # X_scaled must be reindexed to match result_df order after sort
-        sorted_original_index = result_df.index  # already reset
-        # We need to track the original row order; attach a sort key first
         result_df["_orig_idx"] = range(len(result_df))
         X_scaled_sorted = X_scaled.reset_index(drop=True).iloc[
             result_df["_orig_idx"].values
@@ -481,25 +542,11 @@ class ExplosionPredictor:
         data_df: pd.DataFrame,
         historical_gains_df: pd.DataFrame = None,
     ) -> pd.DataFrame:
-        """
-        Predict explosion probability + estimated gain target.
-
-        FIX BUG 1: Current price is now read from data_df['current_price'] or
-        data_df['t3_Close'] (the most recent daily close) rather than searching
-        features_df for any "close"-containing column. features_df contains
-        indicator values from multiple timepoints — accidentally picking t3_Close
-        (3-days-ago close) instead of the actual current price made all target
-        prices wrong.
-
-        FIX BUG 2: X_scaled is reused from _predict_internal instead of being
-        recomputed, eliminating the double prepare_features+_scale_features call.
-        """
         predictions, features_df, X_scaled = self._predict_internal(data_df)
 
         # ── Gain estimation ──────────────────────────────────────────────────
         if self.regressor is not None:
             try:
-                # X_scaled rows are already sorted to match predictions row order
                 predicted_gains = self.regressor.predict(X_scaled)
                 self.logger.info(
                     f"Gain regressor: predicted {len(predicted_gains)} gains  "
@@ -554,14 +601,7 @@ class ExplosionPredictor:
             predictions.loc[nan_gain, "target_gain_high"] = (
                 predictions.loc[nan_gain, "target_gain_pct"] * 1.5)
 
-        # ── Current price lookup (FIX BUG 1) ────────────────────────────────
-        # Priority:
-        #   1. data_df['current_price']  — set by ml_screen_and_predict.py
-        #   2. data_df['t3_Close']       — most recent daily close from T-3 data
-        #   3. Any t3_ price column      — fallback
-        # We intentionally do NOT use features_df because it has values at
-        # multiple timepoints (t3_Close, t5_Close, t10_Close, t1_close_Close)
-        # and picking the wrong one silently corrupts all target prices.
+        # ── Current price lookup ──────────────────────────────────────────────
         if "symbol" in predictions.columns:
             current_price = self._extract_current_price(data_df, predictions)
             if current_price is not None:
@@ -571,8 +611,7 @@ class ExplosionPredictor:
                 predictions["target_price_high"] = current_price * (1 + predictions["target_gain_high"] / 100)
             else:
                 self.logger.warning(
-                    "Could not determine current_price — target_price columns will be missing. "
-                    "Add 'current_price' column to data_df before calling predict_with_targets()."
+                    "Could not determine current_price — target_price columns will be missing."
                 )
 
         return predictions
@@ -580,20 +619,10 @@ class ExplosionPredictor:
     def _extract_current_price(
         self, data_df: pd.DataFrame, predictions: pd.DataFrame
     ) -> Optional[pd.Series]:
-        """
-        Extract per-stock current price aligned to the predictions DataFrame row order.
-
-        Returns a Series aligned to predictions.index, or None if no price source found.
-        """
-        # data_df may be in a different row order than predictions (which was sorted).
-        # predictions has 'symbol'; data_df has 'symbol'. Join on symbol to align.
-
         if "symbol" not in data_df.columns:
             return None
 
-        # Candidate columns in priority order
         price_candidates = ["current_price", "t3_Close", "Close"]
-        # Also accept any t3_* column whose suffix looks like Close/close
         for col in data_df.columns:
             if col.startswith("t3_") and col.lower().endswith("_close"):
                 if col not in price_candidates:
@@ -604,7 +633,6 @@ class ExplosionPredictor:
         )
 
         if price_col is None:
-            # Last resort: any column with both a t3_ prefix and price-like name
             for col in data_df.columns:
                 if col.startswith("t3_") and any(
                     x in col.lower() for x in ("close", "price")
@@ -635,10 +663,6 @@ class ExplosionPredictor:
         return self._classify_signal_absolute(probability)
 
     def _estimate_target_gain(self, probability: float) -> float:
-        """
-        Rule-based fallback — only used when gain_regressor.pkl is absent AND
-        historical accuracy data is unavailable. Values are intentionally rough.
-        """
         if probability >= 0.95: return 30.0
         if probability >= 0.90: return 25.0
         if probability >= 0.80: return 20.0
