@@ -982,7 +982,6 @@ def main():
         'avg_probability':    float(predictions_df['explosion_probability'].mean()),
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
-        'prob_std':           float(predictions_df['explosion_probability'].std()),
         'model_version':      f"{model_prefix}_features_v4",
     }
     supabase.write_screening_log(screening_log)
