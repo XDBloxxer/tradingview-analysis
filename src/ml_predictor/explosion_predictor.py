@@ -1,35 +1,36 @@
 """
 Explosion Predictor
 
-FIXES IN THIS VERSION (2026-03-02):
+FIXES IN THIS VERSION (2026-03-02 v4):
 
-FIX 1 — Bimodal fallback never fires for the low-probability compression case:
-  The previous _detect_bimodal() only checked whether predictions in the
-  0.15–0.85 mid-range were sparse. This catches the *bimodal* failure mode
-  (everything near 0 or 1) but not the *compression* failure mode (everything
-  compressed into 0.25–0.35). When using only t3_ features (no T-1), all
-  stocks get very similar probabilities well below 0.5, so _is_bimodal was
-  never set to True and the relative ranking fallback never activated.
+FIX 1 — Auto-detect which feature prefix the loaded model uses:
+  The previous version hard-coded t1_close_ in the screen script, but the
+  model stored in ml_models/ may have been trained on t3_/t5_/t10_ features
+  (base CSV). When the prefixes don't match, prepare_features() fills
+  everything with defaults → identical probabilities for every stock.
 
-  Fix: _detect_bimodal now also fires when >85% of predictions are below 0.50
-  (the compression case). This makes the relative-ranking fallback activate
-  for both failure modes.
+  Fix: ExplosionPredictor now exposes `model_feature_prefix` property that
+  returns the dominant prefix ("t1_close", "t3", etc.) detected from the
+  model's own feature_names list. ml_screen_and_predict reads this and
+  uses the correct prefix when building features from TV data.
 
-FIX 2 — _classify_signals_relative only classified stocks >= 0.85:
-  The old code separated probs into "high" (>= 0.85) and everything else,
-  then only reclassified the high bucket. When the max probability is 0.35,
-  zero stocks enter that bucket and all remain AVOID.
+FIX 2 — Bimodal/compression detection now also handles the case where
+  all probabilities are in a NARROW band above 0.50 (e.g. 0.70–0.75):
+  The previous compression check only looked at probs < 0.50. After the
+  prefix fix, if the model IS getting real features but they're all similar,
+  probabilities cluster near 0.73. This triggered no fallback → all BUY.
+  
+  Fix: Also detect when prob std < 0.02 (very narrow band regardless of
+  absolute level). This ensures relative ranking activates whenever the
+  distribution is too flat to be meaningful.
 
-  Fix: _classify_signals_relative now works on the FULL sorted distribution.
+FIX 3 — _classify_signals_relative operates on full distribution (carried):
   Top 2% → STRONG BUY, next 8% → BUY, next 15% → HOLD, rest → AVOID.
-  This gives actionable ranked signals regardless of absolute probability values.
-  The percentile thresholds are intentionally conservative to avoid over-signalling.
 
-FIX 3 (carried forward) — target_price computed from correct current_price:
-  Unchanged from previous version. current_price is read from data_df directly.
-
-FIX 4 (carried forward) — X_scaled reused between classifier and regressor:
-  Unchanged from previous version. No double prepare_features call.
+FIX 4 — Gain regressor receives SCALED features (carried and corrected):
+  The regressor is now saved/loaded expecting the same scaled input as the
+  classifier. predict_with_targets passes X_scaled (already StandardScaler
+  transformed) to both classifier and regressor.
 """
 
 import json
@@ -50,21 +51,17 @@ SIGNAL_THRESHOLDS = {
 }
 
 # Relative-ranking percentile thresholds (used when _is_bimodal = True)
-# Top 2% of the distribution → STRONG BUY
-# Top 2–10% → BUY
-# Top 10–25% → HOLD
-# Bottom 75% → AVOID
 RELATIVE_STRONG_BUY_PCT = 0.98   # top 2%
 RELATIVE_BUY_PCT        = 0.90   # top 2-10%
 RELATIVE_HOLD_PCT       = 0.75   # top 10-25%
 
-# Compression detection: if this fraction of predictions is below 0.50,
-# the model is in low-probability compression mode → use relative ranking
-COMPRESSION_THRESHOLD = 0.85
+# Compression detection thresholds
+COMPRESSION_THRESHOLD      = 0.85   # >85% below 0.50 → use relative ranking
+NARROW_BAND_STD_THRESHOLD  = 0.02   # std < 0.02 regardless of level → use relative ranking
 
 # Original mid-range sparsity check (bimodal toward extremes)
-BIMODAL_MIDRANGE = (0.15, 0.85)
-BIMODAL_MIN_MIDRANGE_COUNT = 5
+BIMODAL_MIDRANGE             = (0.15, 0.85)
+BIMODAL_MIN_MIDRANGE_COUNT   = 5
 
 
 def _norm(s: str) -> str:
@@ -86,8 +83,60 @@ class ExplosionPredictor:
         self._regressor_n_features: Optional[int] = None
         self._is_bimodal   = False
         self._diag_done    = False
+        # FIX 1: detected prefix for external callers
+        self._model_feature_prefix: str = "t1_close"
 
         self._load_model()
+
+    # -------------------------------------------------------------------------
+    # FIX 1: Expose which prefix the model uses so screen script can match it
+    # -------------------------------------------------------------------------
+
+    @property
+    def model_feature_prefix(self) -> str:
+        """
+        Returns the dominant feature prefix in this model's feature list.
+        Possible values: "t1_close", "t1_open", "t3", "t5", "t10", "mixed".
+
+        ml_screen_and_predict uses this to build features with the correct prefix
+        so they actually match the model's expectations.
+        """
+        return self._model_feature_prefix
+
+    def _detect_model_prefix(self) -> str:
+        """
+        Examine self.feature_names and return the dominant prefix group.
+        Called once after model load.
+        """
+        if not self.feature_names:
+            return "t1_close"
+
+        counts = {
+            "t1_close": sum(1 for f in self.feature_names if f.startswith("t1_close_")),
+            "t1_open":  sum(1 for f in self.feature_names if f.startswith("t1_open_")),
+            "t3":       sum(1 for f in self.feature_names if f.startswith("t3_")),
+            "t5":       sum(1 for f in self.feature_names if f.startswith("t5_")),
+            "t10":      sum(1 for f in self.feature_names if f.startswith("t10_")),
+        }
+
+        total = sum(counts.values())
+        if total == 0:
+            return "t1_close"
+
+        dominant = max(counts, key=counts.get)
+
+        # Log the breakdown so it's visible in logs
+        self.logger.info("Model feature prefix breakdown:")
+        for pfx, cnt in counts.items():
+            pct = cnt / total * 100 if total else 0
+            self.logger.info(f"  {pfx:12s}: {cnt:4d}  ({pct:.1f}%)")
+        self.logger.info(f"  → dominant prefix: '{dominant}' — screen script will use this")
+
+        # If the model has BOTH t1_close and t3 features (hybrid), prefer t1_close
+        if counts["t1_close"] > 0 and counts["t3"] > 0:
+            return "t1_close"
+
+        return dominant
 
     # -------------------------------------------------------------------------
     # Model loading
@@ -134,6 +183,9 @@ class ExplosionPredictor:
 
         self._build_lookup()
 
+        # FIX 1: Detect the dominant prefix in the loaded model
+        self._model_feature_prefix = self._detect_model_prefix()
+
         classifier_n = self.scaler.n_features_in_
         self.logger.info(
             f"Classifier/scaler expects {classifier_n} features; "
@@ -156,9 +208,9 @@ class ExplosionPredictor:
         if has_flat and has_t1:
             self.logger.info("Model type: HYBRID (T-3/T-5/T-10 + T-1 open/close)")
         elif has_flat:
-            self.logger.info("Model type: CSV-ONLY (T-3/T-5/T-10)")
+            self.logger.info("Model type: CSV-ONLY (T-3/T-5/T-10) — features must use t3_ prefix")
         elif has_t1:
-            self.logger.info("Model type: DATABASE-ONLY (T-1 open/close)")
+            self.logger.info("Model type: DATABASE-ONLY (T-1 open/close) — features must use t1_close_ prefix")
         else:
             self.logger.warning("Could not identify model type. First 10 features: %s",
                                 self.feature_names[:10])
@@ -307,7 +359,11 @@ class ExplosionPredictor:
             sample_avail = [c for c in data_df.columns if c not in _META_COLS][:30]
             self.logger.info(f"First 30 AVAILABLE columns: {sample_avail}")
         if coverage < 50:
-            self.logger.warning(f"LOW feature coverage ({coverage:.1f}%)")
+            self.logger.warning(
+                f"LOW feature coverage ({coverage:.1f}%) — model may be using t3_ prefix "
+                f"but features were built with '{self._model_feature_prefix}' prefix. "
+                f"Check that build_features_from_tv_data uses the correct prefix."
+            )
 
         if not self._diag_done:
             self._log_feature_diagnostics(feature_df, match_log)
@@ -379,7 +435,7 @@ class ExplosionPredictor:
         return X_scaled
 
     # -------------------------------------------------------------------------
-    # FIX 1 & 2: Bimodal detection and relative signal classification
+    # FIX 2: Enhanced bimodal/compression/narrow-band detection
     # -------------------------------------------------------------------------
 
     def _detect_bimodal(self, probabilities: np.ndarray) -> bool:
@@ -387,26 +443,37 @@ class ExplosionPredictor:
         Detect whether the model's output distribution is degenerate and
         requires relative (percentile-based) signal classification.
 
-        Two failure modes:
-          A) Compression: >85% of predictions below 0.50 (the T3-only case
-             where all stocks look similarly unlikely)
-          B) Bimodal collapse toward extremes: sparse mid-range predictions
-             (the original failure mode)
+        Three failure modes:
+          A) Compression below 0.50: >85% of predictions below 0.50
+             (T3-only model with weak features)
+          B) Narrow band regardless of level: std < 0.02
+             (all stocks get ~0.73 because features are too uniform)
+          C) Bimodal collapse toward extremes: sparse mid-range
+             (original failure mode)
         """
         n = len(probabilities)
 
-        # Mode A: Low-probability compression (most common when T1 missing)
+        # Mode A: Low-probability compression
         below_half = int((probabilities < 0.50).sum())
         compression_rate = below_half / n if n > 0 else 0
         if compression_rate > COMPRESSION_THRESHOLD:
             self.logger.warning(
-                f"LOW-PROB COMPRESSION: {compression_rate:.1%} of predictions below 0.50 "
-                f"(threshold: {COMPRESSION_THRESHOLD:.0%}). "
+                f"LOW-PROB COMPRESSION: {compression_rate:.1%} of predictions below 0.50. "
                 f"Switching to percentile-based signals."
             )
             return True
 
-        # Mode B: Bimodal toward extremes (sparse mid-range)
+        # Mode B: FIX — narrow probability band (new check)
+        prob_std = float(np.std(probabilities))
+        if prob_std < NARROW_BAND_STD_THRESHOLD:
+            self.logger.warning(
+                f"NARROW PROBABILITY BAND: std={prob_std:.4f} < {NARROW_BAND_STD_THRESHOLD}. "
+                f"All stocks are getting near-identical scores. "
+                f"Switching to percentile-based signals to give differentiated BUY/STRONG BUY/HOLD."
+            )
+            return True
+
+        # Mode C: Bimodal toward extremes
         mid_lo, mid_hi = BIMODAL_MIDRANGE
         mid_count = int(((probabilities > mid_lo) & (probabilities < mid_hi)).sum())
         if mid_count < BIMODAL_MIN_MIDRANGE_COUNT:
@@ -426,18 +493,12 @@ class ExplosionPredictor:
 
     def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
         """
-        FIX 2: Rank-based signal classification operating on the FULL distribution.
+        FIX 3: Rank-based signal classification on the FULL distribution.
 
-        Assigns signals based on where each stock falls in the probability
-        distribution, regardless of absolute values. This gives actionable
-        BUY/STRONG BUY signals even when all probabilities are in the 0.25-0.35
-        range due to T1 feature absence.
-
-        Percentile thresholds:
-          Top 2%   → STRONG BUY  (very best candidates)
-          2–10%    → BUY         (strong candidates)
-          10–25%   → HOLD        (watch list)
-          Bottom 75% → AVOID
+        Top 2%   → STRONG BUY
+        2–10%    → BUY
+        10–25%   → HOLD
+        Bottom 75% → AVOID
         """
         n = len(probabilities)
         signals = pd.Series("AVOID", index=probabilities.index)
@@ -445,7 +506,6 @@ class ExplosionPredictor:
         if n == 0:
             return signals
 
-        # Compute percentile rank for each prediction (higher rank = higher probability)
         ranks = probabilities.rank(pct=True)
 
         signals[ranks >= RELATIVE_STRONG_BUY_PCT] = "STRONG BUY"
@@ -457,12 +517,12 @@ class ExplosionPredictor:
         hold_n       = (signals == "HOLD").sum()
 
         self.logger.info(
-            f"Relative signals: STRONG BUY={strong_buy_n}, BUY={buy_n}, "
+            f"Relative signals (percentile-based): STRONG BUY={strong_buy_n}, BUY={buy_n}, "
             f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n}"
         )
         self.logger.info(
-            f"  (top 2%: {n*0.02:.0f} stocks, top 10%: {n*0.10:.0f} stocks, "
-            f"top 25%: {n*0.25:.0f} stocks)"
+            f"  Prob range: {probabilities.min():.4f} – {probabilities.max():.4f}, "
+            f"std={probabilities.std():.4f}"
         )
 
         return signals
@@ -488,8 +548,10 @@ class ExplosionPredictor:
         if zero_var_cols > len(self.feature_names) * 0.5:
             self.logger.warning(
                 "MORE THAN HALF of features are zero-variance after scaling. "
-                "This will cause equal probabilities. "
-                "Check the diagnostic report above for which groups are affected."
+                "This strongly suggests the feature prefix in the screen script "
+                f"does not match what the model was trained on. "
+                f"Model dominant prefix: '{self._model_feature_prefix}'. "
+                "Check TV_TO_MODEL_BASE builds features with this prefix."
             )
 
         predictions   = self.model.predict(X_scaled)
@@ -544,18 +606,27 @@ class ExplosionPredictor:
     ) -> pd.DataFrame:
         predictions, features_df, X_scaled = self._predict_internal(data_df)
 
-        # ── Gain estimation ──────────────────────────────────────────────────
+        # FIX 4: Regressor receives X_scaled (same as classifier)
         if self.regressor is not None:
             try:
                 predicted_gains = self.regressor.predict(X_scaled)
                 self.logger.info(
                     f"Gain regressor: predicted {len(predicted_gains)} gains  "
                     f"range=[{predicted_gains.min():.1f}%, {predicted_gains.max():.1f}%]  "
-                    f"mean={predicted_gains.mean():.1f}%"
+                    f"mean={predicted_gains.mean():.1f}%  std={predicted_gains.std():.2f}%"
                 )
-                predictions["target_gain_pct"]  = predicted_gains
-                predictions["target_gain_low"]   = predicted_gains * 0.8
-                predictions["target_gain_high"]  = predicted_gains * 1.2
+
+                # Sanity check: if all gains are nearly identical the regressor isn't helping
+                if predicted_gains.std() < 1.0:
+                    self.logger.warning(
+                        f"Gain regressor std={predicted_gains.std():.4f}% — very flat. "
+                        "Disabling and falling back to historical/rule-based estimates."
+                    )
+                    self.regressor = None
+                else:
+                    predictions["target_gain_pct"]  = predicted_gains
+                    predictions["target_gain_low"]   = predicted_gains * 0.8
+                    predictions["target_gain_high"]  = predicted_gains * 1.2
             except Exception as e:
                 self.logger.warning(f"Regressor predict failed ({e}) — falling back")
                 self.regressor = None
@@ -601,7 +672,7 @@ class ExplosionPredictor:
             predictions.loc[nan_gain, "target_gain_high"] = (
                 predictions.loc[nan_gain, "target_gain_pct"] * 1.5)
 
-        # ── Current price lookup ──────────────────────────────────────────────
+        # Current price lookup
         if "symbol" in predictions.columns:
             current_price = self._extract_current_price(data_df, predictions)
             if current_price is not None:
@@ -622,11 +693,14 @@ class ExplosionPredictor:
         if "symbol" not in data_df.columns:
             return None
 
-        price_candidates = ["current_price", "t3_Close", "Close"]
+        # Build candidate list using both t1_close_ and t3_ prefixes so this works
+        # regardless of which model is loaded
+        price_candidates = ["current_price", "t3_Close", "t1_close_Close", "Close"]
         for col in data_df.columns:
-            if col.startswith("t3_") and col.lower().endswith("_close"):
-                if col not in price_candidates:
-                    price_candidates.append(col)
+            for pfx in ("t3_", "t1_close_", "t1_open_"):
+                if col.startswith(pfx) and col.lower().endswith("_close"):
+                    if col not in price_candidates:
+                        price_candidates.append(col)
 
         price_col = next(
             (c for c in price_candidates if c in data_df.columns), None
@@ -634,10 +708,11 @@ class ExplosionPredictor:
 
         if price_col is None:
             for col in data_df.columns:
-                if col.startswith("t3_") and any(
-                    x in col.lower() for x in ("close", "price")
-                ):
-                    price_col = col
+                for pfx in ("t3_", "t1_close_", "t1_open_"):
+                    if col.startswith(pfx) and any(x in col.lower() for x in ("close", "price")):
+                        price_col = col
+                        break
+                if price_col:
                     break
 
         if price_col is None:
