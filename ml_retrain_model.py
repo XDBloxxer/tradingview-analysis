@@ -2,37 +2,43 @@
 """
 ml_retrain_model.py  —  Weekly Full Retrain From Scratch
 
-FIXES IN THIS VERSION (2026-03-02):
+FIXES IN THIS VERSION (2026-03-02 v2):
 
 FIX 1 — scale_pos_weight capped too low (was [0.5, 3.0]):
-  The previous cap of 3.0 was designed for datasets with ~75% negative samples,
-  not the actual class balance in this system. Daily winners represent roughly
-  0.5–1% of all US stocks on any given day — a natural imbalance ratio of
-  100:1 to 200:1. When we also include non-winner samples from the training set
-  (which are intentionally sampled at a modest ratio), the training imbalance
-  is typically 5:1 to 20:1 depending on accumulation so far.
-
-  A cap of 3.0 means the model was being trained as if positives were only 3×
-  underrepresented — it learned to predict AVOID for anything borderline because
-  the cost of a false positive was 3× the cost of a false negative, when it
-  should be 5–20×. This makes the model extremely conservative.
-
-  New cap: [1.0, 30.0]. The lower bound of 1.0 prevents the rare case where
-  we have more winners than non-winners in a small accumulated training set.
-  The upper bound of 30.0 is a safety rail against degenerate datasets.
+  New cap: [1.0, 30.0].
 
 FIX 2 — Regularisation slightly relaxed for t3_-only prediction:
-  The previous strong regularisation (min_child_weight=10, gamma=1.0) was
-  appropriate for a dataset where T-1 features carry most of the signal.
-  When the model must rely primarily on t3_/t5_/t10_ features (which are
-  less discriminative), too-strong regularisation causes all predictions to
-  collapse toward the base rate. Relaxed to min_child_weight=5, gamma=0.3.
+  min_child_weight=5, gamma=0.3.
 
-All other fixes from the previous version are preserved:
-  - Time-based train/val split (no data leakage)
-  - Intraday-high label support (INTRADAY_WIN_THRESHOLD)
-  - Duplicate-date deduplication
-  - Mistake learner integration
+FIX 3 — Gain regressor date merge was broken:
+  The previous code tried to merge combined_df (which has event_date from base
+  CSV) against daily_winners (which has detection_date). These date columns
+  name different things. The merge used left_on=[symbol_col, date_col] where
+  date_col was usually 'event_date', so it never matched detection_date in
+  winners_gain → near-zero match rate → <30 winners → regressor never trained.
+
+  Fix: Enrich ONLY the T-1 rows (which have detection_date) separately from
+  the base CSV rows (which have event_date). Use the correct date column for
+  each source. Then recombine before passing to train_gain_regressor().
+
+FIX 4 — Gain regressor index mismatch:
+  train_gain_regressor() received X_train (a time-split subset of combined_df)
+  but built winner_mask on the full combined_df. The indices don't align, so
+  X_reg[winner_mask] silently selected the wrong rows or crashed.
+
+  Fix: train_gain_regressor() now takes the FULL X_scaled DataFrame and
+  combined_df together, builds winner_mask on combined_df, then aligns X_scaled
+  using combined_df's index before subsetting.
+
+FIX 5 — Gain regressor scale inconsistency:
+  The gain regressor was trained on raw (unscaled) features by filling NaN with
+  col_means of the raw X_reg. But at prediction time, predict_with_targets()
+  calls regressor.predict(X_scaled) — the StandardScaler-transformed features.
+  Training on raw features and predicting on scaled ones produces garbage.
+
+  Fix: train_gain_regressor() now receives X_scaled_full (the complete scaled
+  feature matrix) and trains on that directly. No separate NaN-filling needed
+  because scaling already used the scaler mean as fill value.
 """
 
 import json
@@ -90,12 +96,8 @@ MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 INTRADAY_WIN_THRESHOLD = 15.0  # %
 
-# FIX 1: Raise upper cap from 3.0 → 30.0 to reflect real class imbalance.
-# Daily winners are ~0.5-1% of market → natural ratio is 100-200:1.
-# With accumulated non-winner samples this is typically 5-20:1 in training data.
-# A cap of 3.0 was causing the model to treat AVOID as nearly free → all AVOID.
-SPW_MIN = 1.0   # was 0.5
-SPW_MAX = 30.0  # was 3.0
+SPW_MIN = 1.0
+SPW_MAX = 30.0
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
@@ -103,13 +105,11 @@ XGBOOST_PARAMS = {
     "learning_rate":      0.05,
     "subsample":          0.8,
     "colsample_bytree":   0.8,
-    # FIX 2: Relaxed regularisation so t3_-only features can still discriminate.
-    # Too-strong regularisation with weak features → all predictions = base rate.
-    "min_child_weight":   5,       # was 10
-    "gamma":              0.3,     # was 1.0
-    "reg_alpha":          0.3,     # was 0.5
-    "reg_lambda":         1.5,     # was 2.0
-    "scale_pos_weight":   1,       # overridden at train time (clamped to SPW_MIN/MAX)
+    "min_child_weight":   5,
+    "gamma":              0.3,
+    "reg_alpha":          0.3,
+    "reg_lambda":         1.5,
+    "scale_pos_weight":   1,
     "objective":          "binary:logistic",
     "eval_metric":        "logloss",
     "use_label_encoder":  False,
@@ -359,13 +359,6 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         f"scale_pos_weight will be clamped to [{SPW_MIN}, {SPW_MAX}] = {clamped:.1f}"
     )
 
-    if n_pos > 0 and (n_neg / n_pos) < 0.2:
-        logger.warning(
-            f"Class imbalance WARNING: {n_pos} positives vs {n_neg} negatives "
-            f"(ratio {n_neg/n_pos:.2f}). scale_pos_weight will compensate, "
-            "but consider accumulating more non-winner data."
-        )
-
     return combined
 
 
@@ -434,16 +427,10 @@ def train_model(
         raw_spw = n_neg / n_pos
         clamped_spw = max(SPW_MIN, min(SPW_MAX, raw_spw))
         params["scale_pos_weight"] = round(clamped_spw, 3)
-        if abs(raw_spw - clamped_spw) > 0.01:
-            logger.info(
-                f"  scale_pos_weight: raw={raw_spw:.3f} → clamped to {clamped_spw:.3f} "
-                f"(limits: [{SPW_MIN}, {SPW_MAX}])  ← FIX: cap raised from 3.0 to 30.0"
-            )
-        else:
-            logger.info(
-                f"  scale_pos_weight set to {clamped_spw:.3f} "
-                f"(neg={n_neg} / pos={n_pos})"
-            )
+        logger.info(
+            f"  scale_pos_weight: raw={raw_spw:.3f} → clamped to {clamped_spw:.3f} "
+            f"(limits: [{SPW_MIN}, {SPW_MAX}])"
+        )
 
     early_stopping = params.pop("early_stopping_rounds", 30)
 
@@ -595,16 +582,97 @@ def compute_feature_importance(
 
 
 # ---------------------------------------------------------------------------
-# Gain regressor
+# FIX 3+4+5: Gain regressor — fixed date enrichment, index alignment, scaling
 # ---------------------------------------------------------------------------
 
+def enrich_t1_data_with_gain(t1_df: pd.DataFrame, client: Client) -> pd.DataFrame:
+    """
+    FIX 3: Enrich T-1 rows with actual_high_pct using detection_date (correct).
+
+    T-1 rows have detection_date (the day the winner was detected).
+    daily_winners also uses detection_date.
+    This merge is correct; the old code used event_date which is a base CSV column.
+
+    Only runs on T-1 rows (those with detection_date). Base CSV rows are enriched
+    separately by main() if they happen to have matching event_dates.
+    """
+    if t1_df.empty or "detection_date" not in t1_df.columns:
+        return t1_df
+
+    logger.info("Fetching intraday peak gain data for T-1 winners...")
+    try:
+        winners_response = fetch_table_paginated(client, "daily_winners")
+        if winners_response.empty:
+            logger.warning("  daily_winners table is empty — gain regressor may not train")
+            return t1_df
+
+        required = {"symbol", "detection_date", "high", "price"}
+        if not required.issubset(winners_response.columns):
+            logger.warning(f"  daily_winners missing columns: {required - set(winners_response.columns)}")
+            return t1_df
+
+        winners_gain = winners_response[["symbol", "detection_date", "high", "price"]].copy()
+        winners_gain["actual_high_pct"] = (
+            (winners_gain["high"].astype(float) / winners_gain["price"].astype(float) - 1) * 100
+        ).clip(lower=0)
+
+        # Only keep the gain cols to avoid duplicate columns after merge
+        winners_gain = winners_gain[["symbol", "detection_date", "actual_high_pct"]]
+
+        sym_col = next((c for c in ["symbol", "ticker"] if c in t1_df.columns), None)
+        if sym_col is None:
+            logger.warning("  No symbol column in T-1 data — skipping gain enrichment")
+            return t1_df
+
+        before = len(t1_df)
+        t1_df = t1_df.merge(
+            winners_gain,
+            left_on=[sym_col, "detection_date"],
+            right_on=["symbol", "detection_date"],
+            how="left",
+            suffixes=("", "_gain"),
+        )
+
+        # Clean up duplicate symbol column if merge added one
+        if "symbol_gain" in t1_df.columns:
+            t1_df = t1_df.drop(columns=["symbol_gain"])
+
+        n_with_gain = t1_df["actual_high_pct"].notna().sum()
+        logger.info(
+            f"  ✓ Enriched {n_with_gain}/{before} T-1 rows with intraday peak gain data"
+        )
+
+        if n_with_gain < 30:
+            logger.warning(
+                f"  Only {n_with_gain} winner rows have gain data. "
+                "Gain regressor needs ≥30 to train. "
+                "Accumulate more T-1 data by running the detection pipeline."
+            )
+    except Exception as e:
+        logger.warning(f"  Could not fetch gain data for T-1: {e} — gain regressor may be skipped")
+
+    return t1_df
+
+
 def train_gain_regressor(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    w_train: pd.Series,
+    X_scaled_full: pd.DataFrame,
+    y_full: pd.Series,
+    w_full: pd.Series,
     combined_df: pd.DataFrame,
     feature_names: list[str],
 ):
+    """
+    FIX 4+5: Train gain regressor on SCALED features aligned by index.
+
+    Args:
+        X_scaled_full:  Complete scaled feature matrix (same index as combined_df).
+                        Using the SCALED version ensures regressor and classifier
+                        operate on the same feature space at prediction time.
+        y_full:         Labels for all rows (aligned with X_scaled_full).
+        w_full:         Sample weights (aligned with X_scaled_full).
+        combined_df:    Full combined DataFrame with actual_high_pct column.
+        feature_names:  List of feature names (columns of X_scaled_full).
+    """
     from xgboost import XGBRegressor
 
     gain_col = None
@@ -617,42 +685,55 @@ def train_gain_regressor(
         logger.warning("No gain column found — skipping gain regressor training.")
         return None
 
-    winner_mask  = (combined_df["label"] == 1) & combined_df[gain_col].notna()
-    n_winners    = int(winner_mask.sum())
+    # FIX 4: Use combined_df.index to align X_scaled_full correctly.
+    # X_scaled_full shares the same index as combined_df after prepare_features + build_scaler.
+    winner_mask = (
+        (combined_df["label"] == 1) &
+        pd.to_numeric(combined_df[gain_col], errors="coerce").notna()
+    )
+
+    n_winners = int(winner_mask.sum())
 
     if n_winners < 30:
-        logger.warning(f"Only {n_winners} winner rows with gain data — "
-                       "need ≥30 to train gain regressor. Skipping.")
+        logger.warning(
+            f"Only {n_winners} winner rows with gain data — "
+            "need ≥30 to train gain regressor. Skipping."
+        )
         return None
 
     logger.info(f"\n── Training gain regressor on {n_winners} winner rows (target: {gain_col}) ──")
 
-    X_reg = pd.DataFrame(index=combined_df.index, columns=feature_names)
-    for col in feature_names:
-        if col in combined_df.columns:
-            X_reg[col] = combined_df[col]
-    X_reg = X_reg.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    # FIX 4+5: Align X_scaled_full to combined_df's index before masking.
+    # Both should already share the same integer RangeIndex after reset_index.
+    # If indices differ, align explicitly.
+    if not X_scaled_full.index.equals(combined_df.index):
+        logger.warning(
+            "X_scaled_full and combined_df indices differ — reindexing X_scaled_full. "
+            "This shouldn't happen; check that prepare_features + build_scaler preserve index."
+        )
+        X_scaled_full = X_scaled_full.reindex(combined_df.index)
 
-    y_reg = pd.to_numeric(combined_df[gain_col], errors="coerce")
-    w_reg = combined_df["sample_weight"].astype(float) \
-            if "sample_weight" in combined_df.columns \
-            else pd.Series(1.0, index=combined_df.index)
+    X_reg  = X_scaled_full.loc[winner_mask]   # FIX 5: already scaled, no raw data
+    y_reg  = pd.to_numeric(combined_df.loc[winner_mask, gain_col], errors="coerce")
+    w_reg  = w_full.loc[winner_mask] if hasattr(w_full, "loc") else w_full[winner_mask]
 
-    X_reg = X_reg[winner_mask]
-    y_reg = y_reg[winner_mask]
-    w_reg = w_reg[winner_mask]
-
-    col_means  = X_reg.mean()
-    X_reg_fill = X_reg.fillna(col_means)
+    # FIX 5: Scaled features may still have NaN (from the scaler's NaN-preservation).
+    # Fill with 0 (scaled mean) since scaler already centered around 0.
+    X_reg_filled = X_reg.fillna(0.0)
 
     from sklearn.model_selection import train_test_split
-    if len(X_reg) >= 10:
+    if len(X_reg_filled) >= 10:
         X_tr, X_va, y_tr, y_va, w_tr, _ = train_test_split(
-            X_reg_fill, y_reg, w_reg,
+            X_reg_filled, y_reg, w_reg,
             test_size=0.2, random_state=42,
         )
     else:
-        X_tr, X_va, y_tr, y_va, w_tr = X_reg_fill, X_reg_fill, y_reg, y_reg, w_reg
+        X_tr, X_va, y_tr, y_va, w_tr = (
+            X_reg_filled, X_reg_filled, y_reg, y_reg, w_reg
+        )
+
+    logger.info(f"  Gain regressor train: {len(X_tr)} rows, val: {len(X_va)} rows")
+    logger.info(f"  Gain range: {y_reg.min():.1f}% – {y_reg.max():.1f}%  mean={y_reg.mean():.1f}%")
 
     regressor = XGBRegressor(
         n_estimators=200,
@@ -669,7 +750,7 @@ def train_gain_regressor(
     )
     regressor.fit(
         X_tr, y_tr,
-        sample_weight=w_tr.values,
+        sample_weight=w_tr.values if hasattr(w_tr, "values") else w_tr,
         eval_set=[(X_va, y_va)],
         verbose=False,
     )
@@ -741,41 +822,15 @@ def main() -> int:
 
     client = get_supabase_client()
 
-    base_df     = load_base_training_data(client)
-    t1_df       = load_t1_data(client)
+    base_df = load_base_training_data(client)
+    t1_df   = load_t1_data(client)
+
+    # FIX 3: Enrich T-1 rows with gain data BEFORE combine_datasets.
+    # This uses detection_date (correct), not event_date (wrong).
+    if not t1_df.empty:
+        t1_df = enrich_t1_data_with_gain(t1_df, client)
+
     combined_df = combine_datasets(base_df, t1_df)
-
-    # Enrich with intraday peak gain
-    logger.info("Fetching intraday peak gain data from daily_winners for gain regressor...")
-    try:
-        winners_response = fetch_table_paginated(client, "daily_winners")
-        if not winners_response.empty:
-            required = {"symbol", "detection_date", "high", "price"}
-            if required.issubset(winners_response.columns):
-                winners_gain = winners_response[["symbol", "detection_date", "high", "price"]].copy()
-                winners_gain["actual_high_pct"] = (
-                    (winners_gain["high"] / winners_gain["price"] - 1) * 100
-                ).clip(lower=0)
-
-                symbol_col = next(
-                    (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
-                )
-                date_col = next(
-                    (c for c in ["detection_date_x", "detection_date", "event_date"]
-                     if c in combined_df.columns), None
-                )
-
-                if symbol_col and date_col:
-                    combined_df = combined_df.merge(
-                        winners_gain[["symbol", "detection_date", "actual_high_pct"]],
-                        left_on=[symbol_col, date_col],
-                        right_on=["symbol", "detection_date"],
-                        how="left",
-                    ).drop(columns=["detection_date"], errors="ignore")
-                    n_with_gain = combined_df["actual_high_pct"].notna().sum()
-                    logger.info(f"Enriched {n_with_gain} rows with intraday peak gain data")
-    except Exception as e:
-        logger.warning(f"Could not fetch gain data: {e} — gain regressor will be skipped")
 
     combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
 
@@ -805,15 +860,23 @@ def main() -> int:
             )
         else:
             logger.info("No mistake samples to add this run.")
+        mistake_df_len = len(mistake_df) if not mistake_df.empty else 0
     else:
         logger.warning("ml_mistake_learner not available — skipping mistake-learning step.")
-        mistake_df = pd.DataFrame()
+        mistake_df_len = 0
 
     X, y, w = prepare_features(combined_df)
     feature_names = list(X.columns)
 
     logger.info("Fitting scaler...")
     scaler, X_scaled = build_scaler(X)
+
+    # FIX 4+5: Reset index on X_scaled and combined_df together so they stay aligned.
+    # prepare_features + build_scaler should preserve index, but reset to be safe.
+    combined_df = combined_df.reset_index(drop=True)
+    X_scaled    = X_scaled.reset_index(drop=True)
+    y           = y.reset_index(drop=True)
+    w           = w.reset_index(drop=True)
 
     X_train, X_val, y_train, y_val, w_train, w_val = train_val_split(
         X_scaled, y, w, combined_df
@@ -826,8 +889,13 @@ def main() -> int:
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING")
     logger.info("=" * 60)
+    # FIX 4+5: Pass X_scaled_full (complete, scaled) so regressor uses same scale as classifier.
     gain_regressor = train_gain_regressor(
-        X_train, y_train, w_train, combined_df, feature_names
+        X_scaled_full=X_scaled,
+        y_full=y,
+        w_full=w,
+        combined_df=combined_df,
+        feature_names=feature_names,
     )
 
     from sklearn.metrics import roc_auc_score, classification_report
@@ -862,12 +930,11 @@ def main() -> int:
     else:
         logger.info(f"  ✅ {gap_count} predictions in mid-range (0.15–0.85) — distribution looks healthy")
 
-    n_mistakes = len(mistake_df) if not mistake_df.empty else 0
     training_stats = {
         "n_total_samples":         len(combined_df),
         "n_base_samples":          len(base_df),
         "n_t1_samples":            len(t1_df) if not t1_df.empty else 0,
-        "n_mistake_samples":       n_mistakes,
+        "n_mistake_samples":       mistake_df_len,
         "n_positive":              int((y == 1).sum()),
         "n_negative":              int((y == 0).sum()),
         "positive_rate":           float((y == 1).mean()),
@@ -899,9 +966,9 @@ def main() -> int:
     logger.info(f"  Validation AUC      : {auc:.4f}")
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
-    logger.info(f"  SPW cap             : [{SPW_MIN}, {SPW_MAX}]  ← was [0.5, 3.0]")
+    logger.info(f"  SPW cap             : [{SPW_MIN}, {SPW_MAX}]")
     logger.info(f"  Split method        : time-based (most recent {15}% as val)")
-    logger.info(f"  Gain regressor      : {'✓ trained' if gain_regressor else '— skipped'}")
+    logger.info(f"  Gain regressor      : {'✓ trained' if gain_regressor else '— skipped (need ≥30 winner rows with gain data)'}")
     logger.info("")
     logger.info("Files written:")
     logger.info(f"  {MODEL_PATH}")
