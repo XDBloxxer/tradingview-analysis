@@ -2,7 +2,7 @@
 """
 ML Stock Screener & Predictor
 
-FIXES IN THIS VERSION (2026-03-03 v6):
+FIXES IN THIS VERSION (2026-03-03 v7):
 
 FIX 1 — fetch_t1_data_for_symbol now computes real indicators from 5-min bars.
 
@@ -10,15 +10,25 @@ FIX 2 — build_features_from_tv_data lowercases keys for t3/t5/t10 prefix model
 
 FIX 3 — write_predictions_upsert instead of insert-skip-on-duplicate.
 
-FIX 4 — SmartScreener._load_learned_filters now clamps aggressive HV minimums
-  (min_hv10 / min_hv20) and volume-ratio minimums before applying them as TV
-  screener filters.  Previously, winner-derived p10 HV values of 56%+ were
-  passed straight to TradingView, excluding ~98% of the market and leaving
-  only 8-15 stocks — too few for the model to produce varied probabilities.
+FIX 4 — SmartScreener._load_learned_filters clamps aggressive HV/vol-ratio minimums.
 
-FIX 5 — Pre-flight variance check in STEP 4 diagnoses zero-variance indicator
-  columns before the model runs, giving an actionable error message instead of
-  silently producing identical probabilities.
+FIX 5 — Pre-flight and post-prediction variance diagnostics.
+
+FIX 6 (NEW) — Hybrid model prefix handling:
+  _detect_model_prefix() returned 't1_close' for HYBRID models (t3+t1) regardless
+  of which prefix dominated, because of an early-return guard:
+      if counts["t1_close"] > 0 and counts["t3"] > 0: return "t1_close"
+  For a model with 72% t3_ features and 28% t1_ features, TV screener data was
+  mapped entirely to t1_close_* columns, leaving all 291 t3_ features at their
+  defaults → identical probabilities for every stock.
+
+  Fix strategy for HYBRID models:
+    1. TV screener data is mapped to BOTH t1_close_* AND t3_* (lowercase) columns
+       so whichever prefix dominates in the model will receive real values.
+    2. The t3/t5/t10 columns are filled from the TV data using lowercase mapping
+       (matching how the base CSV training data was stored).
+    3. T-1 intraday yfinance data continues to fill t1_close_* / t1_open_* columns.
+  This means hybrid models now get real signal in all prefix groups simultaneously.
 """
 
 import argparse
@@ -100,19 +110,6 @@ TV_TO_MODEL_BASE = {
     "Aroon.Down":                   "AROOND_25",
 }
 
-TV_TO_MODEL_BASE_T3_OVERRIDES = {
-    "close":        "Close",
-    "open":         "Open",
-    "high":         "High",
-    "low":          "Low",
-    "volume":       "Volume",
-    "RSI":          "RSI_14",
-    "ATR":          "ATR_14",
-    "ADX":          "ADX_14",
-    "MACD.macd":    "MACD_12_26_9",
-    "MACD.signal":  "MACDs_12_26_9",
-}
-
 EXTRA_TV_COLUMNS = [
     "RSI", "RSI[1]", "Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]",
     "W.R", "W.R[1]", "MACD.macd", "MACD.signal",
@@ -131,13 +128,27 @@ GAIN_CEILING = 55.0
 
 _LOWERCASE_PREFIXES = ("t3", "t5", "t10")
 
-# FIX 4: Screener-level caps — keep the funnel wide so ML has a real distribution
-SCREENER_HV_MIN_CAP    = 30.0   # never require HV > 30% at screen time
-SCREENER_VOL_RATIO_CAP = 2.5   # never require vol_ratio > 2.5 at screen time
+SCREENER_HV_MIN_CAP    = 30.0
+SCREENER_VOL_RATIO_CAP = 2.5
+
+# FIX 6: All flat-bar prefixes used by the base CSV training data.
+# TV screener features are mapped to ALL of these for hybrid models so
+# whichever prefix group dominates in the model gets real values.
+_FLAT_PREFIXES = ("t3", "t5", "t10")
 
 
 def _uses_lowercase(prefix: str) -> bool:
     return any(prefix == p or prefix.startswith(p + "_") for p in _LOWERCASE_PREFIXES)
+
+
+def _is_hybrid_model(predictor: "ExplosionPredictor") -> bool:
+    """Return True if the model has both t1_ and t3/t5/t10 features."""
+    has_t1   = any(f.startswith("t1_") for f in predictor.feature_names)
+    has_flat = any(
+        f.startswith("t3_") or f.startswith("t5_") or f.startswith("t10_")
+        for f in predictor.feature_names
+    )
+    return has_t1 and has_flat
 
 
 def setup_logging(verbose: bool = False):
@@ -195,13 +206,10 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     if probs.std() < 0.02:
         logger.warning(
             f"  ⚠️  VERY LOW PROB STD ({probs.std():.6f}) — likely feature prefix mismatch."
-            f"\n      Check that build_features_from_tv_data is using the same prefix"
-            f"\n      as the model (see predictor.model_feature_prefix in logs)."
+            f"\n      Check that build_features_from_tv_data is populating the correct prefix."
         )
     elif probs.std() < 0.05:
-        logger.warning(
-            f"  ⚠️  LOW PROB STD ({probs.std():.4f}) — limited feature discrimination."
-        )
+        logger.warning(f"  ⚠️  LOW PROB STD ({probs.std():.4f}) — limited feature discrimination.")
     else:
         logger.info(f"  ✅ Probability std {probs.std():.4f} — distribution looks healthy.")
 
@@ -303,10 +311,6 @@ class SmartScreener:
                     if value is None:
                         continue
 
-                    # FIX 4: Clamp aggressive HV minimums.
-                    # Winner-derived p10 HV can be 56%+ — passing that to
-                    # TradingView leaves only 8-15 stocks, too few for the
-                    # model to produce a meaningful probability distribution.
                     if key in ("min_hv10", "min_hv20") and float(value) > SCREENER_HV_MIN_CAP:
                         self.logger.info(
                             f"  Clamping {key}={value:.2f} → {SCREENER_HV_MIN_CAP} "
@@ -314,11 +318,8 @@ class SmartScreener:
                         )
                         value = SCREENER_HV_MIN_CAP
 
-                    # FIX 4: Clamp aggressive volume-ratio minimums.
                     if key in ("min_volume_ratio", "min_relative_volume") and float(value) > SCREENER_VOL_RATIO_CAP:
-                        self.logger.info(
-                            f"  Clamping {key}={value:.2f} → {SCREENER_VOL_RATIO_CAP}"
-                        )
+                        self.logger.info(f"  Clamping {key}={value:.2f} → {SCREENER_VOL_RATIO_CAP}")
                         value = SCREENER_VOL_RATIO_CAP
 
                     defaults[key] = value
@@ -413,9 +414,8 @@ class SmartScreener:
                     f"✓ Screened {len(df)} stocks (default columns only: {list(df.columns)})"
                 )
                 self.logger.warning(
-                    "  ⚠️  Using default TV columns only (no RSI/ATR/etc)."
-                    "\n      All stocks will get default feature values → near-identical probabilities."
-                    "\n      Upgrade tradingview-scraper to >=0.4.19 for indicator columns."
+                    "  ⚠️  Using default TV columns only (no RSI/ATR/etc). "
+                    "Upgrade tradingview-scraper to >=0.4.19 for indicator columns."
                 )
                 return df
 
@@ -428,29 +428,43 @@ class SmartScreener:
 
 
 # ---------------------------------------------------------------------------
-# Feature building
+# FIX 6: Feature building — fills ALL relevant prefix groups
 # ---------------------------------------------------------------------------
 
-def build_features_from_tv_data(row: dict, symbol: str, feature_prefix: str = "t1_close") -> dict:
+def build_features_from_tv_data(
+    row: dict,
+    symbol: str,
+    feature_prefix: str = "t1_close",
+    fill_flat_prefixes: bool = False,
+) -> dict:
     """
     Convert a single TradingView screener row into a feature dict.
-    FIX 2: Lowercases the full key for t3/t5/t10 prefix models.
+
+    FIX 6: For hybrid models (t3+t1), `fill_flat_prefixes=True` causes this
+    function to ALSO write the same values into t3_/t5_/t10_ columns (lowercase),
+    which is the format the base CSV training data used. Without this, a hybrid
+    model with 72% t3_ features receives all-default values for those features
+    and outputs identical probabilities for every stock.
+
+    The t1_close_ columns are still populated as before; T-1 intraday data from
+    yfinance will overwrite them with per-stock computed indicators in Step 3.
     """
     result = {
         "symbol":   symbol,
         "exchange": "NASDAQ",
     }
 
-    seen_targets = set()
-    for tv_col, model_name in TV_TO_MODEL_BASE.items():
-        target = f"{feature_prefix}_{model_name}"
+    seen_targets: set = set()
 
-        if _uses_lowercase(feature_prefix):
+    def _write(prefix: str, model_name: str, fval: float):
+        target = f"{prefix}_{model_name}"
+        if _uses_lowercase(prefix):
             target = target.lower()
+        if target not in seen_targets:
+            result[target] = fval
+            seen_targets.add(target)
 
-        if target in seen_targets:
-            continue
-
+    for tv_col, model_name in TV_TO_MODEL_BASE.items():
         value = row.get(tv_col)
         if value is None:
             value = row.get(tv_col.lower())
@@ -460,14 +474,24 @@ def build_features_from_tv_data(row: dict, symbol: str, feature_prefix: str = "t
                     value = row[k]
                     break
 
-        if value is not None:
-            try:
-                fval = float(value)
-                if not (np.isnan(fval) or np.isinf(fval)):
-                    result[target] = fval
-                    seen_targets.add(target)
-            except (TypeError, ValueError):
-                pass
+        if value is None:
+            continue
+
+        try:
+            fval = float(value)
+            if np.isnan(fval) or np.isinf(fval):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        # Always write to the primary model prefix (e.g. t1_close_RSI_14)
+        _write(feature_prefix, model_name, fval)
+
+        # FIX 6: For hybrid models, also fill t3_/t5_/t10_ with the same value.
+        # These use lowercase column names matching the base CSV training format.
+        if fill_flat_prefixes:
+            for flat_pfx in _FLAT_PREFIXES:
+                _write(flat_pfx, model_name, fval)
 
     close_val = row.get("close") or row.get("Close")
     if close_val is not None:
@@ -476,34 +500,34 @@ def build_features_from_tv_data(row: dict, symbol: str, feature_prefix: str = "t
         except (TypeError, ValueError):
             pass
 
+    # Derived features
     close = result.get("current_price") or result.get(f"{feature_prefix}_Close")
-    if close and close > 0:
-        if _uses_lowercase(feature_prefix):
-            ema20 = result.get(f"{feature_prefix}_ema_20")
-            ema50 = result.get(f"{feature_prefix}_ema_50")
-            ema10 = result.get(f"{feature_prefix}_ema_10")
-            sma20 = result.get(f"{feature_prefix}_sma_20")
-            if ema20:
-                result[f"{feature_prefix}_price_vs_ema20"] = (close / ema20 - 1) * 100
-            if sma20:
-                result[f"{feature_prefix}_price_vs_sma20"] = (close / sma20 - 1) * 100
-            if ema20 and ema50:
-                result[f"{feature_prefix}_ema_12_26_diff"] = ema20 - ema50
-            if ema10 and ema20:
-                result[f"{feature_prefix}_sma_20_50_diff"] = ema10 - ema20
+
+    def _derived(prefix: str, close_v: float):
+        if _uses_lowercase(prefix):
+            ema20 = result.get(f"{prefix}_ema_20")
+            ema50 = result.get(f"{prefix}_ema_50")
+            ema10 = result.get(f"{prefix}_ema_10")
+            sma20 = result.get(f"{prefix}_sma_20")
+            if ema20: result[f"{prefix}_price_vs_ema20"] = (close_v / ema20 - 1) * 100
+            if sma20: result[f"{prefix}_price_vs_sma20"] = (close_v / sma20 - 1) * 100
+            if ema20 and ema50: result[f"{prefix}_ema_12_26_diff"] = ema20 - ema50
+            if ema10 and ema20: result[f"{prefix}_sma_20_50_diff"] = ema10 - ema20
         else:
-            ema20 = result.get(f"{feature_prefix}_EMA_20")
-            ema50 = result.get(f"{feature_prefix}_EMA_50")
-            ema10 = result.get(f"{feature_prefix}_EMA_10")
-            sma20 = result.get(f"{feature_prefix}_SMA_20")
-            if ema20:
-                result[f"{feature_prefix}_Price_vs_EMA20"] = (close / ema20 - 1) * 100
-            if sma20:
-                result[f"{feature_prefix}_Price_vs_SMA20"] = (close / sma20 - 1) * 100
-            if ema20 and ema50:
-                result[f"{feature_prefix}_EMA_12_26_Diff"] = ema20 - ema50
-            if ema10 and ema20:
-                result[f"{feature_prefix}_SMA_20_50_Diff"] = ema10 - ema20
+            ema20 = result.get(f"{prefix}_EMA_20")
+            ema50 = result.get(f"{prefix}_EMA_50")
+            ema10 = result.get(f"{prefix}_EMA_10")
+            sma20 = result.get(f"{prefix}_SMA_20")
+            if ema20: result[f"{prefix}_Price_vs_EMA20"] = (close_v / ema20 - 1) * 100
+            if sma20: result[f"{prefix}_Price_vs_SMA20"] = (close_v / sma20 - 1) * 100
+            if ema20 and ema50: result[f"{prefix}_EMA_12_26_Diff"] = ema20 - ema50
+            if ema10 and ema20: result[f"{prefix}_SMA_20_50_Diff"] = ema10 - ema20
+
+    if close and close > 0:
+        _derived(feature_prefix, close)
+        if fill_flat_prefixes:
+            for flat_pfx in _FLAT_PREFIXES:
+                _derived(flat_pfx, close)
 
     return result
 
@@ -515,7 +539,7 @@ def build_features_from_tv_data(row: dict, symbol: str, feature_prefix: str = "t
 def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
     """
     Fetch T-1 intraday 5-min data and compute technical indicators.
-    FIX 1: Computes the full indicator suite and renames via t1_column_map.
+    Returns dict with t1_close_* and t1_open_* keys ready for model input.
     """
     try:
         import yfinance as yf
@@ -599,10 +623,8 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             ema12_v = ind.get("ema12") or float(c.mean())
             ema26_v = ind.get("ema26") or float(c.mean())
 
-            if sma20_v:
-                ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100
-            if ema20_v:
-                ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100
+            if sma20_v: ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100
+            if ema20_v: ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100
             ind["ema_12_26_diff"] = ema12_v - ema26_v
             ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
 
@@ -615,8 +637,7 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             ind["stoch.d"]    = safe(std, 50.0)
             ind["stoch.k[1]"] = ind["stoch.k"]
             ind["stoch.d[1]"] = ind["stoch.d"]
-
-            ind["w.r"] = safe(-100 * (hi14 - c) / rng14, -50.0)
+            ind["w.r"]        = safe(-100 * (hi14 - c) / rng14, -50.0)
 
             tr = pd.concat([
                 h - l,
@@ -628,14 +649,8 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
 
             up_move = h.diff()
             dn_move = -l.diff()
-            pdm = pd.Series(
-                np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0),
-                index=c.index
-            )
-            ndm = pd.Series(
-                np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0),
-                index=c.index
-            )
+            pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
+            ndm = pd.Series(np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0), index=c.index)
             atr14 = tr.rolling(14).mean().replace(0, np.nan)
             pdi   = 100 * pdm.rolling(14).mean() / atr14
             ndi   = 100 * ndm.rolling(14).mean() / atr14
@@ -651,12 +666,8 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             ind["bb.upper"]  = safe(bb_up,  close_v)
             ind["bb.lower"]  = safe(bb_lo,  close_v)
             ind["bb.middle"] = safe(bb_mid, close_v)
-            ind["bb_width"]  = safe(
-                (bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0
-            )
-            ind["bbpower"] = safe(
-                (c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5
-            )
+            ind["bb_width"]  = safe((bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0)
+            ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
 
             vm5  = v.rolling(5).mean()
             vm10 = v.rolling(10).mean()
@@ -675,40 +686,23 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             ind["obv"] = float(obv_vals[-1])
 
             mf_mult   = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
-            mf_volume = mf_mult * v
-            ind["cmf"] = safe(
-                mf_volume.rolling(20).sum() / v.rolling(20).sum().replace(0, np.nan),
-                0.0
-            )
+            ind["cmf"] = safe(mf_mult * v / v.rolling(20).sum().replace(0, np.nan), 0.0)
 
             tp    = (h + l + c) / 3
             tp_ma = tp.rolling(20).mean()
-            tp_md = tp.rolling(20).apply(
-                lambda x: np.abs(x - x.mean()).mean(), raw=True
-            )
-            ind["cci20"] = safe(
-                (tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan)), 0.0
-            )
+            tp_md = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+            ind["cci20"] = safe((tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan)), 0.0)
 
-            ind["ao"]  = safe(
-                (h + l).rolling(5).mean() / 2 - (h + l).rolling(34).mean() / 2,
-                0.0
-            )
+            ind["ao"]  = safe((h + l).rolling(5).mean() / 2 - (h + l).rolling(34).mean() / 2, 0.0)
             ind["mom"] = safe(c.diff(10), 0.0)
             ind["roc"] = safe(c.pct_change(10) * 100, 0.0)
 
             log_ret = np.log(c / c.shift(1))
-            for hv_w, col_name in [
-                (10, "volatility_10d"), (20, "volatility_20d"), (30, "volatility_30d")
-            ]:
-                ind[col_name] = safe(
-                    log_ret.rolling(hv_w).std() * np.sqrt(252 * 78) * 100, 0.0
-                )
+            for hv_w, col_name in [(10, "volatility_10d"), (20, "volatility_20d"), (30, "volatility_30d")]:
+                ind[col_name] = safe(log_ret.rolling(hv_w).std() * np.sqrt(252 * 78) * 100, 0.0)
 
-            for n, col_name in [
-                (1, "price_change_1d"), (2, "price_change_2d"),
-                (3, "price_change_3d"), (5, "price_change_5d"),
-            ]:
+            for n, col_name in [(1, "price_change_1d"), (2, "price_change_2d"),
+                                 (3, "price_change_3d"), (5, "price_change_5d")]:
                 if len(c) > n:
                     prev = float(c.iloc[-(n + 1)])
                     ind[col_name] = ((close_v / prev) - 1) * 100 if prev else 0.0
@@ -719,21 +713,15 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
                     ind["gap_%"] = (float(o.iloc[0]) / prev_bar - 1) * 100
 
             if len(h) >= 26:
-                hi_idx = h.rolling(26).apply(
-                    lambda x: float(np.argmax(x)), raw=True
-                )
-                lo_idx = l.rolling(26).apply(
-                    lambda x: float(np.argmin(x)), raw=True
-                )
+                hi_idx = h.rolling(26).apply(lambda x: float(np.argmax(x)), raw=True)
+                lo_idx = l.rolling(26).apply(lambda x: float(np.argmin(x)), raw=True)
                 ind["aroon_up"]        = safe(hi_idx / 25 * 100, 50.0)
                 ind["aroon_down"]      = safe(lo_idx / 25 * 100, 50.0)
                 ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
 
             bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
-            tr_u = (
-                pd.concat([h, c.shift()], axis=1).max(axis=1)
-                - pd.concat([l, c.shift()], axis=1).min(axis=1)
-            )
+            tr_u = (pd.concat([h, c.shift()], axis=1).max(axis=1)
+                    - pd.concat([l, c.shift()], axis=1).min(axis=1))
             a7  = bp.rolling(7).sum()  / tr_u.rolling(7).sum().replace(0, np.nan)
             a14 = bp.rolling(14).sum() / tr_u.rolling(14).sum().replace(0, np.nan)
             a28 = bp.rolling(28).sum() / tr_u.rolling(28).sum().replace(0, np.nan)
@@ -747,13 +735,12 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
         )
 
         open_bars = day_bars[day_bars.index.time <= dt_time(10, 0)]
+        open_indicators = {}
         if len(open_bars) >= 10:
             open_indicators = _compute_indicators(
                 open_bars["close"], open_bars["high"], open_bars["low"],
                 open_bars["volume"], open_bars["open"]
             )
-        else:
-            open_indicators = {}
 
         result = {}
 
@@ -811,15 +798,13 @@ def _apply_gain_rank_correction(
 
     logger.warning(
         f"  ⚠️  FLAT GAIN ESTIMATES detected (std={gain_std:.4f}%). "
-        f"All stocks showing ~{gains.mean():.1f}% gain."
-        f"\n      Applying rank-based correction "
-        f"(floor={GAIN_FLOOR}%, ceiling={GAIN_CEILING}%)."
+        f"Applying rank-based correction (floor={GAIN_FLOOR}%, ceiling={GAIN_CEILING}%)."
     )
 
     df    = predictions_df.copy()
     probs = df['explosion_probability']
 
-    base_ranks = probs.rank(pct=True)
+    base_ranks      = probs.rank(pct=True)
     corrected_gains = GAIN_FLOOR + base_ranks * (GAIN_CEILING - GAIN_FLOOR)
 
     if _uses_lowercase(feature_prefix):
@@ -833,20 +818,16 @@ def _apply_gain_rank_correction(
         feat_indexed = features_df.set_index("symbol") if "symbol" in features_df.columns else features_df
 
         if rsi_col in feat_indexed.columns:
-            rsi_map  = feat_indexed[rsi_col]
-            rsi_vals = df['symbol'].map(rsi_map) if 'symbol' in df.columns else None
+            rsi_vals = df['symbol'].map(feat_indexed[rsi_col]) if 'symbol' in df.columns else None
             if rsi_vals is not None and rsi_vals.notna().sum() > 5:
                 rsi_score = 1.0 - (abs(rsi_vals.fillna(55) - 60) / 40).clip(0, 1)
                 corrected_gains += rsi_score * 5.0
-                logger.info(f"  Applied RSI-based gain adjustment (mean RSI: {rsi_vals.mean():.1f})")
 
         if vol_col in feat_indexed.columns:
-            vol_map  = feat_indexed[vol_col]
-            vol_vals = df['symbol'].map(vol_map) if 'symbol' in df.columns else None
+            vol_vals = df['symbol'].map(feat_indexed[vol_col]) if 'symbol' in df.columns else None
             if vol_vals is not None and vol_vals.notna().sum() > 5:
                 vol_score = (vol_vals.fillna(1.0) - 1.0).clip(0, 4) / 4.0
                 corrected_gains += vol_score * 8.0
-                logger.info(f"  Applied volume-based gain adjustment (mean vol_ratio: {vol_vals.mean():.2f})")
 
     corrected_gains = corrected_gains.clip(GAIN_FLOOR, GAIN_CEILING * 1.5)
 
@@ -859,11 +840,7 @@ def _apply_gain_rank_correction(
         df['target_price_low']  = df['current_price'] * (1 + df['target_gain_low']  / 100)
         df['target_price_high'] = df['current_price'] * (1 + df['target_gain_high'] / 100)
 
-    logger.info(
-        f"  Corrected gain range: {corrected_gains.min():.1f}%–{corrected_gains.max():.1f}%  "
-        f"std={corrected_gains.std():.1f}%"
-    )
-
+    logger.info(f"  Corrected gain range: {corrected_gains.min():.1f}%–{corrected_gains.max():.1f}%  std={corrected_gains.std():.1f}%")
     return df
 
 
@@ -913,9 +890,20 @@ def main():
         logger.error(f"Failed to initialize: {e}")
         return 1
 
-    model_prefix = predictor.model_feature_prefix
+    # FIX 6: Detect hybrid model and set fill_flat_prefixes accordingly.
+    # model_feature_prefix still returns 't1_close' for hybrid models (by design,
+    # since T-1 data is the freshest signal), but we ALSO need to populate t3_
+    # columns so the model's dominant feature group gets real values.
+    model_prefix       = predictor.model_feature_prefix
+    hybrid             = _is_hybrid_model(predictor)
+    fill_flat_prefixes = hybrid
+
     logger.info(f"✓ Model feature prefix detected: '{model_prefix}'")
-    logger.info(f"  All TV screener features will be mapped to {model_prefix}_* columns")
+    logger.info(f"  Model is hybrid (t1+t3/t5/t10): {hybrid}")
+    if hybrid:
+        logger.info(
+            "  → TV screener features will be mapped to BOTH t1_close_* AND t3_/t5_/t10_* columns"
+        )
     logger.info(f"  Lowercase keys: {_uses_lowercase(model_prefix)}")
 
     # ── STEP 1: SCREENING ────────────────────────────────────────────────────
@@ -934,6 +922,8 @@ def main():
     logger.info("STEP 2: BUILD FEATURES FROM TRADINGVIEW DATA")
     logger.info("=" * 80)
     logger.info(f"Mapping TV screener columns → {model_prefix}_* model features.")
+    if hybrid:
+        logger.info(f"  Also mapping to t3_*/t5_*/t10_* (hybrid model)")
 
     enriched_stocks = []
     failed_count    = 0
@@ -958,7 +948,11 @@ def main():
                 continue
 
             row_dict = row.to_dict()
-            features = build_features_from_tv_data(row_dict, symbol, feature_prefix=model_prefix)
+            features = build_features_from_tv_data(
+                row_dict, symbol,
+                feature_prefix=model_prefix,
+                fill_flat_prefixes=fill_flat_prefixes,
+            )
             features["exchange"] = exchange
 
             if "current_price" not in features or not features["current_price"]:
@@ -976,18 +970,13 @@ def main():
             failed_count += 1
 
     logger.info(f"✓ Built features for {len(enriched_stocks)} stocks ({failed_count} skipped)")
-    logger.info(
-        f"  Stocks with ≥3 real {model_prefix}_ indicator values: "
-        f"{t1_feature_hits}/{len(enriched_stocks)}"
-    )
 
-    if t1_feature_hits == 0:
-        logger.warning(
-            f"  ⚠️  ZERO stocks have real indicator values from TV screener."
-            "\n      Screener returned only default columns (no RSI/ATR/etc)."
-            "\n      All probabilities will be near-identical."
-            "\n      Check tradingview-scraper version — needs >=0.4.19."
-        )
+    # Spot-check flat prefix coverage for hybrid models
+    if hybrid and enriched_stocks:
+        sample = enriched_stocks[0]
+        t3_hits = sum(1 for k in sample if k.startswith("t3_"))
+        t1_hits = sum(1 for k in sample if k.startswith("t1_close_"))
+        logger.info(f"  Sample stock '{sample['symbol']}': t3_ cols={t3_hits}, t1_close_ cols={t1_hits}")
 
     if not enriched_stocks:
         logger.error("Failed to build features for any stocks")
@@ -998,10 +987,7 @@ def main():
         logger.info("\n" + "=" * 80)
         logger.info("STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT")
         logger.info("=" * 80)
-        logger.info(
-            "Computing RSI, MACD, ATR, Bollinger, ADX, Stoch, OBV, CMF etc. "
-            "from 5-min bars for top 200 candidates."
-        )
+        logger.info("Computing indicators from 5-min bars for top 200 candidates.")
 
         top_200 = [s["symbol"] for s in enriched_stocks[:200]]
 
@@ -1049,61 +1035,40 @@ def main():
 
     features_df  = pd.DataFrame(enriched_stocks)
     model_cols   = [c for c in features_df.columns if c.startswith(f"{model_prefix}_")]
+    t3_cols      = [c for c in features_df.columns if c.startswith("t3_")]
     t1_open_cols = [c for c in features_df.columns if c.startswith("t1_open_")]
 
     logger.info(f"✓ Feature matrix: {len(features_df)} stocks × {len(features_df.columns)} raw columns")
     logger.info(f"  {model_prefix}_ features present: {len(model_cols)}")
+    logger.info(f"  t3_ features present:       {len(t3_cols)}")
     logger.info(f"  t1_open_ features present:  {len(t1_open_cols)}")
 
-    # FIX 5: Pre-flight variance check — catches identical-probability root cause
-    # before the model runs so we get an actionable error message.
+    # Pre-flight: check variance across all relevant prefix groups
     key_indicators = [
         "t1_close_RSI_14", "t1_close_ATR_14", "t1_close_ADX_14",
-        "t1_close_Volume_Ratio", "t1_close_MACD_12_26_9",
-        f"{model_prefix}_RSI_14", f"{model_prefix}_ATR_14",
-        f"{model_prefix}_rsi_14", f"{model_prefix}_atr_14",
+        "t3_rsi_14",        "t3_atr_14",        "t3_adx_14",
+        "t3_volume_ratio",  "t1_close_Volume_Ratio",
     ]
     zero_var_indicators = []
     for col in key_indicators:
         if col in features_df.columns:
             col_data = pd.to_numeric(features_df[col], errors='coerce').dropna()
             std_val  = col_data.std() if len(col_data) > 1 else 0.0
-            logger.info(
-                f"  {col}: n={len(col_data)}, "
-                f"mean={col_data.mean():.2f}, "
-                f"std={std_val:.4f}"
-            )
+            logger.info(f"  {col}: n={len(col_data)}, mean={col_data.mean():.2f}, std={std_val:.4f}")
             if std_val < 1e-4 and len(col_data) > 5:
                 zero_var_indicators.append(col)
 
     if zero_var_indicators:
         logger.warning(
-            f"\n  ⚠️  ZERO-VARIANCE INDICATOR COLUMNS DETECTED: {zero_var_indicators}"
-            "\n      These columns are constant — model will output near-identical probabilities."
-            "\n      Root causes to check:"
-            "\n        1. Too few stocks in features_df (currently "
-            f"{len(features_df)}) — HV filters may be too tight"
-            "\n        2. TV screener returned no indicator columns (tradingview-scraper version)"
-            "\n        3. T-1 yfinance fetch produced no variance (all stocks similar intraday)"
-            "\n      → Run with --no-t1 to isolate whether T-1 or TV data is the culprit"
+            f"\n  ⚠️  ZERO-VARIANCE COLUMNS: {zero_var_indicators}"
+            "\n      Model will output near-identical probabilities for these features."
         )
     elif len(features_df) < 20:
         logger.warning(
-            f"\n  ⚠️  Only {len(features_df)} stocks in feature matrix."
-            "\n      With < 20 stocks there is not enough distribution for meaningful probabilities."
-            "\n      The HV / volume-ratio screener filters are almost certainly too tight."
-            "\n      Check ml_models/learned_filters.json and re-run:"
-            "\n        python ml_track_comprehensive_accuracy.py --filters-only"
+            f"\n  ⚠️  Only {len(features_df)} stocks — too few for a meaningful distribution."
         )
     else:
         logger.info(f"  ✅ Feature variance looks healthy ({len(features_df)} stocks)")
-
-    if len(model_cols) == 0:
-        logger.warning(
-            f"  ⚠️  NO {model_prefix}_ features in DataFrame. "
-            "Check that build_features_from_tv_data and fetch_t1_data_for_symbol "
-            "are producing keys with the correct prefix."
-        )
 
     # ── STEP 5: ML PREDICTION ─────────────────────────────────────────────────
     logger.info("\n" + "=" * 80)
@@ -1121,16 +1086,15 @@ def main():
         traceback.print_exc()
         return 1
 
-    # FIX 5: Post-prediction sanity check
     prob_std = predictions_df['explosion_probability'].std()
     if prob_std < 0.001 and len(predictions_df) > 5:
         logger.error(
             f"\n  ❌ POST-PREDICTION: prob_std={prob_std:.6f} — all probabilities identical."
             "\n     The model received uniform feature inputs."
-            "\n     Most likely fix: recompute learned_filters.json by running:"
-            "\n       python ml_track_comprehensive_accuracy.py --filters-only"
-            "\n     Then re-run. If the problem persists with > 100 stocks,"
-            "\n     the issue is in feature building (TV screener indicator columns absent)."
+            "\n     With fill_flat_prefixes enabled, this may mean the TV screener"
+            "\n     returned no indicator columns (only OHLCV). Check:"
+            "\n       1. tradingview-scraper version (needs >=0.4.19)"
+            "\n       2. Run --verbose to see which TV columns were returned"
         )
 
     # ── STEP 6: GAIN CORRECTION ───────────────────────────────────────────────
@@ -1188,26 +1152,22 @@ def main():
 
     logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
     logger.info("-" * 100)
-    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'Has Inds?'}")
+    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'t3_cols'}")
     logger.info("-" * 100)
 
     for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
         current_price = row.get('current_price', 0)
-        has_real_data = any(
-            k.startswith(f"{model_prefix}_RSI") or k.startswith(f"{model_prefix}_ATR")
-            for k in row.index
-            if pd.notna(row.get(k))
-        )
+        n_t3 = sum(1 for k in row.index if k.startswith("t3_") and pd.notna(row.get(k)))
         logger.info(
             f"{rank:<4} {row['symbol']:<8} {row['signal']:<13} "
             f"{row['explosion_probability']*100:>6.2f}%  "
             f"${current_price:>8.2f}  "
             f"${row.get('target_price', 0):>8.2f}  "
             f"+{row.get('target_gain_pct', 0):>5.1f}%"
-            f"  {'✓' if has_real_data else '—'}"
+            f"  t3={n_t3}"
         )
 
-    # ── STEP 8: STORE PREDICTIONS (FIX 3: upsert) ────────────────────────────
+    # ── STEP 8: STORE PREDICTIONS ─────────────────────────────────────────────
     logger.info("\n" + "=" * 80)
     logger.info("STEP 8: STORE PREDICTIONS")
     logger.info("=" * 80)
@@ -1227,7 +1187,7 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
-            'model_version':         f"{model_prefix}_v6",
+            'model_version':         f"{model_prefix}_v7",
         }
         for _, row in top_predictions.iterrows()
     ]
@@ -1250,7 +1210,7 @@ def main():
         'avg_probability':    float(predictions_df['explosion_probability'].mean()),
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
-        'model_version':      f"{model_prefix}_features_v6",
+        'model_version':      f"{model_prefix}_features_v7",
     }
     supabase.write_screening_log(screening_log)
 
@@ -1264,6 +1224,7 @@ def main():
     logger.info(f"  Stocks scored:      {len(predictions_df)}")
     logger.info(f"  Predictions stored: {len(predictions_list)}")
     logger.info(f"  Model prefix used:  {model_prefix}")
+    logger.info(f"  Hybrid model:       {hybrid}")
     logger.info(f"  Prob std:           {predictions_df['explosion_probability'].std():.4f}")
     logger.info(f"  Gain std:           {predictions_df['target_gain_pct'].std():.2f}%")
 
