@@ -15,6 +15,12 @@ FIXES vs previous version:
      giving near-0% for all stocks. Fixed to use yfinance prev_close like
      analyze_prediction_accuracy does.
 
+  3. HV filter over-aggressiveness: min_hv10/min_hv20 were derived from
+     winner p10 percentiles only, producing values like 56%+ that excluded
+     ~98% of the market at screen time. Added HARD_CAPS["max_min_hv10/20"]
+     and per-filter clamping in compute_model_driven_filters so the screener
+     always passes enough stocks for the ML model to rank.
+
 IMPROVEMENTS (carried from previous version):
 1. Finds most recent prediction date automatically
 2. Validates data exists before fetching
@@ -54,6 +60,8 @@ FILTER_LOOKBACK_DAYS = 90
 MIN_SAMPLES_FOR_FILTER = 20
 YFINANCE_MAX_WORKERS = 10
 
+INTRADAY_WIN_THRESHOLD = 15.0
+
 # FIX 1: Keys are now lowercase to match what load_feature_importance() produces
 # after stripping the t3_/t5_/t10_ prefix from lowercase model feature names.
 SCREENER_FEATURE_MAP = {
@@ -66,14 +74,21 @@ SCREENER_FEATURE_MAP = {
     "adx_14":       ("min_adx",         None),
 }
 
+# FIX 3: Hard caps prevent any single filter from excluding the bulk of the market.
+# Winners skew high-volatility; their p10 HV is already extreme relative to the
+# broader market. The ML model provides fine-grained discrimination — the screener
+# just needs to pass enough stocks for a real distribution to exist.
 HARD_CAPS = {
     "min_price":           0.50,
     "max_price":           500.0,
     "min_volume":          100_000,
     "min_relative_volume": 1.0,
+    # Never require HV > 30% at screen time (winner p10 can be 56%+)
+    "max_min_hv10":        30.0,
+    "max_min_hv20":        30.0,
+    # Never require vol_ratio > 3.0 at screen time
+    "max_min_volume_ratio": 3.0,
 }
-
-INTRADAY_WIN_THRESHOLD = 15.0
 
 
 def load_config(config_path: str) -> dict:
@@ -270,7 +285,6 @@ def load_feature_importance(path: Path, top_n: int = 30) -> list:
                     break
             if feat.startswith("t1_"):
                 continue
-            # FIX 1: normalize to lowercase so comparisons with SCREENER_FEATURE_MAP work
             feat_lower = feat.lower()
             if feat_lower not in seen:
                 seen.add(feat_lower)
@@ -348,7 +362,6 @@ def fetch_non_winner_t1_snapshots(client, lookback_days: int) -> pd.DataFrame:
 def _col_variants(base: str) -> list:
     """
     Return candidate column names for a base feature name.
-    Handles both the old short DB names and any normalized variants.
     base is already lowercase (normalized by load_feature_importance).
     """
     variants = [base, base.replace("_", "")]
@@ -382,7 +395,7 @@ def find_col(df: pd.DataFrame, base: str) -> Optional[str]:
 def compute_model_driven_filters(
     winner_df: pd.DataFrame,
     non_winner_df: pd.DataFrame,
-    top_features: list,      # already lowercase from load_feature_importance()
+    top_features: list,
     logger: logging.Logger,
 ) -> dict:
     filters = {}
@@ -394,11 +407,11 @@ def compute_model_driven_filters(
         )
         return _conservative_defaults()
 
-    # FIX 1: top_features is already lowercase; SCREENER_FEATURE_MAP keys are now
-    # also lowercase — comparison works correctly.
+    # FIX 1: top_features is already lowercase; SCREENER_FEATURE_MAP keys are also
+    # lowercase — comparison works correctly.
     top_features_set = set(top_features)
 
-    # Price range
+    # ── Price range ──────────────────────────────────────────────────────────
     price_col = find_col(winner_df, "close")
     if price_col:
         prices = pd.to_numeric(winner_df[price_col], errors="coerce").dropna()
@@ -413,7 +426,7 @@ def compute_model_driven_filters(
                 f"filters: ${filters['min_price']}–${filters['max_price']}"
             )
 
-    # Volume range
+    # ── Volume ───────────────────────────────────────────────────────────────
     vol_col = find_col(winner_df, "volume")
     if vol_col:
         vols = pd.to_numeric(winner_df[vol_col], errors="coerce").dropna()
@@ -428,9 +441,8 @@ def compute_model_driven_filters(
                 f"min_volume filter: {filters['min_volume']:,}"
             )
 
-    # Screener-relevant features — FIX 1 makes these actually work now
+    # ── Screener-relevant features ────────────────────────────────────────────
     for base_feat, (min_key, max_key) in SCREENER_FEATURE_MAP.items():
-        # base_feat is lowercase, top_features_set is lowercase — match works
         if base_feat not in top_features_set:
             logger.debug(f"  {base_feat}: not in top features, skipping")
             continue
@@ -447,6 +459,7 @@ def compute_model_driven_filters(
         p10_w = float(w_vals.quantile(LOWER_PCT / 100))
         p90_w = float(w_vals.quantile(UPPER_PCT / 100))
 
+        # ── Discriminativeness check ─────────────────────────────────────────
         discriminative = True
         if not non_winner_df.empty:
             nw_col = find_col(non_winner_df, base_feat)
@@ -461,11 +474,42 @@ def compute_model_driven_filters(
                             f"  {base_feat}: winner median {w_median:.2f} vs "
                             f"non-winner {nw_median:.2f} — not discriminative, skipping"
                         )
-
         if not discriminative:
             continue
 
-        filters[min_key] = round(p10_w, 4)
+        # ── FIX 3: Apply hard caps for HV and volume-ratio min filters ───────
+        # Winner-derived p10 for HV can be 56%+ which excludes most of the market.
+        # Cap so the screener remains a broad funnel; ML does the fine filtering.
+        min_val = round(p10_w, 4)
+
+        if min_key in ("min_hv10",):
+            cap = HARD_CAPS["max_min_hv10"]
+            if min_val > cap:
+                logger.info(
+                    f"  {base_feat}: raw p10={min_val:.2f} exceeds cap {cap} "
+                    f"→ clamping {min_key} to {cap}"
+                )
+                min_val = cap
+
+        elif min_key in ("min_hv20",):
+            cap = HARD_CAPS["max_min_hv20"]
+            if min_val > cap:
+                logger.info(
+                    f"  {base_feat}: raw p10={min_val:.2f} exceeds cap {cap} "
+                    f"→ clamping {min_key} to {cap}"
+                )
+                min_val = cap
+
+        elif min_key in ("min_volume_ratio", "min_relative_volume"):
+            cap = HARD_CAPS["max_min_volume_ratio"]
+            if min_val > cap:
+                logger.info(
+                    f"  {base_feat}: raw p10={min_val:.2f} exceeds cap {cap} "
+                    f"→ clamping {min_key} to {cap}"
+                )
+                min_val = cap
+
+        filters[min_key] = min_val
         if max_key and p90_w > p10_w:
             filters[max_key] = round(p90_w, 4)
 
@@ -475,13 +519,15 @@ def compute_model_driven_filters(
             + (f", {max_key}={filters.get(max_key)}" if max_key else "")
         )
 
-    # Relative volume
+    # ── Relative volume ───────────────────────────────────────────────────────
     rv_col = find_col(winner_df, "volume_ratio")
     if rv_col:
         rv_vals = pd.to_numeric(winner_df[rv_col], errors="coerce").dropna()
         if len(rv_vals) >= MIN_SAMPLES_FOR_FILTER:
             p10_rv = float(rv_vals.quantile(LOWER_PCT / 100))
             min_rv = max(HARD_CAPS["min_relative_volume"], round(p10_rv * 0.8, 2))
+            # FIX 3: cap so we don't exclude moderate-volume stocks
+            min_rv = min(min_rv, HARD_CAPS["max_min_volume_ratio"])
             filters["min_relative_volume"] = min_rv
             filters["min_volume_ratio"]    = min_rv
             logger.info(
@@ -644,7 +690,6 @@ class ComprehensiveAccuracyTracker:
                 winner_row   = winners_df[winners_df["symbol"] == symbol].iloc[0]
                 actual_gain  = float(winner_row["change_pct"])
                 actual_price = float(winner_row["price"])
-                # Prefer yfinance actual_high_pct — correct prev_close denominator
                 if yf_data.get("actual_high_pct") is not None:
                     actual_high_pct = yf_data["actual_high_pct"]
                 else:
@@ -758,7 +803,7 @@ class ComprehensiveAccuracyTracker:
         predictions_df: pd.DataFrame,
         winners_df: pd.DataFrame,
         check_date: str,
-        yfinance_gains: dict = None,   # FIX 2: added so we can use correct denominator
+        yfinance_gains: dict = None,
     ) -> list:
         self.logger.info("\n" + "=" * 60)
         self.logger.info("ANALYZING MISSED OPPORTUNITIES")
@@ -777,8 +822,7 @@ class ComprehensiveAccuracyTracker:
             winner_data  = winners_df[winners_df["symbol"] == symbol].iloc[0]
             actual_price = float(winner_data["price"])
 
-            # FIX 2: use yfinance actual_high_pct (prev_close denominator) when available.
-            # Fallback to same-day price only if yfinance has no data — and log a warning.
+            # FIX 2: use yfinance actual_high_pct (prev_close denominator) when available
             yf_data = yf.get(symbol, {})
             if yf_data.get("actual_high_pct") is not None:
                 actual_high_pct = yf_data["actual_high_pct"]
