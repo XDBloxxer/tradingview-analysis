@@ -104,39 +104,60 @@ class ExplosionPredictor:
         return self._model_feature_prefix
 
     def _detect_model_prefix(self) -> str:
-        """
-        Examine self.feature_names and return the dominant prefix group.
-        Called once after model load.
-        """
-        if not self.feature_names:
-            return "t1_close"
-
-        counts = {
-            "t1_close": sum(1 for f in self.feature_names if f.startswith("t1_close_")),
-            "t1_open":  sum(1 for f in self.feature_names if f.startswith("t1_open_")),
-            "t3":       sum(1 for f in self.feature_names if f.startswith("t3_")),
-            "t5":       sum(1 for f in self.feature_names if f.startswith("t5_")),
-            "t10":      sum(1 for f in self.feature_names if f.startswith("t10_")),
-        }
-
-        total = sum(counts.values())
-        if total == 0:
-            return "t1_close"
-
-        dominant = max(counts, key=counts.get)
-
-        # Log the breakdown so it's visible in logs
-        self.logger.info("Model feature prefix breakdown:")
-        for pfx, cnt in counts.items():
-            pct = cnt / total * 100 if total else 0
-            self.logger.info(f"  {pfx:12s}: {cnt:4d}  ({pct:.1f}%)")
-        self.logger.info(f"  → dominant prefix: '{dominant}' — screen script will use this")
-
-        # If the model has BOTH t1_close and t3 features (hybrid), prefer t1_close
-        if counts["t1_close"] > 0 and counts["t3"] > 0:
-            return "t1_close"
-
-        return dominant
+            """
+            Examine self.feature_names and return the dominant prefix group.
+            Called once after model load.
+    
+            FIX 6: The old hybrid guard `if counts["t1_close"] > 0 and counts["t3"] > 0`
+            always returned "t1_close" regardless of which group dominated.
+            For a model with 72% t3_ features this caused all t3_ columns to receive
+            default values at prediction time → identical probabilities.
+    
+            Now returns "t1_close" only when t1_ features genuinely dominate (>50%).
+            For hybrid models where t3/t5/t10 dominate, returns "t1_close" as the
+            *primary* prefix (T-1 data is freshest) but the screen script uses
+            _is_hybrid_model() to also populate flat prefixes.
+            """
+            if not self.feature_names:
+                return "t1_close"
+    
+            counts = {
+                "t1_close": sum(1 for f in self.feature_names if f.startswith("t1_close_")),
+                "t1_open":  sum(1 for f in self.feature_names if f.startswith("t1_open_")),
+                "t3":       sum(1 for f in self.feature_names if f.startswith("t3_")),
+                "t5":       sum(1 for f in self.feature_names if f.startswith("t5_")),
+                "t10":      sum(1 for f in self.feature_names if f.startswith("t10_")),
+            }
+    
+            total = sum(counts.values())
+            if total == 0:
+                return "t1_close"
+    
+            dominant = max(counts, key=counts.get)
+    
+            self.logger.info("Model feature prefix breakdown:")
+            for pfx, cnt in counts.items():
+                pct = cnt / total * 100 if total else 0
+                self.logger.info(f"  {pfx:12s}: {cnt:4d}  ({pct:.1f}%)")
+            self.logger.info(f"  → dominant prefix: '{dominant}' — screen script will use this")
+    
+            # For hybrid models (both t1_ and t3/t5/t10 features present),
+            # always return "t1_close" as the primary prefix — it represents the
+            # freshest signal and the screen script's T-1 yfinance fetch targets it.
+            # The screen script detects hybrid via _is_hybrid_model() and additionally
+            # fills t3_/t5_/t10_* columns from TV data so both groups get real values.
+            has_t1   = counts["t1_close"] > 0 or counts["t1_open"] > 0
+            has_flat = counts["t3"] > 0 or counts["t5"] > 0 or counts["t10"] > 0
+    
+            if has_t1 and has_flat:
+                self.logger.info(
+                    "  → HYBRID model detected (t1_ + t3/t5/t10 features). "
+                    "Returning 't1_close' as primary prefix. "
+                    "Screen script will also fill flat prefixes."
+                )
+                return "t1_close"
+    
+            return dominant
 
     # -------------------------------------------------------------------------
     # Model loading
@@ -745,3 +766,4 @@ class ExplosionPredictor:
         if probability >= 0.60: return 10.0
         if probability >= 0.50: return 7.0
         return 3.0
+
