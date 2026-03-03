@@ -38,6 +38,27 @@ class MLPredictionSupabaseClient:
         self.screening_log_table = "ml_screening_logs"
 
         self.logger.info("ML Supabase client initialized")
+    def write_predictions_upsert(self, predictions: list) -> int:
+        """
+        Upsert predictions — overwrites existing rows for the same
+        (symbol, prediction_date) instead of skipping them.
+        Fixes re-runs appearing to store 0 records.
+        """
+        if not predictions:
+            return 0
+        try:
+            sanitized = [self._sanitize_dict(p) for p in predictions]
+            response  = (
+                self.client.table(self.predictions_table)
+                .upsert(sanitized, on_conflict="symbol,prediction_date")
+                .execute()
+            )
+            count = len(response.data) if response.data else 0
+            self.logger.info(f"✓ Upserted {count} predictions")
+            return count
+        except Exception as e:
+            self.logger.error(f"Failed to upsert predictions: {e}", exc_info=True)
+            raise
 
     # ─────────────────────────────────────────────────────────────────────
     # Sanitisation helpers
@@ -365,3 +386,4 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Error reading daily winners: {e}")
             return pd.DataFrame()
+
