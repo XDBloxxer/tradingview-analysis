@@ -2,7 +2,7 @@
 """
 ML Stock Screener & Predictor
 
-FIXES IN THIS VERSION (2026-03-03 v7):
+FIXES IN THIS VERSION (2026-03-11 v8):
 
 FIX 1 — fetch_t1_data_for_symbol now computes real indicators from 5-min bars.
 
@@ -14,21 +14,31 @@ FIX 4 — SmartScreener._load_learned_filters clamps aggressive HV/vol-ratio min
 
 FIX 5 — Pre-flight and post-prediction variance diagnostics.
 
-FIX 6 (NEW) — Hybrid model prefix handling:
-  _detect_model_prefix() returned 't1_close' for HYBRID models (t3+t1) regardless
-  of which prefix dominated, because of an early-return guard:
-      if counts["t1_close"] > 0 and counts["t3"] > 0: return "t1_close"
-  For a model with 72% t3_ features and 28% t1_ features, TV screener data was
-  mapped entirely to t1_close_* columns, leaving all 291 t3_ features at their
-  defaults → identical probabilities for every stock.
+FIX 6 — Hybrid model prefix handling: TV screener data mapped to BOTH t1_close_*
+         AND t3_/t5_/t10_* columns.
 
-  Fix strategy for HYBRID models:
-    1. TV screener data is mapped to BOTH t1_close_* AND t3_* (lowercase) columns
-       so whichever prefix dominates in the model will receive real values.
-    2. The t3/t5/t10 columns are filled from the TV data using lowercase mapping
-       (matching how the base CSV training data was stored).
-    3. T-1 intraday yfinance data continues to fill t1_close_* / t1_open_* columns.
-  This means hybrid models now get real signal in all prefix groups simultaneously.
+FIX 7 (NEW) — t1_open_* features now reliably populated:
+  Previously, t1_open_* columns were only written when len(open_bars) >= 10.
+  On thin data days the open window (09:30–10:00) returned <10 bars, so all
+  t1_open_* features defaulted to 0/50 — cutting effective coverage to ~43%.
+
+  Fix strategy:
+    1. Compute open indicators from ALL bars up to 10:00 (not just the 09:30–10:00
+       slice). This gives many more bars to work with on all market days.
+    2. Lower the minimum bar threshold from 10 → 5 for the open snapshot.
+    3. When open_bars is still insufficient, copy t1_close_* values into
+       t1_open_* as a graceful fallback (same-day close indicators are a
+       reasonable proxy and far better than constant defaults).
+    4. Always emit t1_open_* keys so the model receives real values.
+
+FIX 8 (NEW) — Added missing indicators to _compute_indicators:
+  TSI, Keltner Channel, Donchian Channel, and VWAP were present in
+  intraday_data_collector.py but missing from fetch_t1_data_for_symbol's
+  inline _compute_indicators, causing t1_close_TSI_13_25_13,
+  t1_close_KCUe_20_2, t1_close_KCLe_20_2, t1_close_KCBe_20_2,
+  t1_close_DCU_20_20, t1_close_DCL_20_20, t1_close_DCM_20_20, and
+  t1_close_VWAP to always be missing.
+  Also added ATR slope (t1_close_ATR_14_Slope).
 """
 
 import argparse
@@ -132,9 +142,11 @@ SCREENER_HV_MIN_CAP    = 30.0
 SCREENER_VOL_RATIO_CAP = 2.5
 
 # FIX 6: All flat-bar prefixes used by the base CSV training data.
-# TV screener features are mapped to ALL of these for hybrid models so
-# whichever prefix group dominates in the model gets real values.
 _FLAT_PREFIXES = ("t3", "t5", "t10")
+
+# FIX 7: Minimum bars needed for open-window indicator calculation.
+# Lowered from 10 → 5 so thin early-session data still produces real indicators.
+T1_OPEN_MIN_BARS = 5
 
 
 def _uses_lowercase(prefix: str) -> bool:
@@ -442,12 +454,7 @@ def build_features_from_tv_data(
 
     FIX 6: For hybrid models (t3+t1), `fill_flat_prefixes=True` causes this
     function to ALSO write the same values into t3_/t5_/t10_ columns (lowercase),
-    which is the format the base CSV training data used. Without this, a hybrid
-    model with 72% t3_ features receives all-default values for those features
-    and outputs identical probabilities for every stock.
-
-    The t1_close_ columns are still populated as before; T-1 intraday data from
-    yfinance will overwrite them with per-stock computed indicators in Step 3.
+    which is the format the base CSV training data used.
     """
     result = {
         "symbol":   symbol,
@@ -487,8 +494,7 @@ def build_features_from_tv_data(
         # Always write to the primary model prefix (e.g. t1_close_RSI_14)
         _write(feature_prefix, model_name, fval)
 
-        # FIX 6: For hybrid models, also fill t3_/t5_/t10_ with the same value.
-        # These use lowercase column names matching the base CSV training format.
+        # FIX 6: For hybrid models, also fill t3_/t5_/t10_* columns.
         if fill_flat_prefixes:
             for flat_pfx in _FLAT_PREFIXES:
                 _write(flat_pfx, model_name, fval)
@@ -533,13 +539,241 @@ def build_features_from_tv_data(
 
 
 # ---------------------------------------------------------------------------
-# T-1 intraday indicator fetch
+# T-1 intraday indicator computation
 # ---------------------------------------------------------------------------
+
+def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
+                         v: pd.Series, o: pd.Series) -> dict:
+    """
+    Compute comprehensive technical indicators from OHLCV series.
+
+    FIX 8: Added TSI, Keltner Channel, Donchian Channel, VWAP, and ATR slope
+    to match the full indicator set computed by intraday_data_collector.py.
+    These were missing from the previous inline version, causing ~10 model
+    features to always be filled with defaults.
+    """
+    ind = {}
+
+    def safe(series, default=0.0):
+        try:
+            val = float(series.iloc[-1])
+            return default if (np.isnan(val) or np.isinf(val)) else val
+        except Exception:
+            return default
+
+    ind["close"]  = float(c.iloc[-1])
+    ind["open"]   = float(o.iloc[0])
+    ind["high"]   = float(h.max())
+    ind["low"]    = float(l.min())
+    ind["volume"] = float(v.sum())
+    close_v = ind["close"]
+
+    # ── RSI (multiple periods) ──────────────────────────────────────────────
+    delta = c.diff()
+    gain  = delta.clip(lower=0)
+    loss  = (-delta.clip(upper=0))
+    for period, col_name in [(7, "rsi7"), (14, "rsi"), (21, "rsi21"), (28, "rsi28")]:
+        ag = gain.ewm(com=period - 1, min_periods=period).mean()
+        al = loss.ewm(com=period - 1, min_periods=period).mean()
+        rs = ag / al.replace(0, np.nan)
+        ind[col_name] = safe(100 - (100 / (1 + rs)), 50.0)
+    ind["rsi[1]"] = ind["rsi"]
+
+    # ── MACD ───────────────────────────────────────────────────────────────
+    ema12     = c.ewm(span=12, adjust=False).mean()
+    ema26     = c.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
+    ind["macd.macd"]   = safe(macd_line)
+    ind["macd.signal"] = safe(macd_sig)
+    ind["macd_diff"]   = safe(macd_line - macd_sig)
+
+    # ── Moving averages ─────────────────────────────────────────────────────
+    for n in [5, 10, 12, 20, 26, 50]:
+        ind[f"ema{n}"] = safe(c.ewm(span=n, adjust=False).mean(), float(c.mean()))
+    for n in [5, 10, 20, 50]:
+        ind[f"sma{n}"] = safe(c.rolling(n).mean(), float(c.mean()))
+
+    sma20_v = ind.get("sma20") or float(c.mean())
+    ema20_v = ind.get("ema20") or float(c.mean())
+    ema10_v = ind.get("ema10") or float(c.mean())
+    ema12_v = ind.get("ema12") or float(c.mean())
+    ema26_v = ind.get("ema26") or float(c.mean())
+
+    if sma20_v: ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100
+    if ema20_v: ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100
+    ind["ema_12_26_diff"] = ema12_v - ema26_v
+    ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
+
+    # ── Stochastic ─────────────────────────────────────────────────────────
+    lo14  = l.rolling(14).min()
+    hi14  = h.rolling(14).max()
+    rng14 = (hi14 - lo14).replace(0, np.nan)
+    stk   = (100 * (c - lo14) / rng14).rolling(3).mean()
+    std   = stk.rolling(3).mean()
+    ind["stoch.k"]    = safe(stk, 50.0)
+    ind["stoch.d"]    = safe(std, 50.0)
+    ind["stoch.k[1]"] = ind["stoch.k"]
+    ind["stoch.d[1]"] = ind["stoch.d"]
+    ind["w.r"]        = safe(-100 * (hi14 - c) / rng14, -50.0)
+
+    # ── ATR ────────────────────────────────────────────────────────────────
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs(),
+    ], axis=1).max(axis=1)
+    for period, col_name in [(7, "atr7"), (14, "atr"), (20, "atr20")]:
+        ind[col_name] = safe(tr.rolling(period).mean(), 0.5)
+
+    # FIX 8: ATR slope (rate of change of ATR over last 5 bars)
+    atr14_series = tr.rolling(14).mean()
+    if len(atr14_series.dropna()) >= 6:
+        atr_slope = atr14_series.diff(5)
+        ind["atr_pct"] = safe(atr_slope, 0.0)   # maps to ATR_14_Slope via t1_column_map
+    else:
+        ind["atr_pct"] = 0.0
+
+    # ── ADX / DMI ──────────────────────────────────────────────────────────
+    up_move = h.diff()
+    dn_move = -l.diff()
+    pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
+    ndm = pd.Series(np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0), index=c.index)
+    atr14 = tr.rolling(14).mean().replace(0, np.nan)
+    pdi   = 100 * pdm.rolling(14).mean() / atr14
+    ndi   = 100 * ndm.rolling(14).mean() / atr14
+    dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
+    ind["adx"]    = safe(dx.rolling(14).mean(), 20.0)
+    ind["adx+di"] = safe(pdi, 20.0)
+    ind["adx-di"] = safe(ndi, 20.0)
+
+    # ── Bollinger Bands ────────────────────────────────────────────────────
+    bb_mid = c.rolling(20).mean()
+    bb_std = c.rolling(20).std()
+    bb_up  = bb_mid + 2 * bb_std
+    bb_lo  = bb_mid - 2 * bb_std
+    ind["bb.upper"]  = safe(bb_up,  close_v)
+    ind["bb.lower"]  = safe(bb_lo,  close_v)
+    ind["bb.middle"] = safe(bb_mid, close_v)
+    ind["bb_width"]  = safe((bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0)
+    ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
+
+    # FIX 8: Keltner Channel
+    kc_mid  = c.ewm(span=20, adjust=False).mean()
+    kc_atr  = tr.rolling(10).mean()
+    kc_mult = 2.0
+    ind["keltner_upper"]  = safe(kc_mid + kc_mult * kc_atr, close_v)
+    ind["keltner_lower"]  = safe(kc_mid - kc_mult * kc_atr, close_v)
+    ind["keltner_middle"] = safe(kc_mid, close_v)
+
+    # FIX 8: Donchian Channel (20-period)
+    dc_up  = h.rolling(20).max()
+    dc_lo  = l.rolling(20).min()
+    dc_mid = (dc_up + dc_lo) / 2
+    ind["donchian_upper"]  = safe(dc_up,  close_v)
+    ind["donchian_lower"]  = safe(dc_lo,  close_v)
+    ind["donchian_middle"] = safe(dc_mid, close_v)
+
+    # ── Volume ─────────────────────────────────────────────────────────────
+    vm5  = v.rolling(5).mean()
+    vm10 = v.rolling(10).mean()
+    vm20 = v.rolling(20).mean()
+    ind["volume_sma5"]  = safe(vm5,  float(v.mean()))
+    ind["volume_sma10"] = safe(vm10, float(v.mean()))
+    ind["volume_sma20"] = safe(vm20, float(v.mean()))
+    ind["volume_ratio"] = safe(v / vm20.replace(0, np.nan), 1.0)
+
+    # ── OBV ────────────────────────────────────────────────────────────────
+    obv_vals = [0.0]
+    c_arr, v_arr = c.values, v.values
+    for i in range(1, len(c_arr)):
+        if   c_arr[i] > c_arr[i - 1]: obv_vals.append(obv_vals[-1] + v_arr[i])
+        elif c_arr[i] < c_arr[i - 1]: obv_vals.append(obv_vals[-1] - v_arr[i])
+        else:                          obv_vals.append(obv_vals[-1])
+    ind["obv"] = float(obv_vals[-1])
+
+    # ── CMF ────────────────────────────────────────────────────────────────
+    mf_mult   = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    ind["cmf"] = safe(mf_mult * v / v.rolling(20).sum().replace(0, np.nan), 0.0)
+
+    # ── CCI ────────────────────────────────────────────────────────────────
+    tp    = (h + l + c) / 3
+    tp_ma = tp.rolling(20).mean()
+    tp_md = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    ind["cci20"] = safe((tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan)), 0.0)
+
+    # ── AO / MOM / ROC ─────────────────────────────────────────────────────
+    ind["ao"]  = safe((h + l).rolling(5).mean() / 2 - (h + l).rolling(34).mean() / 2, 0.0)
+    ind["mom"] = safe(c.diff(10), 0.0)
+    ind["roc"] = safe(c.pct_change(10) * 100, 0.0)
+
+    # FIX 8: TSI (True Strength Index)
+    pc        = c.diff(1)
+    double_smooth_pc  = pc.ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    double_smooth_apc = pc.abs().ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    tsi_denom = double_smooth_apc.replace(0, np.nan)
+    tsi_series = 100 * double_smooth_pc / tsi_denom
+    ind["tsi"]       = safe(tsi_series, 0.0)
+    ind["kst"]       = ind["tsi"]   # kst maps to TSIs_13_25_13 in t1_column_map
+
+    # ── Ultimate Oscillator ────────────────────────────────────────────────
+    bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
+    tr_u = (pd.concat([h, c.shift()], axis=1).max(axis=1)
+            - pd.concat([l, c.shift()], axis=1).min(axis=1))
+    a7  = bp.rolling(7).sum()  / tr_u.rolling(7).sum().replace(0, np.nan)
+    a14 = bp.rolling(14).sum() / tr_u.rolling(14).sum().replace(0, np.nan)
+    a28 = bp.rolling(28).sum() / tr_u.rolling(28).sum().replace(0, np.nan)
+    ind["uo"] = safe(100 * (4 * a7 + 2 * a14 + a28) / 7, 50.0)
+
+    # ── Volatility (annualised HV) ─────────────────────────────────────────
+    log_ret = np.log(c / c.shift(1))
+    for hv_w, col_name in [(10, "volatility_10d"), (20, "volatility_20d"), (30, "volatility_30d")]:
+        ind[col_name] = safe(log_ret.rolling(hv_w).std() * np.sqrt(252 * 78) * 100, 0.0)
+
+    # ── Price changes ──────────────────────────────────────────────────────
+    for n, col_name in [(1, "price_change_1d"), (2, "price_change_2d"),
+                         (3, "price_change_3d"), (5, "price_change_5d")]:
+        if len(c) > n:
+            prev = float(c.iloc[-(n + 1)])
+            ind[col_name] = ((close_v / prev) - 1) * 100 if prev else 0.0
+
+    # ── Gap ────────────────────────────────────────────────────────────────
+    if len(c) > 1:
+        prev_bar = float(c.iloc[-2])
+        if prev_bar:
+            ind["gap_%"] = (float(o.iloc[0]) / prev_bar - 1) * 100
+
+    # ── Aroon ──────────────────────────────────────────────────────────────
+    if len(h) >= 26:
+        hi_idx = h.rolling(26).apply(lambda x: float(np.argmax(x)), raw=True)
+        lo_idx = l.rolling(26).apply(lambda x: float(np.argmin(x)), raw=True)
+        ind["aroon_up"]        = safe(hi_idx / 25 * 100, 50.0)
+        ind["aroon_down"]      = safe(lo_idx / 25 * 100, 50.0)
+        ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
+
+    # FIX 8: VWAP (cumulative for the session)
+    try:
+        tp_vwap = (h + l + c) / 3
+        # Use cumsum over the entire window — best approximation without session boundary
+        cum_vol = v.cumsum().replace(0, np.nan)
+        vwap_series = (tp_vwap * v).cumsum() / cum_vol
+        ind["vwap"] = safe(vwap_series, close_v)
+    except Exception:
+        ind["vwap"] = close_v
+
+    return ind
+
 
 def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
     """
     Fetch T-1 intraday 5-min data and compute technical indicators.
     Returns dict with t1_close_* and t1_open_* keys ready for model input.
+
+    FIX 7: t1_open_* features are now always populated:
+      - Minimum bar threshold lowered from 10 → T1_OPEN_MIN_BARS (5)
+      - Open window extended to include all bars up to 10:30 for better coverage
+      - Fallback: if open_bars still too few, copy t1_close_* → t1_open_*
+        so the model receives real same-day values instead of constant defaults
     """
     try:
         import yfinance as yf
@@ -577,174 +811,38 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
 
         day_bars.columns = [c.lower() for c in day_bars.columns]
 
-        def _compute_indicators(c, h, l, v, o) -> dict:
-            ind = {}
-
-            def safe(series, default=0.0):
-                try:
-                    val = float(series.iloc[-1])
-                    return default if (np.isnan(val) or np.isinf(val)) else val
-                except Exception:
-                    return default
-
-            ind["close"]  = float(c.iloc[-1])
-            ind["open"]   = float(o.iloc[0])
-            ind["high"]   = float(h.max())
-            ind["low"]    = float(l.min())
-            ind["volume"] = float(v.sum())
-            close_v = ind["close"]
-
-            delta = c.diff()
-            gain  = delta.clip(lower=0)
-            loss  = (-delta.clip(upper=0))
-            for period, col_name in [(7, "rsi7"), (14, "rsi"), (21, "rsi21"), (28, "rsi28")]:
-                ag = gain.ewm(com=period - 1, min_periods=period).mean()
-                al = loss.ewm(com=period - 1, min_periods=period).mean()
-                rs = ag / al.replace(0, np.nan)
-                ind[col_name] = safe(100 - (100 / (1 + rs)), 50.0)
-            ind["rsi[1]"] = ind["rsi"]
-
-            ema12     = c.ewm(span=12, adjust=False).mean()
-            ema26     = c.ewm(span=26, adjust=False).mean()
-            macd_line = ema12 - ema26
-            macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
-            ind["macd.macd"]   = safe(macd_line)
-            ind["macd.signal"] = safe(macd_sig)
-            ind["macd_diff"]   = safe(macd_line - macd_sig)
-
-            for n in [5, 10, 12, 20, 26, 50]:
-                ind[f"ema{n}"] = safe(c.ewm(span=n, adjust=False).mean(), float(c.mean()))
-            for n in [5, 10, 20, 50]:
-                ind[f"sma{n}"] = safe(c.rolling(n).mean(), float(c.mean()))
-
-            sma20_v = ind.get("sma20") or float(c.mean())
-            ema20_v = ind.get("ema20") or float(c.mean())
-            ema10_v = ind.get("ema10") or float(c.mean())
-            ema12_v = ind.get("ema12") or float(c.mean())
-            ema26_v = ind.get("ema26") or float(c.mean())
-
-            if sma20_v: ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100
-            if ema20_v: ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100
-            ind["ema_12_26_diff"] = ema12_v - ema26_v
-            ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
-
-            lo14  = l.rolling(14).min()
-            hi14  = h.rolling(14).max()
-            rng14 = (hi14 - lo14).replace(0, np.nan)
-            stk   = (100 * (c - lo14) / rng14).rolling(3).mean()
-            std   = stk.rolling(3).mean()
-            ind["stoch.k"]    = safe(stk, 50.0)
-            ind["stoch.d"]    = safe(std, 50.0)
-            ind["stoch.k[1]"] = ind["stoch.k"]
-            ind["stoch.d[1]"] = ind["stoch.d"]
-            ind["w.r"]        = safe(-100 * (hi14 - c) / rng14, -50.0)
-
-            tr = pd.concat([
-                h - l,
-                (h - c.shift()).abs(),
-                (l - c.shift()).abs(),
-            ], axis=1).max(axis=1)
-            for period, col_name in [(7, "atr7"), (14, "atr"), (20, "atr20")]:
-                ind[col_name] = safe(tr.rolling(period).mean(), 0.5)
-
-            up_move = h.diff()
-            dn_move = -l.diff()
-            pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
-            ndm = pd.Series(np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0), index=c.index)
-            atr14 = tr.rolling(14).mean().replace(0, np.nan)
-            pdi   = 100 * pdm.rolling(14).mean() / atr14
-            ndi   = 100 * ndm.rolling(14).mean() / atr14
-            dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
-            ind["adx"]    = safe(dx.rolling(14).mean(), 20.0)
-            ind["adx+di"] = safe(pdi, 20.0)
-            ind["adx-di"] = safe(ndi, 20.0)
-
-            bb_mid = c.rolling(20).mean()
-            bb_std = c.rolling(20).std()
-            bb_up  = bb_mid + 2 * bb_std
-            bb_lo  = bb_mid - 2 * bb_std
-            ind["bb.upper"]  = safe(bb_up,  close_v)
-            ind["bb.lower"]  = safe(bb_lo,  close_v)
-            ind["bb.middle"] = safe(bb_mid, close_v)
-            ind["bb_width"]  = safe((bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0)
-            ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
-
-            vm5  = v.rolling(5).mean()
-            vm10 = v.rolling(10).mean()
-            vm20 = v.rolling(20).mean()
-            ind["volume_sma5"]  = safe(vm5,  float(v.mean()))
-            ind["volume_sma10"] = safe(vm10, float(v.mean()))
-            ind["volume_sma20"] = safe(vm20, float(v.mean()))
-            ind["volume_ratio"] = safe(v / vm20.replace(0, np.nan), 1.0)
-
-            obv_vals = [0.0]
-            c_arr, v_arr = c.values, v.values
-            for i in range(1, len(c_arr)):
-                if   c_arr[i] > c_arr[i - 1]: obv_vals.append(obv_vals[-1] + v_arr[i])
-                elif c_arr[i] < c_arr[i - 1]: obv_vals.append(obv_vals[-1] - v_arr[i])
-                else:                          obv_vals.append(obv_vals[-1])
-            ind["obv"] = float(obv_vals[-1])
-
-            mf_mult   = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
-            ind["cmf"] = safe(mf_mult * v / v.rolling(20).sum().replace(0, np.nan), 0.0)
-
-            tp    = (h + l + c) / 3
-            tp_ma = tp.rolling(20).mean()
-            tp_md = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
-            ind["cci20"] = safe((tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan)), 0.0)
-
-            ind["ao"]  = safe((h + l).rolling(5).mean() / 2 - (h + l).rolling(34).mean() / 2, 0.0)
-            ind["mom"] = safe(c.diff(10), 0.0)
-            ind["roc"] = safe(c.pct_change(10) * 100, 0.0)
-
-            log_ret = np.log(c / c.shift(1))
-            for hv_w, col_name in [(10, "volatility_10d"), (20, "volatility_20d"), (30, "volatility_30d")]:
-                ind[col_name] = safe(log_ret.rolling(hv_w).std() * np.sqrt(252 * 78) * 100, 0.0)
-
-            for n, col_name in [(1, "price_change_1d"), (2, "price_change_2d"),
-                                 (3, "price_change_3d"), (5, "price_change_5d")]:
-                if len(c) > n:
-                    prev = float(c.iloc[-(n + 1)])
-                    ind[col_name] = ((close_v / prev) - 1) * 100 if prev else 0.0
-
-            if len(c) > 1:
-                prev_bar = float(c.iloc[-2])
-                if prev_bar:
-                    ind["gap_%"] = (float(o.iloc[0]) / prev_bar - 1) * 100
-
-            if len(h) >= 26:
-                hi_idx = h.rolling(26).apply(lambda x: float(np.argmax(x)), raw=True)
-                lo_idx = l.rolling(26).apply(lambda x: float(np.argmin(x)), raw=True)
-                ind["aroon_up"]        = safe(hi_idx / 25 * 100, 50.0)
-                ind["aroon_down"]      = safe(lo_idx / 25 * 100, 50.0)
-                ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
-
-            bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
-            tr_u = (pd.concat([h, c.shift()], axis=1).max(axis=1)
-                    - pd.concat([l, c.shift()], axis=1).min(axis=1))
-            a7  = bp.rolling(7).sum()  / tr_u.rolling(7).sum().replace(0, np.nan)
-            a14 = bp.rolling(14).sum() / tr_u.rolling(14).sum().replace(0, np.nan)
-            a28 = bp.rolling(28).sum() / tr_u.rolling(28).sum().replace(0, np.nan)
-            ind["uo"] = safe(100 * (4 * a7 + 2 * a14 + a28) / 7, 50.0)
-
-            return ind
-
+        # ── Close-of-day indicators (full session) ────────────────────────
         close_indicators = _compute_indicators(
             day_bars["close"], day_bars["high"], day_bars["low"],
             day_bars["volume"], day_bars["open"]
         )
 
-        open_bars = day_bars[day_bars.index.time <= dt_time(10, 0)]
-        open_indicators = {}
-        if len(open_bars) >= 10:
+        # ── Open indicators (first ~1 hour of session) ─────────────────────
+        # FIX 7: Use bars up to 10:30 instead of just 09:30–10:00 to get
+        # more bars for stable indicator calculation. Lower threshold to 5.
+        open_bars = day_bars[day_bars.index.time <= dt_time(10, 30)]
+
+        open_indicators: dict = {}
+        if len(open_bars) >= T1_OPEN_MIN_BARS:
             open_indicators = _compute_indicators(
                 open_bars["close"], open_bars["high"], open_bars["low"],
                 open_bars["volume"], open_bars["open"]
             )
+            logger.debug(f"{symbol}: computed open indicators from {len(open_bars)} bars")
+        else:
+            # FIX 7: Graceful fallback — use close indicators for open window.
+            # This is far better than constant defaults (50 for RSI, 0 for momentum, etc.)
+            # and correctly reflects the day-prior state the model was trained to see.
+            logger.debug(
+                f"{symbol}: only {len(open_bars)} open bars (< {T1_OPEN_MIN_BARS}), "
+                "copying close indicators as open fallback"
+            )
+            open_indicators = dict(close_indicators)
 
         result = {}
 
         if _t1_map_available:
+            # ── Rename and write t1_close_* ────────────────────────────────
             close_df      = pd.DataFrame([close_indicators])
             close_renamed = _rename(close_df, prefix="t1_close")
             for col in close_renamed.columns:
@@ -755,21 +853,32 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
                     except (TypeError, ValueError):
                         pass
 
-            if open_indicators:
-                open_df      = pd.DataFrame([open_indicators])
-                open_renamed = _rename(open_df, prefix="t1_open")
-                for col in open_renamed.columns:
-                    val = open_renamed.iloc[0][col]
-                    if pd.notna(val) and col not in result:
-                        try:
-                            result[col] = float(val)
-                        except (TypeError, ValueError):
-                            pass
+            # ── Rename and write t1_open_* ─────────────────────────────────
+            # FIX 7: Write t1_open_* unconditionally (either real open data
+            # or the close-based fallback). No longer gated on col not in result,
+            # since t1_close_* and t1_open_* have different prefixes and never collide.
+            open_df      = pd.DataFrame([open_indicators])
+            open_renamed = _rename(open_df, prefix="t1_open")
+            for col in open_renamed.columns:
+                val = open_renamed.iloc[0][col]
+                if pd.notna(val):
+                    try:
+                        result[col] = float(val)
+                    except (TypeError, ValueError):
+                        pass
+
         else:
+            # No column map — write raw indicator names with prefixes
             for k, val in close_indicators.items():
                 result[f"t1_close_{k}"] = val
             for k, val in open_indicators.items():
-                result.setdefault(f"t1_open_{k}", val)
+                result[f"t1_open_{k}"] = val
+
+        t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
+        t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
+        logger.debug(
+            f"{symbol}: t1_close_* = {t1_close_count}, t1_open_* = {t1_open_count}"
+        )
 
         return result
 
@@ -891,9 +1000,6 @@ def main():
         return 1
 
     # FIX 6: Detect hybrid model and set fill_flat_prefixes accordingly.
-    # model_feature_prefix still returns 't1_close' for hybrid models (by design,
-    # since T-1 data is the freshest signal), but we ALSO need to populate t3_
-    # columns so the model's dominant feature group gets real values.
     model_prefix       = predictor.model_feature_prefix
     hybrid             = _is_hybrid_model(predictor)
     fill_flat_prefixes = hybrid
@@ -1016,13 +1122,21 @@ def main():
             if sym in t1_map:
                 stock.update(t1_map[sym])
 
+        # Coverage report: show both t1_close and t1_open counts
         sample = next((s for s in enriched_stocks if s["symbol"] in t1_map), None)
         if sample:
+            t1c = sum(1 for k in sample if k.startswith("t1_close_"))
+            t1o = sum(1 for k in sample if k.startswith("t1_open_"))
             logger.info(
                 f"  Sample ({sample['symbol']}): "
-                f"t1_close_RSI_14={sample.get('t1_close_RSI_14', 'MISSING')}, "
-                f"t1_close_ATR_14={sample.get('t1_close_ATR_14', 'MISSING')}"
+                f"t1_close_* = {t1c} features, "
+                f"t1_open_* = {t1o} features"
             )
+            if t1o == 0:
+                logger.warning(
+                    "  ⚠️  t1_open_* still 0 — check that t1_column_map.py is present "
+                    "alongside this script."
+                )
 
         logger.info(f"✓ T-1 indicator enrichment: {t1_count}/{len(top_200)} stocks")
     else:
@@ -1046,6 +1160,8 @@ def main():
     # Pre-flight: check variance across all relevant prefix groups
     key_indicators = [
         "t1_close_RSI_14", "t1_close_ATR_14", "t1_close_ADX_14",
+        "t1_close_TSI_13_25_13", "t1_close_KCUe_20_2", "t1_close_VWAP",
+        "t1_open_RSI_14",  "t1_open_ATR_14",  "t1_open_ADX_14",
         "t3_rsi_14",        "t3_atr_14",        "t3_adx_14",
         "t3_volume_ratio",  "t1_close_Volume_Ratio",
     ]
@@ -1187,7 +1303,7 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
-            'model_version':         f"{model_prefix}_v7",
+            'model_version':         f"{model_prefix}_v8",
         }
         for _, row in top_predictions.iterrows()
     ]
@@ -1210,7 +1326,7 @@ def main():
         'avg_probability':    float(predictions_df['explosion_probability'].mean()),
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
-        'model_version':      f"{model_prefix}_features_v7",
+        'model_version':      f"{model_prefix}_features_v8",
     }
     supabase.write_screening_log(screening_log)
 
