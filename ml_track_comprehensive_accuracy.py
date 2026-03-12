@@ -21,6 +21,12 @@ FIXES vs previous version:
      and per-filter clamping in compute_model_driven_filters so the screener
      always passes enough stocks for the ML model to rank.
 
+  4. (NEW) KeyError 'symbol' crash when winners_df is empty for the check
+     date (e.g. a date with predictions but no recorded winners yet).
+     analyze_prediction_accuracy now guards winners_set construction with an
+     empty-DataFrame check so the script completes and writes accuracy records
+     even when winners data is absent.
+
 IMPROVEMENTS (carried from previous version):
 1. Finds most recent prediction date automatically
 2. Validates data exists before fetching
@@ -75,18 +81,13 @@ SCREENER_FEATURE_MAP = {
 }
 
 # FIX 3: Hard caps prevent any single filter from excluding the bulk of the market.
-# Winners skew high-volatility; their p10 HV is already extreme relative to the
-# broader market. The ML model provides fine-grained discrimination — the screener
-# just needs to pass enough stocks for a real distribution to exist.
 HARD_CAPS = {
     "min_price":           0.50,
     "max_price":           500.0,
     "min_volume":          100_000,
     "min_relative_volume": 1.0,
-    # Never require HV > 30% at screen time (winner p10 can be 56%+)
     "max_min_hv10":        30.0,
     "max_min_hv20":        30.0,
-    # Never require vol_ratio > 3.0 at screen time
     "max_min_volume_ratio": 3.0,
 }
 
@@ -407,8 +408,6 @@ def compute_model_driven_filters(
         )
         return _conservative_defaults()
 
-    # FIX 1: top_features is already lowercase; SCREENER_FEATURE_MAP keys are also
-    # lowercase — comparison works correctly.
     top_features_set = set(top_features)
 
     # ── Price range ──────────────────────────────────────────────────────────
@@ -477,9 +476,7 @@ def compute_model_driven_filters(
         if not discriminative:
             continue
 
-        # ── FIX 3: Apply hard caps for HV and volume-ratio min filters ───────
-        # Winner-derived p10 for HV can be 56%+ which excludes most of the market.
-        # Cap so the screener remains a broad funnel; ML does the fine filtering.
+        # ── FIX 3: Apply hard caps ───────────────────────────────────────────
         min_val = round(p10_w, 4)
 
         if min_key in ("min_hv10",):
@@ -526,7 +523,6 @@ def compute_model_driven_filters(
         if len(rv_vals) >= MIN_SAMPLES_FOR_FILTER:
             p10_rv = float(rv_vals.quantile(LOWER_PCT / 100))
             min_rv = max(HARD_CAPS["min_relative_volume"], round(p10_rv * 0.8, 2))
-            # FIX 3: cap so we don't exclude moderate-volume stocks
             min_rv = min(min_rv, HARD_CAPS["max_min_volume_ratio"])
             filters["min_relative_volume"] = min_rv
             filters["min_volume_ratio"]    = min_rv
@@ -664,7 +660,24 @@ class ComprehensiveAccuracyTracker:
         if not winners_df.empty:
             self.logger.info(f"Winner columns: {winners_df.columns.tolist()}")
 
-        winners_set = set(winners_df["symbol"].tolist())
+        # ── FIX 4: Guard against empty winners_df before building winners_set ──
+        # Previously: winners_set = set(winners_df["symbol"].tolist())
+        # This crashed with KeyError when winners_df was empty (e.g. a weekend
+        # date or a date where the daily_winners table had no rows yet).
+        if not winners_df.empty and "symbol" in winners_df.columns:
+            winners_set = set(winners_df["symbol"].tolist())
+        else:
+            winners_set = set()
+            if winners_df.empty:
+                self.logger.warning(
+                    "winners_df is empty — all predictions will be scored as "
+                    "non-winners. Run again after daily_winners is populated."
+                )
+            else:
+                self.logger.warning(
+                    "winners_df has no 'symbol' column — cannot match winners. "
+                    f"Available columns: {winners_df.columns.tolist()}"
+                )
 
         yf_populated = sum(
             1 for r in yfinance_gains.values()
@@ -808,6 +821,11 @@ class ComprehensiveAccuracyTracker:
         self.logger.info("\n" + "=" * 60)
         self.logger.info("ANALYZING MISSED OPPORTUNITIES")
         self.logger.info("=" * 60)
+
+        # Guard: if winners_df is empty or missing symbol column, nothing to compare
+        if winners_df.empty or "symbol" not in winners_df.columns:
+            self.logger.info("No winner data available — skipping missed opportunity analysis.")
+            return []
 
         predicted_symbols = set(predictions_df["symbol"].tolist())
         winner_symbols    = set(winners_df["symbol"].tolist())
@@ -971,7 +989,6 @@ def main():
         predictions_df, winners_df, yfinance_gains
     )
 
-    # FIX 2: pass yfinance_gains so missed opps get correct actual_high_pct
     missed_records = tracker.analyze_missed_opportunities(
         predictions_df, winners_df, check_date,
         yfinance_gains=yfinance_gains,
