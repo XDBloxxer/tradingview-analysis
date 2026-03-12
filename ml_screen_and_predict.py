@@ -2,7 +2,7 @@
 """
 ML Stock Screener & Predictor
 
-FIXES IN THIS VERSION (2026-03-11 v8):
+FIXES IN THIS VERSION (2026-03-12 v9):
 
 FIX 1 — fetch_t1_data_for_symbol now computes real indicators from 5-min bars.
 
@@ -17,28 +17,27 @@ FIX 5 — Pre-flight and post-prediction variance diagnostics.
 FIX 6 — Hybrid model prefix handling: TV screener data mapped to BOTH t1_close_*
          AND t3_/t5_/t10_* columns.
 
-FIX 7 (NEW) — t1_open_* features now reliably populated:
-  Previously, t1_open_* columns were only written when len(open_bars) >= 10.
-  On thin data days the open window (09:30–10:00) returned <10 bars, so all
-  t1_open_* features defaulted to 0/50 — cutting effective coverage to ~43%.
+FIX 7 — t1_open_* features now reliably populated (lowered min bar threshold,
+         extended open window, fallback to close indicators).
 
-  Fix strategy:
-    1. Compute open indicators from ALL bars up to 10:00 (not just the 09:30–10:00
-       slice). This gives many more bars to work with on all market days.
-    2. Lower the minimum bar threshold from 10 → 5 for the open snapshot.
-    3. When open_bars is still insufficient, copy t1_close_* values into
-       t1_open_* as a graceful fallback (same-day close indicators are a
-       reasonable proxy and far better than constant defaults).
-    4. Always emit t1_open_* keys so the model receives real values.
+FIX 8 — Added missing indicators to _compute_indicators:
+  TSI, Keltner Channel, Donchian Channel, VWAP, ATR slope.
 
-FIX 8 (NEW) — Added missing indicators to _compute_indicators:
-  TSI, Keltner Channel, Donchian Channel, and VWAP were present in
-  intraday_data_collector.py but missing from fetch_t1_data_for_symbol's
-  inline _compute_indicators, causing t1_close_TSI_13_25_13,
-  t1_close_KCUe_20_2, t1_close_KCLe_20_2, t1_close_KCBe_20_2,
-  t1_close_DCU_20_20, t1_close_DCL_20_20, t1_close_DCM_20_20, and
-  t1_close_VWAP to always be missing.
-  Also added ATR slope (t1_close_ATR_14_Slope).
+FIX 9 (NEW) — T-1 yfinance indicators now also written under flat prefixes
+  (t3_/t5_/t10_) when the model is hybrid.
+
+  ROOT CAUSE: The model was trained with features like t3_ema_12, t3_rsi_7,
+  t3_wma_10 etc. that come from the base CSV pipeline. At prediction time,
+  build_features_from_tv_data fills t3_* columns from TV screener data, but
+  the TV screener does NOT expose EMA_12, EMA_26, WMA_10, RSI_7, RSI_21,
+  MACDh_12_26_9, Keltner, Donchian, etc.  Those columns therefore always
+  defaulted to 0 / 50, reducing effective coverage.
+
+  The T-1 yfinance fetch DOES compute all of these (ema12, ema26, rsi7,
+  rsi21, etc.) — but previously only wrote them as t1_close_* / t1_open_*.
+  In hybrid mode, fetch_t1_data_for_symbol now also copies the computed
+  intraday indicators into t3_/t5_/t10_* columns (lowercase, matching the
+  base CSV training schema), giving the model real values for every prefix.
 """
 
 import argparse
@@ -145,7 +144,6 @@ SCREENER_VOL_RATIO_CAP = 2.5
 _FLAT_PREFIXES = ("t3", "t5", "t10")
 
 # FIX 7: Minimum bars needed for open-window indicator calculation.
-# Lowered from 10 → 5 so thin early-session data still produces real indicators.
 T1_OPEN_MIN_BARS = 5
 
 
@@ -547,10 +545,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     """
     Compute comprehensive technical indicators from OHLCV series.
 
-    FIX 8: Added TSI, Keltner Channel, Donchian Channel, VWAP, and ATR slope
-    to match the full indicator set computed by intraday_data_collector.py.
-    These were missing from the previous inline version, causing ~10 model
-    features to always be filled with defaults.
+    FIX 8: Added TSI, Keltner Channel, Donchian Channel, VWAP, and ATR slope.
     """
     ind = {}
 
@@ -578,6 +573,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         rs = ag / al.replace(0, np.nan)
         ind[col_name] = safe(100 - (100 / (1 + rs)), 50.0)
     ind["rsi[1]"] = ind["rsi"]
+    ind["rsi14"]  = ind["rsi"]   # alias for column-map dedup
 
     # ── MACD ───────────────────────────────────────────────────────────────
     ema12     = c.ewm(span=12, adjust=False).mean()
@@ -593,6 +589,16 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         ind[f"ema{n}"] = safe(c.ewm(span=n, adjust=False).mean(), float(c.mean()))
     for n in [5, 10, 20, 50]:
         ind[f"sma{n}"] = safe(c.rolling(n).mean(), float(c.mean()))
+
+    # WMA approximations (not in _compute_indicators previously)
+    for n in [10, 20]:
+        weights = np.arange(1, n + 1, dtype=float)
+        wma_vals = c.rolling(n).apply(
+            lambda x: np.dot(x, weights[-len(x):]) / weights[-len(x):].sum()
+            if len(x) >= 2 else float(x.iloc[-1]),
+            raw=True
+        )
+        ind[f"wma{n}"] = safe(wma_vals, float(c.mean()))
 
     sma20_v = ind.get("sma20") or float(c.mean())
     ema20_v = ind.get("ema20") or float(c.mean())
@@ -625,12 +631,13 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ], axis=1).max(axis=1)
     for period, col_name in [(7, "atr7"), (14, "atr"), (20, "atr20")]:
         ind[col_name] = safe(tr.rolling(period).mean(), 0.5)
+    ind["atr14"] = ind["atr"]   # alias
 
-    # FIX 8: ATR slope (rate of change of ATR over last 5 bars)
+    # ATR slope
     atr14_series = tr.rolling(14).mean()
     if len(atr14_series.dropna()) >= 6:
         atr_slope = atr14_series.diff(5)
-        ind["atr_pct"] = safe(atr_slope, 0.0)   # maps to ATR_14_Slope via t1_column_map
+        ind["atr_pct"] = safe(atr_slope, 0.0)
     else:
         ind["atr_pct"] = 0.0
 
@@ -658,7 +665,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["bb_width"]  = safe((bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0)
     ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
 
-    # FIX 8: Keltner Channel
+    # Keltner Channel
     kc_mid  = c.ewm(span=20, adjust=False).mean()
     kc_atr  = tr.rolling(10).mean()
     kc_mult = 2.0
@@ -666,7 +673,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["keltner_lower"]  = safe(kc_mid - kc_mult * kc_atr, close_v)
     ind["keltner_middle"] = safe(kc_mid, close_v)
 
-    # FIX 8: Donchian Channel (20-period)
+    # Donchian Channel (20-period)
     dc_up  = h.rolling(20).max()
     dc_lo  = l.rolling(20).min()
     dc_mid = (dc_up + dc_lo) / 2
@@ -707,14 +714,14 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["mom"] = safe(c.diff(10), 0.0)
     ind["roc"] = safe(c.pct_change(10) * 100, 0.0)
 
-    # FIX 8: TSI (True Strength Index)
+    # TSI (True Strength Index)
     pc        = c.diff(1)
     double_smooth_pc  = pc.ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
     double_smooth_apc = pc.abs().ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
     tsi_denom = double_smooth_apc.replace(0, np.nan)
     tsi_series = 100 * double_smooth_pc / tsi_denom
     ind["tsi"]       = safe(tsi_series, 0.0)
-    ind["kst"]       = ind["tsi"]   # kst maps to TSIs_13_25_13 in t1_column_map
+    ind["kst"]       = ind["tsi"]
 
     # ── Ultimate Oscillator ────────────────────────────────────────────────
     bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
@@ -751,10 +758,9 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         ind["aroon_down"]      = safe(lo_idx / 25 * 100, 50.0)
         ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
 
-    # FIX 8: VWAP (cumulative for the session)
+    # VWAP
     try:
         tp_vwap = (h + l + c) / 3
-        # Use cumsum over the entire window — best approximation without session boundary
         cum_vol = v.cumsum().replace(0, np.nan)
         vwap_series = (tp_vwap * v).cumsum() / cum_vol
         ind["vwap"] = safe(vwap_series, close_v)
@@ -764,16 +770,72 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     return ind
 
 
-def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
+# ---------------------------------------------------------------------------
+# FIX 9: Helper — write intraday indicators under flat prefixes
+# ---------------------------------------------------------------------------
+
+def _write_flat_prefix_features(
+    indicators: dict,
+    result: dict,
+    flat_prefixes: tuple = _FLAT_PREFIXES,
+) -> None:
+    """
+    FIX 9: Copy computed intraday indicators into t3_/t5_/t10_* columns.
+
+    The model was trained with flat-prefix features like t3_ema_12, t3_rsi_7,
+    t3_wma_10, etc.  The TV screener does not expose these indicators, so they
+    always defaulted to 0/50 at prediction time.  The T-1 yfinance fetch DOES
+    compute them — this helper writes each computed indicator under every flat
+    prefix so the model sees real values regardless of prefix.
+
+    Mapping uses INTRADAY_TO_MODEL from t1_column_map (lowercased targets)
+    so the resulting column names exactly match what the model was trained on.
+    """
+    try:
+        from t1_column_map import INTRADAY_TO_MODEL
+    except ImportError:
+        # Fallback: write raw indicator names with flat prefixes (names won't
+        # perfectly match model, but better than zeros)
+        for key, val in indicators.items():
+            if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
+                continue
+            for pfx in flat_prefixes:
+                col = f"{pfx}_{key}"
+                if col not in result:
+                    result[col] = val
+        return
+
+    for src_key, val in indicators.items():
+        if not isinstance(val, (int, float)):
+            continue
+        try:
+            fval = float(val)
+            if np.isnan(fval) or np.isinf(fval):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        src_lower = src_key.lower()
+        if src_lower not in INTRADAY_TO_MODEL:
+            continue
+
+        model_name = INTRADAY_TO_MODEL[src_lower]   # e.g. "EMA_12"
+        for pfx in flat_prefixes:
+            col = f"{pfx}_{model_name}".lower()      # e.g. "t3_ema_12"
+            if col not in result:
+                result[col] = fval
+
+
+def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = False) -> dict:
     """
     Fetch T-1 intraday 5-min data and compute technical indicators.
     Returns dict with t1_close_* and t1_open_* keys ready for model input.
 
-    FIX 7: t1_open_* features are now always populated:
-      - Minimum bar threshold lowered from 10 → T1_OPEN_MIN_BARS (5)
-      - Open window extended to include all bars up to 10:30 for better coverage
-      - Fallback: if open_bars still too few, copy t1_close_* → t1_open_*
-        so the model receives real same-day values instead of constant defaults
+    FIX 7: t1_open_* features are now always populated.
+    FIX 9: When fill_flat_prefixes=True (hybrid model), indicators are ALSO
+           written under t3_/t5_/t10_* columns so the model receives real
+           values for features like t3_ema_12, t3_rsi_7, t3_wma_10 that the
+           TV screener cannot supply.
     """
     try:
         import yfinance as yf
@@ -818,8 +880,6 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
         )
 
         # ── Open indicators (first ~1 hour of session) ─────────────────────
-        # FIX 7: Use bars up to 10:30 instead of just 09:30–10:00 to get
-        # more bars for stable indicator calculation. Lower threshold to 5.
         open_bars = day_bars[day_bars.index.time <= dt_time(10, 30)]
 
         open_indicators: dict = {}
@@ -830,9 +890,6 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             )
             logger.debug(f"{symbol}: computed open indicators from {len(open_bars)} bars")
         else:
-            # FIX 7: Graceful fallback — use close indicators for open window.
-            # This is far better than constant defaults (50 for RSI, 0 for momentum, etc.)
-            # and correctly reflects the day-prior state the model was trained to see.
             logger.debug(
                 f"{symbol}: only {len(open_bars)} open bars (< {T1_OPEN_MIN_BARS}), "
                 "copying close indicators as open fallback"
@@ -854,9 +911,6 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
                         pass
 
             # ── Rename and write t1_open_* ─────────────────────────────────
-            # FIX 7: Write t1_open_* unconditionally (either real open data
-            # or the close-based fallback). No longer gated on col not in result,
-            # since t1_close_* and t1_open_* have different prefixes and never collide.
             open_df      = pd.DataFrame([open_indicators])
             open_renamed = _rename(open_df, prefix="t1_open")
             for col in open_renamed.columns:
@@ -874,10 +928,19 @@ def fetch_t1_data_for_symbol(symbol: str, logger) -> dict:
             for k, val in open_indicators.items():
                 result[f"t1_open_{k}"] = val
 
+        # ── FIX 9: Also write flat-prefix features for hybrid models ──────
+        # This fills t3_ema_12, t3_rsi_7, t3_wma_10, t3_keltner_upper, etc.
+        # that the TV screener cannot supply but the model was trained on.
+        if fill_flat_prefixes:
+            _write_flat_prefix_features(close_indicators, result, flat_prefixes=_FLAT_PREFIXES)
+
         t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
         t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
+        flat_count     = sum(1 for k in result if k.startswith("t3_"))
         logger.debug(
-            f"{symbol}: t1_close_* = {t1_close_count}, t1_open_* = {t1_open_count}"
+            f"{symbol}: t1_close_* = {t1_close_count}, "
+            f"t1_open_* = {t1_open_count}, "
+            f"t3_* = {flat_count}"
         )
 
         return result
@@ -999,7 +1062,7 @@ def main():
         logger.error(f"Failed to initialize: {e}")
         return 1
 
-    # FIX 6: Detect hybrid model and set fill_flat_prefixes accordingly.
+    # FIX 6: Detect hybrid model
     model_prefix       = predictor.model_feature_prefix
     hybrid             = _is_hybrid_model(predictor)
     fill_flat_prefixes = hybrid
@@ -1008,7 +1071,8 @@ def main():
     logger.info(f"  Model is hybrid (t1+t3/t5/t10): {hybrid}")
     if hybrid:
         logger.info(
-            "  → TV screener features will be mapped to BOTH t1_close_* AND t3_/t5_/t10_* columns"
+            "  → TV screener features will be mapped to BOTH t1_close_* AND t3_/t5_/t10_* columns\n"
+            "  → T-1 yfinance indicators will ALSO be written to t3_/t5_/t10_* (FIX 9)"
         )
     logger.info(f"  Lowercase keys: {_uses_lowercase(model_prefix)}")
 
@@ -1027,9 +1091,6 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("STEP 2: BUILD FEATURES FROM TRADINGVIEW DATA")
     logger.info("=" * 80)
-    logger.info(f"Mapping TV screener columns → {model_prefix}_* model features.")
-    if hybrid:
-        logger.info(f"  Also mapping to t3_*/t5_*/t10_* (hybrid model)")
 
     enriched_stocks = []
     failed_count    = 0
@@ -1077,7 +1138,6 @@ def main():
 
     logger.info(f"✓ Built features for {len(enriched_stocks)} stocks ({failed_count} skipped)")
 
-    # Spot-check flat prefix coverage for hybrid models
     if hybrid and enriched_stocks:
         sample = enriched_stocks[0]
         t3_hits = sum(1 for k in sample if k.startswith("t3_"))
@@ -1094,6 +1154,11 @@ def main():
         logger.info("STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT")
         logger.info("=" * 80)
         logger.info("Computing indicators from 5-min bars for top 200 candidates.")
+        if hybrid:
+            logger.info(
+                "  Hybrid model: indicators will ALSO be written as t3_/t5_/t10_* "
+                "to cover features like t3_ema_12, t3_rsi_7, t3_wma_10 (FIX 9)."
+            )
 
         top_200 = [s["symbol"] for s in enriched_stocks[:200]]
 
@@ -1105,7 +1170,7 @@ def main():
 
         def fetch_with_jitter(sym):
             time.sleep(random.uniform(0.05, 0.2))
-            return sym, fetch_t1_data_for_symbol(sym, logger)
+            return sym, fetch_t1_data_for_symbol(sym, logger, fill_flat_prefixes=fill_flat_prefixes)
 
         with ThreadPoolExecutor(max_workers=5) as executor:
             futures = {executor.submit(fetch_with_jitter, sym): sym for sym in top_200}
@@ -1122,20 +1187,27 @@ def main():
             if sym in t1_map:
                 stock.update(t1_map[sym])
 
-        # Coverage report: show both t1_close and t1_open counts
+        # Coverage report
         sample = next((s for s in enriched_stocks if s["symbol"] in t1_map), None)
         if sample:
             t1c = sum(1 for k in sample if k.startswith("t1_close_"))
             t1o = sum(1 for k in sample if k.startswith("t1_open_"))
+            t3c = sum(1 for k in sample if k.startswith("t3_"))
             logger.info(
                 f"  Sample ({sample['symbol']}): "
                 f"t1_close_* = {t1c} features, "
-                f"t1_open_* = {t1o} features"
+                f"t1_open_* = {t1o} features, "
+                f"t3_* = {t3c} features"
             )
             if t1o == 0:
                 logger.warning(
                     "  ⚠️  t1_open_* still 0 — check that t1_column_map.py is present "
                     "alongside this script."
+                )
+            if hybrid and t3c == 0:
+                logger.warning(
+                    "  ⚠️  t3_* still 0 after T-1 enrichment — check that "
+                    "t1_column_map.py exposes INTRADAY_TO_MODEL."
                 )
 
         logger.info(f"✓ T-1 indicator enrichment: {t1_count}/{len(top_200)} stocks")
@@ -1157,13 +1229,13 @@ def main():
     logger.info(f"  t3_ features present:       {len(t3_cols)}")
     logger.info(f"  t1_open_ features present:  {len(t1_open_cols)}")
 
-    # Pre-flight: check variance across all relevant prefix groups
     key_indicators = [
         "t1_close_RSI_14", "t1_close_ATR_14", "t1_close_ADX_14",
         "t1_close_TSI_13_25_13", "t1_close_KCUe_20_2", "t1_close_VWAP",
         "t1_open_RSI_14",  "t1_open_ATR_14",  "t1_open_ADX_14",
-        "t3_rsi_14",        "t3_atr_14",        "t3_adx_14",
-        "t3_volume_ratio",  "t1_close_Volume_Ratio",
+        "t3_rsi_14",       "t3_atr_14",       "t3_adx_14",
+        "t3_ema_12",       "t3_rsi_7",        "t3_wma_10",
+        "t3_volume_ratio", "t1_close_Volume_Ratio",
     ]
     zero_var_indicators = []
     for col in key_indicators:
@@ -1207,10 +1279,6 @@ def main():
         logger.error(
             f"\n  ❌ POST-PREDICTION: prob_std={prob_std:.6f} — all probabilities identical."
             "\n     The model received uniform feature inputs."
-            "\n     With fill_flat_prefixes enabled, this may mean the TV screener"
-            "\n     returned no indicator columns (only OHLCV). Check:"
-            "\n       1. tradingview-scraper version (needs >=0.4.19)"
-            "\n       2. Run --verbose to see which TV columns were returned"
         )
 
     # ── STEP 6: GAIN CORRECTION ───────────────────────────────────────────────
@@ -1303,7 +1371,7 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
-            'model_version':         f"{model_prefix}_v8",
+            'model_version':         f"{model_prefix}_v9",
         }
         for _, row in top_predictions.iterrows()
     ]
@@ -1326,7 +1394,7 @@ def main():
         'avg_probability':    float(predictions_df['explosion_probability'].mean()),
         'max_probability':    float(predictions_df['explosion_probability'].max()),
         'min_probability':    float(predictions_df['explosion_probability'].min()),
-        'model_version':      f"{model_prefix}_features_v8",
+        'model_version':      f"{model_prefix}_features_v9",
     }
     supabase.write_screening_log(screening_log)
 
