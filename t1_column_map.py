@@ -180,6 +180,33 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "mom20":            "MOM_20",
     "gap_%":            "Gap_Pct",
     "gap_pct":          "Gap_Pct",      # alias — deduped at runtime
+    # ── NEW: previously missing ──────────────────────────────────────────
+    "hma9":                 "HMA_9",
+    "hma20":                "HMA_20",
+    "price_vs_sma50":       "Price_vs_SMA50",
+    "sma_20_slope":         "SMA_20_Slope",
+    "ema_20_slope":         "EMA_20_Slope",
+    "macd_roc":             "MACD_ROC",
+    "macd_fast":            "MACD_Fast",
+    "macdh_fast":           "MACDh_Fast",
+    "macds_fast":           "MACDs_Fast",
+    "rsi_14_slope":         "RSI_14_Slope",
+    "stochh_14_3_3":        "STOCHh_14_3_3",
+    "stochk_5_3_1":         "STOCHk_5_3_1",
+    "stochd_5_3_1":         "STOCHd_5_3_1",
+    "stochh_5_3_1":         "STOCHh_5_3_1",
+    "stochrsik_14_14_3_3":  "STOCHRSIk_14_14_3_3",
+    "stochrsid_14_14_3_3":  "STOCHRSId_14_14_3_3",
+    "cci":                  "CCI_14",
+    "obv_sma20":            "OBV_SMA20",
+    "adxr":                 "ADXR_14_2",
+    "supert":               "SUPERT_10_3",
+    "supert_d":             "SUPERTd_10_3",
+    "supert_l":             "SUPERTl_10_3",
+    "supert_s":             "SUPERTs_10_3",
+    "mfi":                  "MFI_14",
+    "roc20":                "ROC_20",
+    "mom20":                "MOM_20",
 }
 
 # Columns that are metadata — never renamed, just preserved or dropped
