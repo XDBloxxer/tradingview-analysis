@@ -767,6 +767,170 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     except Exception:
         ind["vwap"] = close_v
 
+# ── HMA (Hull Moving Average) ─────────────────────────────────────────
+    # HMA(n) = WMA(2*WMA(n/2) - WMA(n), sqrt(n))
+    for n, col_name in [(9, "hma9"), (20, "hma20")]:
+        try:
+            half = n // 2
+            sqrt_n = int(round(n ** 0.5))
+            weights_half = np.arange(1, half + 1, dtype=float)
+            weights_n    = np.arange(1, n + 1, dtype=float)
+            weights_sqrt = np.arange(1, sqrt_n + 1, dtype=float)
+            wma_half = c.rolling(half).apply(
+                lambda x: np.dot(x, weights_half[-len(x):]) / weights_half[-len(x):].sum(), raw=True)
+            wma_n = c.rolling(n).apply(
+                lambda x: np.dot(x, weights_n[-len(x):]) / weights_n[-len(x):].sum(), raw=True)
+            hma_raw = 2 * wma_half - wma_n
+            hma = hma_raw.rolling(sqrt_n).apply(
+                lambda x: np.dot(x, weights_sqrt[-len(x):]) / weights_sqrt[-len(x):].sum(), raw=True)
+            ind[col_name] = safe(hma, float(c.mean()))
+        except Exception:
+            ind[col_name] = float(c.mean())
+
+    # ── Price vs SMA50 ───────────────────────────────────────────────────
+    sma50_v = ind.get("sma50") or float(c.mean())
+    if sma50_v:
+        ind["price_vs_sma50"] = (close_v / sma50_v - 1) * 100
+
+    # ── Slope indicators (5-bar linear slope) ────────────────────────────
+    def _slope(series, n=5):
+        s = series.dropna()
+        if len(s) < n:
+            return 0.0
+        y = s.iloc[-n:].values.astype(float)
+        x = np.arange(n, dtype=float)
+        try:
+            return float(np.polyfit(x, y, 1)[0])
+        except Exception:
+            return 0.0
+
+    sma20_series = c.rolling(20).mean()
+    ema20_series = c.ewm(span=20, adjust=False).mean()
+    rsi14_delta  = c.diff()
+    rsi14_gain   = rsi14_delta.clip(lower=0)
+    rsi14_loss   = (-rsi14_delta.clip(upper=0))
+    rsi14_ag     = rsi14_gain.ewm(com=13, min_periods=14).mean()
+    rsi14_al     = rsi14_loss.ewm(com=13, min_periods=14).mean()
+    rsi14_series = 100 - (100 / (1 + rsi14_ag / rsi14_al.replace(0, np.nan)))
+
+    ind["sma_20_slope"] = _slope(sma20_series)
+    ind["ema_20_slope"] = _slope(ema20_series)
+    ind["rsi_14_slope"] = _slope(rsi14_series)
+
+    # ── Fast MACD (5/13/1) and MACD ROC ─────────────────────────────────
+    ema5_f  = c.ewm(span=5,  adjust=False).mean()
+    ema13_f = c.ewm(span=13, adjust=False).mean()
+    macd_fast_line = ema5_f - ema13_f
+    macd_fast_sig  = macd_fast_line.ewm(span=1, adjust=False).mean()
+    ind["macd_fast"]  = safe(macd_fast_line)
+    ind["macdh_fast"] = safe(macd_fast_line - macd_fast_sig)
+    ind["macds_fast"] = safe(macd_fast_sig)
+    # MACD ROC = rate of change of standard MACD line
+    macd_std = ema12 - ema26  # already computed above
+    ind["macd_roc"] = safe(macd_std.pct_change(3) * 100, 0.0)
+
+    # ── Stochastic variants ───────────────────────────────────────────────
+    # STOCHh_14_3_3 = highest Stoch.K over smoothing window
+    stk_raw = (100 * (c - l.rolling(14).min()) / 
+               (h.rolling(14).max() - l.rolling(14).min()).replace(0, np.nan))
+    stk_smooth = stk_raw.rolling(3).mean()
+    ind["stochh_14_3_3"] = safe(stk_smooth.rolling(3).max(), 50.0)
+
+    # STOCH 5,3,1
+    lo5  = l.rolling(5).min()
+    hi5  = h.rolling(5).max()
+    rng5 = (hi5 - lo5).replace(0, np.nan)
+    stk5 = (100 * (c - lo5) / rng5).rolling(3).mean()
+    std5 = stk5.rolling(1).mean()
+    ind["stochk_5_3_1"] = safe(stk5, 50.0)
+    ind["stochd_5_3_1"] = safe(std5, 50.0)
+    ind["stochh_5_3_1"] = safe(stk5.rolling(1).max(), 50.0)
+
+    # ── StochRSI ─────────────────────────────────────────────────────────
+    rsi_s   = rsi14_series
+    rsi_min = rsi_s.rolling(14).min()
+    rsi_max = rsi_s.rolling(14).max()
+    stoch_rsi = (rsi_s - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    stochrsi_k = stoch_rsi.rolling(3).mean() * 100
+    stochrsi_d = stochrsi_k.rolling(3).mean()
+    ind["stochrsik_14_14_3_3"] = safe(stochrsi_k, 50.0)
+    ind["stochrsid_14_14_3_3"] = safe(stochrsi_d, 50.0)
+
+    # ── CCI 14 ───────────────────────────────────────────────────────────
+    tp14   = (h + l + c) / 3
+    tp_ma14 = tp14.rolling(14).mean()
+    tp_md14 = tp14.rolling(14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    ind["cci"] = safe((tp14 - tp_ma14) / (0.015 * tp_md14.replace(0, np.nan)), 0.0)
+
+    # ── OBV SMA20 ─────────────────────────────────────────────────────────
+    obv_series = pd.Series(obv_vals, index=c.index)  # obv_vals built earlier in _compute_indicators
+    ind["obv_sma20"] = safe(obv_series.rolling(20).mean(), 0.0)
+
+    # ── ADXR (ADX smoothed) ───────────────────────────────────────────────
+    adx_series = dx.rolling(14).mean()  # dx computed earlier in _compute_indicators
+    ind["adxr"] = safe(adx_series.rolling(2).mean(), 20.0)
+
+    # ── MFI 14 (Money Flow Index) ─────────────────────────────────────────
+    tp_mfi = (h + l + c) / 3
+    mf     = tp_mfi * v
+    pos_mf = mf.where(tp_mfi > tp_mfi.shift(1), 0.0)
+    neg_mf = mf.where(tp_mfi < tp_mfi.shift(1), 0.0)
+    mfr    = pos_mf.rolling(14).sum() / neg_mf.rolling(14).sum().replace(0, np.nan)
+    ind["mfi"] = safe(100 - (100 / (1 + mfr)), 50.0)
+
+    # ── ROC 20 and MOM 20 ─────────────────────────────────────────────────
+    ind["roc20"] = safe(c.pct_change(20) * 100, 0.0)
+    ind["mom20"] = safe(c.diff(20), 0.0)
+
+    # ── Supertrend (10, 3) ────────────────────────────────────────────────
+    try:
+        atr10 = tr.rolling(10).mean()
+        basic_upper = (h + l) / 2 + 3 * atr10
+        basic_lower = (h + l) / 2 - 3 * atr10
+        final_upper = basic_upper.copy()
+        final_lower = basic_lower.copy()
+        supertrend  = pd.Series(np.nan, index=c.index)
+        direction   = pd.Series(1, index=c.index)      # 1=bullish, -1=bearish
+        for i in range(1, len(c)):
+            fu_prev = final_upper.iloc[i-1]
+            fl_prev = final_lower.iloc[i-1]
+            final_upper.iloc[i] = (
+                basic_upper.iloc[i]
+                if basic_upper.iloc[i] < fu_prev or c.iloc[i-1] > fu_prev
+                else fu_prev
+            )
+            final_lower.iloc[i] = (
+                basic_lower.iloc[i]
+                if basic_lower.iloc[i] > fl_prev or c.iloc[i-1] < fl_prev
+                else fl_prev
+            )
+            if pd.isna(supertrend.iloc[i-1]):
+                supertrend.iloc[i] = final_upper.iloc[i]
+                direction.iloc[i]  = -1
+            elif supertrend.iloc[i-1] == fu_prev:
+                if c.iloc[i] <= final_upper.iloc[i]:
+                    supertrend.iloc[i] = final_upper.iloc[i]
+                    direction.iloc[i]  = -1
+                else:
+                    supertrend.iloc[i] = final_lower.iloc[i]
+                    direction.iloc[i]  = 1
+            else:
+                if c.iloc[i] >= final_lower.iloc[i]:
+                    supertrend.iloc[i] = final_lower.iloc[i]
+                    direction.iloc[i]  = 1
+                else:
+                    supertrend.iloc[i] = final_upper.iloc[i]
+                    direction.iloc[i]  = -1
+        ind["supert"]   = safe(supertrend, close_v)
+        ind["supert_d"] = safe(direction.astype(float), 1.0)
+        ind["supert_l"] = safe(final_lower, close_v)
+        ind["supert_s"] = safe(final_upper, close_v)
+    except Exception:
+        ind["supert"]   = close_v
+        ind["supert_d"] = 1.0
+        ind["supert_l"] = close_v
+        ind["supert_s"] = close_v
+
     return ind
 
 
