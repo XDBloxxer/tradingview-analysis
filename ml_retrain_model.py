@@ -447,11 +447,11 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
       )
         sys.exit(1)
 
-      logger.info(
-        f"Combined dataset: {len(combined)} rows, "
-        f"{len(combined.columns)} columns, "
-        f"pos={n_pos}, neg={n_neg}, "
-        f"pos_rate={n_pos/len(combined)*100:.1f}%"
+    logger.info(
+      f"Combined dataset: {len(combined)} rows, "
+      f"{len(combined.columns)} columns, "
+      f"pos={n_pos}, neg={n_neg}, "
+      f"pos_rate={n_pos/len(combined)*100:.1f}%"
     )
 
     if n_neg == 0:
