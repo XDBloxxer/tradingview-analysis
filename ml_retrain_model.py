@@ -445,7 +445,8 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
           "The base training data likely has corrupt labels. "
           "Check ml_training_base — it should have ~5-20% positives."
       )
-      sys.exit(1)
+        sys.exit(1)
+
       logger.info(
         f"Combined dataset: {len(combined)} rows, "
         f"{len(combined.columns)} columns, "
