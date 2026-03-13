@@ -234,6 +234,38 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
                 f"neg={int((df['label']==0).sum())}")
     return df
 
+def audit_base_data(base_df: pd.DataFrame) -> None:
+    """Call this immediately after load_base_training_data() to catch label corruption."""
+    n_pos = int((base_df['label'] == 1).sum())
+    n_neg = int((base_df['label'] == 0).sum())
+    pos_rate = n_pos / len(base_df)
+    
+    logger.info(f"BASE DATA AUDIT:")
+    logger.info(f"  Positive rate: {pos_rate:.1%}  ({n_pos} pos / {n_neg} neg)")
+    
+    if pos_rate > 0.40:
+        logger.error(
+            f"CRITICAL: Base data has {pos_rate:.1%} positive rate. "
+            "This is way too high for explosive-stock prediction. "
+            "Expected ~5-20%. Your ml_training_base table likely has "
+            "far too few non-winner rows. Check upload_base_training_data.py."
+        )
+    
+    # Check if 'source' column tells us where the imbalance comes from
+    if 'source' in base_df.columns:
+        logger.info(f"  Label breakdown by source:")
+        for src, grp in base_df.groupby('source'):
+            p = (grp['label'] == 1).mean()
+            logger.info(f"    {src}: {p:.1%} positive ({len(grp)} rows)")
+    
+    # Check intraday relabelling impact
+    if 'actual_high_pct' in base_df.columns:
+        would_upgrade = (
+            (base_df['label'] == 0) & 
+            (pd.to_numeric(base_df['actual_high_pct'], errors='coerce') >= 15.0)
+        ).sum()
+        logger.info(f"  Rows intraday_high_labels would upgrade: {would_upgrade}")
+
 
 def load_t1_data(client: Client) -> pd.DataFrame:
     """
@@ -406,7 +438,15 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
 
     n_pos = int((combined["label"] == 1).sum())
     n_neg = int((combined["label"] == 0).sum())
-    logger.info(
+
+    if n_pos > 0 and n_pos / (n_pos + n_neg) > 0.40:
+        logger.error(
+          f"ABORTING: positive rate {n_pos/(n_pos+n_neg):.1%} is too high. "
+          "The base training data likely has corrupt labels. "
+          "Check ml_training_base — it should have ~5-20% positives."
+      )
+      sys.exit(1)
+      logger.info(
         f"Combined dataset: {len(combined)} rows, "
         f"{len(combined.columns)} columns, "
         f"pos={n_pos}, neg={n_neg}, "
@@ -620,7 +660,7 @@ def train_val_split(
     else:
         # Sort by unified date, take most recent val_fraction as validation set
         dates      = pd.to_datetime(df_work[date_col], errors="coerce")
-        sorted_idx = dates.sort_values().index
+        sorted_idx = dates.sort_values(na_position='last').index
         split_pos  = int(len(sorted_idx) * (1 - val_fraction))
 
         train_idx = sorted_idx[:split_pos]
