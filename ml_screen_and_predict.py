@@ -1312,13 +1312,6 @@ def main():
         logger.error("Failed to build features for any stocks")
         return 1
 
-# After building features_df, before prediction:
-    t3_nonzero = sum(
-         1 for c in features_df.columns 
-         if c.startswith("t3_") and features_df[c].std() > 0.01
-    )
-    logger.info(f"t3_ columns with real variance: {t3_nonzero}")
-
     # ── STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT ────────────────────────────
     if not args.no_t1:
         logger.info("\n" + "=" * 80)
@@ -1428,6 +1421,13 @@ def main():
         )
     else:
         logger.info(f"  ✅ Feature variance looks healthy ({len(features_df)} stocks)")
+             
+# After building features_df, before prediction:
+    t3_nonzero = sum(
+         1 for c in features_df.columns 
+         if c.startswith("t3_") and features_df[c].std() > 0.01
+    )
+    logger.info(f"t3_ columns with real variance: {t3_nonzero}")
 
     # ── STEP 5: ML PREDICTION ─────────────────────────────────────────────────
     logger.info("\n" + "=" * 80)
