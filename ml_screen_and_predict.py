@@ -255,30 +255,6 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
 
 
 def get_next_trading_day() -> str:
-    """
-    Derive prediction date from the most recent detection_date in daily_winners,
-    then advance to the next trading day (skipping weekends).
-    Falls back to clock-based calculation if the DB query fails.
-    """
-    try:
-        response = supabase_client.table("daily_winners") \
-            .select("detection_date") \
-            .order("detection_date", desc=True) \
-            .limit(1) \
-            .execute()
-
-        if response.data:
-            last_date = date.fromisoformat(response.data[0]["detection_date"][:10])
-            next_day = last_date + timedelta(days=1)
-            while next_day.weekday() >= 5:  # 5=Sat, 6=Sun
-                next_day += timedelta(days=1)
-            log.info(f"Prediction date derived from DB: last_winners={last_date} → predicting={next_day}")
-            return next_day.isoformat()
-
-    except Exception as e:
-        log.warning(f"Could not fetch last detection_date from DB, falling back to clock: {e}")
-
-    # Fallback: original clock-based logic
     est = pytz.timezone('America/New_York')
     now_est = datetime.now(est)
     prediction_day = now_est + timedelta(days=1)
