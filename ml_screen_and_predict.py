@@ -1232,7 +1232,7 @@ def main():
     args   = parser.parse_args()
     logger = setup_logging(args.verbose)
 
-    prediction_date = get_next_trading_day(supabase_client)
+    prediction_date = get_next_trading_day()
 
     logger.info("=" * 80)
     logger.info("ML SCREENING & PREDICTION")
