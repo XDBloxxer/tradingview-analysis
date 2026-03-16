@@ -254,7 +254,7 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info("")
 
 
-def get_next_trading_day(supabase_client) -> str:
+def get_next_trading_day() -> str:
     """
     Derive prediction date from the most recent detection_date in daily_winners,
     then advance to the next trading day (skipping weekends).
@@ -1232,7 +1232,7 @@ def main():
     args   = parser.parse_args()
     logger = setup_logging(args.verbose)
 
-    prediction_date = get_next_trading_day(supabase_client)
+    prediction_date = get_next_trading_day()
 
     logger.info("=" * 80)
     logger.info("ML SCREENING & PREDICTION")
