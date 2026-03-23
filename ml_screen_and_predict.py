@@ -38,6 +38,12 @@ FIX 9 (NEW) — T-1 yfinance indicators now also written under flat prefixes
   In hybrid mode, fetch_t1_data_for_symbol now also copies the computed
   intraday indicators into t3_/t5_/t10_* columns (lowercase, matching the
   base CSV training schema), giving the model real values for every prefix.
+
+FIX 10 — get_next_trading_day now queries the daily_winners table for the most
+  recent detection_date and returns the next weekday after it, rather than
+  deriving the date from wall-clock time. This prevents mis-dating when GitHub
+  Actions runs late or on the wrong side of midnight. Falls back to the
+  original time-based logic if no winners data exists yet.
 """
 
 import argparse
@@ -254,7 +260,49 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info("")
 
 
-def get_next_trading_day() -> str:
+def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
+    """
+    FIX 10: Determine the prediction date as the next trading weekday after
+    the most recent detection_date in daily_winners.
+
+    This is more reliable than deriving the date from wall-clock time because
+    GitHub Actions can run late, early, or on the wrong side of midnight.
+
+    Logic:
+      1. Query daily_winners for the latest detection_date.
+      2. Add one calendar day.
+      3. Skip forward over weekends until we land on a weekday.
+         e.g. last_winners = Friday → +1 = Saturday → skip → Monday ✓
+
+    Fallback: if the table is empty or the query fails, fall back to the
+    original time-based approach so the workflow never hard-crashes.
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        response = (
+            supabase.client.table("daily_winners")
+            .select("detection_date")
+            .order("detection_date", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if response.data:
+            last_date_str = response.data[0]["detection_date"]
+            last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+            prediction_day = last_date + timedelta(days=1)
+            while prediction_day.weekday() >= 5:  # 5=Sat, 6=Sun
+                prediction_day += timedelta(days=1)
+            logger.info(
+                f"Prediction date derived from daily_winners: "
+                f"last={last_date}  →  next trading day={prediction_day}"
+            )
+            return prediction_day.isoformat()
+    except Exception as e:
+        logger.warning(f"Could not fetch most recent winners date: {e}")
+
+    # ── Fallback: wall-clock based ────────────────────────────────────────
+    logger.warning("Falling back to time-based prediction date.")
     est = pytz.timezone('America/New_York')
     now_est = datetime.now(est)
     prediction_day = now_est + timedelta(days=1)
@@ -590,7 +638,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     for n in [5, 10, 20, 50]:
         ind[f"sma{n}"] = safe(c.rolling(n).mean(), float(c.mean()))
 
-    # WMA approximations (not in _compute_indicators previously)
+    # WMA approximations
     for n in [10, 20]:
         weights = np.arange(1, n + 1, dtype=float)
         wma_vals = c.rolling(n).apply(
@@ -767,8 +815,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     except Exception:
         ind["vwap"] = close_v
 
-# ── HMA (Hull Moving Average) ─────────────────────────────────────────
-    # HMA(n) = WMA(2*WMA(n/2) - WMA(n), sqrt(n))
+    # ── HMA (Hull Moving Average) ─────────────────────────────────────────
     for n, col_name in [(9, "hma9"), (20, "hma20")]:
         try:
             half = n // 2
@@ -830,8 +877,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["macd_roc"] = safe(macd_std.pct_change(3) * 100, 0.0)
 
     # ── Stochastic variants ───────────────────────────────────────────────
-    # STOCHh_14_3_3 = highest Stoch.K over smoothing window
-    stk_raw = (100 * (c - l.rolling(14).min()) / 
+    stk_raw = (100 * (c - l.rolling(14).min()) /
                (h.rolling(14).max() - l.rolling(14).min()).replace(0, np.nan))
     stk_smooth = stk_raw.rolling(3).mean()
     ind["stochh_14_3_3"] = safe(stk_smooth.rolling(3).max(), 50.0)
@@ -863,11 +909,11 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["cci"] = safe((tp14 - tp_ma14) / (0.015 * tp_md14.replace(0, np.nan)), 0.0)
 
     # ── OBV SMA20 ─────────────────────────────────────────────────────────
-    obv_series = pd.Series(obv_vals, index=c.index)  # obv_vals built earlier in _compute_indicators
+    obv_series = pd.Series(obv_vals, index=c.index)
     ind["obv_sma20"] = safe(obv_series.rolling(20).mean(), 0.0)
 
     # ── ADXR (ADX smoothed) ───────────────────────────────────────────────
-    adx_series = dx.rolling(14).mean()  # dx computed earlier in _compute_indicators
+    adx_series = dx.rolling(14).mean()
     ind["adxr"] = safe(adx_series.rolling(2).mean(), 20.0)
 
     # ── MFI 14 (Money Flow Index) ─────────────────────────────────────────
@@ -890,7 +936,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         final_upper = basic_upper.copy()
         final_lower = basic_lower.copy()
         supertrend  = pd.Series(np.nan, index=c.index)
-        direction   = pd.Series(1, index=c.index)      # 1=bullish, -1=bearish
+        direction   = pd.Series(1, index=c.index)
         for i in range(1, len(c)):
             fu_prev = final_upper.iloc[i-1]
             fl_prev = final_lower.iloc[i-1]
@@ -945,21 +991,10 @@ def _write_flat_prefix_features(
 ) -> None:
     """
     FIX 9: Copy computed intraday indicators into t3_/t5_/t10_* columns.
-
-    The model was trained with flat-prefix features like t3_ema_12, t3_rsi_7,
-    t3_wma_10, etc.  The TV screener does not expose these indicators, so they
-    always defaulted to 0/50 at prediction time.  The T-1 yfinance fetch DOES
-    compute them — this helper writes each computed indicator under every flat
-    prefix so the model sees real values regardless of prefix.
-
-    Mapping uses INTRADAY_TO_MODEL from t1_column_map (lowercased targets)
-    so the resulting column names exactly match what the model was trained on.
     """
     try:
         from t1_column_map import INTRADAY_TO_MODEL
     except ImportError:
-        # Fallback: write raw indicator names with flat prefixes (names won't
-        # perfectly match model, but better than zeros)
         for key, val in indicators.items():
             if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
                 continue
@@ -983,9 +1018,9 @@ def _write_flat_prefix_features(
         if src_lower not in INTRADAY_TO_MODEL:
             continue
 
-        model_name = INTRADAY_TO_MODEL[src_lower]   # e.g. "EMA_12"
+        model_name = INTRADAY_TO_MODEL[src_lower]
         for pfx in flat_prefixes:
-            col = f"{pfx}_{model_name}".lower()      # e.g. "t3_ema_12"
+            col = f"{pfx}_{model_name}".lower()
             if col not in result:
                 result[col] = fval
 
@@ -997,9 +1032,7 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
 
     FIX 7: t1_open_* features are now always populated.
     FIX 9: When fill_flat_prefixes=True (hybrid model), indicators are ALSO
-           written under t3_/t5_/t10_* columns so the model receives real
-           values for features like t3_ema_12, t3_rsi_7, t3_wma_10 that the
-           TV screener cannot supply.
+           written under t3_/t5_/t10_* columns.
     """
     try:
         import yfinance as yf
@@ -1086,15 +1119,12 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
                         pass
 
         else:
-            # No column map — write raw indicator names with prefixes
             for k, val in close_indicators.items():
                 result[f"t1_close_{k}"] = val
             for k, val in open_indicators.items():
                 result[f"t1_open_{k}"] = val
 
         # ── FIX 9: Also write flat-prefix features for hybrid models ──────
-        # This fills t3_ema_12, t3_rsi_7, t3_wma_10, t3_keltner_upper, etc.
-        # that the TV screener cannot supply but the model was trained on.
         if fill_flat_prefixes:
             _write_flat_prefix_features(close_indicators, result, flat_prefixes=_FLAT_PREFIXES)
 
@@ -1208,13 +1238,8 @@ def main():
     args   = parser.parse_args()
     logger = setup_logging(args.verbose)
 
-    prediction_date = get_next_trading_day()
-
     logger.info("=" * 80)
     logger.info("ML SCREENING & PREDICTION")
-    logger.info("=" * 80)
-    logger.info(f"Prediction date (trading session): {prediction_date}")
-    logger.info(f"Top N to store: {args.top_n}")
     logger.info("=" * 80)
 
     screener = SmartScreener(logger=logger)
@@ -1225,6 +1250,13 @@ def main():
     except Exception as e:
         logger.error(f"Failed to initialize: {e}")
         return 1
+
+    # FIX 10: derive prediction date from daily_winners rather than wall clock
+    prediction_date = get_next_trading_day(supabase)
+
+    logger.info(f"Prediction date (trading session): {prediction_date}")
+    logger.info(f"Top N to store: {args.top_n}")
+    logger.info("=" * 80)
 
     # FIX 6: Detect hybrid model
     model_prefix       = predictor.model_feature_prefix
@@ -1421,11 +1453,10 @@ def main():
         )
     else:
         logger.info(f"  ✅ Feature variance looks healthy ({len(features_df)} stocks)")
-             
-# After building features_df, before prediction:
+
     t3_nonzero = sum(
-         1 for c in features_df.columns 
-         if c.startswith("t3_") and features_df[c].std() > 0.01
+        1 for c in features_df.columns
+        if c.startswith("t3_") and features_df[c].std() > 0.01
     )
     logger.info(f"t3_ columns with real variance: {t3_nonzero}")
 
