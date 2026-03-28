@@ -1,16 +1,16 @@
 {
   "min_price": 0.5,
-  "max_price": 33.1,
+  "max_price": 33.41,
   "min_volume": 100000,
   "min_hv10": 30.0,
-  "max_hv10": 510.5992,
+  "max_hv10": 513.6417,
   "min_hv20": 30.0,
-  "max_hv20": 472.9712,
-  "min_atr14": 0.0095,
+  "max_hv20": 473.8653,
+  "min_atr14": 0.0098,
   "min_relative_volume": 1.0,
   "min_volume_ratio": 1.0,
-  "_derived_from_n_winners": 486,
-  "_derived_at": "2026-03-26T23:27:39.513752",
+  "_derived_from_n_winners": 501,
+  "_derived_at": "2026-03-27T23:14:21.970276",
   "_lookback_days": 90,
   "_comment": "Tightened from defaults. max_price 50 and min_volume 500k target the small-cap explosive universe. min_relative_volume 2.0 requires stocks already showing above-normal activity. Model-driven thresholds (hv10, rsi) will be auto-populated by ml_track_comprehensive_accuracy.py after enough prediction history accumulates."
 }
