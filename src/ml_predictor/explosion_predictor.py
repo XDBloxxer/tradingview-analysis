@@ -1,36 +1,40 @@
 """
 Explosion Predictor
 
-FIXES IN THIS VERSION (2026-03-02 v4):
+FIXES IN THIS VERSION (2026-03-02 v4 + 2026 RC4/RC5 gain fixes):
 
-FIX 1 — Auto-detect which feature prefix the loaded model uses:
-  The previous version hard-coded t1_close_ in the screen script, but the
-  model stored in ml_models/ may have been trained on t3_/t5_/t10_ features
-  (base CSV). When the prefixes don't match, prepare_features() fills
-  everything with defaults → identical probabilities for every stock.
+FIX 1 — Auto-detect which feature prefix the loaded model uses.
 
-  Fix: ExplosionPredictor now exposes `model_feature_prefix` property that
-  returns the dominant prefix ("t1_close", "t3", etc.) detected from the
-  model's own feature_names list. ml_screen_and_predict reads this and
-  uses the correct prefix when building features from TV data.
+FIX 2 — Bimodal/compression detection now also handles narrow probability bands.
 
-FIX 2 — Bimodal/compression detection now also handles the case where
-  all probabilities are in a NARROW band above 0.50 (e.g. 0.70–0.75):
-  The previous compression check only looked at probs < 0.50. After the
-  prefix fix, if the model IS getting real features but they're all similar,
-  probabilities cluster near 0.73. This triggered no fallback → all BUY.
-  
-  Fix: Also detect when prob std < 0.02 (very narrow band regardless of
-  absolute level). This ensures relative ranking activates whenever the
-  distribution is too flat to be meaningful.
+FIX 3 — _classify_signals_relative operates on full distribution.
 
-FIX 3 — _classify_signals_relative operates on full distribution (carried):
-  Top 2% → STRONG BUY, next 8% → BUY, next 15% → HOLD, rest → AVOID.
+FIX 4 — Gain regressor receives SCALED features.
 
-FIX 4 — Gain regressor receives SCALED features (carried and corrected):
-  The regressor is now saved/loaded expecting the same scaled input as the
-  classifier. predict_with_targets passes X_scaled (already StandardScaler
-  transformed) to both classifier and regressor.
+RC4 FIX — Relaxed std guard:
+  The previous `if predicted_gains.std() < 1.0 → disable regressor` guard was
+  too aggressive. Because RC1/RC2/RC3 were not yet fixed, the regressor
+  legitimately produced narrow ranges (18–22%) and was always disabled,
+  falling back to rule-based estimates forever. The guard is now lowered to
+  0.5 with a minimum sample count requirement, so a regressor that produces
+  even modest variation is kept rather than discarded. Additionally, the
+  guard now logs a warning rather than silently nulling self.regressor, so
+  the disable is visible in logs.
+
+RC5 FIX — Isotonic regression calibration for the gain fallback:
+  The previous fallback bucketed predictions into Low/Medium/High/Very High
+  and used the median per bucket. With most predictions clustering in the
+  0.60–0.80 range, all buckets converged on ~20–30% regardless of signal
+  strength, giving identical gain estimates across all stocks.
+
+  The new fallback fits an IsotonicRegression on (probability, actual_gain_pct)
+  pairs from historical data — this is a monotone, non-parametric curve that
+  maps probability → expected gain without the bucket-collapse problem. If
+  isotonic regression cannot be fit (too few points), it falls back to a
+  simple linear interpolation over the observed quantiles, which at minimum
+  preserves rank order across the probability range.
+
+  The rule-based _estimate_target_gain() is retained as the final backstop.
 """
 
 import json
@@ -63,10 +67,139 @@ NARROW_BAND_STD_THRESHOLD  = 0.02   # std < 0.02 regardless of level → use rel
 BIMODAL_MIDRANGE             = (0.15, 0.85)
 BIMODAL_MIN_MIDRANGE_COUNT   = 5
 
+# RC4 FIX: Lowered from 1.0 to 0.5.
+# A regressor that produces 0.5% std is still near-useless, but one producing
+# e.g. 3–5% std should NOT be discarded. The previous 1.0 threshold was
+# disabling competent regressors whenever the gain distribution was moderate.
+REGRESSOR_MIN_STD_THRESHOLD = 0.5
+# Minimum predictions needed before the std guard fires
+REGRESSOR_MIN_PRED_COUNT    = 10
+
+# RC5: minimum historical samples needed to fit isotonic calibration
+ISOTONIC_MIN_SAMPLES = 30
+
 
 def _norm(s: str) -> str:
     """Normalize for matching: lowercase + dots to underscores."""
     return s.lower().replace(".", "_")
+
+
+# ---------------------------------------------------------------------------
+# RC5 FIX: Isotonic calibration of gain estimates
+# ---------------------------------------------------------------------------
+
+def _build_isotonic_gain_calibrator(historical_df: pd.DataFrame):
+    """
+    RC5 FIX: Fit an IsotonicRegression on (predicted_probability, actual_gain_pct)
+    from historical accuracy data.
+
+    IsotonicRegression is monotone and non-parametric — it learns the actual
+    relationship between probability and gain without assuming linearity, and
+    avoids the bucket-collapse problem of the old median-per-bucket approach.
+
+    Returns a callable f(prob_array) → gain_array, or None if not enough data.
+    """
+    if historical_df is None or historical_df.empty:
+        return None
+
+    # Need predicted_probability and actual_gain_pct
+    prob_col = next(
+        (c for c in ["predicted_probability", "probability", "explosion_probability"]
+         if c in historical_df.columns),
+        None,
+    )
+    gain_col = next(
+        (c for c in ["actual_gain_pct", "actual_high_pct"] if c in historical_df.columns),
+        None,
+    )
+
+    if prob_col is None or gain_col is None:
+        return None
+
+    pairs = historical_df[[prob_col, gain_col]].copy()
+    pairs = pairs.rename(columns={prob_col: "prob", gain_col: "gain"})
+    pairs["prob"] = pd.to_numeric(pairs["prob"], errors="coerce")
+    pairs["gain"] = pd.to_numeric(pairs["gain"], errors="coerce")
+    pairs = pairs.dropna()
+    pairs = pairs[(pairs["prob"] > 0) & (pairs["prob"] <= 1) & (pairs["gain"].abs() < 500)]
+
+    if len(pairs) < ISOTONIC_MIN_SAMPLES:
+        logging.getLogger(__name__).info(
+            f"RC5: Only {len(pairs)} historical pairs — need {ISOTONIC_MIN_SAMPLES} "
+            "for isotonic calibration. Falling back to quantile interpolation."
+        )
+        return _build_quantile_interpolator(pairs)
+
+    try:
+        from sklearn.isotonic import IsotonicRegression
+
+        ir = IsotonicRegression(out_of_bounds="clip", increasing=True)
+        ir.fit(pairs["prob"].values, pairs["gain"].values)
+
+        # Sanity check: calibrated std across the probability range
+        test_probs = np.linspace(0.05, 0.99, 50)
+        test_gains = ir.predict(test_probs)
+        calib_std = float(test_gains.std())
+
+        logger = logging.getLogger(__name__)
+        logger.info(
+            f"RC5: IsotonicRegression fitted on {len(pairs)} pairs. "
+            f"Calibrated gain range: {test_gains.min():.1f}%–{test_gains.max():.1f}% "
+            f"(std={calib_std:.2f}%)"
+        )
+
+        if calib_std < 1.0:
+            logger.warning(
+                f"RC5: IsotonicRegression std={calib_std:.2f}% is low. "
+                "Historical gain data may still be compressed (RC2 not yet taking effect). "
+                "Falling back to quantile interpolation for better rank separation."
+            )
+            return _build_quantile_interpolator(pairs)
+
+        return lambda probs: ir.predict(np.asarray(probs, dtype=float))
+
+    except ImportError:
+        logging.getLogger(__name__).warning(
+            "RC5: sklearn IsotonicRegression not available — using quantile interpolation"
+        )
+        return _build_quantile_interpolator(pairs)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"RC5: IsotonicRegression failed ({e}) — using quantile interpolation")
+        return _build_quantile_interpolator(pairs)
+
+
+def _build_quantile_interpolator(pairs: pd.DataFrame):
+    """
+    RC5 fallback: build a piecewise-linear interpolation over observed quantiles
+    of (probability, gain) so that rank order is preserved even when isotonic
+    regression is unavailable or produces a flat curve.
+
+    At minimum this ensures STRONG BUY stocks get higher gain estimates than
+    BUY stocks get higher than HOLD stocks, which was not guaranteed by the
+    old median-per-bucket approach.
+    """
+    if pairs.empty:
+        return None
+
+    quantile_points = np.linspace(0.05, 0.95, 19)
+    prob_quantiles = np.quantile(pairs["prob"].values, quantile_points)
+    gain_quantiles = np.quantile(pairs["gain"].values, quantile_points)
+
+    # Ensure monotone (isotone) by taking cumulative max
+    gain_quantiles = np.maximum.accumulate(gain_quantiles)
+
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"RC5: Quantile interpolator fitted. "
+        f"Gain range: {gain_quantiles.min():.1f}%–{gain_quantiles.max():.1f}% "
+        f"(std={gain_quantiles.std():.2f}%)"
+    )
+
+    def _interpolate(probs):
+        probs_arr = np.asarray(probs, dtype=float).clip(0.01, 0.99)
+        return np.interp(probs_arr, prob_quantiles, gain_quantiles)
+
+    return _interpolate
 
 
 class ExplosionPredictor:
@@ -94,70 +227,43 @@ class ExplosionPredictor:
 
     @property
     def model_feature_prefix(self) -> str:
-        """
-        Returns the dominant feature prefix in this model's feature list.
-        Possible values: "t1_close", "t1_open", "t3", "t5", "t10", "mixed".
-
-        ml_screen_and_predict uses this to build features with the correct prefix
-        so they actually match the model's expectations.
-        """
         return self._model_feature_prefix
 
     def _detect_model_prefix(self) -> str:
-            """
-            Examine self.feature_names and return the dominant prefix group.
-            Called once after model load.
-    
-            FIX 6: The old hybrid guard `if counts["t1_close"] > 0 and counts["t3"] > 0`
-            always returned "t1_close" regardless of which group dominated.
-            For a model with 72% t3_ features this caused all t3_ columns to receive
-            default values at prediction time → identical probabilities.
-    
-            Now returns "t1_close" only when t1_ features genuinely dominate (>50%).
-            For hybrid models where t3/t5/t10 dominate, returns "t1_close" as the
-            *primary* prefix (T-1 data is freshest) but the screen script uses
-            _is_hybrid_model() to also populate flat prefixes.
-            """
-            if not self.feature_names:
-                return "t1_close"
-    
-            counts = {
-                "t1_close": sum(1 for f in self.feature_names if f.startswith("t1_close_")),
-                "t1_open":  sum(1 for f in self.feature_names if f.startswith("t1_open_")),
-                "t3":       sum(1 for f in self.feature_names if f.startswith("t3_")),
-                "t5":       sum(1 for f in self.feature_names if f.startswith("t5_")),
-                "t10":      sum(1 for f in self.feature_names if f.startswith("t10_")),
-            }
-    
-            total = sum(counts.values())
-            if total == 0:
-                return "t1_close"
-    
-            dominant = max(counts, key=counts.get)
-    
-            self.logger.info("Model feature prefix breakdown:")
-            for pfx, cnt in counts.items():
-                pct = cnt / total * 100 if total else 0
-                self.logger.info(f"  {pfx:12s}: {cnt:4d}  ({pct:.1f}%)")
-            self.logger.info(f"  → dominant prefix: '{dominant}' — screen script will use this")
-    
-            # For hybrid models (both t1_ and t3/t5/t10 features present),
-            # always return "t1_close" as the primary prefix — it represents the
-            # freshest signal and the screen script's T-1 yfinance fetch targets it.
-            # The screen script detects hybrid via _is_hybrid_model() and additionally
-            # fills t3_/t5_/t10_* columns from TV data so both groups get real values.
-            has_t1   = counts["t1_close"] > 0 or counts["t1_open"] > 0
-            has_flat = counts["t3"] > 0 or counts["t5"] > 0 or counts["t10"] > 0
-    
-            if has_t1 and has_flat:
-                self.logger.info(
-                    "  → HYBRID model detected (t1_ + t3/t5/t10 features). "
-                    "Returning 't1_close' as primary prefix. "
-                    "Screen script will also fill flat prefixes."
-                )
-                return "t1_close"
-    
-            return dominant
+        if not self.feature_names:
+            return "t1_close"
+
+        counts = {
+            "t1_close": sum(1 for f in self.feature_names if f.startswith("t1_close_")),
+            "t1_open":  sum(1 for f in self.feature_names if f.startswith("t1_open_")),
+            "t3":       sum(1 for f in self.feature_names if f.startswith("t3_")),
+            "t5":       sum(1 for f in self.feature_names if f.startswith("t5_")),
+            "t10":      sum(1 for f in self.feature_names if f.startswith("t10_")),
+        }
+
+        total = sum(counts.values())
+        if total == 0:
+            return "t1_close"
+
+        dominant = max(counts, key=counts.get)
+
+        self.logger.info("Model feature prefix breakdown:")
+        for pfx, cnt in counts.items():
+            pct = cnt / total * 100 if total else 0
+            self.logger.info(f"  {pfx:12s}: {cnt:4d}  ({pct:.1f}%)")
+        self.logger.info(f"  → dominant prefix: '{dominant}' — screen script will use this")
+
+        has_t1   = counts["t1_close"] > 0 or counts["t1_open"] > 0
+        has_flat = counts["t3"] > 0 or counts["t5"] > 0 or counts["t10"] > 0
+
+        if has_t1 and has_flat:
+            self.logger.info(
+                "  → HYBRID model detected (t1_ + t3/t5/t10 features). "
+                "Returning 't1_close' as primary prefix."
+            )
+            return "t1_close"
+
+        return dominant
 
     # -------------------------------------------------------------------------
     # Model loading
@@ -188,8 +294,8 @@ class ExplosionPredictor:
         else:
             self.regressor = None
             self.logger.warning(
-                "gain_regressor.pkl not found — will use rule-based gain estimates. "
-                "Run ml_retrain_model.py once ≥30 winner rows have gain data."
+                "gain_regressor.pkl not found — will use calibrated gain estimates. "
+                "Run ml_retrain_model.py once ≥30 rows have gain data."
             )
 
         if metadata_path.exists():
@@ -204,7 +310,6 @@ class ExplosionPredictor:
 
         self._build_lookup()
 
-        # FIX 1: Detect the dominant prefix in the loaded model
         self._model_feature_prefix = self._detect_model_prefix()
 
         classifier_n = self.scaler.n_features_in_
@@ -229,9 +334,9 @@ class ExplosionPredictor:
         if has_flat and has_t1:
             self.logger.info("Model type: HYBRID (T-3/T-5/T-10 + T-1 open/close)")
         elif has_flat:
-            self.logger.info("Model type: CSV-ONLY (T-3/T-5/T-10) — features must use t3_ prefix")
+            self.logger.info("Model type: CSV-ONLY (T-3/T-5/T-10)")
         elif has_t1:
-            self.logger.info("Model type: DATABASE-ONLY (T-1 open/close) — features must use t1_close_ prefix")
+            self.logger.info("Model type: DATABASE-ONLY (T-1 open/close)")
         else:
             self.logger.warning("Could not identify model type. First 10 features: %s",
                                 self.feature_names[:10])
@@ -382,8 +487,7 @@ class ExplosionPredictor:
         if coverage < 50:
             self.logger.warning(
                 f"LOW feature coverage ({coverage:.1f}%) — model may be using t3_ prefix "
-                f"but features were built with '{self._model_feature_prefix}' prefix. "
-                f"Check that build_features_from_tv_data uses the correct prefix."
+                f"but features were built with '{self._model_feature_prefix}' prefix."
             )
 
         if not self._diag_done:
@@ -460,18 +564,6 @@ class ExplosionPredictor:
     # -------------------------------------------------------------------------
 
     def _detect_bimodal(self, probabilities: np.ndarray) -> bool:
-        """
-        Detect whether the model's output distribution is degenerate and
-        requires relative (percentile-based) signal classification.
-
-        Three failure modes:
-          A) Compression below 0.50: >85% of predictions below 0.50
-             (T3-only model with weak features)
-          B) Narrow band regardless of level: std < 0.02
-             (all stocks get ~0.73 because features are too uniform)
-          C) Bimodal collapse toward extremes: sparse mid-range
-             (original failure mode)
-        """
         n = len(probabilities)
 
         # Mode A: Low-probability compression
@@ -484,13 +576,12 @@ class ExplosionPredictor:
             )
             return True
 
-        # Mode B: FIX — narrow probability band (new check)
+        # Mode B: Narrow probability band (FIX 2)
         prob_std = float(np.std(probabilities))
         if prob_std < NARROW_BAND_STD_THRESHOLD:
             self.logger.warning(
                 f"NARROW PROBABILITY BAND: std={prob_std:.4f} < {NARROW_BAND_STD_THRESHOLD}. "
-                f"All stocks are getting near-identical scores. "
-                f"Switching to percentile-based signals to give differentiated BUY/STRONG BUY/HOLD."
+                f"Switching to percentile-based signals."
             )
             return True
 
@@ -499,8 +590,8 @@ class ExplosionPredictor:
         mid_count = int(((probabilities > mid_lo) & (probabilities < mid_hi)).sum())
         if mid_count < BIMODAL_MIN_MIDRANGE_COUNT:
             self.logger.warning(
-                f"BIMODAL COLLAPSE: only {mid_count} predictions in mid-range "
-                f"({mid_lo:.0%}–{mid_hi:.0%}). Switching to percentile-based signals."
+                f"BIMODAL COLLAPSE: only {mid_count} predictions in mid-range. "
+                "Switching to percentile-based signals."
             )
             return True
 
@@ -513,14 +604,7 @@ class ExplosionPredictor:
         return "AVOID"
 
     def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
-        """
-        FIX 3: Rank-based signal classification on the FULL distribution.
-
-        Top 2%   → STRONG BUY
-        2–10%    → BUY
-        10–25%   → HOLD
-        Bottom 75% → AVOID
-        """
+        """FIX 3: Rank-based signal classification on the FULL distribution."""
         n = len(probabilities)
         signals = pd.Series("AVOID", index=probabilities.index)
 
@@ -540,10 +624,6 @@ class ExplosionPredictor:
         self.logger.info(
             f"Relative signals (percentile-based): STRONG BUY={strong_buy_n}, BUY={buy_n}, "
             f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n}"
-        )
-        self.logger.info(
-            f"  Prob range: {probabilities.min():.4f} – {probabilities.max():.4f}, "
-            f"std={probabilities.std():.4f}"
         )
 
         return signals
@@ -569,10 +649,7 @@ class ExplosionPredictor:
         if zero_var_cols > len(self.feature_names) * 0.5:
             self.logger.warning(
                 "MORE THAN HALF of features are zero-variance after scaling. "
-                "This strongly suggests the feature prefix in the screen script "
-                f"does not match what the model was trained on. "
-                f"Model dominant prefix: '{self._model_feature_prefix}'. "
-                "Check TV_TO_MODEL_BASE builds features with this prefix."
+                "Check TV_TO_MODEL_BASE builds features with the correct prefix."
             )
 
         predictions   = self.model.predict(X_scaled)
@@ -617,7 +694,7 @@ class ExplosionPredictor:
         return result_df
 
     # -------------------------------------------------------------------------
-    # Prediction with gain targets
+    # Prediction with gain targets — RC4 + RC5 fixes applied here
     # -------------------------------------------------------------------------
 
     def predict_with_targets(
@@ -627,24 +704,46 @@ class ExplosionPredictor:
     ) -> pd.DataFrame:
         predictions, features_df, X_scaled = self._predict_internal(data_df)
 
-        # FIX 4: Regressor receives X_scaled (same as classifier)
+        # ------------------------------------------------------------------
+        # FIX 4 (original) + RC4 FIX: Regressor receives X_scaled.
+        # RC4: Relaxed std guard from 1.0 → REGRESSOR_MIN_STD_THRESHOLD (0.5)
+        #      and added minimum sample count guard.
+        # ------------------------------------------------------------------
         if self.regressor is not None:
             try:
                 predicted_gains = self.regressor.predict(X_scaled)
+                gain_std  = float(predicted_gains.std())
+                gain_mean = float(predicted_gains.mean())
+                n_preds   = len(predicted_gains)
+
                 self.logger.info(
-                    f"Gain regressor: predicted {len(predicted_gains)} gains  "
+                    f"Gain regressor: {n_preds} predictions  "
                     f"range=[{predicted_gains.min():.1f}%, {predicted_gains.max():.1f}%]  "
-                    f"mean={predicted_gains.mean():.1f}%  std={predicted_gains.std():.2f}%"
+                    f"mean={gain_mean:.1f}%  std={gain_std:.2f}%"
                 )
 
-                # Sanity check: if all gains are nearly identical the regressor isn't helping
-                if predicted_gains.std() < 1.0:
+                # RC4 FIX: Use relaxed threshold and minimum sample count
+                if n_preds < REGRESSOR_MIN_PRED_COUNT:
                     self.logger.warning(
-                        f"Gain regressor std={predicted_gains.std():.4f}% — very flat. "
-                        "Disabling and falling back to historical/rule-based estimates."
+                        f"RC4: Regressor made only {n_preds} predictions "
+                        f"(need {REGRESSOR_MIN_PRED_COUNT}). "
+                        "Falling back to calibrated gain estimates."
+                    )
+                    self.regressor = None
+                elif gain_std < REGRESSOR_MIN_STD_THRESHOLD:
+                    self.logger.warning(
+                        f"RC4: Gain regressor std={gain_std:.4f}% < {REGRESSOR_MIN_STD_THRESHOLD}% "
+                        f"(was 1.0 in previous version — now using relaxed threshold). "
+                        f"Gain predictions are too flat to be useful. "
+                        f"This likely means RC2/RC3 fixes haven't propagated yet "
+                        f"(model trained before fixes). Falling back to calibrated estimates."
                     )
                     self.regressor = None
                 else:
+                    self.logger.info(
+                        f"RC4: Regressor std={gain_std:.2f}% passes threshold "
+                        f"({REGRESSOR_MIN_STD_THRESHOLD}%). Using regressor predictions."
+                    )
                     predictions["target_gain_pct"]  = predicted_gains
                     predictions["target_gain_low"]   = predicted_gains * 0.8
                     predictions["target_gain_high"]  = predicted_gains * 1.2
@@ -652,35 +751,79 @@ class ExplosionPredictor:
                 self.logger.warning(f"Regressor predict failed ({e}) — falling back")
                 self.regressor = None
 
+        # ------------------------------------------------------------------
+        # RC5 FIX: Calibrated fallback when regressor is unavailable/disabled
+        # ------------------------------------------------------------------
         if self.regressor is None:
+            gain_calibrator = None
+
             if historical_gains_df is not None and not historical_gains_df.empty:
-                gain_buckets = historical_gains_df.copy()
-                gain_buckets["prob_bucket"] = pd.cut(
-                    gain_buckets["predicted_probability"],
-                    bins=[0, 0.5, 0.7, 0.9, 1.0],
-                    labels=["Low", "Medium", "High", "Very High"],
+                # RC5: Try to build an isotonic/quantile calibrator first
+                gain_calibrator = _build_isotonic_gain_calibrator(historical_gains_df)
+
+                if gain_calibrator is not None:
+                    self.logger.info(
+                        "RC5: Using isotonic/quantile calibration for gain estimates."
+                    )
+                    probs = predictions["explosion_probability"].values
+                    calibrated_gains = gain_calibrator(probs)
+
+                    predictions["target_gain_pct"]  = calibrated_gains
+                    predictions["target_gain_low"]   = calibrated_gains * 0.7
+                    predictions["target_gain_high"]  = calibrated_gains * 1.3
+
+                    gain_std_cal = float(np.std(calibrated_gains))
+                    self.logger.info(
+                        f"RC5: Calibrated gains range: "
+                        f"{calibrated_gains.min():.1f}%–{calibrated_gains.max():.1f}%  "
+                        f"std={gain_std_cal:.2f}%"
+                    )
+
+                    if gain_std_cal < 1.0:
+                        self.logger.warning(
+                            f"RC5: Calibrated gain std={gain_std_cal:.2f}% still low. "
+                            "Historical gain data may be compressed (RC2 not yet in effect). "
+                            "Falling back to rank-adjusted rule-based estimates."
+                        )
+                        gain_calibrator = None  # Will use rule-based below
+
+                else:
+                    # Old bucket approach as intermediate fallback
+                    # (kept for compatibility but with rank-adjustment to avoid collapse)
+                    self.logger.info(
+                        "RC5: Isotonic calibration unavailable. "
+                        "Using rank-adjusted bucket estimates."
+                    )
+                    gain_calibrator = None
+
+            if gain_calibrator is None:
+                # Final fallback: rule-based but with rank adjustment to ensure
+                # spread across the prediction pool (avoids flat 20–30% for all)
+                self.logger.info(
+                    "RC5: Using rank-adjusted rule-based gain estimates."
                 )
-                avg_gains = gain_buckets.groupby("prob_bucket")["actual_gain_pct"].agg(
-                    ["mean", "median", "std"]
+                probs = predictions["explosion_probability"].values
+                base_gains = np.array([self._estimate_target_gain(p) for p in probs])
+
+                # Apply rank-based spread: boost high-probability stocks,
+                # reduce low-probability stocks relative to their rule-based estimate
+                if len(probs) > 1:
+                    prob_ranks = pd.Series(probs).rank(pct=True).values
+                    # Spread multiplier: ranges from 0.6 (bottom) to 1.4 (top)
+                    spread_multiplier = 0.6 + 0.8 * prob_ranks
+                    adjusted_gains = base_gains * spread_multiplier
+                else:
+                    adjusted_gains = base_gains
+
+                predictions["target_gain_pct"]  = adjusted_gains
+                predictions["target_gain_low"]   = adjusted_gains * 0.5
+                predictions["target_gain_high"]  = adjusted_gains * 1.5
+
+                self.logger.info(
+                    f"RC5: Rank-adjusted gains: "
+                    f"{adjusted_gains.min():.1f}%–{adjusted_gains.max():.1f}%  "
+                    f"std={adjusted_gains.std():.2f}%"
                 )
-                predictions["prob_bucket"] = pd.cut(
-                    predictions["explosion_probability"],
-                    bins=[0, 0.5, 0.7, 0.9, 1.0],
-                    labels=["Low", "Medium", "High", "Very High"],
-                )
-                predictions = predictions.merge(
-                    avg_gains, left_on="prob_bucket", right_index=True, how="left"
-                )
-                predictions["target_gain_pct"]  = predictions["median"]
-                predictions["target_gain_low"]   = predictions["median"] - predictions["std"].fillna(0)
-                predictions["target_gain_high"]  = predictions["median"] + predictions["std"].fillna(0)
-                predictions = predictions.drop(["prob_bucket", "mean", "median", "std"], axis=1)
-            else:
-                self.logger.warning("No regressor and no historical data — using rule-based gain estimates")
-                predictions["target_gain_pct"]  = predictions["explosion_probability"].apply(
-                    self._estimate_target_gain)
-                predictions["target_gain_low"]   = predictions["target_gain_pct"] * 0.5
-                predictions["target_gain_high"]  = predictions["target_gain_pct"] * 1.5
 
         # Fill any remaining NaN gains
         nan_gain = predictions["target_gain_pct"].isna()
@@ -714,8 +857,6 @@ class ExplosionPredictor:
         if "symbol" not in data_df.columns:
             return None
 
-        # Build candidate list using both t1_close_ and t3_ prefixes so this works
-        # regardless of which model is loaded
         price_candidates = ["current_price", "t3_Close", "t1_close_Close", "Close"]
         for col in data_df.columns:
             for pfx in ("t3_", "t1_close_", "t1_open_"):
@@ -759,6 +900,11 @@ class ExplosionPredictor:
         return self._classify_signal_absolute(probability)
 
     def _estimate_target_gain(self, probability: float) -> float:
+        """
+        Rule-based gain estimate. Used only as backstop when both the regressor
+        and calibrated fallback are unavailable. RC5 applies a rank-adjustment
+        multiplier on top of these values to ensure spread.
+        """
         if probability >= 0.95: return 30.0
         if probability >= 0.90: return 25.0
         if probability >= 0.80: return 20.0
@@ -766,4 +912,3 @@ class ExplosionPredictor:
         if probability >= 0.60: return 10.0
         if probability >= 0.50: return 7.0
         return 3.0
-
