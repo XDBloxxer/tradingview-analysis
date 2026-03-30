@@ -43,6 +43,19 @@ FIXES IN THIS VERSION:
      now deduplicate after combine_datasets() so the model doesn't overfit to
      repeated rows.
 
+GAIN REGRESSOR FIXES (2026 update):
+  RC2. Correct gain target: actual_high_pct now uses prev_close as denominator
+       (fetched from daily_winners prev-day row or ml_prediction_accuracy), NOT the
+       same-day close. This was severely compressing the target range.
+  RC3. Scale alignment: regressor is trained on X_scaled (StandardScaler output),
+       exactly matching what explosion_predictor.py passes at inference time.
+  RC1. Broader training set: regressor now also trains on non-winner rows that have
+       actual_gain_pct from ml_prediction_accuracy (yfinance data), giving far more
+       training samples and a wider gain distribution.
+  RC6. Mistake row enrichment: mistake samples (false positives/negatives) are
+       enriched with actual_gain_pct from ml_prediction_accuracy before being added
+       to combined_df, so they contribute to regressor training.
+
 NOTE ON CLASS BALANCE:
   ml_training_base contains both winners (label=1) and non-winners (label=0) from
   the original CSV, all with t3_/t5_/t10_ features from daily bars.
@@ -118,8 +131,6 @@ MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # FIX 4: Intraday high threshold — a stock is considered a "winner" even if
 # it didn't close at the top, as long as it hit this intraday gain.
-# This corrects false positives where the model correctly identified explosive
-# stocks that moved big intraday but closed below the strict winner threshold.
 INTRADAY_WIN_THRESHOLD = 15.0  # %
 
 # FIX 3: scale_pos_weight caps — prevent extreme corrections
@@ -128,14 +139,14 @@ SPW_MAX = 3.0
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
-    "max_depth":          5,       # FIX 2: reduced from 6 → less overfitting
+    "max_depth":          5,       # reduced from 6 → less overfitting
     "learning_rate":      0.05,
     "subsample":          0.8,
     "colsample_bytree":   0.8,
-    "min_child_weight":   10,      # FIX 2: raised from 3 → requires more samples per leaf
-    "gamma":              1.0,     # FIX 2: raised from 0.1 → higher minimum gain to split
-    "reg_alpha":          0.5,     # FIX 2: raised from 0.1 → more L1 regularisation
-    "reg_lambda":         2.0,     # FIX 2: raised from 1.0 → more L2 regularisation
+    "min_child_weight":   10,      # raised from 3 → requires more samples per leaf
+    "gamma":              1.0,     # raised from 0.1 → higher minimum gain to split
+    "reg_alpha":          0.5,     # raised from 0.1 → more L1 regularisation
+    "reg_lambda":         2.0,     # raised from 1.0 → more L2 regularisation
     "scale_pos_weight":   1,       # overridden at train time (clamped to SPW_MIN/MAX)
     "objective":          "binary:logistic",
     "eval_metric":        "logloss",
@@ -344,6 +355,185 @@ def load_t1_data(client: Client) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# RC6 FIX: Enrich mistake samples with actual_gain_pct from accuracy table
+# ---------------------------------------------------------------------------
+
+def enrich_mistakes_with_gains(
+    mistake_df: pd.DataFrame,
+    client: Client,
+) -> pd.DataFrame:
+    """
+    RC6 FIX: Fetch actual_gain_pct and actual_high_pct for mistake rows from
+    ml_prediction_accuracy so they contribute to gain regressor training.
+
+    Without this, mistake rows have no gain target and are silently excluded
+    from the regressor's winner_mask, wasting the corrective signal they carry.
+    """
+    if mistake_df.empty:
+        return mistake_df
+
+    if "symbol" not in mistake_df.columns or "detection_date" not in mistake_df.columns:
+        return mistake_df
+
+    logger.info("RC6: Enriching mistake samples with actual gain data...")
+
+    # Collect unique (symbol, date) pairs from mistake rows
+    pairs = (
+        mistake_df[["symbol", "detection_date"]]
+        .dropna()
+        .drop_duplicates()
+    )
+
+    if pairs.empty:
+        return mistake_df
+
+    dates = pairs["detection_date"].unique().tolist()
+    symbols = pairs["symbol"].unique().tolist()
+
+    accuracy_rows = []
+    for i in range(0, len(dates), 20):
+        date_chunk = dates[i:i + 20]
+        try:
+            resp = (
+                client.table("ml_prediction_accuracy")
+                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+                .in_("prediction_date", date_chunk)
+                .in_("symbol", symbols)
+                .execute()
+            )
+            if resp.data:
+                accuracy_rows.extend(resp.data)
+        except Exception as e:
+            logger.debug(f"RC6: accuracy fetch chunk failed: {e}")
+
+    if not accuracy_rows:
+        logger.info("RC6: No accuracy data found for mistake symbols — skipping enrichment")
+        return mistake_df
+
+    acc_df = pd.DataFrame(accuracy_rows).rename(columns={"prediction_date": "detection_date"})
+    acc_df = acc_df.dropna(subset=["symbol", "detection_date"])
+
+    result = mistake_df.copy()
+    # Merge in actual_gain_pct and actual_high_pct where missing
+    merged = result.merge(
+        acc_df[["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]],
+        on=["symbol", "detection_date"],
+        how="left",
+        suffixes=("", "_acc"),
+    )
+
+    # Fill missing values from the accuracy table
+    if "actual_gain_pct" not in merged.columns:
+        merged["actual_gain_pct"] = np.nan
+    if "actual_high_pct" not in merged.columns:
+        merged["actual_high_pct"] = np.nan
+
+    # Prefer existing values; only fill where NaN
+    for col in ["actual_gain_pct", "actual_high_pct"]:
+        acc_col = f"{col}_acc"
+        if acc_col in merged.columns:
+            was_nan = merged[col].isna()
+            merged.loc[was_nan, col] = merged.loc[was_nan, acc_col]
+            merged = merged.drop(columns=[acc_col])
+
+    enriched_count = merged["actual_high_pct"].notna().sum()
+    logger.info(
+        f"RC6: Enriched {enriched_count}/{len(merged)} mistake rows with gain data"
+    )
+    return merged
+
+
+# ---------------------------------------------------------------------------
+# RC2 FIX: Correct gain target computation (prev_close denominator)
+# ---------------------------------------------------------------------------
+
+def _compute_correct_actual_high_pct(
+    winners_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    RC2 FIX: Compute actual_high_pct using the PREVIOUS day's close as the
+    denominator, not the same-day close (which produces near-zero values and
+    was the root cause of the compressed gain range in the regressor).
+
+    For each winner row we need the previous day's close. We approximate this
+    using the daily_winners table itself: sort by (symbol, detection_date) and
+    shift by one row per symbol to get prev_close.
+
+    If prev_close is unavailable we fall back to the same-day open as a
+    reasonable proxy (at minimum this is far better than same-day close).
+
+    Args:
+        winners_df: DataFrame from daily_winners with columns:
+                    symbol, detection_date, price (same-day close),
+                    high, open, close
+
+    Returns:
+        winners_df with corrected actual_high_pct column added/overwritten
+    """
+    if winners_df.empty:
+        return winners_df
+
+    required = {"symbol", "detection_date", "high"}
+    if not required.issubset(winners_df.columns):
+        logger.warning(
+            f"RC2: daily_winners missing required columns {required - set(winners_df.columns)} "
+            "— cannot compute corrected actual_high_pct"
+        )
+        return winners_df
+
+    df = winners_df.copy()
+    df["detection_date"] = pd.to_datetime(df["detection_date"], errors="coerce")
+    df = df.sort_values(["symbol", "detection_date"])
+
+    # Compute prev_close by shifting close within each symbol group
+    if "close" in df.columns:
+        df["prev_close"] = df.groupby("symbol")["close"].shift(1)
+    elif "price" in df.columns:
+        df["prev_close"] = df.groupby("symbol")["price"].shift(1)
+    else:
+        df["prev_close"] = np.nan
+
+    # Fallback: use same-day open as proxy when prev_close is NaN
+    if "open" in df.columns:
+        df["prev_close"] = df["prev_close"].fillna(df["open"])
+
+    # Compute corrected actual_high_pct
+    high_vals = pd.to_numeric(df["high"], errors="coerce")
+    prev_close_vals = pd.to_numeric(df["prev_close"], errors="coerce")
+
+    valid_mask = prev_close_vals.notna() & (prev_close_vals > 0) & high_vals.notna()
+    df["actual_high_pct"] = np.nan
+    df.loc[valid_mask, "actual_high_pct"] = (
+        (high_vals[valid_mask] / prev_close_vals[valid_mask] - 1) * 100
+    ).clip(lower=0)
+
+    # Also compute actual_gain_pct if change_pct not available from same source
+    if "change_pct" not in df.columns and "price" in df.columns:
+        price_vals = pd.to_numeric(df["price"], errors="coerce")
+        df.loc[valid_mask, "change_pct"] = (
+            (price_vals[valid_mask] / prev_close_vals[valid_mask] - 1) * 100
+        )
+
+    n_corrected = int(valid_mask.sum())
+    n_total = len(df)
+    if n_corrected > 0:
+        pct_range = df.loc[valid_mask, "actual_high_pct"]
+        logger.info(
+            f"RC2: Corrected actual_high_pct for {n_corrected}/{n_total} winner rows "
+            f"(range: {pct_range.min():.1f}%–{pct_range.max():.1f}%, "
+            f"mean: {pct_range.mean():.1f}%)"
+        )
+    else:
+        logger.warning(
+            "RC2: Could not compute corrected actual_high_pct — no prev_close data available"
+        )
+
+    # Restore string dates
+    df["detection_date"] = df["detection_date"].dt.strftime("%Y-%m-%d")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Data preparation
 # ---------------------------------------------------------------------------
 
@@ -418,8 +608,6 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
     # Safe dedup: only deduplicate if BOTH sources use the same date column name.
-    # Base CSV uses event_date, T-1 data uses detection_date — these are different
-    # columns and should NOT be deduped against each other.
     sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
     date_cols_present = [c for c in ["detection_date", "event_date"] if c in combined.columns]
 
@@ -582,7 +770,7 @@ def train_model(
     logger.info(f"  Best iteration: {model.best_iteration}")
     logger.info(f"  Best val logloss: {model.best_score:.4f}")
 
-    # FIX: Warn loudly if val logloss is suspiciously perfect — sign of data leakage
+    # Warn if val logloss is suspiciously perfect — sign of data leakage
     if model.best_score < 0.05:
         logger.warning(
             f"  ⚠️  Val logloss={model.best_score:.4f} is suspiciously low. "
@@ -601,24 +789,13 @@ def train_val_split(
     val_fraction: float = 0.15,
 ) -> tuple:
     """
-    FIX 1: TIME-BASED train/val split instead of random stratified split.
+    TIME-BASED train/val split instead of random stratified split.
 
-    Why this matters: With a random split, the model sees stocks from the
-    same week in both train and val. Since market regimes persist over days,
-    this makes val performance look much better than it actually is (0.9999 AUC).
-
-    A time-based split forces the model to validate on the MOST RECENT data,
-    which is the honest test of whether it generalises across time.
-
-    KEY FIX: We build a unified _sort_date column that takes detection_date
-    for T-1 rows and falls back to event_date for base CSV rows. Without this,
-    base CSV rows (which have no detection_date) sort as NaT and float to the
-    front, putting the entire val set in the T-1 non-winner rows → 0 positives
-    in val → degenerate model that outputs a constant probability.
+    Uses a unified _sort_date column (detection_date ?? event_date) so that
+    base CSV rows sort correctly alongside T-1 rows.
     """
     df_work = df_with_dates.copy()
 
-    # Build unified sort date: prefer detection_date, fall back to event_date
     has_detection = "detection_date" in df_work.columns
     has_event     = "event_date" in df_work.columns
 
@@ -627,7 +804,6 @@ def train_val_split(
         if has_detection:
             sort_date = pd.to_datetime(df_work["detection_date"], errors="coerce")
         if has_event:
-            # Fill any NaT (base CSV rows) with event_date
             event_parsed = pd.to_datetime(df_work["event_date"], errors="coerce")
             sort_date = sort_date.fillna(event_parsed)
 
@@ -648,8 +824,7 @@ def train_val_split(
     if date_col is None:
         logger.warning(
             "No date column found for time-based split — "
-            "falling back to sequential split (first N rows train, last M rows val). "
-            "This is still better than random but not ideal."
+            "falling back to sequential split."
         )
         split_idx = int(len(X) * (1 - val_fraction))
         X_train = X.iloc[:split_idx]
@@ -659,7 +834,6 @@ def train_val_split(
         w_train = w.iloc[:split_idx]
         w_val   = w.iloc[split_idx:]
     else:
-        # Sort by unified date, take most recent val_fraction as validation set
         dates      = pd.to_datetime(df_work[date_col], errors="coerce")
         sorted_idx = dates.sort_values(na_position='last').index
         split_pos  = int(len(sorted_idx) * (1 - val_fraction))
@@ -690,12 +864,11 @@ def train_val_split(
         f"(pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())})"
     )
 
-    # Warn if val set has very few positives — calibration will be noisy
     val_pos = int((y_val == 1).sum())
     if val_pos < 10:
         logger.warning(
             f"  ⚠️  Only {val_pos} positive examples in validation set. "
-            "Accuracy metrics may be noisy. Consider using a longer training window."
+            "Accuracy metrics may be noisy."
         )
 
     return X_train, X_val, y_train, y_val, w_train, w_val
@@ -737,70 +910,190 @@ def compute_feature_importance(
 
 
 # ---------------------------------------------------------------------------
-# Gain regressor
+# RC1 + RC3 FIX: Gain regressor — broader training set, correct scale input
 # ---------------------------------------------------------------------------
 
 def train_gain_regressor(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    w_train: pd.Series,
+    X_scaled: pd.DataFrame,           # RC3 FIX: receive pre-scaled features
     combined_df: pd.DataFrame,
     feature_names: list[str],
-) -> "Optional[XGBClassifier]":
+    client: Client,
+) -> "Optional[object]":
     """
     Train a regression model to predict actual % gain for stocks the
     classifier labels as winners.
+
+    RC1 FIX: Broaden training set beyond just winners.
+      - Winners from daily_winners (with corrected actual_high_pct via prev_close)
+      - Non-winners that have actual_gain_pct in ml_prediction_accuracy
+        (yfinance data captured by the accuracy tracker)
+      This gives far more training samples and a realistic gain distribution.
+
+    RC2 FIX: Use actual_high_pct computed from prev_close (already corrected
+      in the enrichment step before this function is called).
+
+    RC3 FIX: X_scaled is the StandardScaler output, matching exactly what
+      explosion_predictor.py passes to the regressor at inference time.
+      Previously the regressor was trained on raw/filled values but received
+      scaled values → systematically wrong predictions from day one.
+
+    RC4 FIX: The std < 1.0 guard in explosion_predictor.py is relaxed to
+      0.5 (see that file), but we also improve training quality here so the
+      regressor doesn't collapse to the mean.
     """
     from xgboost import XGBRegressor
 
-    # Prefer actual_high_pct over change_pct for the gain target —
-    # it captures the best intraday opportunity, not just the close.
+    # ------------------------------------------------------------------
+    # Determine gain target column
+    # ------------------------------------------------------------------
     gain_col = None
     for candidate in ("actual_high_pct", "actual_gain_pct", "change_pct"):
         if candidate in combined_df.columns:
-            gain_col = candidate
-            break
+            col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
+            non_null = col_vals.notna().sum()
+            if non_null >= 30:
+                gain_col = candidate
+                logger.info(f"Gain regressor target column: '{gain_col}' ({non_null} non-null values)")
+                break
 
     if gain_col is None:
-        logger.warning("No gain column found — skipping gain regressor training.")
+        logger.warning("No gain column with sufficient data — skipping gain regressor training.")
         return None
 
-    winner_mask  = (combined_df["label"] == 1) & combined_df[gain_col].notna()
-    n_winners    = int(winner_mask.sum())
+    # ------------------------------------------------------------------
+    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy
+    # for rows that DON'T have gain data in combined_df
+    # ------------------------------------------------------------------
+    accuracy_gain_map: dict = {}
+    try:
+        logger.info("RC1: Fetching gain data from ml_prediction_accuracy for non-winner rows...")
+        from datetime import timedelta
+        start_date = (datetime.now().date() - timedelta(days=120)).isoformat()
+        resp = (
+            client.table("ml_prediction_accuracy")
+            .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+            .gte("prediction_date", start_date)
+            .not_.is_("actual_gain_pct", "null")
+            .execute()
+        )
+        if resp.data:
+            for row in resp.data:
+                key = (row["symbol"], row["prediction_date"])
+                accuracy_gain_map[key] = {
+                    "actual_gain_pct": row.get("actual_gain_pct"),
+                    "actual_high_pct": row.get("actual_high_pct"),
+                }
+            logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
+    except Exception as e:
+        logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
 
-    if n_winners < 30:
-        logger.warning(f"Only {n_winners} winner rows with gain data — "
-                       "need ≥30 to train gain regressor. Skipping.")
+    # ------------------------------------------------------------------
+    # Build gain targets for every row in combined_df
+    # Priority: actual_high_pct > actual_gain_pct > accuracy table > skip
+    # ------------------------------------------------------------------
+    gain_targets = pd.to_numeric(combined_df[gain_col], errors="coerce").copy()
+
+    if accuracy_gain_map:
+        sym_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
+        date_col = next((c for c in ["detection_date", "event_date"] if c in combined_df.columns), None)
+
+        if sym_col and date_col:
+            filled_count = 0
+            for idx, row in combined_df.iterrows():
+                if pd.notna(gain_targets[idx]):
+                    continue  # already have a value
+                key = (row.get(sym_col), str(row.get(date_col, ""))[:10])
+                acc_data = accuracy_gain_map.get(key)
+                if acc_data:
+                    # Prefer actual_high_pct from accuracy table
+                    val = acc_data.get("actual_high_pct") or acc_data.get("actual_gain_pct")
+                    if val is not None:
+                        gain_targets[idx] = float(val)
+                        filled_count += 1
+            logger.info(f"RC1: Filled {filled_count} additional gain targets from accuracy table")
+
+    # ------------------------------------------------------------------
+    # Build training mask: all rows with a valid gain target
+    # (not just winners — RC1 fix to broaden training set)
+    # ------------------------------------------------------------------
+    valid_gain_mask = gain_targets.notna() & (gain_targets.abs() < 500)
+    n_valid = int(valid_gain_mask.sum())
+    n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
+    n_non_winners_with_gain = n_valid - n_winners_with_gain
+
+    logger.info(
+        f"\n── Training gain regressor on {n_valid} rows with gain data ──\n"
+        f"  Winners:     {n_winners_with_gain}\n"
+        f"  Non-winners: {n_non_winners_with_gain} (RC1: broader training set)\n"
+        f"  Target:      {gain_col}"
+    )
+
+    if n_valid < 30:
+        logger.warning(f"Only {n_valid} rows with gain data — need ≥30. Skipping gain regressor.")
         return None
 
-    logger.info(f"\n── Training gain regressor on {n_winners} winner rows (target: {gain_col}) ──")
+    # ------------------------------------------------------------------
+    # RC3 FIX: Use X_scaled (already StandardScaler-transformed), not raw
+    # ------------------------------------------------------------------
+    # X_scaled has the same row order as combined_df
+    if len(X_scaled) != len(combined_df):
+        logger.warning(
+            f"RC3: X_scaled length ({len(X_scaled)}) != combined_df ({len(combined_df)}) — "
+            "cannot align. Skipping gain regressor."
+        )
+        return None
 
-    X_reg = pd.DataFrame(index=combined_df.index, columns=feature_names)
-    for col in feature_names:
-        if col in combined_df.columns:
-            X_reg[col] = combined_df[col]
-    X_reg = X_reg.apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
+    # Align index so we can use valid_gain_mask safely
+    X_reg = X_scaled.copy()
+    X_reg.index = combined_df.index
+    y_reg = gain_targets.copy()
+    w_reg = (
+        combined_df["sample_weight"].astype(float)
+        if "sample_weight" in combined_df.columns
+        else pd.Series(1.0, index=combined_df.index)
+    )
 
-    y_reg = pd.to_numeric(combined_df[gain_col], errors="coerce")
-    w_reg = combined_df["sample_weight"].astype(float) \
-            if "sample_weight" in combined_df.columns \
-            else pd.Series(1.0, index=combined_df.index)
+    # Boost weight for winner rows — their gain prediction is more important
+    winner_bonus_mask = (combined_df["label"] == 1) & valid_gain_mask
+    if winner_bonus_mask.any():
+        w_reg = w_reg.copy()
+        w_reg[winner_bonus_mask] *= 2.0
 
-    X_reg = X_reg[winner_mask]
-    y_reg = y_reg[winner_mask]
-    w_reg = w_reg[winner_mask]
+    X_reg_valid = X_reg[valid_gain_mask]
+    y_reg_valid = y_reg[valid_gain_mask]
+    w_reg_valid = w_reg[valid_gain_mask]
 
-    col_means  = X_reg.mean()
-    X_reg_fill = X_reg.fillna(col_means)
+    # Fill NaN in scaled features with 0 (mean after scaling = 0)
+    X_reg_fill = X_reg_valid.fillna(0.0)
 
     from sklearn.model_selection import train_test_split
-    if len(X_reg) >= 10:
+    if len(X_reg_fill) >= 20:
         X_tr, X_va, y_tr, y_va, w_tr, _ = train_test_split(
-            X_reg_fill, y_reg, w_reg,
+            X_reg_fill, y_reg_valid, w_reg_valid,
             test_size=0.2, random_state=42,
         )
     else:
-        X_tr, X_va, y_tr, y_va, w_tr = X_reg_fill, X_reg_fill, y_reg, y_reg, w_reg
+        X_tr, X_va, y_tr, y_va, w_tr = (
+            X_reg_fill, X_reg_fill, y_reg_valid, y_reg_valid, w_reg_valid
+        )
+
+    # Log gain distribution to diagnose compression
+    y_tr_arr = y_tr.values if hasattr(y_tr, 'values') else y_tr
+    logger.info(
+        f"  Gain target distribution (train set):\n"
+        f"    min={float(y_tr_arr.min()):.1f}%  "
+        f"max={float(y_tr_arr.max()):.1f}%  "
+        f"mean={float(y_tr_arr.mean()):.1f}%  "
+        f"std={float(y_tr_arr.std()):.1f}%  "
+        f"median={float(np.median(y_tr_arr)):.1f}%"
+    )
+
+    if float(y_tr_arr.std()) < 2.0:
+        logger.warning(
+            f"  ⚠️  Gain target std={float(y_tr_arr.std()):.2f}% is very low. "
+            "The gain distribution is compressed — predictions will be flat. "
+            "Check RC2 fix (prev_close denominator) is working correctly."
+        )
 
     regressor = XGBRegressor(
         n_estimators=200,
@@ -826,8 +1119,23 @@ def train_gain_regressor(
     from sklearn.metrics import mean_absolute_error, r2_score
     mae = mean_absolute_error(y_va, val_pred)
     r2  = r2_score(y_va, val_pred) if len(y_va) > 1 else float("nan")
-    logger.info(f"  Gain regressor — val MAE: {mae:.2f}%  R²: {r2:.3f}")
-    logger.info(f"  Predicted gains range: {val_pred.min():.1f}% – {val_pred.max():.1f}%")
+    pred_std = float(val_pred.std())
+    logger.info(
+        f"  Gain regressor — val MAE: {mae:.2f}%  R²: {r2:.3f}  "
+        f"pred_std: {pred_std:.2f}%"
+    )
+    logger.info(
+        f"  Predicted gains range: {val_pred.min():.1f}% – {val_pred.max():.1f}%"
+    )
+
+    if pred_std < 0.5:
+        logger.warning(
+            f"  ⚠️  Regressor prediction std={pred_std:.3f}% is very flat. "
+            "Root causes: too few training samples, compressed gain targets (RC2), "
+            "or scaled vs unscaled feature mismatch (RC3). "
+            "The explosion_predictor will use the relaxed std guard (0.5) "
+            "rather than disabling immediately."
+        )
 
     return regressor
 
@@ -857,7 +1165,7 @@ def save_outputs(
         joblib.dump(gain_regressor, GAIN_REGRESSOR_PATH, protocol=4)
         logger.info(f"Saved gain regressor → {GAIN_REGRESSOR_PATH}")
     else:
-        logger.info("Gain regressor not trained this run — predictor will use rule-based gains")
+        logger.info("Gain regressor not trained this run — predictor will use calibrated fallback")
 
     fi_df.to_csv(FEATURE_IMPORTANCE_PATH, index=False)
     logger.info(f"Saved feature importance → {FEATURE_IMPORTANCE_PATH}")
@@ -872,6 +1180,8 @@ def save_outputs(
         "best_iteration":        int(model.best_iteration),
         "best_val_logloss":      float(model.best_score),
         "gain_regressor_trained": gain_regressor is not None,
+        "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
+                                  "RC3_scaled_features", "RC6_mistake_enrichment"],
         **training_stats,
     }
     with open(METADATA_PATH, "w") as f:
@@ -896,17 +1206,16 @@ def main() -> int:
     t1_df       = load_t1_data(client)
     combined_df = combine_datasets(base_df, t1_df)
 
-    # ── Enrich combined_df with intraday peak gain from daily_winners ─────────
-    logger.info("Fetching intraday peak gain data from daily_winners for gain regressor...")
+    # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
+    # Use prev_close as denominator instead of same-day close
+    logger.info("RC2: Fetching daily_winners data for corrected actual_high_pct computation...")
     try:
         winners_response = fetch_table_paginated(client, "daily_winners")
         if not winners_response.empty:
-            required = {"symbol", "detection_date", "high", "price"}
+            required = {"symbol", "detection_date", "high"}
             if required.issubset(winners_response.columns):
-                winners_gain = winners_response[["symbol", "detection_date", "high", "price"]].copy()
-                winners_gain["actual_high_pct"] = (
-                    (winners_gain["high"] / winners_gain["price"] - 1) * 100
-                ).clip(lower=0)
+                # RC2: Apply the corrected computation using prev_close
+                winners_corrected = _compute_correct_actual_high_pct(winners_response)
 
                 symbol_col = next(
                     (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
@@ -917,21 +1226,43 @@ def main() -> int:
                 )
 
                 if symbol_col and date_col:
+                    gain_cols = ["symbol", "detection_date", "actual_high_pct"]
+                    if "change_pct" in winners_corrected.columns:
+                        gain_cols.append("change_pct")
+
                     combined_df = combined_df.merge(
-                        winners_gain[["symbol", "detection_date", "actual_high_pct"]],
+                        winners_corrected[gain_cols],
                         left_on=[symbol_col, date_col],
                         right_on=["symbol", "detection_date"],
                         how="left",
-                    ).drop(columns=["detection_date"], errors="ignore")
+                        suffixes=("", "_winners"),
+                    ).drop(columns=["detection_date_winners"], errors="ignore")
+
+                    # Resolve column conflicts after merge
+                    for col in ["actual_high_pct", "change_pct"]:
+                        merged_col = f"{col}_winners"
+                        if merged_col in combined_df.columns:
+                            # Fill original NaN with corrected values
+                            if col in combined_df.columns:
+                                mask = combined_df[col].isna()
+                                combined_df.loc[mask, col] = combined_df.loc[mask, merged_col]
+                            else:
+                                combined_df[col] = combined_df[merged_col]
+                            combined_df = combined_df.drop(columns=[merged_col])
+
                     n_with_gain = combined_df["actual_high_pct"].notna().sum()
-                    logger.info(f"Enriched {n_with_gain} rows with intraday peak gain data")
+                    logger.info(
+                        f"RC2: {n_with_gain} rows now have corrected actual_high_pct "
+                        f"(prev_close denominator)"
+                    )
     except Exception as e:
-        logger.warning(f"Could not fetch gain data: {e} — gain regressor will be skipped")
+        logger.warning(f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited")
 
     # ── FIX 4: Relabel rows with strong intraday moves as winners ─────────────
     combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
 
     # ── Load mistake samples and append AFTER combine_datasets ───────────────
+    mistake_df = pd.DataFrame()
     if MISTAKE_LEARNER_AVAILABLE:
         logger.info("\n" + "=" * 60)
         logger.info("MISTAKE LEARNING STEP")
@@ -949,6 +1280,10 @@ def main() -> int:
         )
 
         if not mistake_df.empty:
+            # RC6 FIX: Enrich mistake rows with actual gain data BEFORE appending
+            # so they contribute to gain regressor training
+            mistake_df = enrich_mistakes_with_gains(mistake_df, client)
+
             log_mistake_summary(mistake_df)
             combined_df = pd.concat([combined_df, mistake_df],
                                     ignore_index=True, sort=False)
@@ -960,7 +1295,6 @@ def main() -> int:
             logger.info("No mistake samples to add this run.")
     else:
         logger.warning("ml_mistake_learner not available — skipping mistake-learning step.")
-        mistake_df = pd.DataFrame()
 
     # ── Prepare features ──────────────────────────────────────────────────────
     X, y, w = prepare_features(combined_df)
@@ -981,12 +1315,15 @@ def main() -> int:
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
 
-    # ── Train gain regressor ───────────────────────────────────────────────────
+    # ── RC1+RC2+RC3+RC6 FIX: Train gain regressor with corrected inputs ───────
     logger.info("\n" + "=" * 60)
-    logger.info("GAIN REGRESSOR TRAINING")
+    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_train, y_train, w_train, combined_df, feature_names
+        X_scaled=X_scaled,          # RC3: pass scaled features
+        combined_df=combined_df,
+        feature_names=feature_names,
+        client=client,              # RC1: fetch additional gain data
     )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
@@ -1007,7 +1344,7 @@ def main() -> int:
         if line.strip():
             logger.info(f"  {line}")
 
-    # Log probability distribution on val set — early warning for bimodal collapse
+    # Log probability distribution on val set
     val_proba_series = pd.Series(val_proba)
     bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     dist = pd.cut(val_proba_series, bins=bins).value_counts().sort_index()
@@ -1019,8 +1356,6 @@ def main() -> int:
     if gap_count < 5:
         logger.warning(
             f"  ⚠️  BIMODAL COLLAPSE detected: only {gap_count} predictions in 0.15–0.85 range. "
-            "The model is making near-binary decisions. This typically means overfitting. "
-            "Increase min_child_weight or reduce max_depth if this persists."
         )
     else:
         logger.info(f"  ✅ {gap_count} predictions in mid-range (0.15–0.85) — distribution looks healthy")
@@ -1045,6 +1380,8 @@ def main() -> int:
         ),
         "gain_regressor_trained":  gain_regressor is not None,
         "split_method":            "time_based",
+        "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
+                                    "RC3_scaled_input", "RC6_mistake_enrichment"],
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -1064,7 +1401,7 @@ def main() -> int:
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
     logger.info(f"  Split method        : time-based (most recent {15}% as val)")
-    logger.info(f"  Gain regressor      : {'✓ trained' if gain_regressor else '— skipped'}")
+    logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
     logger.info("Files written:")
     logger.info(f"  {MODEL_PATH}")
