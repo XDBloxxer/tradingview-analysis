@@ -853,6 +853,7 @@ def train_val_split(
             "falling back to sequential split."
         )
         split_idx = int(len(X) * (1 - val_fraction))
+        train_idx = X.index[:split_idx]
         X_train = X.iloc[:split_idx]
         X_val   = X.iloc[split_idx:]
         y_train = y.iloc[:split_idx]
@@ -899,7 +900,7 @@ def train_val_split(
             "Consider increasing val_fraction or adding more labelled data."
         )
 
-    return X_train, X_val, y_train, y_val, w_train, w_val
+    return X_train, X_val, y_train, y_val, w_train, w_val, train_idx
 
 
 # ---------------------------------------------------------------------------
@@ -951,6 +952,11 @@ def train_gain_regressor(
     Train a regression model to predict actual % gain for stocks the
     classifier labels as winners.
 
+    ISSUE #1 FIX: X_scaled and combined_df now contain only the TRAINING split
+      rows (passed from main() after train_val_split). Previously the full
+      dataset was passed, meaning val-set rows were seen during regressor
+      training and val MAE / R² metrics were meaningless.
+
     RC1 FIX: Broaden training set beyond just winners.
       - Winners from daily_winners (with corrected actual_high_pct via prev_close)
       - Non-winners that have actual_gain_pct in ml_prediction_accuracy
@@ -968,6 +974,10 @@ def train_gain_regressor(
     RC4 FIX: The std < 1.0 guard in explosion_predictor.py is relaxed to
       0.5 (see that file), but we also improve training quality here so the
       regressor doesn't collapse to the mean.
+
+    MODERATE ISSUE #5 FIX: Internal val split is now time-based (matching the
+      classifier split) rather than random, preventing future gain patterns
+      from leaking into regressor training.
     """
     from xgboost import XGBRegressor
 
@@ -1094,12 +1104,44 @@ def train_gain_regressor(
     # Fill NaN in scaled features with 0 (mean after scaling = 0)
     X_reg_fill = X_reg_valid.fillna(0.0)
 
-    from sklearn.model_selection import train_test_split
+    # Time-based split for the regressor (mirrors the classifier split).
+    # Using a random split here would allow future gain patterns to leak into
+    # training, making val R² optimistic.
     if len(X_reg_fill) >= 20:
-        X_tr, X_va, y_tr, y_va, w_tr, _ = train_test_split(
-            X_reg_fill, y_reg_valid, w_reg_valid,
-            test_size=0.2, random_state=42,
+        # Re-use the date information from combined_df to sort rows
+        _date_col = next(
+            (c for c in ["detection_date", "event_date"] if c in combined_df.columns),
+            None,
         )
+        if _date_col is not None:
+            _dates = pd.to_datetime(
+                combined_df.loc[valid_gain_mask, _date_col], errors="coerce"
+            )
+            _sorted_idx = _dates.sort_values(na_position="last").index
+            _split_pos  = int(len(_sorted_idx) * 0.8)
+            _tr_idx = _sorted_idx[:_split_pos]
+            _va_idx = _sorted_idx[_split_pos:]
+            X_tr   = X_reg_fill.loc[_tr_idx]
+            X_va   = X_reg_fill.loc[_va_idx]
+            y_tr   = y_reg_valid.loc[_tr_idx]
+            y_va   = y_reg_valid.loc[_va_idx]
+            w_tr   = w_reg_valid.loc[_tr_idx]
+            logger.info(
+                f"  Gain regressor time-based split: "
+                f"{len(X_tr)} train / {len(X_va)} val"
+            )
+        else:
+            # No date column — fall back to sequential split (still no random leakage)
+            _split_pos = int(len(X_reg_fill) * 0.8)
+            X_tr = X_reg_fill.iloc[:_split_pos]
+            X_va = X_reg_fill.iloc[_split_pos:]
+            y_tr = y_reg_valid.iloc[:_split_pos]
+            y_va = y_reg_valid.iloc[_split_pos:]
+            w_tr = w_reg_valid.iloc[:_split_pos]
+            logger.info(
+                f"  Gain regressor sequential split (no date column): "
+                f"{len(X_tr)} train / {len(X_va)} val"
+            )
     else:
         X_tr, X_va, y_tr, y_va, w_tr = (
             X_reg_fill, X_reg_fill, y_reg_valid, y_reg_valid, w_reg_valid
@@ -1333,7 +1375,7 @@ def main() -> int:
     scaler, X_scaled = build_scaler(X)
 
     # ── FIX 1: Time-based train/val split ─────────────────────────────────────
-    X_train, X_val, y_train, y_val, w_train, w_val = train_val_split(
+    X_train, X_val, y_train, y_val, w_train, w_val, train_idx = train_val_split(
         X_scaled, y, w, combined_df
     )
 
@@ -1344,12 +1386,15 @@ def main() -> int:
     fi_df = compute_feature_importance(model, feature_names)
 
     # ── RC1+RC2+RC3+RC6 FIX: Train gain regressor with corrected inputs ───────
+    # FIX (issue #1): pass only the TRAIN-split rows so the regressor never
+    # sees val-set rows during training (previously X_scaled / combined_df
+    # included all rows, making val MAE and R² metrics meaningless).
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled,          # RC3: pass scaled features
-        combined_df=combined_df,
+        X_scaled=X_scaled.loc[train_idx],       # train rows only — no val leakage
+        combined_df=combined_df.loc[train_idx], # aligned to same train rows
         feature_names=feature_names,
         client=client,              # RC1: fetch additional gain data
     )
