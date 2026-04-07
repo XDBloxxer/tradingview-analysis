@@ -946,171 +946,320 @@ def compute_feature_importance(
 # RC1 + RC3 FIX: Gain regressor — broader training set, correct scale input
 # ---------------------------------------------------------------------------
 
-# ONLY the gain regressor function is modified below
-# Drop-in replacement for train_gain_regressor()
-
 def train_gain_regressor(
-    X_scaled: pd.DataFrame,
+    X_scaled: pd.DataFrame,           # RC3 FIX: receive pre-scaled features
     combined_df: pd.DataFrame,
     feature_names: list[str],
     client: Client,
 ) -> "Optional[object]":
     """
-    Improved gain regressor with stronger signal extraction and stability.
+    Train a regression model to predict actual % gain for stocks the
+    classifier labels as winners.
 
-    Changes made (ONLY within regressor scope):
-    - Robust target building (priority + winsorization)
-    - Log-transform target to reduce skew
-    - Better filtering of noisy rows
-    - Stronger model (slightly deeper, more trees)
-    - Smarter weighting (continuous, not binary boost)
-    - Stability guardrails (variance + sample checks)
+    ISSUE #1 FIX: X_scaled and combined_df now contain only the TRAINING split
+      rows (passed from main() after train_val_split). Previously the full
+      dataset was passed, meaning val-set rows were seen during regressor
+      training and val MAE / R² metrics were meaningless.
+
+    RC1 FIX: Broaden training set beyond just winners.
+      - Winners from daily_winners (with corrected actual_high_pct via prev_close)
+      - Non-winners that have actual_gain_pct in ml_prediction_accuracy
+        (yfinance data captured by the accuracy tracker)
+      This gives far more training samples and a realistic gain distribution.
+
+    RC2 FIX: Use actual_high_pct computed from prev_close (already corrected
+      in the enrichment step before this function is called).
+
+    RC3 FIX: X_scaled is the StandardScaler output, matching exactly what
+      explosion_predictor.py passes to the regressor at inference time.
+      Previously the regressor was trained on raw/filled values but received
+      scaled values → systematically wrong predictions from day one.
+
+    RC4 FIX: The std < 1.0 guard in explosion_predictor.py is relaxed to
+      0.5 (see that file), but we also improve training quality here so the
+      regressor doesn't collapse to the mean.
+
+    MODERATE ISSUE #5 FIX: Internal val split is now time-based (matching the
+      classifier split) rather than random, preventing future gain patterns
+      from leaking into regressor training.
     """
     from xgboost import XGBRegressor
 
-    # -------------------------------
-    # 1. Build gain target (cleaner)
-    # -------------------------------
-    gain_targets = None
+    # ------------------------------------------------------------------
+    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy FIRST.
+    # This must happen before the gain-column check because the accuracy
+    # table is often the primary source of gain labels (the base CSV rows
+    # have no gain data at all).  Previously this fetch ran after the check,
+    # so the function returned early before RC1 could supply any data.
+    # ------------------------------------------------------------------
+    accuracy_gain_map: dict = {}
+    try:
+        logger.info("RC1: Fetching gain data from ml_prediction_accuracy for non-winner rows...")
+        from datetime import timedelta
+        start_date = (datetime.now().date() - timedelta(days=120)).isoformat()
+        resp = (
+            client.table("ml_prediction_accuracy")
+            .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+            .gte("prediction_date", start_date)
+            .not_.is_("actual_gain_pct", "null")
+            .execute()
+        )
+        if resp.data:
+            for row in resp.data:
+                key = (row["symbol"], row["prediction_date"])
+                accuracy_gain_map[key] = {
+                    "actual_gain_pct": row.get("actual_gain_pct"),
+                    "actual_high_pct": row.get("actual_high_pct"),
+                }
+            logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
+    except Exception as e:
+        logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
 
-    for col in ["actual_high_pct", "actual_gain_pct", "change_pct"]:
-        if col in combined_df.columns:
-            vals = pd.to_numeric(combined_df[col], errors="coerce")
-            if vals.notna().sum() >= 30:
-                gain_targets = vals
+    # ------------------------------------------------------------------
+    # Determine gain target column — evaluated AFTER the RC1 fetch so
+    # that accuracy-table data can count toward the ≥30 threshold.
+    # ------------------------------------------------------------------
+    gain_col = None
+    for candidate in ("actual_high_pct", "actual_gain_pct", "change_pct"):
+        if candidate in combined_df.columns:
+            col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
+            non_null = col_vals.notna().sum()
+            if non_null >= 30:
+                gain_col = candidate
+                logger.info(f"Gain regressor target column (from combined_df): '{gain_col}' ({non_null} non-null values)")
                 break
 
-    if gain_targets is None:
-        print("[GAIN] No usable gain column — skipping")
+    # If no column in combined_df has enough data, check whether the RC1
+    # accuracy table fetch alone can supply ≥30 rows — use actual_gain_pct
+    # as the target in that case (we will fill it from accuracy_gain_map).
+    if gain_col is None and len(accuracy_gain_map) >= 30:
+        # Inject a synthetic column so the downstream code has something
+        # to read from before the accuracy-map fill loop runs.
+        for candidate in ("actual_high_pct", "actual_gain_pct"):
+            if candidate not in combined_df.columns:
+                combined_df[candidate] = float("nan")
+        gain_col = "actual_gain_pct"
+        logger.info(
+            f"Gain regressor target column (from accuracy table): '{gain_col}' "
+            f"({len(accuracy_gain_map)} records available via RC1 fetch)"
+        )
+
+    if gain_col is None:
+        logger.warning(
+            "No gain column with sufficient data (checked combined_df columns "
+            f"and RC1 accuracy table — {len(accuracy_gain_map)} accuracy rows). "
+            "Skipping gain regressor training."
+        )
         return None
 
-    # -------------------------------
-    # 2. Clean + normalize target
-    # -------------------------------
-    gain_targets = gain_targets.clip(-50, 300)  # remove insane outliers
+    # ------------------------------------------------------------------
+    # Build gain targets for every row in combined_df
+    # Priority: actual_high_pct > actual_gain_pct > accuracy table > skip
+    # ------------------------------------------------------------------
+    gain_targets = pd.to_numeric(combined_df[gain_col], errors="coerce").copy()
 
-    # Log transform → BIG improvement for skewed gains
-    gain_targets = np.sign(gain_targets) * np.log1p(np.abs(gain_targets))
+    if accuracy_gain_map:
+        sym_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
 
-    # -------------------------------
-    # 3. Build mask (quality filter)
-    # -------------------------------
-    valid_mask = gain_targets.notna()
+        # combined_df has two different date columns depending on data source:
+        #   T-1 rows      -> detection_date  (the day *before* explosion = prediction_date)
+        #   base CSV rows -> event_date      (the explosion day itself = prediction_date + 1)
+        # We need to try both, and for event_date rows subtract 1 business day.
+        has_detection = "detection_date" in combined_df.columns
+        has_event     = "event_date" in combined_df.columns
 
-    # Drop ultra-low signal rows (noise floor)
-    valid_mask &= (np.abs(gain_targets) > 0.01)
+        if sym_col and (has_detection or has_event):
+            filled_count = 0
+            for idx, row in combined_df.iterrows():
+                if pd.notna(gain_targets[idx]):
+                    continue  # already have a value
 
-    if valid_mask.sum() < 50:
-        print(f"[GAIN] Too few samples ({valid_mask.sum()}) — skipping")
+                sym = row.get(sym_col)
+                acc_data = None
+
+                # Try detection_date first (T-1 rows -- direct match to prediction_date)
+                if has_detection:
+                    d = str(row.get("detection_date", ""))[:10]
+                    if d and d != "nan":
+                        acc_data = accuracy_gain_map.get((sym, d))
+
+                # Fall back to event_date - 1 business day (base CSV rows)
+                if acc_data is None and has_event:
+                    ev = row.get("event_date")
+                    if ev and str(ev) not in ("nan", "NaT", "None"):
+                        try:
+                            pred_date = (
+                                pd.Timestamp(ev) - pd.tseries.offsets.BDay(1)
+                            ).strftime("%Y-%m-%d")
+                            acc_data = accuracy_gain_map.get((sym, pred_date))
+                        except Exception:
+                            pass
+
+                if acc_data:
+                    val = acc_data.get("actual_high_pct") or acc_data.get("actual_gain_pct")
+                    if val is not None:
+                        gain_targets[idx] = float(val)
+                        filled_count += 1
+            logger.info(f"RC1: Filled {filled_count} additional gain targets from accuracy table")
+
+    # ------------------------------------------------------------------
+    # Build training mask: all rows with a valid gain target
+    # (not just winners — RC1 fix to broaden training set)
+    # ------------------------------------------------------------------
+    valid_gain_mask = gain_targets.notna() & (gain_targets.abs() < 500)
+    n_valid = int(valid_gain_mask.sum())
+    n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
+    n_non_winners_with_gain = n_valid - n_winners_with_gain
+
+    logger.info(
+        f"\n── Training gain regressor on {n_valid} rows with gain data ──\n"
+        f"  Winners:     {n_winners_with_gain}\n"
+        f"  Non-winners: {n_non_winners_with_gain} (RC1: broader training set)\n"
+        f"  Target:      {gain_col}"
+    )
+
+    if n_valid < 30:
+        logger.warning(f"Only {n_valid} rows with gain data — need ≥30. Skipping gain regressor.")
         return None
 
-    # -------------------------------
-    # 4. Align features
-    # -------------------------------
+    # ------------------------------------------------------------------
+    # RC3 FIX: Use X_scaled (already StandardScaler-transformed), not raw
+    # ------------------------------------------------------------------
+    # X_scaled has the same row order as combined_df
+    if len(X_scaled) != len(combined_df):
+        logger.warning(
+            f"RC3: X_scaled length ({len(X_scaled)}) != combined_df ({len(combined_df)}) — "
+            "cannot align. Skipping gain regressor."
+        )
+        return None
+
+    # Align index so we can use valid_gain_mask safely
     X_reg = X_scaled.copy()
     X_reg.index = combined_df.index
-
-    X_reg = X_reg[valid_mask].fillna(0.0)
-    y_reg = gain_targets[valid_mask]
-
-    # -------------------------------
-    # 5. Smarter weighting
-    # -------------------------------
-    base_weights = (
-        combined_df.loc[valid_mask, "sample_weight"]
+    y_reg = gain_targets.copy()
+    w_reg = (
+        combined_df["sample_weight"].astype(float)
         if "sample_weight" in combined_df.columns
-        else pd.Series(1.0, index=y_reg.index)
+        else pd.Series(1.0, index=combined_df.index)
     )
 
-    # Continuous weighting: bigger moves matter more
-    magnitude_weight = 1 + (np.abs(y_reg) * 0.5)
+    # Boost weight for winner rows — their gain prediction is more important
+    winner_bonus_mask = (combined_df["label"] == 1) & valid_gain_mask
+    if winner_bonus_mask.any():
+        w_reg = w_reg.copy()
+        w_reg[winner_bonus_mask] *= 2.0
 
-    # Winners get mild boost (not overpowering)
-    winner_boost = 1 + (combined_df.loc[valid_mask, "label"] * 0.5)
+    X_reg_valid = X_reg[valid_gain_mask]
+    y_reg_valid = y_reg[valid_gain_mask]
+    w_reg_valid = w_reg[valid_gain_mask]
 
-    w_reg = base_weights * magnitude_weight * winner_boost
+    # Fill NaN in scaled features with 0 (mean after scaling = 0)
+    X_reg_fill = X_reg_valid.fillna(0.0)
 
-    # -------------------------------
-    # 6. Time-based split
-    # -------------------------------
-    date_col = next(
-        (c for c in ["detection_date", "event_date"] if c in combined_df.columns),
-        None,
-    )
-
-    if date_col:
-        dates = pd.to_datetime(combined_df.loc[valid_mask, date_col], errors="coerce")
-        sorted_idx = dates.sort_values(na_position="last").index
+    # Time-based split for the regressor (mirrors the classifier split).
+    # Using a random split here would allow future gain patterns to leak into
+    # training, making val R² optimistic.
+    if len(X_reg_fill) >= 20:
+        # Re-use the date information from combined_df to sort rows
+        _date_col = next(
+            (c for c in ["detection_date", "event_date"] if c in combined_df.columns),
+            None,
+        )
+        if _date_col is not None:
+            _dates = pd.to_datetime(
+                combined_df.loc[valid_gain_mask, _date_col], errors="coerce"
+            )
+            _sorted_idx = _dates.sort_values(na_position="last").index
+            _split_pos  = int(len(_sorted_idx) * 0.8)
+            _tr_idx = _sorted_idx[:_split_pos]
+            _va_idx = _sorted_idx[_split_pos:]
+            X_tr   = X_reg_fill.loc[_tr_idx]
+            X_va   = X_reg_fill.loc[_va_idx]
+            y_tr   = y_reg_valid.loc[_tr_idx]
+            y_va   = y_reg_valid.loc[_va_idx]
+            w_tr   = w_reg_valid.loc[_tr_idx]
+            logger.info(
+                f"  Gain regressor time-based split: "
+                f"{len(X_tr)} train / {len(X_va)} val"
+            )
+        else:
+            # No date column — fall back to sequential split (still no random leakage)
+            _split_pos = int(len(X_reg_fill) * 0.8)
+            X_tr = X_reg_fill.iloc[:_split_pos]
+            X_va = X_reg_fill.iloc[_split_pos:]
+            y_tr = y_reg_valid.iloc[:_split_pos]
+            y_va = y_reg_valid.iloc[_split_pos:]
+            w_tr = w_reg_valid.iloc[:_split_pos]
+            logger.info(
+                f"  Gain regressor sequential split (no date column): "
+                f"{len(X_tr)} train / {len(X_va)} val"
+            )
     else:
-        sorted_idx = X_reg.index
+        X_tr, X_va, y_tr, y_va, w_tr = (
+            X_reg_fill, X_reg_fill, y_reg_valid, y_reg_valid, w_reg_valid
+        )
 
-    split = int(len(sorted_idx) * 0.8)
-    train_idx = sorted_idx[:split]
-    val_idx = sorted_idx[split:]
+    # Log gain distribution to diagnose compression
+    y_tr_arr = y_tr.values if hasattr(y_tr, 'values') else y_tr
+    logger.info(
+        f"  Gain target distribution (train set):\n"
+        f"    min={float(y_tr_arr.min()):.1f}%  "
+        f"max={float(y_tr_arr.max()):.1f}%  "
+        f"mean={float(y_tr_arr.mean()):.1f}%  "
+        f"std={float(y_tr_arr.std()):.1f}%  "
+        f"median={float(np.median(y_tr_arr)):.1f}%"
+    )
 
-    X_tr, X_va = X_reg.loc[train_idx], X_reg.loc[val_idx]
-    y_tr, y_va = y_reg.loc[train_idx], y_reg.loc[val_idx]
-    w_tr = w_reg.loc[train_idx]
+    if float(y_tr_arr.std()) < 2.0:
+        logger.warning(
+            f"  ⚠️  Gain target std={float(y_tr_arr.std()):.2f}% is very low. "
+            "The gain distribution is compressed — predictions will be flat. "
+            "Check RC2 fix (prev_close denominator) is working correctly."
+        )
 
-    # -------------------------------
-    # 7. Model (stronger but stable)
-    # -------------------------------
-    model = XGBRegressor(
-        n_estimators=400,
-        max_depth=5,
-        learning_rate=0.04,
-        subsample=0.85,
-        colsample_bytree=0.85,
-        min_child_weight=3,
-        reg_alpha=0.3,
-        reg_lambda=1.5,
+    regressor = XGBRegressor(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_weight=5,
         objective="reg:squarederror",
         eval_metric="rmse",
-        early_stopping_rounds=30,
         random_state=42,
         n_jobs=-1,
+        early_stopping_rounds=20,
     )
-
-    model.fit(
-        X_tr,
-        y_tr,
-        sample_weight=w_tr,
+    regressor.fit(
+        X_tr, y_tr,
+        sample_weight=w_tr.values,
         eval_set=[(X_va, y_va)],
         verbose=False,
     )
 
-    # -------------------------------
-    # 8. Evaluate (invert log transform)
-    # -------------------------------
-    pred = model.predict(X_va)
+    val_pred = regressor.predict(X_va)
+    from sklearn.metrics import mean_absolute_error, r2_score
+    mae = mean_absolute_error(y_va, val_pred)
+    r2  = r2_score(y_va, val_pred) if len(y_va) > 1 else float("nan")
+    pred_std = float(val_pred.std())
+    logger.info(
+        f"  Gain regressor — val MAE: {mae:.2f}%  R²: {r2:.3f}  "
+        f"pred_std: {pred_std:.2f}%"
+    )
+    logger.info(
+        f"  Predicted gains range: {val_pred.min():.1f}% – {val_pred.max():.1f}%"
+    )
 
-    # Inverse transform
-    pred_real = np.sign(pred) * (np.expm1(np.abs(pred)))
-    y_real = np.sign(y_va) * (np.expm1(np.abs(y_va)))
+    if pred_std < 0.5:
+        logger.warning(
+            f"  ⚠️  Regressor prediction std={pred_std:.3f}% is very flat. "
+            "Root causes: too few training samples, compressed gain targets (RC2), "
+            "or scaled vs unscaled feature mismatch (RC3). "
+            "The explosion_predictor will use the relaxed std guard (0.5) "
+            "rather than disabling immediately."
+        )
 
-    from sklearn.metrics import mean_absolute_error
-
-    mae = mean_absolute_error(y_real, pred_real)
-    std = float(pred_real.std())
-
-    print(f"[GAIN] MAE: {mae:.2f}% | pred_std: {std:.2f}")
-
-    # -------------------------------
-    # 9. Hard quality gate (EDGE)
-    # -------------------------------
-    if std < 1.0:
-        print("[GAIN] Rejected — predictions too flat")
-        return None
-
-    if mae > 25:
-        print("[GAIN] Rejected — too inaccurate")
-        return None
-
-    print("[GAIN] Model accepted ✅")
-    return model
-
-
-    
+    return regressor
 
 
 # ---------------------------------------------------------------------------
