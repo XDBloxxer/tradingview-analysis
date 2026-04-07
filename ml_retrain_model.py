@@ -154,15 +154,18 @@ XGBOOST_PARAMS = {
     "reg_lambda":         2.0,     # raised from 1.0 → more L2 regularisation
     "scale_pos_weight":   1,       # overridden at train time (clamped to SPW_MIN/MAX)
     "objective":          "binary:logistic",
-    "eval_metric":        "logloss",
+    # eval_metric changed from "logloss" to "auc":
+    # logloss is sensitive to predicted probability calibration.  When the val
+    # set has a very different positive rate from the train set (e.g. val has
+    # 27% positives vs train 9.5%), scale_pos_weight causes logloss on the val
+    # set to be noisy from tree 1, triggering early stopping after just 7 trees.
+    # AUC is rank-based and immune to this calibration skew — it only cares
+    # whether the model separates positives from negatives, not the absolute
+    # probability level, so it gives a stable and meaningful early-stopping signal.
+    "eval_metric":        "auc",
     "use_label_encoder":  False,
     "random_state":       42,
     "n_jobs":             -1,
-    # early_stopping_rounds raised from 30 → 50: with heavy regularisation
-    # (gamma=1.0, min_child_weight=10) and a small/sparse val set, logloss
-    # improvements are slow and noisy.  30 rounds was triggering a halt on
-    # tree 12 — well before the model had meaningfully learned.  50 rounds
-    # gives the model enough patience to push through early noise plateaus.
     "early_stopping_rounds": 50,
 }
 
@@ -778,7 +781,7 @@ def train_model(
     )
 
     logger.info(f"  Best iteration: {model.best_iteration}")
-    logger.info(f"  Best val logloss: {model.best_score:.4f}")
+    logger.info(f"  Best val AUC: {model.best_score:.4f}")
 
     # Warn if early stopping fired suspiciously early — indicates the val set
     # is too small, too imbalanced, or temporally non-representative.
@@ -791,16 +794,16 @@ def train_model(
             f"(early_stopping fired after only {model.best_iteration} trees). "
             f"Val set: {val_pos} pos / {val_neg} neg ({val_rate:.1%} positive rate). "
             "Possible causes: (1) val set has too few positives (<20), causing "
-            "noisy logloss that prematurely triggers early stopping; "
+            "noisy AUC that prematurely triggers early stopping; "
             "(2) val period has a very different class distribution from train; "
             "(3) heavy regularisation params (gamma/min_child_weight) need loosening."
         )
 
-    # Warn if val logloss is suspiciously perfect — sign of data leakage
-    if model.best_score < 0.05:
+    # Warn if val AUC is suspiciously perfect — sign of data leakage
+    if model.best_score > 0.999:
         logger.warning(
-            f"  ⚠️  Val logloss={model.best_score:.4f} is suspiciously low. "
-            "This may indicate data leakage or overfitting. "
+            f"  ⚠️  Val AUC={model.best_score:.4f} is suspiciously high. "
+            "This may indicate data leakage or label overlap. "
             "Check that the validation set does not overlap with training dates."
         )
 
@@ -1056,17 +1059,42 @@ def train_gain_regressor(
 
     if accuracy_gain_map:
         sym_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
-        date_col = next((c for c in ["detection_date", "event_date"] if c in combined_df.columns), None)
 
-        if sym_col and date_col:
+        # combined_df has two different date columns depending on data source:
+        #   T-1 rows      -> detection_date  (the day *before* explosion = prediction_date)
+        #   base CSV rows -> event_date      (the explosion day itself = prediction_date + 1)
+        # We need to try both, and for event_date rows subtract 1 business day.
+        has_detection = "detection_date" in combined_df.columns
+        has_event     = "event_date" in combined_df.columns
+
+        if sym_col and (has_detection or has_event):
             filled_count = 0
             for idx, row in combined_df.iterrows():
                 if pd.notna(gain_targets[idx]):
                     continue  # already have a value
-                key = (row.get(sym_col), str(row.get(date_col, ""))[:10])
-                acc_data = accuracy_gain_map.get(key)
+
+                sym = row.get(sym_col)
+                acc_data = None
+
+                # Try detection_date first (T-1 rows -- direct match to prediction_date)
+                if has_detection:
+                    d = str(row.get("detection_date", ""))[:10]
+                    if d and d != "nan":
+                        acc_data = accuracy_gain_map.get((sym, d))
+
+                # Fall back to event_date - 1 business day (base CSV rows)
+                if acc_data is None and has_event:
+                    ev = row.get("event_date")
+                    if ev and str(ev) not in ("nan", "NaT", "None"):
+                        try:
+                            pred_date = (
+                                pd.Timestamp(ev) - pd.tseries.offsets.BDay(1)
+                            ).strftime("%Y-%m-%d")
+                            acc_data = accuracy_gain_map.get((sym, pred_date))
+                        except Exception:
+                            pass
+
                 if acc_data:
-                    # Prefer actual_high_pct from accuracy table
                     val = acc_data.get("actual_high_pct") or acc_data.get("actual_gain_pct")
                     if val is not None:
                         gain_targets[idx] = float(val)
