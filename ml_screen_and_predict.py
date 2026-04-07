@@ -1217,8 +1217,16 @@ def _apply_gain_rank_correction(
 
 
 def _get_calibrated_gain_estimate(probability: float) -> float:
-    if probability >= 0.95: return 40.0
-    if probability >= 0.90: return 30.0
+    # FIX (Moderate Issue #6): Top-tier values now match _estimate_target_gain()
+    # in explosion_predictor.py exactly (≥0.95: 40→30, ≥0.90: 30→25).
+    # Previously the two fallback tables diverged by up to 10% at high
+    # probabilities, producing different target_price values depending on
+    # which code path executed. Both functions serve the same role (rule-based
+    # backstop when the regressor/isotonic calibrator is unavailable), so they
+    # must agree. _estimate_target_gain() is the authoritative definition;
+    # this function is now kept in sync with it.
+    if probability >= 0.95: return 30.0
+    if probability >= 0.90: return 25.0
     if probability >= 0.80: return 20.0
     if probability >= 0.70: return 15.0
     if probability >= 0.60: return 10.0
