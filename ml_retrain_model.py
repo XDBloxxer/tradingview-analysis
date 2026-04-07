@@ -23,15 +23,16 @@ FIXES IN THIS VERSION:
      IMPORTANT: Uses a unified sort_date column (detection_date ?? event_date) so
      that base CSV rows (which have event_date but no detection_date) sort correctly
      alongside T-1 rows (which have detection_date). Without this, base CSV rows
-     sort to the front as NaT and the val set ends up being entirely T-1 non-winners
-     → 0 positives in val → degenerate model.
+     sort to the END as NaT (na_position='last') and the val set ends up being
+     entirely T-1 non-winners → 0 positives in val → degenerate model.
 
   2. Stronger regularisation — min_child_weight raised from 3→10, max_depth 6→5,
      gamma 0.1→1.0, reg_alpha 0.1→0.5. These prevent the model from memorising
      individual stocks.
 
-  3. scale_pos_weight capped at [0.5, 3.0] — avoids extreme corrections when the
+  3. scale_pos_weight capped at [0.5, 5.0] — avoids extreme corrections when the
      training set happens to be very imbalanced in either direction.
+     (SPW_MAX raised from 3.0 → 5.0 to better handle the ~8.8x production imbalance.)
 
   4. Intraday-high label support — if actual_high_pct is available and exceeds
      INTRADAY_WIN_THRESHOLD, those rows are also treated as winners (label=1).
