@@ -982,25 +982,11 @@ def train_gain_regressor(
     from xgboost import XGBRegressor
 
     # ------------------------------------------------------------------
-    # Determine gain target column
-    # ------------------------------------------------------------------
-    gain_col = None
-    for candidate in ("actual_high_pct", "actual_gain_pct", "change_pct"):
-        if candidate in combined_df.columns:
-            col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
-            non_null = col_vals.notna().sum()
-            if non_null >= 30:
-                gain_col = candidate
-                logger.info(f"Gain regressor target column: '{gain_col}' ({non_null} non-null values)")
-                break
-
-    if gain_col is None:
-        logger.warning("No gain column with sufficient data — skipping gain regressor training.")
-        return None
-
-    # ------------------------------------------------------------------
-    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy
-    # for rows that DON'T have gain data in combined_df
+    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy FIRST.
+    # This must happen before the gain-column check because the accuracy
+    # table is often the primary source of gain labels (the base CSV rows
+    # have no gain data at all).  Previously this fetch ran after the check,
+    # so the function returned early before RC1 could supply any data.
     # ------------------------------------------------------------------
     accuracy_gain_map: dict = {}
     try:
@@ -1024,6 +1010,43 @@ def train_gain_regressor(
             logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
     except Exception as e:
         logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
+
+    # ------------------------------------------------------------------
+    # Determine gain target column — evaluated AFTER the RC1 fetch so
+    # that accuracy-table data can count toward the ≥30 threshold.
+    # ------------------------------------------------------------------
+    gain_col = None
+    for candidate in ("actual_high_pct", "actual_gain_pct", "change_pct"):
+        if candidate in combined_df.columns:
+            col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
+            non_null = col_vals.notna().sum()
+            if non_null >= 30:
+                gain_col = candidate
+                logger.info(f"Gain regressor target column (from combined_df): '{gain_col}' ({non_null} non-null values)")
+                break
+
+    # If no column in combined_df has enough data, check whether the RC1
+    # accuracy table fetch alone can supply ≥30 rows — use actual_gain_pct
+    # as the target in that case (we will fill it from accuracy_gain_map).
+    if gain_col is None and len(accuracy_gain_map) >= 30:
+        # Inject a synthetic column so the downstream code has something
+        # to read from before the accuracy-map fill loop runs.
+        for candidate in ("actual_high_pct", "actual_gain_pct"):
+            if candidate not in combined_df.columns:
+                combined_df[candidate] = float("nan")
+        gain_col = "actual_gain_pct"
+        logger.info(
+            f"Gain regressor target column (from accuracy table): '{gain_col}' "
+            f"({len(accuracy_gain_map)} records available via RC1 fetch)"
+        )
+
+    if gain_col is None:
+        logger.warning(
+            "No gain column with sufficient data (checked combined_df columns "
+            f"and RC1 accuracy table — {len(accuracy_gain_map)} accuracy rows). "
+            "Skipping gain regressor training."
+        )
+        return None
 
     # ------------------------------------------------------------------
     # Build gain targets for every row in combined_df
