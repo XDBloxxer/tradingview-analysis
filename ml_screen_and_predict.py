@@ -14,8 +14,12 @@ FIX 4 — SmartScreener._load_learned_filters clamps aggressive HV/vol-ratio min
 
 FIX 5 — Pre-flight and post-prediction variance diagnostics.
 
-FIX 6 — Hybrid model prefix handling: TV screener data mapped to BOTH t1_close_*
-         AND t3_/t5_/t10_* columns.
+FIX 6 — Hybrid model prefix handling: TV screener data mapped to t1_close_*
+         only.  t3_/t5_/t10_* are NOT populated from the TV screener row.
+         (Reverted the old fill_flat_prefixes=True path in
+         build_features_from_tv_data which was writing identical TV-screener
+         values into all three flat prefixes, corrupting 2/3 of the hybrid
+         model's flat-prefix features.  See FIX 9 for the correct source.)
 
 FIX 7 — t1_open_* features now reliably populated (lowered min bar threshold,
          extended open window, fallback to close indicators).
@@ -493,14 +497,18 @@ def build_features_from_tv_data(
     row: dict,
     symbol: str,
     feature_prefix: str = "t1_close",
-    fill_flat_prefixes: bool = False,
 ) -> dict:
     """
     Convert a single TradingView screener row into a feature dict.
 
-    FIX 6: For hybrid models (t3+t1), `fill_flat_prefixes=True` causes this
-    function to ALSO write the same values into t3_/t5_/t10_ columns (lowercase),
-    which is the format the base CSV training data used.
+    Writes values ONLY to the requested feature_prefix (e.g. t1_close_*).
+    t3_/t5_/t10_* columns must NOT be populated from TV screener data —
+    those prefixes represent daily-bar snapshots from the training CSV and
+    must be filled exclusively from T-1 yfinance intraday indicators via
+    fetch_t1_data_for_symbol → _write_flat_prefix_features.  Filling them
+    with today's TV screener row (as the old fill_flat_prefixes=True path
+    did) made t3/t5/t10 identical to each other and to t1, corrupting 2/3
+    of the hybrid model's flat-prefix features on every production run.
     """
     result = {
         "symbol":   symbol,
@@ -537,13 +545,10 @@ def build_features_from_tv_data(
         except (TypeError, ValueError):
             continue
 
-        # Always write to the primary model prefix (e.g. t1_close_RSI_14)
+        # Write to the primary model prefix (e.g. t1_close_RSI_14).
+        # t3_/t5_/t10_* columns are intentionally NOT written here — they are
+        # populated from T-1 yfinance intraday data in fetch_t1_data_for_symbol.
         _write(feature_prefix, model_name, fval)
-
-        # FIX 6: For hybrid models, also fill t3_/t5_/t10_* columns.
-        if fill_flat_prefixes:
-            for flat_pfx in _FLAT_PREFIXES:
-                _write(flat_pfx, model_name, fval)
 
     close_val = row.get("close") or row.get("Close")
     if close_val is not None:
@@ -577,9 +582,6 @@ def build_features_from_tv_data(
 
     if close and close > 0:
         _derived(feature_prefix, close)
-        if fill_flat_prefixes:
-            for flat_pfx in _FLAT_PREFIXES:
-                _derived(flat_pfx, close)
 
     return result
 
@@ -1314,7 +1316,6 @@ def main():
             features = build_features_from_tv_data(
                 row_dict, symbol,
                 feature_prefix=model_prefix,
-                fill_flat_prefixes=fill_flat_prefixes,
             )
             features["exchange"] = exchange
 
