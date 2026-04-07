@@ -85,14 +85,14 @@ TV_TO_MODEL_BASE = {
     "volume":                       "Volume",
     "change":                       "price_change_1d",
     "change_abs":                   "MOM_10",
+    # RSI — use today's value only; RSI[1] is yesterday's bar and must NOT
+    # overwrite RSI_14 with a stale reading.
     "RSI":                          "RSI_14",
-    "RSI[1]":                       "RSI_14",
+    # Stochastic — today's K/D only; [1] variants are T-1 bars.
     "Stoch.K":                      "STOCHk_14_3_3",
     "Stoch.D":                      "STOCHd_14_3_3",
-    "Stoch.K[1]":                   "STOCHk_14_3_3",
-    "Stoch.D[1]":                   "STOCHd_14_3_3",
+    # Williams %R — today's value only; W.R[1] is T-1.
     "W.R":                          "WILLR_14",
-    "W.R[1]":                       "WILLR_14",
     "MACD.macd":                    "MACD_12_26_9",
     "MACD.signal":                  "MACDs_12_26_9",
     "BB.upper":                     "BBU_20_2.0_2.0",
@@ -102,12 +102,16 @@ TV_TO_MODEL_BASE = {
     "EMA5":                         "EMA_5",
     "EMA10":                        "EMA_10",
     "EMA20":                        "EMA_20",
-    "EMA30":                        "EMA_26",
+    # EMA30 is NOT mapped: the TV screener exposes a 30-period EMA while the
+    # model feature EMA_26 is a 26-period EMA.  Feeding a wrong-period value
+    # corrupts the feature; EMA_26 is left NaN and imputed by the model.
     "EMA50":                        "EMA_50",
     "SMA5":                         "SMA_5",
     "SMA10":                        "SMA_10",
     "SMA20":                        "SMA_20",
-    "SMA30":                        "SMA_50",
+    # SMA30 is NOT mapped: the TV screener's 30-period SMA is a distinct
+    # indicator from the model's SMA_50 (50-period).  The old mapping silently
+    # duplicated SMA_50 with the wrong period value.
     "SMA50":                        "SMA_50",
     "Mom":                          "MOM_10",
     "AO":                           "AO",
