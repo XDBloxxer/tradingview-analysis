@@ -133,9 +133,14 @@ MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 # it didn't close at the top, as long as it hit this intraday gain.
 INTRADAY_WIN_THRESHOLD = 15.0  # %
 
-# FIX 3: scale_pos_weight caps — prevent extreme corrections
+# scale_pos_weight caps — prevent extreme corrections while still respecting
+# the actual class imbalance (~8.8x in production data).
+# SPW_MAX raised from 3.0 → 5.0: the previous cap of 3.0 on an 8.8x imbalance
+# under-weighted positives so severely that the logloss surface was distorted,
+# making it harder for early stopping to detect genuine improvement and
+# contributing to the model halting at best_iteration=12.
 SPW_MIN = 0.5
-SPW_MAX = 3.0
+SPW_MAX = 5.0
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
@@ -153,7 +158,12 @@ XGBOOST_PARAMS = {
     "use_label_encoder":  False,
     "random_state":       42,
     "n_jobs":             -1,
-    "early_stopping_rounds": 30,
+    # early_stopping_rounds raised from 30 → 50: with heavy regularisation
+    # (gamma=1.0, min_child_weight=10) and a small/sparse val set, logloss
+    # improvements are slow and noisy.  30 rounds was triggering a halt on
+    # tree 12 — well before the model had meaningfully learned.  50 rounds
+    # gives the model enough patience to push through early noise plateaus.
+    "early_stopping_rounds": 50,
 }
 
 # Columns excluded from the feature matrix X.
@@ -770,6 +780,22 @@ def train_model(
     logger.info(f"  Best iteration: {model.best_iteration}")
     logger.info(f"  Best val logloss: {model.best_score:.4f}")
 
+    # Warn if early stopping fired suspiciously early — indicates the val set
+    # is too small, too imbalanced, or temporally non-representative.
+    if model.best_iteration < 30:
+        val_pos  = int((y_val == 1).sum())
+        val_neg  = int((y_val == 0).sum())
+        val_rate = val_pos / max(1, val_pos + val_neg)
+        logger.warning(
+            f"  ⚠️  UNDERTRAINED: best_iteration={model.best_iteration} "
+            f"(early_stopping fired after only {model.best_iteration} trees). "
+            f"Val set: {val_pos} pos / {val_neg} neg ({val_rate:.1%} positive rate). "
+            "Possible causes: (1) val set has too few positives (<20), causing "
+            "noisy logloss that prematurely triggers early stopping; "
+            "(2) val period has a very different class distribution from train; "
+            "(3) heavy regularisation params (gamma/min_child_weight) need loosening."
+        )
+
     # Warn if val logloss is suspiciously perfect — sign of data leakage
     if model.best_score < 0.05:
         logger.warning(
@@ -786,7 +812,7 @@ def train_val_split(
     y: pd.Series,
     w: pd.Series,
     df_with_dates: pd.DataFrame,
-    val_fraction: float = 0.15,
+    val_fraction: float = 0.20,
 ) -> tuple:
     """
     TIME-BASED train/val split instead of random stratified split.
@@ -814,7 +840,7 @@ def train_val_split(
         n_nat        = sort_date.isna().sum()
         logger.info(
             f"Unified sort_date: {n_base_dates} rows have a valid date, "
-            f"{n_nat} rows have NaT (will sort to front — investigate if large)"
+            f"{n_nat} rows have NaT (will sort to END of sequence → into val set — investigate if large)"
         )
     else:
         date_col = next(
@@ -865,10 +891,12 @@ def train_val_split(
     )
 
     val_pos = int((y_val == 1).sum())
-    if val_pos < 10:
+    if val_pos < 20:
         logger.warning(
-            f"  ⚠️  Only {val_pos} positive examples in validation set. "
-            "Accuracy metrics may be noisy."
+            f"  ⚠️  Only {val_pos} positive examples in validation set "
+            f"({val_pos / max(1, len(y_val)):.1%} of val). "
+            "Early stopping logloss will be noisy — model may under-train. "
+            "Consider increasing val_fraction or adding more labelled data."
         )
 
     return X_train, X_val, y_train, y_val, w_train, w_val
@@ -1400,7 +1428,7 @@ def main() -> int:
     logger.info(f"  Validation AUC      : {auc:.4f}")
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
-    logger.info(f"  Split method        : time-based (most recent {15}% as val)")
+    logger.info(f"  Split method        : time-based (most recent {20}% as val)")
     logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
     logger.info("Files written:")
