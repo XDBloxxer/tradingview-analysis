@@ -20,6 +20,7 @@ from pandas.tseries.holiday import USFederalHolidayCalendar
 from src.daily_non_winners_detector import DailyNonWinnersDetector
 from src.intraday_data_collector import IntradayDataCollector
 from src.daily_non_winners_supabase_client import DailyNonWinnersSupabaseClient
+from src.multiday_feature_collector import MultidayFeatureCollector
 from src.utils import setup_logging, load_config
 
 
@@ -158,6 +159,18 @@ def main():
         logger.info(f"✓ Written intraday data to Supabase:")
         for data_type, count in counts.items():
             logger.info(f"  - {data_type}: {count} rows")
+
+        # Step 3: Compute and store T-3 / T-5 / T-10 multiday features
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("STEP 3: COMPUTE T-3/T-5/T-10 MULTIDAY FEATURES FOR NON-WINNERS")
+        logger.info("=" * 60)
+        multiday_collector = MultidayFeatureCollector(config)
+        multiday_count = multiday_collector.collect_and_write(
+            stocks=intraday_data["day_prior_close"],   # has symbol + detection_date
+            table="non_winners_day_prior_multiday",
+        )
+        logger.info(f"✓ Written {multiday_count} multiday feature rows for non-winners")
 
         logger.info("")
         logger.info("=" * 60)
