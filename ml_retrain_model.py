@@ -1246,7 +1246,9 @@ def train_gain_regressor(
                 if pd.notna(gain_targets[idx]):
                     continue  # already have a value
 
-                sym = row.get(sym_col)
+                sym = row.get("symbol") or row.get("ticker")
+                if not sym or str(sym) == "nan":
+                    continue
                 acc_data = None
 
                 # Try detection_date first (T-1 rows -- direct match to prediction_date)
