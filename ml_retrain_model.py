@@ -313,14 +313,25 @@ def load_multiday_data(client: Client) -> tuple[pd.DataFrame, pd.DataFrame]:
         try:
             df = fetch_table_paginated(client, table)
             if df.empty:
-                logger.warning(f"  {table}: empty — T-1 rows for this class will lack multiday features")
+                logger.warning(f"  {table}: table is empty or does not exist")
                 result[key] = pd.DataFrame()
                 continue
+
+            logger.info(f"  {table}: raw fetch {len(df)} rows, sample cols: {sorted(df.columns.tolist())[:15]}")
 
             # Keep only key columns + feature columns (drop Supabase bookkeeping)
             keep = {"symbol", "detection_date"}
             feature_cols = [c for c in df.columns
                             if c.startswith(("t3_", "t5_", "t10_"))]
+
+            if not feature_cols:
+                logger.warning(
+                    f"  {table}: NO t3_/t5_/t10_ columns found! "
+                    f"All columns: {sorted(df.columns.tolist())}"
+                )
+                result[key] = pd.DataFrame()
+                continue
+
             keep.update(feature_cols)
             df = df[[c for c in df.columns if c in keep]].copy()
 
@@ -333,14 +344,16 @@ def load_multiday_data(client: Client) -> tuple[pd.DataFrame, pd.DataFrame]:
             # Drop dupes (shouldn't happen but be safe)
             df = df.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
 
+            sample_dates = df["detection_date"].dropna().head(3).tolist()
             logger.info(
                 f"  {table}: {len(df)} rows, "
-                f"{len(feature_cols)} multiday feature columns"
+                f"{len(feature_cols)} multiday feature columns, "
+                f"sample dates: {sample_dates}"
             )
             result[key] = df
 
         except Exception as e:
-            logger.warning(f"Could not load '{table}': {e}")
+            logger.error(f"Could not load '{table}': {e}", exc_info=True)
             result[key] = pd.DataFrame()
 
     return result.get("winners", pd.DataFrame()), result.get("non_winners", pd.DataFrame())
@@ -378,6 +391,18 @@ def _join_multiday(
     if not sym_col:
         logger.warning(f"  {table_name}: no symbol column, skipping multiday join")
         return t1_df
+
+    # Diagnostic: show sample keys from both sides so date format mismatches are obvious
+    t1_sample = list(zip(
+        t1_copy[sym_col].head(3).tolist(),
+        t1_copy["detection_date"].head(3).tolist()
+    ))
+    md_sample = list(zip(
+        multiday_df["symbol"].head(3).tolist(),
+        multiday_df["detection_date"].head(3).tolist()
+    ))
+    logger.info(f"  {table_name}: T-1 join keys sample    : {t1_sample}")
+    logger.info(f"  {table_name}: multiday join keys sample: {md_sample}")
 
     before_cols = len(t1_copy.columns)
     merged = t1_copy.merge(
