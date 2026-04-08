@@ -113,11 +113,13 @@ except ImportError:
 # Configuration
 # ---------------------------------------------------------------------------
 
-TABLE_BASE              = "ml_training_base"
-TABLE_WINNERS_CLOSE     = "winners_day_prior_close"
-TABLE_WINNERS_OPEN      = "winners_day_prior_open"
-TABLE_NON_WINNERS_CLOSE = "non_winners_day_prior_close"
-TABLE_NON_WINNERS_OPEN  = "non_winners_day_prior_open"
+TABLE_BASE                   = "ml_training_base"
+TABLE_WINNERS_CLOSE          = "winners_day_prior_close"
+TABLE_WINNERS_OPEN           = "winners_day_prior_open"
+TABLE_NON_WINNERS_CLOSE      = "non_winners_day_prior_close"
+TABLE_NON_WINNERS_OPEN       = "non_winners_day_prior_open"
+TABLE_WINNERS_MULTIDAY       = "winners_day_prior_multiday"
+TABLE_NON_WINNERS_MULTIDAY   = "non_winners_day_prior_multiday"
 
 MODEL_DIR               = Path("ml_models")
 MODEL_PATH              = MODEL_DIR / "best_model.pkl"
@@ -292,28 +294,148 @@ def audit_base_data(base_df: pd.DataFrame) -> None:
         logger.info(f"  Rows intraday_high_labels would upgrade: {would_upgrade}")
 
 
+def load_multiday_data(client: Client) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Load the backfilled / daily-generated T-3/T-5/T-10 feature tables.
+
+    Returns two DataFrames (winners_multiday, non_winners_multiday), each
+    indexed by (symbol, detection_date) and containing only the t3_/t5_/t10_
+    feature columns plus those two key columns.
+
+    These are joined onto the T-1 rows inside load_t1_data() so that every
+    T-1 training row ends up with the full feature set the model expects.
+    """
+    result = {}
+    for table, key in [
+        (TABLE_WINNERS_MULTIDAY,     "winners"),
+        (TABLE_NON_WINNERS_MULTIDAY, "non_winners"),
+    ]:
+        try:
+            df = fetch_table_paginated(client, table)
+            if df.empty:
+                logger.warning(f"  {table}: empty — T-1 rows for this class will lack multiday features")
+                result[key] = pd.DataFrame()
+                continue
+
+            # Keep only key columns + feature columns (drop Supabase bookkeeping)
+            keep = {"symbol", "detection_date"}
+            feature_cols = [c for c in df.columns
+                            if c.startswith(("t3_", "t5_", "t10_"))]
+            keep.update(feature_cols)
+            df = df[[c for c in df.columns if c in keep]].copy()
+
+            # Normalise detection_date to plain string YYYY-MM-DD for joining
+            df["detection_date"] = pd.to_datetime(
+                df["detection_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            df = df.dropna(subset=["symbol", "detection_date"])
+
+            # Drop dupes (shouldn't happen but be safe)
+            df = df.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+
+            logger.info(
+                f"  {table}: {len(df)} rows, "
+                f"{len(feature_cols)} multiday feature columns"
+            )
+            result[key] = df
+
+        except Exception as e:
+            logger.warning(f"Could not load '{table}': {e}")
+            result[key] = pd.DataFrame()
+
+    return result.get("winners", pd.DataFrame()), result.get("non_winners", pd.DataFrame())
+
+
+def _join_multiday(
+    t1_df: pd.DataFrame,
+    multiday_df: pd.DataFrame,
+    table_name: str,
+) -> pd.DataFrame:
+    """
+    Left-join multiday (t3_/t5_/t10_) features onto a T-1 DataFrame.
+
+    Rows without a matching multiday entry keep NaN for the multiday columns —
+    XGBoost handles this natively, so they still contribute intraday signal.
+    """
+    if multiday_df.empty:
+        logger.warning(
+            f"  {table_name}: no multiday data to join — "
+            "t3/t5/t10 features will be NaN for these rows"
+        )
+        return t1_df
+
+    # Normalise detection_date in t1_df to the same plain string format
+    if "detection_date" not in t1_df.columns:
+        logger.warning(f"  {table_name}: no detection_date column, skipping multiday join")
+        return t1_df
+
+    t1_copy = t1_df.copy()
+    t1_copy["detection_date"] = pd.to_datetime(
+        t1_copy["detection_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    sym_col = next((c for c in ["symbol", "ticker"] if c in t1_copy.columns), None)
+    if not sym_col:
+        logger.warning(f"  {table_name}: no symbol column, skipping multiday join")
+        return t1_df
+
+    before_cols = len(t1_copy.columns)
+    merged = t1_copy.merge(
+        multiday_df,
+        left_on=[sym_col, "detection_date"],
+        right_on=["symbol", "detection_date"],
+        how="left",
+        suffixes=("", "_md"),
+    )
+
+    # If sym_col != "symbol", the merge introduced a duplicate "symbol" column — drop it
+    if sym_col != "symbol" and "symbol" in merged.columns:
+        merged = merged.drop(columns=["symbol"])
+
+    multiday_cols_added = [c for c in merged.columns
+                           if c.startswith(("t3_", "t5_", "t10_"))
+                           and c not in t1_df.columns]
+    n_matched = merged[multiday_cols_added[0]].notna().sum() if multiday_cols_added else 0
+
+    logger.info(
+        f"  {table_name}: joined {len(multiday_cols_added)} multiday columns, "
+        f"{n_matched}/{len(merged)} rows have multiday data "
+        f"({n_matched/len(merged)*100:.0f}% coverage)"
+    )
+    return merged
+
+
 def load_t1_data(client: Client) -> pd.DataFrame:
     """
-    Load accumulated T-1 winner and non-winner samples.
+    Load accumulated T-1 winner and non-winner samples, then join in the
+    corresponding T-3/T-5/T-10 multiday features so every row has the full
+    feature set the model expects.
 
-    Applies t1_column_map to rename intraday short-form column names
-    to the model's expected long-form names with the correct prefix.
+    Column flow
+    -----------
+    T-1 intraday columns  → renamed via t1_column_map → t1_close_* / t1_open_*
+    Multiday columns      → loaded separately          → t3_* / t5_* / t10_*
+    Both are joined on (symbol, detection_date) into one unified row.
 
-    close tables → prefix "t1_close"
-    open  tables → prefix "t1_open"
+    close tables → intraday prefix "t1_close", joined against winners/non-winners multiday
+    open  tables → intraday prefix "t1_open",  joined against winners/non-winners multiday
     """
     logger.info("Loading accumulated T-1 training data...")
 
+    # Load multiday tables once — reused for both open and close variants
+    logger.info("Loading multiday feature tables for T-1 enrichment...")
+    winners_multiday, non_winners_multiday = load_multiday_data(client)
+
     TABLE_CONFIG = [
-        (TABLE_WINNERS_CLOSE,      1, "t1_close"),
-        (TABLE_WINNERS_OPEN,       1, "t1_open"),
-        (TABLE_NON_WINNERS_CLOSE,  0, "t1_close"),
-        (TABLE_NON_WINNERS_OPEN,   0, "t1_open"),
+        (TABLE_WINNERS_CLOSE,      1, "t1_close", winners_multiday),
+        (TABLE_WINNERS_OPEN,       1, "t1_open",  winners_multiday),
+        (TABLE_NON_WINNERS_CLOSE,  0, "t1_close", non_winners_multiday),
+        (TABLE_NON_WINNERS_OPEN,   0, "t1_open",  non_winners_multiday),
     ]
 
     frames = []
 
-    for table, label, prefix in TABLE_CONFIG:
+    for table, label, prefix, multiday_df in TABLE_CONFIG:
         try:
             df = fetch_table_paginated(client, table)
             if df.empty:
@@ -322,6 +444,7 @@ def load_t1_data(client: Client) -> pd.DataFrame:
             df["label"]  = label
             df["source"] = table
 
+            # ── Rename intraday columns to t1_close_* / t1_open_* ────────────
             if T1_MAP_AVAILABLE:
                 before = len(df.columns)
                 df     = rename_t1_columns(df, prefix=prefix)
@@ -344,6 +467,9 @@ def load_t1_data(client: Client) -> pd.DataFrame:
                     "T-1 features will be NaN in model (not ideal but won't crash)"
                 )
 
+            # ── Join multiday (t3/t5/t10) features ───────────────────────────
+            df = _join_multiday(df, multiday_df, table)
+
             frames.append(df)
 
         except Exception as e:
@@ -358,12 +484,28 @@ def load_t1_data(client: Client) -> pd.DataFrame:
 
     t1_feature_cols = [c for c in combined.columns
                        if c.startswith("t1_close_") or c.startswith("t1_open_")]
-    non_null_t1 = combined[t1_feature_cols].notna().any().sum() if t1_feature_cols else 0
+    multiday_feature_cols = [c for c in combined.columns
+                             if c.startswith(("t3_", "t5_", "t10_"))]
+    non_null_t1       = combined[t1_feature_cols].notna().any().sum() if t1_feature_cols else 0
+    non_null_multiday = combined[multiday_feature_cols].notna().any().sum() if multiday_feature_cols else 0
 
     logger.info(f"T-1 data: {len(combined)} rows, "
                 f"pos={int((combined['label']==1).sum())}, "
                 f"neg={int((combined['label']==0).sum())}")
-    logger.info(f"T-1 feature columns populated: {non_null_t1}/{len(t1_feature_cols)}")
+    logger.info(f"T-1 intraday feature columns populated : {non_null_t1}/{len(t1_feature_cols)}")
+    logger.info(f"T-1 multiday feature columns populated : {non_null_multiday}/{len(multiday_feature_cols)}")
+
+    # Warn if multiday coverage is low — most rows should have it after backfill
+    if multiday_feature_cols:
+        rows_with_any_multiday = combined[multiday_feature_cols].notna().any(axis=1).sum()
+        coverage_pct = rows_with_any_multiday / len(combined) * 100
+        if coverage_pct < 50:
+            logger.warning(
+                f"  ⚠️  Only {coverage_pct:.0f}% of T-1 rows have multiday features. "
+                "Run the backfill script (backfill_multiday_features.py) to improve coverage."
+            )
+        else:
+            logger.info(f"  ✅ {coverage_pct:.0f}% of T-1 rows have multiday features")
 
     return combined
 
@@ -1487,10 +1629,16 @@ def main() -> int:
 
     # ── Training stats for metadata ───────────────────────────────────────────
     n_mistakes = len(mistake_df) if not mistake_df.empty else 0
+    n_t1_with_multiday = 0
+    if not t1_df.empty:
+        md_cols = [c for c in t1_df.columns if c.startswith(("t3_", "t5_", "t10_"))]
+        if md_cols:
+            n_t1_with_multiday = int(t1_df[md_cols].notna().any(axis=1).sum())
     training_stats = {
         "n_total_samples":         len(combined_df),
         "n_base_samples":          len(base_df),
         "n_t1_samples":            len(t1_df) if not t1_df.empty else 0,
+        "n_t1_with_multiday":      n_t1_with_multiday,
         "n_mistake_samples":       n_mistakes,
         "n_positive":              int((y == 1).sum()),
         "n_negative":              int((y == 0).sum()),
@@ -1520,6 +1668,13 @@ def main() -> int:
     logger.info(f"  Total samples       : {training_stats['n_total_samples']}")
     logger.info(f"  Base CSV samples    : {training_stats['n_base_samples']}")
     logger.info(f"  T-1 samples         : {training_stats['n_t1_samples']}")
+    t1_total = training_stats['n_t1_samples']
+    t1_md    = training_stats['n_t1_with_multiday']
+    if t1_total > 0:
+        logger.info(
+            f"  T-1 w/ multiday     : {t1_md}/{t1_total} "
+            f"({t1_md/t1_total*100:.0f}% have t3/t5/t10 features)"
+        )
     logger.info(f"  Mistake samples     : {training_stats['n_mistake_samples']}")
     logger.info(f"  Positive rate       : {training_stats['positive_rate']:.1%}")
     logger.info(f"  Validation AUC      : {auc:.4f}")
