@@ -132,6 +132,17 @@ BASE_CSV_WEIGHT         = 1.5
 T1_WEIGHT               = 1.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
+# FIX 1: Fixed validation cutoff date — keeps the val set stable across retrains.
+# Everything on or after this date becomes the val set; everything before is train.
+# Update this date roughly every quarter as your dataset grows, ensuring at least
+# MIN_VAL_POSITIVES winner examples fall after the cutoff.
+VAL_CUTOFF_DATE = "2025-10-01"
+
+# FIX 3: Minimum number of positive examples required in the val set before
+# training proceeds. If the cutoff date produces fewer than this many winners,
+# training aborts with a clear message rather than producing a junk model.
+MIN_VAL_POSITIVES = 50
+
 # FIX 4: Intraday high threshold — a stock is considered a "winner" even if
 # it didn't close at the top, as long as it hit this intraday gain.
 INTRADAY_WIN_THRESHOLD = 15.0  # %
@@ -983,18 +994,34 @@ def train_val_split(
     y: pd.Series,
     w: pd.Series,
     df_with_dates: pd.DataFrame,
-    val_fraction: float = 0.20,
+    val_fraction: float = 0.20,  # only used as fallback when no date column exists
 ) -> tuple:
     """
-    TIME-BASED train/val split instead of random stratified split.
+    FIXED train/val split with three stability improvements:
 
-    Uses a unified _sort_date column (detection_date ?? event_date) so that
-    base CSV rows sort correctly alongside T-1 rows.
+    FIX 1 — Fixed cutoff date (VAL_CUTOFF_DATE) instead of a floating fraction.
+      The old approach used the most-recent 20% of rows, which shifts every
+      retrain as new T-1 data accumulates. That means the val set is a different
+      slice of the market each week, so early stopping fires at a different
+      iteration each time. A fixed date gives the same val window every run.
+
+    FIX 2 — Mistake samples (rows with NaT dates) are forced into the train set.
+      Previously NaT rows sorted to the end and landed in the val set, biasing
+      AUC on the model's own hardest errors rather than a general held-out period.
+
+    FIX 3 — Hard minimum on val positives (MIN_VAL_POSITIVES).
+      If the fixed cutoff leaves fewer than MIN_VAL_POSITIVES winner rows in val,
+      training aborts with a clear message rather than producing a junk model
+      (previously the code only warned and then continued).
+
+    Update VAL_CUTOFF_DATE in the configuration block roughly every quarter,
+    once enough new labelled data has accumulated after the cutoff.
     """
     df_work = df_with_dates.copy()
 
+    # ── Build a unified sort_date from whichever date column(s) exist ────────
     has_detection = "detection_date" in df_work.columns
-    has_event     = "event_date" in df_work.columns
+    has_event     = "event_date"     in df_work.columns
 
     if has_detection or has_event:
         sort_date = pd.Series(pd.NaT, index=df_work.index)
@@ -1006,54 +1033,60 @@ def train_val_split(
 
         df_work["_sort_date"] = sort_date
         date_col = "_sort_date"
+    else:
+        date_col = next((c for c in ["date"] if c in df_work.columns), None)
+        sort_date = (
+            pd.to_datetime(df_work[date_col], errors="coerce")
+            if date_col else pd.Series(pd.NaT, index=df_work.index)
+        )
 
-        n_base_dates = sort_date.notna().sum()
-        n_nat        = sort_date.isna().sum()
+    # ── FIX 2: Identify NaT rows (mistake samples) — pin them to train ───────
+    nat_mask = sort_date.isna()
+    n_nat    = int(nat_mask.sum())
+    if n_nat > 0:
         logger.info(
-            f"Unified sort_date: {n_base_dates} rows have a valid date, "
-            f"{n_nat} rows have NaT (will sort to END of sequence → into val set — investigate if large)"
-        )
-    else:
-        date_col = next(
-            (c for c in ["date"] if c in df_work.columns), None
+            f"FIX 2: {n_nat} rows have NaT dates (mistake samples) — "
+            "forcing them into the train set so they don't pollute val AUC."
         )
 
-    if date_col is None:
-        logger.warning(
-            "No date column found for time-based split — "
-            "falling back to sequential split."
-        )
-        split_idx = int(len(X) * (1 - val_fraction))
-        train_idx = X.index[:split_idx]
-        X_train = X.iloc[:split_idx]
-        X_val   = X.iloc[split_idx:]
-        y_train = y.iloc[:split_idx]
-        y_val   = y.iloc[split_idx:]
-        w_train = w.iloc[:split_idx]
-        w_val   = w.iloc[split_idx:]
-    else:
-        dates      = pd.to_datetime(df_work[date_col], errors="coerce")
-        sorted_idx = dates.sort_values(na_position='last').index
-        split_pos  = int(len(sorted_idx) * (1 - val_fraction))
+    # ── FIX 1: Split on fixed date rather than a floating fraction ────────────
+    if date_col is not None:
+        cutoff = pd.Timestamp(VAL_CUTOFF_DATE)
+        dates  = pd.to_datetime(df_work[date_col], errors="coerce")
 
-        train_idx = sorted_idx[:split_pos]
-        val_idx   = sorted_idx[split_pos:]
+        # FIX 2 applied here: NaT → train regardless of cutoff
+        train_mask = nat_mask | (dates < cutoff)
+        val_mask   = (~nat_mask) & (dates >= cutoff)
 
-        X_train = X.loc[train_idx]
-        X_val   = X.loc[val_idx]
-        y_train = y.loc[train_idx]
-        y_val   = y.loc[val_idx]
-        w_train = w.loc[train_idx]
-        w_val   = w.loc[val_idx]
+        train_idx = df_work.index[train_mask]
+        val_idx   = df_work.index[val_mask]
 
         train_dates = dates.loc[train_idx].dropna()
         val_dates   = dates.loc[val_idx].dropna()
-        if not train_dates.empty and not val_dates.empty:
-            logger.info(
-                f"Time-based split: "
-                f"train {train_dates.min().date()} → {train_dates.max().date()}, "
-                f"val {val_dates.min().date()} → {val_dates.max().date()}"
-            )
+
+        logger.info(
+            f"FIX 1 — Fixed-cutoff split on {VAL_CUTOFF_DATE}: "
+            f"train {train_dates.min().date() if not train_dates.empty else '?'} "
+            f"→ {train_dates.max().date() if not train_dates.empty else '?'}, "
+            f"val {val_dates.min().date() if not val_dates.empty else '?'} "
+            f"→ {val_dates.max().date() if not val_dates.empty else '?'}"
+        )
+    else:
+        # No date column at all — fall back to sequential split (last resort)
+        logger.warning(
+            "No date column found — falling back to sequential split. "
+            "Set VAL_CUTOFF_DATE and ensure detection_date/event_date columns exist."
+        )
+        split_pos = int(len(X) * (1 - val_fraction))
+        train_idx = X.index[:split_pos]
+        val_idx   = X.index[split_pos:]
+
+    X_train = X.loc[train_idx]
+    X_val   = X.loc[val_idx]
+    y_train = y.loc[train_idx]
+    y_val   = y.loc[val_idx]
+    w_train = w.loc[train_idx]
+    w_val   = w.loc[val_idx]
 
     logger.info(
         f"Train/val split: {len(X_train)} train "
@@ -1062,14 +1095,28 @@ def train_val_split(
         f"(pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())})"
     )
 
+    # ── FIX 3: Hard minimum on val positives — abort instead of warn ──────────
     val_pos = int((y_val == 1).sum())
-    if val_pos < 20:
-        logger.warning(
-            f"  ⚠️  Only {val_pos} positive examples in validation set "
-            f"({val_pos / max(1, len(y_val)):.1%} of val). "
-            "Early stopping logloss will be noisy — model may under-train. "
-            "Consider increasing val_fraction or adding more labelled data."
+    if val_pos < MIN_VAL_POSITIVES:
+        logger.error(
+            f"FIX 3 — ABORTING: only {val_pos} positive examples in val set "
+            f"(need ≥ {MIN_VAL_POSITIVES}). "
+            f"The cutoff date {VAL_CUTOFF_DATE!r} is too recent — not enough winners "
+            "have accumulated after it. "
+            "Options: (1) move VAL_CUTOFF_DATE earlier, "
+            "(2) accumulate more labelled data, "
+            "(3) lower MIN_VAL_POSITIVES if you accept noisier early stopping."
         )
+        sys.exit(1)
+    elif val_pos < 100:
+        logger.warning(
+            f"  ⚠️  Only {val_pos} positive examples in val set "
+            f"({val_pos / max(1, len(y_val)):.1%} of val). "
+            "Early stopping AUC may still be somewhat noisy. "
+            f"Consider moving VAL_CUTOFF_DATE earlier once more data accumulates."
+        )
+    else:
+        logger.info(f"  ✅ Val set has {val_pos} positives — early stopping signal is stable.")
 
     return X_train, X_val, y_train, y_val, w_train, w_val, train_idx
 
@@ -1682,7 +1729,7 @@ def main() -> int:
             if not t1_df.empty else False
         ),
         "gain_regressor_trained":  gain_regressor is not None,
-        "split_method":            "time_based",
+        "split_method":            f"fixed_cutoff:{VAL_CUTOFF_DATE}",
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
                                     "RC3_scaled_input", "RC6_mistake_enrichment"],
     }
@@ -1710,7 +1757,7 @@ def main() -> int:
     logger.info(f"  Validation AUC      : {auc:.4f}")
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
-    logger.info(f"  Split method        : time-based (most recent {20}% as val)")
+    logger.info(f"  Split method        : fixed cutoff {VAL_CUTOFF_DATE} (val = everything after)")
     logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
     logger.info("Files written:")
