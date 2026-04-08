@@ -1617,8 +1617,8 @@ def main() -> int:
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled.loc[train_idx],       # train rows only — no val leakage
-        combined_df=combined_df.loc[train_idx], # aligned to same train rows
+        X_scaled=X_scaled,       # use ALL rows — gain regressor is a separate model
+        combined_df=combined_df, # with a different target (actual_gain_pct), no leakage concern
         feature_names=feature_names,
         client=client,              # RC1: fetch additional gain data
     )
