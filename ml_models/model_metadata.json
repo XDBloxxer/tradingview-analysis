@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-04-08T13:18:05.632033+00:00",
+  "trained_at": "2026-04-08T13:25:21.970351+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
   "n_features": 405,
@@ -432,8 +432,8 @@
     "t1_close_DMP_14",
     "t1_close_DMN_14"
   ],
-  "best_iteration": 64,
-  "best_val_logloss": 0.8240587397000267,
+  "best_iteration": 132,
+  "best_val_logloss": 0.8241233082884077,
   "gain_regressor_trained": false,
   "gain_regressor_fixes": [
     "RC1_broader_training",
@@ -446,10 +446,10 @@
   "n_t1_samples": 2446,
   "n_t1_with_multiday": 0,
   "n_mistake_samples": 15,
-  "n_positive": 5951,
-  "n_negative": 18418,
-  "positive_rate": 0.24420370142394024,
-  "val_auc_roc": 0.8240587397000267,
+  "n_positive": 7897,
+  "n_negative": 16472,
+  "positive_rate": 0.32405925561163773,
+  "val_auc_roc": 0.8241233082884076,
   "base_sample_weight": 1.5,
   "t1_sample_weight": 1.0,
   "intraday_win_threshold": 15.0,
