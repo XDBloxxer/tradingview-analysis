@@ -1237,15 +1237,13 @@ def train_gain_regressor(
 
         if sym_col and (has_detection or has_event):
             filled_count = 0
-          # Add this before the for idx, row loop:
-            sample_keys = list(accuracy_gain_map.keys())[:5]
-            logger.info(f"accuracy_gain_map sample keys: {sample_keys}")
-            sample_rows = combined_df[["symbol", "detection_date"]].head(5).to_dict("records")
-            logger.info(f"combined_df sample join keys: {sample_rows}")
             for idx, row in combined_df.iterrows():
                 if pd.notna(gain_targets[idx]):
                     continue  # already have a value
 
+                # Support both column naming conventions:
+                # T-1 rows use "symbol" + "detection_date"
+                # base CSV rows use "ticker" + "event_date"
                 sym = row.get("symbol") or row.get("ticker")
                 if not sym or str(sym) == "nan":
                     continue
