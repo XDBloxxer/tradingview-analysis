@@ -118,8 +118,8 @@ TABLE_WINNERS_CLOSE          = "winners_day_prior_close"
 TABLE_WINNERS_OPEN           = "winners_day_prior_open"
 TABLE_NON_WINNERS_CLOSE      = "non_winners_day_prior_close"
 TABLE_NON_WINNERS_OPEN       = "non_winners_day_prior_open"
-TABLE_WINNERS_MULTIDAY       = "winners_day_prior_multiday"
-TABLE_NON_WINNERS_MULTIDAY   = "non_winners_day_prior_multiday"
+TABLE_WINNERS_MULTIDAY       = "winners_multiday"
+TABLE_NON_WINNERS_MULTIDAY   = "non_winners_multiday"
 
 MODEL_DIR               = Path("ml_models")
 MODEL_PATH              = MODEL_DIR / "best_model.pkl"
