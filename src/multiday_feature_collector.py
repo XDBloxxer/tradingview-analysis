@@ -11,8 +11,8 @@ sees a consistent feature set across historical and live rows.
 
 Table targets
 -------------
-  winners    →  winners_day_prior_multiday
-  non-winners →  non_winners_day_prior_multiday
+  winners    →  winners_multiday
+  non-winners →  non_winners_multiday
 
 Both tables share the same schema:
   symbol, detection_date, <t3_* columns>, <t5_* columns>, <t10_* columns>
