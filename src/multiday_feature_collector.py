@@ -93,6 +93,88 @@ TIMEFRAMES = {
     "t10": 10,
 }
 
+# ---------------------------------------------------------------------------
+# Columns that actually exist in the Supabase schema.
+# Any key NOT in this set will be stripped before upsert to avoid PGRST204
+# "column not found in schema cache" errors.
+# Derived from the non_winners_multiday table export (non_winners_multiday_rows.csv).
+# ---------------------------------------------------------------------------
+DB_COLUMNS: set = {
+    "symbol", "detection_date",
+    # ── t10 ──────────────────────────────────────────────────────────────────
+    "t10_adx_14", "t10_adxr_14_2", "t10_ao", "t10_aroond_25", "t10_aroonosc_25",
+    "t10_aroonu_25", "t10_atr_14", "t10_atr_14_slope", "t10_atr_20", "t10_atr_7",
+    "t10_bbb_20_2_0_2_0", "t10_bbl_20_2_0_2_0", "t10_bbm_20_2_0_2_0",
+    "t10_bbp_20_2_0_2_0", "t10_bbu_20_2_0_2_0", "t10_cci_14", "t10_cci_20",
+    "t10_close", "t10_cmf_20", "t10_dcl_20_20", "t10_dcm_20_20", "t10_dcu_20_20",
+    "t10_dmn_14", "t10_dmp_14", "t10_ema_10", "t10_ema_12", "t10_ema_12_26_diff",
+    "t10_ema_20", "t10_ema_20_slope", "t10_ema_26", "t10_ema_5", "t10_ema_50",
+    "t10_gap_pct", "t10_high", "t10_hma_20", "t10_hma_9", "t10_hv_10", "t10_hv_20",
+    "t10_hv_30", "t10_kcbe_20_2", "t10_kcle_20_2", "t10_kcue_20_2", "t10_low",
+    "t10_macd_12_26_9", "t10_macd_fast", "t10_macd_roc", "t10_macdh_12_26_9",
+    "t10_macdh_fast", "t10_macds_12_26_9", "t10_macds_fast", "t10_mfi_14",
+    "t10_mom_10", "t10_mom_20", "t10_obv", "t10_obv_sma20", "t10_open",
+    "t10_price_vs_ema20", "t10_price_vs_sma20", "t10_price_vs_sma50",
+    "t10_roc_10", "t10_roc_20", "t10_rsi_14", "t10_rsi_14_slope", "t10_rsi_21",
+    "t10_rsi_28", "t10_rsi_7", "t10_sma_10", "t10_sma_20", "t10_sma_20_50_diff",
+    "t10_sma_20_slope", "t10_sma_5", "t10_sma_50", "t10_stochd_14_3_3",
+    "t10_stochd_5_3_1", "t10_stochh_14_3_3", "t10_stochh_5_3_1",
+    "t10_stochk_14_3_3", "t10_stochk_5_3_1", "t10_stochrsid_14_14_3_3",
+    "t10_stochrsik_14_14_3_3", "t10_supert_10_3", "t10_supertd_10_3",
+    "t10_supertl_10_3", "t10_superts_10_3", "t10_tsi_13_25_13", "t10_tsis_13_25_13",
+    "t10_uo", "t10_volume", "t10_volume_ma10", "t10_volume_ma20", "t10_volume_ma5",
+    "t10_volume_ratio", "t10_vwap", "t10_vwma_20", "t10_willr_14", "t10_wma_10",
+    "t10_wma_20",
+    # ── t3 ───────────────────────────────────────────────────────────────────
+    "t3_adx_14", "t3_adxr_14_2", "t3_ao", "t3_aroond_25", "t3_aroonosc_25",
+    "t3_aroonu_25", "t3_atr_14", "t3_atr_14_slope", "t3_atr_20", "t3_atr_7",
+    "t3_bbb_20_2_0_2_0", "t3_bbl_20_2_0_2_0", "t3_bbm_20_2_0_2_0",
+    "t3_bbp_20_2_0_2_0", "t3_bbu_20_2_0_2_0", "t3_cci_14", "t3_cci_20",
+    "t3_close", "t3_cmf_20", "t3_dcl_20_20", "t3_dcm_20_20", "t3_dcu_20_20",
+    "t3_dmn_14", "t3_dmp_14", "t3_ema_10", "t3_ema_12", "t3_ema_12_26_diff",
+    "t3_ema_20", "t3_ema_20_slope", "t3_ema_26", "t3_ema_5", "t3_ema_50",
+    "t3_gap_pct", "t3_high", "t3_hma_20", "t3_hma_9", "t3_hv_10", "t3_hv_20",
+    "t3_hv_30", "t3_kcbe_20_2", "t3_kcle_20_2", "t3_kcue_20_2", "t3_low",
+    "t3_macd_12_26_9", "t3_macd_fast", "t3_macd_roc", "t3_macdh_12_26_9",
+    "t3_macdh_fast", "t3_macds_12_26_9", "t3_macds_fast", "t3_mfi_14",
+    "t3_mom_10", "t3_mom_20", "t3_obv", "t3_obv_sma20", "t3_open",
+    "t3_price_vs_ema20", "t3_price_vs_sma20", "t3_price_vs_sma50",
+    "t3_roc_10", "t3_roc_20", "t3_rsi_14", "t3_rsi_14_slope", "t3_rsi_21",
+    "t3_rsi_28", "t3_rsi_7", "t3_sma_10", "t3_sma_20", "t3_sma_20_50_diff",
+    "t3_sma_20_slope", "t3_sma_5", "t3_sma_50", "t3_stochd_14_3_3",
+    "t3_stochd_5_3_1", "t3_stochh_14_3_3", "t3_stochh_5_3_1",
+    "t3_stochk_14_3_3", "t3_stochk_5_3_1", "t3_stochrsid_14_14_3_3",
+    "t3_stochrsik_14_14_3_3", "t3_supert_10_3", "t3_supertd_10_3",
+    "t3_supertl_10_3", "t3_superts_10_3", "t3_tsi_13_25_13", "t3_tsis_13_25_13",
+    "t3_uo", "t3_volume", "t3_volume_ma10", "t3_volume_ma20", "t3_volume_ma5",
+    "t3_volume_ratio", "t3_vwap", "t3_vwma_20", "t3_willr_14", "t3_wma_10",
+    "t3_wma_20",
+    # ── t5 ───────────────────────────────────────────────────────────────────
+    "t5_adx_14", "t5_adxr_14_2", "t5_ao", "t5_aroond_25", "t5_aroonosc_25",
+    "t5_aroonu_25", "t5_atr_14", "t5_atr_14_slope", "t5_atr_20", "t5_atr_7",
+    "t5_bbb_20_2_0_2_0", "t5_bbl_20_2_0_2_0", "t5_bbm_20_2_0_2_0",
+    "t5_bbp_20_2_0_2_0", "t5_bbu_20_2_0_2_0", "t5_cci_14", "t5_cci_20",
+    "t5_close", "t5_cmf_20", "t5_dcl_20_20", "t5_dcm_20_20", "t5_dcu_20_20",
+    "t5_dmn_14", "t5_dmp_14", "t5_ema_10", "t5_ema_12", "t5_ema_12_26_diff",
+    "t5_ema_20", "t5_ema_20_slope", "t5_ema_26", "t5_ema_5", "t5_ema_50",
+    "t5_gap_pct", "t5_high", "t5_hma_20", "t5_hma_9", "t5_hv_10", "t5_hv_20",
+    "t5_hv_30", "t5_kcbe_20_2", "t5_kcle_20_2", "t5_kcue_20_2", "t5_low",
+    "t5_macd_12_26_9", "t5_macd_fast", "t5_macd_roc", "t5_macdh_12_26_9",
+    "t5_macdh_fast", "t5_macds_12_26_9", "t5_macds_fast", "t5_mfi_14",
+    "t5_mom_10", "t5_mom_20", "t5_obv", "t5_obv_sma20", "t5_open",
+    "t5_price_vs_ema20", "t5_price_vs_sma20", "t5_price_vs_sma50",
+    "t5_roc_10", "t5_roc_20", "t5_rsi_14", "t5_rsi_14_slope", "t5_rsi_21",
+    "t5_rsi_28", "t5_rsi_7", "t5_sma_10", "t5_sma_20", "t5_sma_20_50_diff",
+    "t5_sma_20_slope", "t5_sma_5", "t5_sma_50", "t5_stochd_14_3_3",
+    "t5_stochd_5_3_1", "t5_stochh_14_3_3", "t5_stochh_5_3_1",
+    "t5_stochk_14_3_3", "t5_stochk_5_3_1", "t5_stochrsid_14_14_3_3",
+    "t5_stochrsik_14_14_3_3", "t5_supert_10_3", "t5_supertd_10_3",
+    "t5_supertl_10_3", "t5_superts_10_3", "t5_tsi_13_25_13", "t5_tsis_13_25_13",
+    "t5_uo", "t5_volume", "t5_volume_ma10", "t5_volume_ma20", "t5_volume_ma5",
+    "t5_volume_ratio", "t5_vwap", "t5_vwma_20", "t5_willr_14", "t5_wma_10",
+    "t5_wma_20",
+}
+
 MAX_WORKERS = 5
 LOOKBACK_BARS = 260   # ~1 year of daily bars — enough for SMA_200
 
@@ -339,7 +421,11 @@ class MultidayFeatureCollector:
     @staticmethod
     def _sanitize(row: Dict[str, Any]) -> Dict[str, Any]:
         clean = {}
+        skipped = []
         for k, v in row.items():
+            if k not in DB_COLUMNS:
+                skipped.append(k)
+                continue
             if v is None:
                 clean[k] = None
             elif isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
@@ -352,6 +438,10 @@ class MultidayFeatureCollector:
                 clean[k] = bool(v)
             else:
                 clean[k] = v
+        if skipped:
+            logger.debug(
+                f"_sanitize: dropped {len(skipped)} key(s) not in DB schema: {skipped}"
+            )
         return clean
 
     # ------------------------------------------------------------------
