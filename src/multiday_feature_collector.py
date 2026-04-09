@@ -52,18 +52,17 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     # MACD — DB uses full suffix names
     "MACD_12_26_9": "macd_12_26_9", "MACDh_12_26_9": "macdh_12_26_9", "MACDs_12_26_9": "macds_12_26_9",
     "MACD_6_13_5": "macd_fast", "MACDh_6_13_5": "macdh_fast", "MACDs_6_13_5": "macds_fast",
-    # Stochastic (both param sets)
-    "STOCHk_14_3_3": "stochk_14_3_3", "STOCHd_14_3_3": "stochd_14_3_3", "STOCHh_14_3_3": "stochh_14_3_3",
-    "STOCHk_5_3_1": "stochk_5_3_1", "STOCHd_5_3_1": "stochd_5_3_1", "STOCHh_5_3_1": "stochh_5_3_1",
-    # Bollinger Bands — DB uses _2_0_2_0 suffix
-    "BBL_20_2.0_2.0": "bbl_20_2_0_2_0", "BBM_20_2.0_2.0": "bbm_20_2_0_2_0",
-    "BBU_20_2.0_2.0": "bbu_20_2_0_2_0", "BBB_20_2.0_2.0": "bbb_20_2_0_2_0",
-    "BBP_20_2.0_2.0": "bbp_20_2_0_2_0",
+    # Stochastic — pandas_ta_classic does NOT produce STOCHh; only k and d
+    "STOCHk_14_3_3": "stochk_14_3_3", "STOCHd_14_3_3": "stochd_14_3_3",
+    "STOCHk_5_3_1": "stochk_5_3_1", "STOCHd_5_3_1": "stochd_5_3_1",
+    # Bollinger Bands — actual pandas_ta names use single _2.0 suffix
+    "BBL_20_2.0": "bbl_20_2_0_2_0", "BBM_20_2.0": "bbm_20_2_0_2_0",
+    "BBU_20_2.0": "bbu_20_2_0_2_0", "BBB_20_2.0": "bbb_20_2_0_2_0",
+    "BBP_20_2.0": "bbp_20_2_0_2_0",
     # ATR
     "ATRr_14": "atr_14", "ATRr_7": "atr_7", "ATRr_20": "atr_20",
-    # ADX / ADXR
+    # ADX (ADXR not available in pandas_ta_classic)
     "ADX_14": "adx_14", "DMP_14": "dmp_14", "DMN_14": "dmn_14",
-    "ADXR_14_2": "adxr_14_2",
     # CCI (both periods)
     "CCI_14_0.015": "cci_14", "CCI_20_0.015": "cci_20",
     # Williams %R
@@ -85,8 +84,8 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     "CMF_20": "cmf_20",
     # Donchian Channels
     "DCL_20_20": "dcl_20_20", "DCM_20_20": "dcm_20_20", "DCU_20_20": "dcu_20_20",
-    # Keltner Channels
-    "KCLe_20_2": "kcle_20_2", "KCBe_20_2": "kcbe_20_2", "KCUe_20_2": "kcue_20_2",
+    # Keltner Channels — actual names use _2.0 suffix
+    "KCLe_20_2.0": "kcle_20_2", "KCBe_20_2.0": "kcbe_20_2", "KCUe_20_2.0": "kcue_20_2",
     # OBV
     "OBV": "obv",
     # Supertrend
@@ -274,9 +273,8 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
                     {"kind": "atr",       "length": 14},
                     {"kind": "atr",       "length": 7},
                     {"kind": "atr",       "length": 20},
-                    # ADX / ADXR
+                    # ADX
                     {"kind": "adx",       "length": 14},
-                    {"kind": "adxr",      "length": 14, "lensig": 2},
                     # CCI (two periods)
                     {"kind": "cci",       "length": 14},
                     {"kind": "cci",       "length": 20},
