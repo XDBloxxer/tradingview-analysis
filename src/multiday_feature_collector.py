@@ -42,32 +42,52 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     # RSI variants
     "RSI_14": "rsi_14", "RSI_7": "rsi_7", "RSI_21": "rsi_21", "RSI_28": "rsi_28",
     # Moving averages
-    "SMA_5": "sma_5", "SMA_10": "sma_10", "SMA_20": "sma_20",
-    "SMA_50": "sma_50", "SMA_100": "sma_100", "SMA_200": "sma_200",
+    "SMA_5": "sma_5", "SMA_10": "sma_10", "SMA_20": "sma_20", "SMA_50": "sma_50",
     "EMA_5": "ema_5", "EMA_10": "ema_10", "EMA_12": "ema_12",
     "EMA_20": "ema_20", "EMA_26": "ema_26", "EMA_50": "ema_50",
-    "EMA_100": "ema_100", "EMA_200": "ema_200",
-    # MACD (pandas_ta native names)
-    "MACD_12_26_9": "macd", "MACDh_12_26_9": "macdh", "MACDs_12_26_9": "macds",
+    # WMA / HMA / VWMA
+    "WMA_10": "wma_10", "WMA_20": "wma_20",
+    "HMA_9": "hma_9", "HMA_20": "hma_20",
+    "VWMA_20": "vwma_20",
+    # MACD — DB uses full suffix names
+    "MACD_12_26_9": "macd_12_26_9", "MACDh_12_26_9": "macdh_12_26_9", "MACDs_12_26_9": "macds_12_26_9",
     "MACD_6_13_5": "macd_fast", "MACDh_6_13_5": "macdh_fast", "MACDs_6_13_5": "macds_fast",
-    # Stochastic
-    "STOCHk_14_3_3": "stochk_14_3_3", "STOCHd_14_3_3": "stochd_14_3_3",
-    "STOCHh_14_3_3": "stochh_14_3_3",
-    # Bollinger Bands
-    "BBL_20_2.0_2.0": "bbl_20_2_0", "BBM_20_2.0_2.0": "bbm_20_2_0",
-    "BBU_20_2.0_2.0": "bbu_20_2_0", "BBB_20_2.0_2.0": "bbb_20_2_0",
-    "BBP_20_2.0_2.0": "bbp_20_2_0",
-    # ATR / volatility
+    # Stochastic (both param sets)
+    "STOCHk_14_3_3": "stochk_14_3_3", "STOCHd_14_3_3": "stochd_14_3_3", "STOCHh_14_3_3": "stochh_14_3_3",
+    "STOCHk_5_3_1": "stochk_5_3_1", "STOCHd_5_3_1": "stochd_5_3_1", "STOCHh_5_3_1": "stochh_5_3_1",
+    # Bollinger Bands — DB uses _2_0_2_0 suffix
+    "BBL_20_2.0_2.0": "bbl_20_2_0_2_0", "BBM_20_2.0_2.0": "bbm_20_2_0_2_0",
+    "BBU_20_2.0_2.0": "bbu_20_2_0_2_0", "BBB_20_2.0_2.0": "bbb_20_2_0_2_0",
+    "BBP_20_2.0_2.0": "bbp_20_2_0_2_0",
+    # ATR
     "ATRr_14": "atr_14", "ATRr_7": "atr_7", "ATRr_20": "atr_20",
-    # ADX
+    # ADX / ADXR
     "ADX_14": "adx_14", "DMP_14": "dmp_14", "DMN_14": "dmn_14",
-    # CCI
-    "CCI_14_0.015": "cci_14",
+    "ADXR_14_2": "adxr_14_2",
+    # CCI (both periods)
+    "CCI_14_0.015": "cci_14", "CCI_20_0.015": "cci_20",
     # Williams %R
     "WILLR_14": "willr_14",
-    # Momentum / ROC
-    "MOM_10": "mom_10", "ROC_10": "roc_10",
-    # OBV / volume
+    # Momentum / ROC (both periods)
+    "MOM_10": "mom_10", "MOM_20": "mom_20",
+    "ROC_10": "roc_10", "ROC_20": "roc_20",
+    # Aroon
+    "AROOND_25": "aroond_25", "AROONU_25": "aroonu_25", "AROONOSC_25": "aroonosc_25",
+    # Awesome Oscillator
+    "AO_5_34": "ao",
+    # MFI
+    "MFI_14": "mfi_14",
+    # Ultimate Oscillator
+    "UO_7_14_28": "uo",
+    # TSI
+    "TSI_13_25_13": "tsi_13_25_13", "TSIs_13_25_13": "tsis_13_25_13",
+    # CMF
+    "CMF_20": "cmf_20",
+    # Donchian Channels
+    "DCL_20_20": "dcl_20_20", "DCM_20_20": "dcm_20_20", "DCU_20_20": "dcu_20_20",
+    # Keltner Channels
+    "KCLe_20_2": "kcle_20_2", "KCBe_20_2": "kcbe_20_2", "KCUe_20_2": "kcue_20_2",
+    # OBV
     "OBV": "obv",
     # Supertrend
     "SUPERT_10_3.0": "supert_10_3", "SUPERTd_10_3.0": "supertd_10_3",
@@ -77,14 +97,20 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     "STOCHRSId_14_14_3_3": "stochrsid_14_14_3_3",
     # VWAP
     "VWAP_D": "vwap",
-    # Price-change helpers (computed manually, see below)
-    "price_change_3d": "price_change_3d",
-    "price_change_5d": "price_change_5d",
-    "price_change_10d": "price_change_10d",
+    # Manually computed fields (see helpers section below)
     "gap_pct": "gap_pct",
     "volume_ratio": "volume_ratio",
-    "high_52w_pct": "high_52w_pct",
-    "low_52w_pct": "low_52w_pct",
+    "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume",
+    "obv_sma20": "obv_sma20",
+    "volume_ma5": "volume_ma5", "volume_ma10": "volume_ma10", "volume_ma20": "volume_ma20",
+    "atr_14_slope": "atr_14_slope", "rsi_14_slope": "rsi_14_slope",
+    "ema_20_slope": "ema_20_slope", "sma_20_slope": "sma_20_slope",
+    "ema_12_26_diff": "ema_12_26_diff",
+    "sma_20_50_diff": "sma_20_50_diff",
+    "price_vs_sma20": "price_vs_sma20", "price_vs_sma50": "price_vs_sma50",
+    "price_vs_ema20": "price_vs_ema20",
+    "macd_roc": "macd_roc",
+    "hv_10": "hv_10", "hv_20": "hv_20", "hv_30": "hv_30",
 }
 
 TIMEFRAMES = {
@@ -215,40 +241,75 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             ta.Strategy(
                 "multiday",
                 [
+                    # RSI
                     {"kind": "rsi",       "length": 14},
                     {"kind": "rsi",       "length": 7},
                     {"kind": "rsi",       "length": 21},
                     {"kind": "rsi",       "length": 28},
+                    # SMA / EMA / WMA / HMA / VWMA
                     {"kind": "sma",       "length": 5},
                     {"kind": "sma",       "length": 10},
                     {"kind": "sma",       "length": 20},
                     {"kind": "sma",       "length": 50},
-                    {"kind": "sma",       "length": 100},
-                    {"kind": "sma",       "length": 200},
                     {"kind": "ema",       "length": 5},
                     {"kind": "ema",       "length": 10},
                     {"kind": "ema",       "length": 12},
                     {"kind": "ema",       "length": 20},
                     {"kind": "ema",       "length": 26},
                     {"kind": "ema",       "length": 50},
-                    {"kind": "ema",       "length": 100},
-                    {"kind": "ema",       "length": 200},
+                    {"kind": "wma",       "length": 10},
+                    {"kind": "wma",       "length": 20},
+                    {"kind": "hma",       "length": 9},
+                    {"kind": "hma",       "length": 20},
+                    {"kind": "vwma",      "length": 20},
+                    # MACD (standard + fast)
                     {"kind": "macd",      "fast": 12, "slow": 26, "signal": 9},
                     {"kind": "macd",      "fast": 6,  "slow": 13, "signal": 5},
+                    # Stochastic (two param sets)
                     {"kind": "stoch",     "k": 14, "d": 3, "smooth_k": 3},
+                    {"kind": "stoch",     "k": 5,  "d": 3, "smooth_k": 1},
+                    # Bollinger Bands
                     {"kind": "bbands",    "length": 20, "std": 2.0},
+                    # ATR
                     {"kind": "atr",       "length": 14},
                     {"kind": "atr",       "length": 7},
                     {"kind": "atr",       "length": 20},
+                    # ADX / ADXR
                     {"kind": "adx",       "length": 14},
+                    {"kind": "adxr",      "length": 14, "lensig": 2},
+                    # CCI (two periods)
                     {"kind": "cci",       "length": 14},
+                    {"kind": "cci",       "length": 20},
+                    # Williams %R
                     {"kind": "willr",     "length": 14},
+                    # Momentum / ROC (two periods)
                     {"kind": "mom",       "length": 10},
+                    {"kind": "mom",       "length": 20},
                     {"kind": "roc",       "length": 10},
+                    {"kind": "roc",       "length": 20},
+                    # Aroon
+                    {"kind": "aroon",     "length": 25},
+                    # Awesome Oscillator
+                    {"kind": "ao"},
+                    # MFI
+                    {"kind": "mfi",       "length": 14},
+                    # Ultimate Oscillator
+                    {"kind": "uo"},
+                    # TSI
+                    {"kind": "tsi",       "fast": 13, "slow": 25, "signal": 13},
+                    # CMF
+                    {"kind": "cmf",       "length": 20},
+                    # Donchian Channels
+                    {"kind": "donchian",  "lower_length": 20, "upper_length": 20},
+                    # Keltner Channels
+                    {"kind": "kc",        "length": 20, "scalar": 2},
+                    # OBV
                     {"kind": "obv"},
+                    # Supertrend
                     {"kind": "supertrend","length": 10, "multiplier": 3.0},
-                    {"kind": "stochrsi",  "length": 14, "rsi_length": 14,
-                     "k": 3, "d": 3},
+                    # Stoch RSI
+                    {"kind": "stochrsi",  "length": 14, "rsi_length": 14, "k": 3, "d": 3},
+                    # VWAP
                     {"kind": "vwap"},
                 ]
             ),
@@ -257,34 +318,64 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     except Exception as exc:
         logger.debug(f"pandas_ta strategy error: {exc}")
 
-    # ── Price-change helpers ─────────────────────────────────────────────────
-    close = df["close"]
+    # ── Raw OHLCV snapshot ───────────────────────────────────────────────────
+    close  = df["close"]
     volume = df["volume"]
     high   = df["high"]
     low    = df["low"]
     open_  = df["open"]
 
-    for n, col in [(3, "price_change_3d"), (5, "price_change_5d"),
-                   (10, "price_change_10d")]:
-        if len(close) > n:
-            df[col] = (close - close.shift(n)) / close.shift(n) * 100
-        else:
-            df[col] = np.nan
+    df["open"]   = open_
+    df["high"]   = high
+    df["low"]    = low
+    df["close"]  = close
+    df["volume"] = volume
 
+    # ── Volume helpers ───────────────────────────────────────────────────────
+    df["volume_ma5"]  = volume.rolling(5).mean()
+    df["volume_ma10"] = volume.rolling(10).mean()
+    df["volume_ma20"] = volume.rolling(20).mean()
+    vol_ma20 = df["volume_ma20"]
+    df["volume_ratio"] = volume / vol_ma20.replace(0, np.nan)
+
+    # ── OBV SMA ──────────────────────────────────────────────────────────────
+    if "OBV" in df.columns:
+        df["obv_sma20"] = df["OBV"].rolling(20).mean()
+
+    # ── Gap pct ──────────────────────────────────────────────────────────────
     if len(df) > 1:
         df["gap_pct"] = (open_ - close.shift(1)) / close.shift(1) * 100
     else:
         df["gap_pct"] = np.nan
 
-    vol_ma = volume.rolling(20).mean()
-    df["volume_ratio"] = volume / vol_ma.replace(0, np.nan)
+    # ── Derived price metrics ─────────────────────────────────────────────────
+    if "SMA_20" in df.columns:
+        df["price_vs_sma20"]  = (close - df["SMA_20"])  / df["SMA_20"]  * 100
+        df["sma_20_slope"]    = df["SMA_20"].diff(1)
+        df["sma_20_50_diff"]  = df["SMA_20"] - df.get("SMA_50", np.nan)
+    if "SMA_50" in df.columns:
+        df["price_vs_sma50"]  = (close - df["SMA_50"])  / df["SMA_50"]  * 100
+    if "EMA_20" in df.columns:
+        df["price_vs_ema20"]  = (close - df["EMA_20"])  / df["EMA_20"]  * 100
+        df["ema_20_slope"]    = df["EMA_20"].diff(1)
+    if "EMA_12" in df.columns and "EMA_26" in df.columns:
+        df["ema_12_26_diff"]  = df["EMA_12"] - df["EMA_26"]
 
-    if len(close) >= 252:
-        df["high_52w_pct"] = (close - high.rolling(252).max()) / high.rolling(252).max() * 100
-        df["low_52w_pct"]  = (close - low.rolling(252).min())  / low.rolling(252).min()  * 100
-    else:
-        df["high_52w_pct"] = np.nan
-        df["low_52w_pct"]  = np.nan
+    # ── Slopes ───────────────────────────────────────────────────────────────
+    if "ATRr_14" in df.columns:
+        df["atr_14_slope"] = df["ATRr_14"].diff(1)
+    if "RSI_14" in df.columns:
+        df["rsi_14_slope"] = df["RSI_14"].diff(1)
+
+    # ── MACD ROC ─────────────────────────────────────────────────────────────
+    if "MACD_12_26_9" in df.columns:
+        df["macd_roc"] = df["MACD_12_26_9"].pct_change(1) * 100
+
+    # ── Historical Volatility ─────────────────────────────────────────────────
+    log_ret = np.log(close / close.shift(1))
+    df["hv_10"] = log_ret.rolling(10).std() * np.sqrt(252) * 100
+    df["hv_20"] = log_ret.rolling(20).std() * np.sqrt(252) * 100
+    df["hv_30"] = log_ret.rolling(30).std() * np.sqrt(252) * 100
 
     # ── Extract last row and map column names ───────────────────────────────
     last = df.iloc[-1]
@@ -521,20 +612,25 @@ class MultidayFeatureCollector:
             self.logger.warning("MultidayFeatureCollector: no rows to write.")
             return 0
 
-        # Supabase upsert in chunks of 500 to stay under request-size limits
+        # Insert in chunks of 500 to stay under request-size limits.
+        # ignore_duplicates=True silently skips rows that already exist,
+        # so re-runs are safe without needing a unique constraint.
+        # If you add UNIQUE(symbol, detection_date) to the table you can
+        # switch back to upsert(on_conflict="symbol,detection_date").
         written = 0
         chunk_size = 500
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
             try:
-                resp = self.client.table(table).upsert(
+                self.client.table(table).insert(
                     chunk,
-                    on_conflict="symbol,detection_date",
+                    returning="minimal",
+                    ignore_duplicates=True,
                 ).execute()
-                written += len(resp.data or chunk)
+                written += len(chunk)
             except Exception as exc:
                 self.logger.error(
-                    f"MultidayFeatureCollector: upsert error for chunk "
+                    f"MultidayFeatureCollector: insert error for chunk "
                     f"{i}–{i+len(chunk)}: {exc}"
                 )
 
