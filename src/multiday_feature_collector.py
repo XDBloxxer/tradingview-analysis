@@ -622,11 +622,7 @@ class MultidayFeatureCollector:
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
             try:
-                self.client.table(table).insert(
-                    chunk,
-                    returning="minimal",
-                    ignore_duplicates=True,
-                ).execute()
+                self.client.table(table).insert(chunk).execute()
                 written += len(chunk)
             except Exception as exc:
                 self.logger.error(
