@@ -300,10 +300,10 @@ class MultidayFeatureCollector:
     collector = MultidayFeatureCollector(config)
 
     # For winners:
-    collector.collect_and_write(symbols_and_dates, table="winners_day_prior_multiday")
+    collector.collect_and_write(symbols_and_dates, table="winners_multiday")
 
     # For non-winners:
-    collector.collect_and_write(symbols_and_dates, table="non_winners_day_prior_multiday")
+    collector.collect_and_write(symbols_and_dates, table="non_winners_multiday")
     """
 
     def __init__(self, config: dict):
@@ -373,7 +373,7 @@ class MultidayFeatureCollector:
             - "symbol"         : str
             - "detection_date" : str  (YYYY-MM-DD)  OR  datetime/Timestamp
         table  : Supabase table name
-            e.g. "winners_day_prior_multiday" or "non_winners_day_prior_multiday"
+            e.g. "winners_multiday" or "non_winners_multiday"
 
         Returns
         -------
