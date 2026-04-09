@@ -55,6 +55,7 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     # Stochastic — pandas_ta_classic does NOT produce STOCHh; only k and d
     "STOCHk_14_3_3": "stochk_14_3_3", "STOCHd_14_3_3": "stochd_14_3_3",
     "STOCHk_5_3_1": "stochk_5_3_1", "STOCHd_5_3_1": "stochd_5_3_1",
+    "STOCHh_14_3_3": "stochh_14_3_3", "STOCHh_5_3_1": "stochh_5_3_1",
     # Bollinger Bands — actual pandas_ta names use single _2.0 suffix
     "BBL_20_2.0": "bbl_20_2_0_2_0", "BBM_20_2.0": "bbm_20_2_0_2_0",
     "BBU_20_2.0": "bbu_20_2_0_2_0", "BBB_20_2.0": "bbb_20_2_0_2_0",
@@ -63,6 +64,7 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     "ATRr_14": "atr_14", "ATRr_7": "atr_7", "ATRr_20": "atr_20",
     # ADX (ADXR not available in pandas_ta_classic)
     "ADX_14": "adx_14", "DMP_14": "dmp_14", "DMN_14": "dmn_14",
+    "ADXR_14_2": "adxr_14_2",
     # CCI (both periods)
     "CCI_14_0.015": "cci_14", "CCI_20_0.015": "cci_20",
     # Williams %R
@@ -385,10 +387,14 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     if "STOCHk_5_3_1" in df.columns:
         df["STOCHh_5_3_1"] = df["STOCHk_5_3_1"].rolling(1).max()
 
-    # ── SUPERTs (pandas_ta supertrend doesn't output SUPERTs; reconstruct upper band) ──
+    # ── SUPERTs/SUPERTl (pandas_ta doesn't output these; reconstruct from direction) ──
     if "SUPERTd_10_3.0" in df.columns and "SUPERT_10_3.0" in df.columns:
+        # Upper band (resistance): SUPERT value when bearish (direction == -1)
         upper = df["SUPERT_10_3.0"].where(df["SUPERTd_10_3.0"] == -1)
         df["SUPERTs_10_3.0"] = upper.ffill()
+        # Lower band (support): SUPERT value when bullish (direction == 1)
+        lower = df["SUPERT_10_3.0"].where(df["SUPERTd_10_3.0"] == 1)
+        df["SUPERTl_10_3.0"] = lower.ffill()
 
 
     # ── Extract last row and map column names ───────────────────────────────
