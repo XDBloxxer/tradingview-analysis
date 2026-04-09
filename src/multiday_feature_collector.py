@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-import pandas_ta as ta
+import pandas_ta_classic as ta
 import yfinance as yf
 from supabase import Client, create_client
 
