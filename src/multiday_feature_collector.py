@@ -375,6 +375,22 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     df["hv_20"] = log_ret.rolling(20).std() * np.sqrt(252) * 100
     df["hv_30"] = log_ret.rolling(30).std() * np.sqrt(252) * 100
 
+    # ── ADXR (pandas_ta does not output ADXR; compute as 2-period SMA of ADX) ──────
+    if "ADX_14" in df.columns:
+        df["ADXR_14_2"] = df["ADX_14"].rolling(2).mean()
+
+    # ── STOCHh (pandas_ta stoch only outputs k/d; h = rolling max of smoothed k) ────
+    if "STOCHk_14_3_3" in df.columns:
+        df["STOCHh_14_3_3"] = df["STOCHk_14_3_3"].rolling(3).max()
+    if "STOCHk_5_3_1" in df.columns:
+        df["STOCHh_5_3_1"] = df["STOCHk_5_3_1"].rolling(1).max()
+
+    # ── SUPERTs (pandas_ta supertrend doesn't output SUPERTs; reconstruct upper band) ──
+    if "SUPERTd_10_3.0" in df.columns and "SUPERT_10_3.0" in df.columns:
+        upper = df["SUPERT_10_3.0"].where(df["SUPERTd_10_3.0"] == -1)
+        df["SUPERTs_10_3.0"] = upper.ffill()
+
+
     # ── Extract last row and map column names ───────────────────────────────
     last = df.iloc[-1]
     result: Dict[str, Any] = {}
