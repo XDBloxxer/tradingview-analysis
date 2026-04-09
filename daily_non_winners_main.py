@@ -168,7 +168,7 @@ def main():
         multiday_collector = MultidayFeatureCollector(config)
         multiday_count = multiday_collector.collect_and_write(
             stocks=intraday_data["day_prior_close"],   # has symbol + detection_date
-            table="non_winners_day_prior_multiday",
+            table="non_winners_multiday",
         )
         logger.info(f"✓ Written {multiday_count} multiday feature rows for non-winners")
 
