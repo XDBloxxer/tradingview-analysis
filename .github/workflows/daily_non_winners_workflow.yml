@@ -4,7 +4,6 @@ on:
   # Run daily at 5:00 PM EST (after daily winners at 4:30 PM)
   schedule:
     - cron: '50 20 * * 1-5'  # 22:00 UTC = 5:00 PM EST (Mon-Fri only)
-  
   # Allow manual triggering
   workflow_dispatch:
     inputs:
@@ -16,6 +15,9 @@ on:
         description: 'Number of non-winners to track'
         required: false
         default: '15'
+permissions:
+  contents: read   # <---- REQUIRED for pip install git+https://github.com/
+
 
 jobs:
   track-non-winners:
