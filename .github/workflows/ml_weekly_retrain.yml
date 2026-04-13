@@ -71,16 +71,24 @@ jobs:
       
       - name: Commit updated model files
         run: |
+          # Ensure LFS is initialised in this checkout so that `git add` on
+          # *.pkl files writes LFS pointers rather than raw binary blobs.
+          git lfs install
+
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action Bot"
-          
-          # Add model files
-          git add ml_models/best_model.pkl || true
-          git add ml_models/scaler.pkl || true
+
+          # Stage model files — *.pkl are routed through LFS by .gitattributes,
+          # so only ~130-byte pointer files land in the regular git object store.
+          # ml_models/archive/ is .gitignored; the archive is preserved as a
+          # GitHub Actions artifact instead (see "Upload model archive" step).
+          git add ml_models/best_model.pkl    || true
+          git add ml_models/scaler.pkl        || true
           git add ml_models/gain_regressor.pkl || true
           git add ml_models/model_metadata.json || true
           git add ml_models/feature_importance.csv || true
-          
+          git add ml_models/learned_filters.json   || true
+
           # Commit if there are changes
           git diff --staged --quiet || git commit -m "🤖 Auto-retrain: $(date +'%Y-%m-%d %H:%M:%S UTC')"
       
