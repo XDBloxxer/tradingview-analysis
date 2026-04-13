@@ -1,0 +1,13 @@
+# Git LFS — route all model binary files through LFS so they don't accumulate
+# as regular git objects.  Requires `git lfs install` on first clone and the
+# LFS GitHub App enabled on the repository.
+#
+# The workflow (ml_weekly_retrain.yml) already checks out with `lfs: true`
+# and installs git-lfs before committing, so these patterns are the only
+# missing piece needed to activate LFS tracking.
+
+# Trained model files
+ml_models/*.pkl         filter=lfs diff=lfs merge=lfs -text
+
+# Archive copies (kept for rollback, never need inline diffs)
+ml_models/archive/*.pkl filter=lfs diff=lfs merge=lfs -text
