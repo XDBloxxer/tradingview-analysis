@@ -27,21 +27,25 @@ FIX 7 — t1_open_* features now reliably populated (lowered min bar threshold,
 FIX 8 — Added missing indicators to _compute_indicators:
   TSI, Keltner Channel, Donchian Channel, VWAP, ATR slope.
 
-FIX 9 (NEW) — T-1 yfinance indicators now also written under flat prefixes
-  (t3_/t5_/t10_) when the model is hybrid.
+FIX 9 (revised) — t3_/t5_/t10_* columns now populated from REAL daily-bar
+  snapshots at the correct calendar offsets, not from T-1 intraday data.
 
-  ROOT CAUSE: The model was trained with features like t3_ema_12, t3_rsi_7,
-  t3_wma_10 etc. that come from the base CSV pipeline. At prediction time,
-  build_features_from_tv_data fills t3_* columns from TV screener data, but
-  the TV screener does NOT expose EMA_12, EMA_26, WMA_10, RSI_7, RSI_21,
-  MACDh_12_26_9, Keltner, Donchian, etc.  Those columns therefore always
-  defaulted to 0 / 50, reducing effective coverage.
+  ROOT CAUSE: The model was trained with t3_*/t5_*/t10_* features representing
+  indicator snapshots taken 3, 5, and 10 calendar days before detection_date,
+  computed from daily OHLCV bars via multiday_feature_collector.py.  The
+  original FIX 9 implementation paperd over a feature-pipeline gap by copying
+  yesterday's intraday bar indicators into all three prefix columns, causing
+  the model to receive identical data under three different names and degrading
+  any signal that depends on how conditions differed at T-3 vs T-5 vs T-10.
 
-  The T-1 yfinance fetch DOES compute all of these (ema12, ema26, rsi7,
-  rsi21, etc.) — but previously only wrote them as t1_close_* / t1_open_*.
-  In hybrid mode, fetch_t1_data_for_symbol now also copies the computed
-  intraday indicators into t3_/t5_/t10_* columns (lowercase, matching the
-  base CSV training schema), giving the model real values for every prefix.
+  The revised fix calls _fetch_real_multiday_features(), which:
+    1. Fetches daily OHLCV bars from yfinance (same as training time).
+    2. Calls _snapshot_for_offset() from multiday_feature_collector for each
+       offset (3, 5, 10 calendar days before detection_date).
+    3. Uses the same _compute_indicators + PANDAS_TA_TO_BASE pipeline as the
+       training data pipeline, so feature names and scaling match exactly.
+  The result is that prediction-time t3_*/t5_*/t10_* values are structurally
+  identical to what the model saw during training.
 
 FIX 10 — get_next_trading_day now queries the daily_winners table for the most
   recent detection_date and returns the next weekday after it, rather than
@@ -1013,48 +1017,89 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
 
 
 # ---------------------------------------------------------------------------
-# FIX 9: Helper — write intraday indicators under flat prefixes
+# FIX 9 (revised): Fetch real T-3/T-5/T-10 daily-bar snapshots
 # ---------------------------------------------------------------------------
 
-def _write_flat_prefix_features(
-    indicators: dict,
+# Calendar days of lookback needed so that all MAs (up to SMA_50) have
+# enough history even when the furthest offset is T-10.
+_MULTIDAY_LOOKBACK_DAYS = 120
+
+# Offset in calendar days for each flat prefix — must match the training
+# pipeline in multiday_feature_collector.py exactly.
+_MULTIDAY_TIMEFRAMES = {"t3": 3, "t5": 5, "t10": 10}
+
+
+def _fetch_real_multiday_features(
+    symbol: str,
+    detection_date: "datetime",
     result: dict,
-    flat_prefixes: tuple = _FLAT_PREFIXES,
+    logger: "logging.Logger",
 ) -> None:
     """
-    FIX 9: Copy computed intraday indicators into t3_/t5_/t10_* columns.
+    Fetch daily OHLCV bars from yfinance and write genuine T-3, T-5, and T-10
+    indicator snapshots into `result` under the t3_*/t5_*/t10_* keys.
+
+    Uses the same _compute_indicators logic and PANDAS_TA_TO_BASE column map
+    as multiday_feature_collector.py so that prediction-time features are
+    identical in structure to the training-time features.
     """
     try:
-        from t1_column_map import INTRADAY_TO_MODEL
-    except ImportError:
-        for key, val in indicators.items():
-            if not isinstance(val, (int, float)) or np.isnan(val) or np.isinf(val):
-                continue
-            for pfx in flat_prefixes:
-                col = f"{pfx}_{key}"
-                if col not in result:
-                    result[col] = val
+        from src.multiday_feature_collector import (
+            _compute_indicators as _daily_compute,
+            _snapshot_for_offset,
+            PANDAS_TA_TO_BASE,
+        )
+    except ImportError as exc:
+        logger.warning(
+            f"{symbol}: could not import multiday_feature_collector — "
+            f"t3/t5/t10 features will be absent ({exc})"
+        )
         return
 
-    for src_key, val in indicators.items():
-        if not isinstance(val, (int, float)):
-            continue
-        try:
-            fval = float(val)
-            if np.isnan(fval) or np.isinf(fval):
+    try:
+        import yfinance as yf
+
+        fetch_start = detection_date - timedelta(days=_MULTIDAY_LOOKBACK_DAYS)
+        ticker = yf.Ticker(symbol)
+        daily_df = ticker.history(
+            start=fetch_start.strftime("%Y-%m-%d"),
+            end=(detection_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
+        )
+
+        if daily_df is None or daily_df.empty:
+            logger.debug(f"{symbol}: no daily bar data for multiday features")
+            return
+
+        # Strip timezone so index comparisons work uniformly
+        daily_df.index = pd.to_datetime(daily_df.index).tz_localize(None)
+
+        detection_ts = pd.Timestamp(detection_date).tz_localize(None)
+
+        filled = 0
+        for prefix, offset in _MULTIDAY_TIMEFRAMES.items():
+            snap = _snapshot_for_offset(daily_df, detection_ts, offset)
+            if not snap:
+                logger.debug(f"{symbol}: empty snapshot for {prefix} (offset={offset})")
                 continue
-        except (TypeError, ValueError):
-            continue
+            for base_name, val in snap.items():
+                if val is None:
+                    continue
+                col = f"{prefix}_{base_name}"
+                result[col] = val
+                filled += 1
 
-        src_lower = src_key.lower()
-        if src_lower not in INTRADAY_TO_MODEL:
-            continue
+        logger.debug(
+            f"{symbol}: wrote {filled} real multiday features "
+            f"(t3/t5/t10) from daily bars"
+        )
 
-        model_name = INTRADAY_TO_MODEL[src_lower]
-        for pfx in flat_prefixes:
-            col = f"{pfx}_{model_name}".lower()
-            if col not in result:
-                result[col] = fval
+    except Exception as exc:
+        logger.warning(
+            f"{symbol}: failed to fetch real multiday features — {exc}. "
+            "t3/t5/t10 columns will be absent for this symbol."
+        )
 
 
 def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = False) -> dict:
@@ -1156,9 +1201,17 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
             for k, val in open_indicators.items():
                 result[f"t1_open_{k}"] = val
 
-        # ── FIX 9: Also write flat-prefix features for hybrid models ──────
+        # ── FIX 9 (revised): Fetch REAL T-3/T-5/T-10 daily-bar snapshots ──
+        # Uses genuine daily bars fetched from yfinance, processed through the
+        # same _compute_indicators + PANDAS_TA_TO_BASE pipeline as training.
+        # This replaces the old approach of copying T-1 intraday indicators
+        # into all three prefix columns, which gave the model identical data
+        # under three different names.
         if fill_flat_prefixes:
-            _write_flat_prefix_features(close_indicators, result, flat_prefixes=_FLAT_PREFIXES)
+            # detection_date = the trading day whose T-1 bar we just computed,
+            # i.e. yesterday (the most recent date in df_intraday).
+            detection_date_for_multiday = datetime.combine(yesterday, dt_time(0, 0))
+            _fetch_real_multiday_features(symbol, detection_date_for_multiday, result, logger)
 
         t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
         t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
@@ -1166,7 +1219,7 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
         logger.debug(
             f"{symbol}: t1_close_* = {t1_close_count}, "
             f"t1_open_* = {t1_open_count}, "
-            f"t3_* = {flat_count}"
+            f"t3_* = {flat_count} (from real daily bars)"
         )
 
         return result
