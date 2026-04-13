@@ -747,6 +747,7 @@ class ExplosionPredictor:
                     predictions["target_gain_pct"]  = predicted_gains
                     predictions["target_gain_low"]   = predicted_gains * 0.8
                     predictions["target_gain_high"]  = predicted_gains * 1.2
+                    predictions["gain_source"]        = "model"
             except Exception as e:
                 self.logger.warning(f"Regressor predict failed ({e}) — falling back")
                 self.regressor = None
@@ -771,6 +772,7 @@ class ExplosionPredictor:
                     predictions["target_gain_pct"]  = calibrated_gains
                     predictions["target_gain_low"]   = calibrated_gains * 0.7
                     predictions["target_gain_high"]  = calibrated_gains * 1.3
+                    predictions["gain_source"]        = "isotonic_fallback"
 
                     gain_std_cal = float(np.std(calibrated_gains))
                     self.logger.info(
@@ -818,6 +820,7 @@ class ExplosionPredictor:
                 predictions["target_gain_pct"]  = adjusted_gains
                 predictions["target_gain_low"]   = adjusted_gains * 0.5
                 predictions["target_gain_high"]  = adjusted_gains * 1.5
+                predictions["gain_source"]        = "rule_based_fallback"
 
                 self.logger.info(
                     f"RC5: Rank-adjusted gains: "
@@ -901,14 +904,25 @@ class ExplosionPredictor:
 
     def _estimate_target_gain(self, probability: float) -> float:
         """
-        Rule-based gain estimate. Used only as backstop when both the regressor
-        and calibrated fallback are unavailable. RC5 applies a rank-adjustment
-        multiplier on top of these values to ensure spread.
+        Rule-based gain estimate.  Used only as the final backstop when both
+        the gain regressor and RC5 isotonic calibrator are unavailable (or when
+        filling individual NaN rows after the main gain pipeline).
+
+        Values are aligned with ml_screen_and_predict._GAIN_CURVE so both
+        files produce consistent estimates when falling back to rule-based
+        logic.  The ceiling is deliberately uncapped at the top end because
+        STRONG BUY stocks (p ≥ 0.95) genuinely produce 100 %+ intraday highs.
+        RC5 applies an additional rank-adjustment multiplier on top of these
+        base values to ensure spread within each probability bucket.
         """
-        if probability >= 0.95: return 30.0
-        if probability >= 0.90: return 25.0
-        if probability >= 0.80: return 20.0
-        if probability >= 0.70: return 15.0
-        if probability >= 0.60: return 10.0
-        if probability >= 0.50: return 7.0
-        return 3.0
+        if probability >= 0.95: return 100.0
+        if probability >= 0.90:  return 60.0
+        if probability >= 0.85:  return 45.0
+        if probability >= 0.80:  return 35.0
+        if probability >= 0.75:  return 28.0
+        if probability >= 0.70:  return 22.0
+        if probability >= 0.65:  return 17.0
+        if probability >= 0.60:  return 13.0
+        if probability >= 0.55:  return 10.0
+        if probability >= 0.50:   return 7.0
+        return 4.0
