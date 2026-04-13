@@ -40,6 +40,11 @@ data/exports/
 logs/
 *.log
 
+# Model archive — kept locally for rollback but never committed.
+# Each retrain uploads ml_models/archive/ as a GitHub Actions artifact
+# (retention-days: 90), so the history is preserved without bloating git.
+ml_models/archive/
+
 # Credential files - Extra protection (should never exist locally, but just in case)
 *_credentials.json
 *_service_account.json
