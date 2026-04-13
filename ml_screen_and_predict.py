@@ -146,8 +146,34 @@ EXTRA_TV_COLUMNS = [
     "close", "open", "high", "low", "volume", "change",
 ]
 
-GAIN_FLOOR   = 5.0
-GAIN_CEILING = 55.0
+# ---------------------------------------------------------------------------
+# Gain estimation curve — probability → expected intraday high % gain.
+#
+# These values are anchored to the actual distribution of explosive mover
+# intraday highs (from daily_winners / ml_prediction_accuracy history):
+#   - p ≥ 0.95: truly explosive moves (100 %+ seen regularly on STRONG BUY)
+#   - p ≥ 0.90: strong movers, typically 50–80 % intraday high
+#   - p ≥ 0.80: solid movers, 30–50 %
+#   - Below 0.60: conservative — model is not confident
+#
+# The curve is used ONLY when the gain regressor and isotonic calibrator are
+# both unavailable (rank_fallback path).  When the regressor is healthy it
+# predicts freely from the training data, so there is no ceiling there.
+# ---------------------------------------------------------------------------
+_GAIN_CURVE: list[tuple[float, float]] = [
+    # (min_probability, base_gain_pct)
+    (0.95, 100.0),
+    (0.90,  60.0),
+    (0.85,  45.0),
+    (0.80,  35.0),
+    (0.75,  28.0),
+    (0.70,  22.0),
+    (0.65,  17.0),
+    (0.60,  13.0),
+    (0.55,  10.0),
+    (0.50,   7.0),
+    (0.00,   4.0),
+]
 
 _LOWERCASE_PREFIXES = ("t3", "t5", "t10")
 
@@ -1150,8 +1176,21 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
 
 
 # ---------------------------------------------------------------------------
-# Gain correction helpers
+# Gain estimation helpers
 # ---------------------------------------------------------------------------
+
+def _prob_to_gain(probability: float) -> float:
+    """
+    Convert a probability score to a base gain estimate using _GAIN_CURVE.
+    Used as the final fallback when both the regressor and isotonic calibrator
+    are unavailable.  The curve is anchored to real explosive-mover intraday
+    highs, so high-confidence predictions can reach 100 %+.
+    """
+    for min_prob, gain in _GAIN_CURVE:
+        if probability >= min_prob:
+            return gain
+    return _GAIN_CURVE[-1][1]
+
 
 def _apply_gain_rank_correction(
     predictions_df: pd.DataFrame,
@@ -1159,6 +1198,19 @@ def _apply_gain_rank_correction(
     feature_prefix: str,
     logger: logging.Logger,
 ) -> pd.DataFrame:
+    """
+    Emergency fallback applied only when the predictor returns near-identical
+    gain estimates (std < 1 %).  Instead of a fixed floor-to-ceiling formula,
+    the correction is anchored to each stock's probability score via
+    _GAIN_CURVE, with a small rank-based spread added on top.  This means:
+
+    - A 0.95-probability STRONG BUY stock can receive a 100 %+ estimate.
+    - A 0.55-probability HOLD stock gets ~10 %, not an artificially inflated
+      number just because it happens to rank highly in a mediocre pool.
+    - The `gain_source` column is set to "rank_fallback" on every overwritten
+      row so callers and the Supabase table can distinguish model estimates
+      from fallback values.
+    """
     if 'target_gain_pct' not in predictions_df.columns:
         return predictions_df
 
@@ -1166,19 +1218,34 @@ def _apply_gain_rank_correction(
     gain_std = gains.std()
 
     if gain_std >= 1.0:
+        # Model gains look healthy — just ensure gain_source is stamped
+        if 'gain_source' not in predictions_df.columns:
+            predictions_df = predictions_df.copy()
+            predictions_df['gain_source'] = predictions_df.get(
+                'gain_source', pd.Series('model', index=predictions_df.index)
+            )
         return predictions_df
 
     logger.warning(
         f"  ⚠️  FLAT GAIN ESTIMATES detected (std={gain_std:.4f}%). "
-        f"Applying rank-based correction (floor={GAIN_FLOOR}%, ceiling={GAIN_CEILING}%)."
+        f"Applying probability-anchored rank fallback correction."
     )
 
     df    = predictions_df.copy()
     probs = df['explosion_probability']
 
-    base_ranks      = probs.rank(pct=True)
-    corrected_gains = GAIN_FLOOR + base_ranks * (GAIN_CEILING - GAIN_FLOOR)
+    # Base gain from the probability curve (tied to model confidence, not rank)
+    base_gains = probs.apply(_prob_to_gain)
 
+    # Small rank-based spread on top: ±20 % of the base gain, so stocks with
+    # the same bucket probability are still differentiated.  This keeps the
+    # spread proportional — a 100 % base gets ±20 %, a 10 % base gets ±2 %.
+    prob_ranks   = probs.rank(pct=True)           # 0..1, higher = better
+    rank_spread  = (prob_ranks - 0.5) * 0.40      # -0.20 .. +0.20 multiplier
+    corrected_gains = base_gains * (1.0 + rank_spread)
+
+    # RSI adjustment: stocks near RSI 60 (momentum without being overbought)
+    # get a small boost; extremely overbought (RSI > 80) get a haircut
     if _uses_lowercase(feature_prefix):
         rsi_col = f"{feature_prefix}_rsi_14"
         vol_col = f"{feature_prefix}_volume_ratio"
@@ -1192,46 +1259,67 @@ def _apply_gain_rank_correction(
         if rsi_col in feat_indexed.columns:
             rsi_vals = df['symbol'].map(feat_indexed[rsi_col]) if 'symbol' in df.columns else None
             if rsi_vals is not None and rsi_vals.notna().sum() > 5:
-                rsi_score = 1.0 - (abs(rsi_vals.fillna(55) - 60) / 40).clip(0, 1)
-                corrected_gains += rsi_score * 5.0
+                # +5 % boost near RSI 60, haircut when RSI > 80
+                rsi_filled   = rsi_vals.fillna(55)
+                rsi_boost    = (1.0 - (abs(rsi_filled - 60) / 40).clip(0, 1)) * 0.05
+                rsi_overbought_cut = ((rsi_filled - 80).clip(0, 20) / 20) * -0.10
+                corrected_gains = corrected_gains * (1 + rsi_boost + rsi_overbought_cut)
 
         if vol_col in feat_indexed.columns:
             vol_vals = df['symbol'].map(feat_indexed[vol_col]) if 'symbol' in df.columns else None
             if vol_vals is not None and vol_vals.notna().sum() > 5:
+                # Up to +10 % boost for relative volume 5×; proportional below that
                 vol_score = (vol_vals.fillna(1.0) - 1.0).clip(0, 4) / 4.0
-                corrected_gains += vol_score * 8.0
+                corrected_gains = corrected_gains * (1 + vol_score * 0.10)
 
-    corrected_gains = corrected_gains.clip(GAIN_FLOOR, GAIN_CEILING * 1.5)
+    # No hard ceiling — explosive movers genuinely go 100 %+.
+    # Floor at 3 % to avoid negative or zero estimates on low-probability stocks.
+    corrected_gains = corrected_gains.clip(lower=3.0)
 
     df['target_gain_pct']  = corrected_gains
-    df['target_gain_low']  = corrected_gains * 0.65
-    df['target_gain_high'] = corrected_gains * 1.40
+    df['target_gain_low']  = corrected_gains * 0.50   # conservative scenario
+    df['target_gain_high'] = corrected_gains * 1.60   # explosive scenario
+    df['gain_source']      = 'rank_fallback'
 
     if 'current_price' in df.columns:
         df['target_price']      = df['current_price'] * (1 + df['target_gain_pct']  / 100)
         df['target_price_low']  = df['current_price'] * (1 + df['target_gain_low']  / 100)
         df['target_price_high'] = df['current_price'] * (1 + df['target_gain_high'] / 100)
 
-    logger.info(f"  Corrected gain range: {corrected_gains.min():.1f}%–{corrected_gains.max():.1f}%  std={corrected_gains.std():.1f}%")
+    n_fallback = len(df)
+    logger.warning(
+        f"  ⚠️  gain_source='rank_fallback' applied to all {n_fallback} rows. "
+        f"Gain estimates are NOT from the model — they are probability-anchored "
+        f"approximations. Retrain the gain regressor to restore model-based estimates."
+    )
+    logger.info(
+        f"  Corrected gain range: "
+        f"{corrected_gains.min():.1f}%–{corrected_gains.max():.1f}%  "
+        f"std={corrected_gains.std():.1f}%"
+    )
+
+    # Per-signal breakdown so the log makes the distribution visible
+    if 'signal' in df.columns:
+        for sig in ['STRONG BUY', 'BUY', 'HOLD', 'AVOID']:
+            mask = df['signal'] == sig
+            if mask.any():
+                g = corrected_gains[mask]
+                logger.info(
+                    f"    {sig:<12}: n={mask.sum():>4}  "
+                    f"gain {g.min():.1f}%–{g.max():.1f}%  "
+                    f"(mean {g.mean():.1f}%)"
+                )
     return df
 
 
 def _get_calibrated_gain_estimate(probability: float) -> float:
-    # FIX (Moderate Issue #6): Top-tier values now match _estimate_target_gain()
-    # in explosion_predictor.py exactly (≥0.95: 40→30, ≥0.90: 30→25).
-    # Previously the two fallback tables diverged by up to 10% at high
-    # probabilities, producing different target_price values depending on
-    # which code path executed. Both functions serve the same role (rule-based
-    # backstop when the regressor/isotonic calibrator is unavailable), so they
-    # must agree. _estimate_target_gain() is the authoritative definition;
-    # this function is now kept in sync with it.
-    if probability >= 0.95: return 30.0
-    if probability >= 0.90: return 25.0
-    if probability >= 0.80: return 20.0
-    if probability >= 0.70: return 15.0
-    if probability >= 0.60: return 10.0
-    if probability >= 0.50: return 7.0
-    return 3.0
+    """
+    Rule-based gain backstop for individual NaN rows after the main gain
+    pipeline has run.  Uses the same _GAIN_CURVE as _prob_to_gain so both
+    paths are consistent.  Replaces the old hard-coded table that topped out
+    at 30 % regardless of model confidence.
+    """
+    return _prob_to_gain(probability)
 
 
 # ---------------------------------------------------------------------------
@@ -1561,6 +1649,10 @@ def main():
             predictions_df.loc[bad_gain_mask, 'target_gain_high'] = (
                 predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 1.8
             )
+            # Tag individual-fallback rows so they're distinguishable
+            if 'gain_source' not in predictions_df.columns:
+                predictions_df['gain_source'] = 'model'
+            predictions_df.loc[bad_gain_mask, 'gain_source'] = 'individual_fallback'
 
         predictions_df = _apply_gain_rank_correction(
             predictions_df, features_df, model_prefix, logger
@@ -1631,6 +1723,7 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
+            'gain_source':           row.get('gain_source', 'model'),
             'model_version':         f"{model_prefix}_v9",
         }
         for _, row in top_predictions.iterrows()
