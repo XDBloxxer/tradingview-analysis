@@ -143,6 +143,19 @@ VAL_CUTOFF_DATE = "2025-10-01"
 # training aborts with a clear message rather than producing a junk model.
 MIN_VAL_POSITIVES = 50
 
+# Train-set size guards — abort if the training split is too thin to generalise.
+# These fire when the Supabase tables are sparse (new deployment, data gaps, or
+# a lookback_days window that returned far less data than expected).
+#
+# MIN_TRAIN_POSITIVES: minimum winner examples needed in the train split.
+#   XGBoost with early stopping requires enough positives for the loss surface
+#   to carry a meaningful gradient signal.  50 is intentionally conservative;
+#   raise it once you have more accumulated data.
+# MIN_TRAIN_ROWS: minimum total rows (positives + negatives) in the train split.
+#   A very small train set will overfit regardless of regularisation settings.
+MIN_TRAIN_POSITIVES = 50
+MIN_TRAIN_ROWS      = 200
+
 # FIX 4: Intraday high threshold — a stock is considered a "winner" even if
 # it didn't close at the top, as long as it hit this intraday gain.
 INTRADAY_WIN_THRESHOLD = 15.0  # %
@@ -1649,6 +1662,53 @@ def main() -> int:
     X_train, X_val, y_train, y_val, w_train, w_val, train_idx = train_val_split(
         X_scaled, y, w, combined_df
     )
+
+    # ── Train-set size guard ──────────────────────────────────────────────────
+    # The MIN_VAL_POSITIVES check (inside train_val_split) only guards the val
+    # set.  A sparse Supabase deployment can still produce a train split that is
+    # too small for XGBoost to generalise — e.g. if lookback_days=90 returns
+    # far fewer rows than expected due to data gaps or a new deployment.
+    train_pos  = int((y_train == 1).sum())
+    train_neg  = int((y_train == 0).sum())
+    train_rows = len(X_train)
+
+    if train_pos < MIN_TRAIN_POSITIVES:
+        logger.error(
+            f"ABORTING: only {train_pos} positive (winner) examples in the train split "
+            f"(need ≥ {MIN_TRAIN_POSITIVES}). "
+            "The Supabase tables are likely sparse — this may be a new deployment or "
+            "data gap. The model cannot learn a useful decision boundary from so few "
+            "positive examples. "
+            "Options: (1) accumulate more labelled T-1 data before retraining, "
+            "(2) lower MIN_TRAIN_POSITIVES if you accept a noisier model, "
+            "(3) verify that load_t1_data() and combine_datasets() returned the "
+            "expected rows (check logs above for row counts)."
+        )
+        sys.exit(1)
+
+    if train_rows < MIN_TRAIN_ROWS:
+        logger.error(
+            f"ABORTING: only {train_rows} total rows in the train split "
+            f"(pos={train_pos}, neg={train_neg}; need ≥ {MIN_TRAIN_ROWS} total). "
+            "A train set this small will overfit regardless of regularisation. "
+            "Accumulate more data or lower MIN_TRAIN_ROWS if running in a known "
+            "low-data environment."
+        )
+        sys.exit(1)
+
+    if train_pos < 100:
+        logger.warning(
+            f"  ⚠️  Train split has only {train_pos} positive examples "
+            f"({train_pos / max(1, train_rows):.1%} of {train_rows} rows). "
+            "The model may underfit on the positive class. "
+            "Consider accumulating more winner data before the next retrain."
+        )
+    else:
+        logger.info(
+            f"  ✅ Train split: {train_rows} rows "
+            f"(pos={train_pos}, neg={train_neg}, "
+            f"pos_rate={train_pos/train_rows:.1%}) — size looks adequate."
+        )
 
     # ── Train ─────────────────────────────────────────────────────────────────
     model = train_model(X_train, y_train, w_train, X_val, y_val)
