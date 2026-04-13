@@ -1246,7 +1246,25 @@ def main():
     parser.add_argument(
         "--no-t1",
         action="store_true",
-        help="Skip T-1 intraday fetch (fastest — uses only TV screener data)"
+        help="Skip T-1 intraday fetch (fastest — uses only TV screener data)",
+    )
+    parser.add_argument(
+        "--t1-limit",
+        type=int,
+        default=500,
+        help=(
+            "Maximum number of screened stocks to enrich with T-1 yfinance intraday "
+            "data (default: 500). Stocks are taken in screener sort order (descending "
+            "relative volume), so stocks ranked beyond this limit are scored on TV "
+            "screener features only — a known lower-fidelity signal. Set to 0 to "
+            "enrich ALL screened stocks (slow: ~0.15 s per stock)."
+        ),
+    )
+    parser.add_argument(
+        "--t1-workers",
+        type=int,
+        default=5,
+        help="Number of parallel threads for T-1 yfinance fetches (default: 5).",
     )
 
     args   = parser.parse_args()
@@ -1362,14 +1380,36 @@ def main():
         logger.info("\n" + "=" * 80)
         logger.info("STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT")
         logger.info("=" * 80)
-        logger.info("Computing indicators from 5-min bars for top 200 candidates.")
+
+        # Resolve how many stocks to enrich.  --t1-limit 0 means "all of them".
+        t1_limit = args.t1_limit if args.t1_limit > 0 else len(enriched_stocks)
+        t1_candidates = [s["symbol"] for s in enriched_stocks[:t1_limit]]
+
+        logger.info(
+            f"Computing T-1 indicators from 5-min bars for "
+            f"{len(t1_candidates)} / {len(enriched_stocks)} screened stocks "
+            f"(--t1-limit={t1_limit}, --t1-workers={args.t1_workers})."
+        )
+
+        # ── Known-limitation notice ──────────────────────────────────────────
+        # Stocks are taken in screener sort order (descending relative volume).
+        # Stocks ranked beyond --t1-limit are scored on TV screener features
+        # only, which are lower fidelity than T-1 yfinance intraday indicators.
+        # To eliminate this bias entirely, pass --t1-limit 0, at the cost of
+        # a longer runtime (~0.15 s per additional stock).
+        if t1_limit < len(enriched_stocks):
+            skipped = len(enriched_stocks) - t1_limit
+            logger.warning(
+                f"  ⚠️  {skipped} stocks beyond rank {t1_limit} will be scored on "
+                f"TV screener features only (lower fidelity). "
+                f"Pass --t1-limit 0 to enrich all stocks."
+            )
+
         if hybrid:
             logger.info(
                 "  Hybrid model: indicators will ALSO be written as t3_/t5_/t10_* "
                 "to cover features like t3_ema_12, t3_rsi_7, t3_wma_10 (FIX 9)."
             )
-
-        top_200 = [s["symbol"] for s in enriched_stocks[:200]]
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import time, random
@@ -1381,11 +1421,13 @@ def main():
             time.sleep(random.uniform(0.05, 0.2))
             return sym, fetch_t1_data_for_symbol(sym, logger, fill_flat_prefixes=fill_flat_prefixes)
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = {executor.submit(fetch_with_jitter, sym): sym for sym in top_200}
+        with ThreadPoolExecutor(max_workers=args.t1_workers) as executor:
+            futures = {executor.submit(fetch_with_jitter, sym): sym for sym in t1_candidates}
             for i, future in enumerate(as_completed(futures), 1):
                 if i % 50 == 0:
-                    logger.info(f"  T-1 progress: {i}/{len(top_200)} | enriched: {t1_count}")
+                    logger.info(
+                        f"  T-1 progress: {i}/{len(t1_candidates)} | enriched: {t1_count}"
+                    )
                 sym, t1_data = future.result()
                 if t1_data:
                     t1_map[sym] = t1_data
@@ -1419,7 +1461,10 @@ def main():
                     "t1_column_map.py exposes INTRADAY_TO_MODEL."
                 )
 
-        logger.info(f"✓ T-1 indicator enrichment: {t1_count}/{len(top_200)} stocks")
+        logger.info(
+            f"✓ T-1 indicator enrichment: {t1_count}/{len(t1_candidates)} stocks enriched "
+            f"({len(enriched_stocks) - len(t1_candidates)} stocks scored on TV screener features only)"
+        )
     else:
         logger.info("\nSTEP 3: Skipped (--no-t1 flag)")
 
