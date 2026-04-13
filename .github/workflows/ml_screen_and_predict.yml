@@ -13,6 +13,20 @@ on:
         required: false
         default: '50'
         type: string
+      t1_limit:
+        description: >
+          Max stocks to enrich with T-1 yfinance intraday data.
+          Stocks beyond this rank (by relative volume) are scored on TV
+          screener features only. Set to 0 to enrich all screened stocks
+          (slower — budget ~0.15 s per stock beyond the default 500).
+        required: false
+        default: '500'
+        type: string
+      t1_workers:
+        description: 'Parallel threads for T-1 yfinance fetches (default: 5)'
+        required: false
+        default: '5'
+        type: string
 
 jobs:
   screen-and-predict:
@@ -44,14 +58,18 @@ jobs:
           TZ: 'America/New_York'
         run: |
           TOP_N="${{ github.event.inputs.top_n }}"
-          
-          if [ -z "$TOP_N" ]; then
-            TOP_N="50"
-          fi
-          
+          T1_LIMIT="${{ github.event.inputs.t1_limit }}"
+          T1_WORKERS="${{ github.event.inputs.t1_workers }}"
+
+          if [ -z "$TOP_N" ];     then TOP_N="50";    fi
+          if [ -z "$T1_LIMIT" ];  then T1_LIMIT="500"; fi
+          if [ -z "$T1_WORKERS" ]; then T1_WORKERS="5"; fi
+
           python ml_screen_and_predict.py \
             --max-results 1500 \
             --top-n "$TOP_N" \
+            --t1-limit "$T1_LIMIT" \
+            --t1-workers "$T1_WORKERS" \
             --verbose
       
       - name: Upload screening results
