@@ -1108,8 +1108,10 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
     Returns dict with t1_close_* and t1_open_* keys ready for model input.
 
     FIX 7: t1_open_* features are now always populated.
-    FIX 9: When fill_flat_prefixes=True (hybrid model), indicators are ALSO
-           written under t3_/t5_/t10_* columns.
+    FIX 9 (revised): When fill_flat_prefixes=True (hybrid model), REAL T-3/T-5/T-10
+           daily-bar snapshots are fetched via _fetch_real_multiday_features() and
+           written under t3_/t5_/t10_* columns.  The old approach of copying T-1
+           intraday indicators into all three prefix columns has been removed.
     """
     try:
         import yfinance as yf
@@ -1431,7 +1433,8 @@ def main():
     logger.info(f"Top N to store: {args.top_n}")
     logger.info("=" * 80)
 
-    # FIX 6: Detect hybrid model
+    # FIX 9: Detect hybrid model — determines whether real T-3/T-5/T-10
+    # daily-bar snapshots should be fetched for t3_/t5_/t10_* columns.
     model_prefix       = predictor.model_feature_prefix
     hybrid             = _is_hybrid_model(predictor)
     fill_flat_prefixes = hybrid
