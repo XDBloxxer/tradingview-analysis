@@ -1717,9 +1717,10 @@ def main() -> int:
     fi_df = compute_feature_importance(model, feature_names)
 
     # ── RC1+RC2+RC3+RC6 FIX: Train gain regressor with corrected inputs ───────
-    # FIX (issue #1): pass only the TRAIN-split rows so the regressor never
-    # sees val-set rows during training (previously X_scaled / combined_df
-    # included all rows, making val MAE and R² metrics meaningless).
+    # NOTE: X_scaled and combined_df contain ALL rows (train + val).  The gain
+    # regressor is a separate model with a different target (actual_gain_pct) and
+    # no leakage concern — it is evaluated on its own internal time-based val
+    # split (see train_gain_regressor), not on the classifier's val set.
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6 fixes applied)")
     logger.info("=" * 60)
