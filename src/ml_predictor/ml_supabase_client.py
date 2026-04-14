@@ -38,17 +38,51 @@ class MLPredictionSupabaseClient:
         self.screening_log_table = "ml_screening_logs"
 
         self.logger.info("ML Supabase client initialized")
+
+    # Columns that exist in the ml_explosion_predictions Supabase table.
+    # Any key NOT in this set is stripped before upsert to prevent
+    # PGRST204 "column not found in schema cache" errors when the code adds
+    # new fields (e.g. gain_source) ahead of a table migration being applied.
+    # Update this set whenever a new column is added to the table.
+    _PREDICTIONS_COLUMNS: frozenset = frozenset({
+        "symbol", "exchange", "prediction_date",
+        "explosion_probability", "prediction", "signal",
+        "target_gain_pct", "target_gain_low", "target_gain_high",
+        "current_price", "target_price", "target_price_low", "target_price_high",
+        "rsi", "macd", "adx", "volume_ratio", "hv_20", "bb_width",
+        "model_version", "screening_universe",
+    })
+
     def write_predictions_upsert(self, predictions: list) -> int:
         """
         Upsert predictions — overwrites existing rows for the same
         (symbol, prediction_date) instead of skipping them.
         Fixes re-runs appearing to store 0 records.
+
+        Keys not present in _PREDICTIONS_COLUMNS are stripped before the
+        upsert so that code-side fields added ahead of a schema migration
+        (e.g. gain_source) never cause a PGRST204 error.
         """
         if not predictions:
             return 0
         try:
-            sanitized = [self._sanitize_dict(p) for p in predictions]
-            response  = (
+            sanitized = [
+                {k: v for k, v in self._sanitize_dict(p).items()
+                 if k in self._PREDICTIONS_COLUMNS}
+                for p in predictions
+            ]
+
+            # Warn once if any keys were dropped so it's easy to spot in logs.
+            all_keys = {k for p in predictions for k in p}
+            extra    = all_keys - self._PREDICTIONS_COLUMNS
+            if extra:
+                self.logger.warning(
+                    f"write_predictions_upsert: dropping {len(extra)} key(s) not in "
+                    f"ml_explosion_predictions schema: {sorted(extra)}. "
+                    "Add them to _PREDICTIONS_COLUMNS once the Supabase migration is applied."
+                )
+
+            response = (
                 self.client.table(self.predictions_table)
                 .upsert(sanitized, on_conflict="symbol,prediction_date")
                 .execute()
@@ -386,4 +420,3 @@ class MLPredictionSupabaseClient:
         except Exception as e:
             self.logger.error(f"Error reading daily winners: {e}")
             return pd.DataFrame()
-
