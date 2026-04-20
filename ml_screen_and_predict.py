@@ -1224,6 +1224,11 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
             f"t3_* = {flat_count} (from real daily bars)"
         )
 
+        # Store the accurate t3 count as metadata so the display loop can read
+        # it after predictions are generated (predictions_df doesn't carry raw
+        # feature columns, so counting t3_ there always returns 0).
+        result["_meta_t3_count"] = flat_count
+
         return result
 
     except Exception:
@@ -1747,9 +1752,19 @@ def main():
     logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'t3_cols'}")
     logger.info("-" * 100)
 
+    # Build a symbol → t3 count lookup from the features DataFrame.
+    # _meta_t3_count was stored there during feature building, before raw
+    # feature columns are dropped when assembling predictions_df.
+    t3_count_by_symbol = {}
+    if "_meta_t3_count" in features_df.columns:
+        t3_count_by_symbol = (
+            features_df.set_index("symbol")["_meta_t3_count"]
+            .fillna(0).astype(int).to_dict()
+        )
+
     for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
         current_price = row.get('current_price', 0)
-        n_t3 = sum(1 for k in row.index if k.startswith("t3_") and pd.notna(row.get(k)))
+        n_t3 = t3_count_by_symbol.get(row['symbol'], 0)
         logger.info(
             f"{rank:<4} {row['symbol']:<8} {row['signal']:<13} "
             f"{row['explosion_probability']*100:>6.2f}%  "
