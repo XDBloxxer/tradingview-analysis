@@ -466,8 +466,11 @@ def load_t1_data(client: Client) -> pd.DataFrame:
     Multiday columns      → loaded separately          → t3_* / t5_* / t10_*
     Both are joined on (symbol, detection_date) into one unified row.
 
-    close tables → intraday prefix "t1_close", joined against winners/non-winners multiday
-    open  tables → intraday prefix "t1_open",  joined against winners/non-winners multiday
+    Fix: close and open tables for the same label are merged into a single row
+    per (symbol, detection_date) — t1_close_* features from the close snapshot
+    and t1_open_* features from the open snapshot coexist in the same row.
+    Previously they were concatenated as separate rows, causing every T-1 event
+    to appear twice and inflating validation AUC via near-identical duplicates.
     """
     logger.info("Loading accumulated T-1 training data...")
 
@@ -475,54 +478,124 @@ def load_t1_data(client: Client) -> pd.DataFrame:
     logger.info("Loading multiday feature tables for T-1 enrichment...")
     winners_multiday, non_winners_multiday = load_multiday_data(client)
 
-    TABLE_CONFIG = [
-        (TABLE_WINNERS_CLOSE,      1, "t1_close", winners_multiday),
-        (TABLE_WINNERS_OPEN,       1, "t1_open",  winners_multiday),
-        (TABLE_NON_WINNERS_CLOSE,  0, "t1_close", non_winners_multiday),
-        (TABLE_NON_WINNERS_OPEN,   0, "t1_open",  non_winners_multiday),
+    # Each label (winner=1, non-winner=0) has a close table and an open table.
+    # We load them as paired groups and merge close+open features into a single
+    # row per (symbol, detection_date) so the same event is never duplicated.
+    PAIR_CONFIG = [
+        # (close_table,           open_table,             label, multiday_df)
+        (TABLE_WINNERS_CLOSE,    TABLE_WINNERS_OPEN,    1, winners_multiday),
+        (TABLE_NON_WINNERS_CLOSE, TABLE_NON_WINNERS_OPEN, 0, non_winners_multiday),
     ]
+
+    # Metadata columns that exist in both tables but should not be prefixed.
+    # We keep the close-table copy and ignore the open-table copy on merge.
+    META_COLS = {"symbol", "detection_date", "label", "source",
+                 "explosion_date", "interval", "days_since_event",
+                 "t3_high_pct", "t5_high_pct", "t10_high_pct"}  # multiday cols added later
+
+    def _load_and_rename(table: str, prefix: str) -> pd.DataFrame:
+        """Fetch one table and rename its intraday feature columns."""
+        df = fetch_table_paginated(client, table)
+        if df.empty:
+            return df
+        df["label"]  = -1          # placeholder; caller sets the real value
+        df["source"] = table
+        if T1_MAP_AVAILABLE:
+            before = len(df.columns)
+            df     = rename_t1_columns(df, prefix=prefix)
+            after  = len([c for c in df.columns if c.startswith(prefix)])
+            logger.info(
+                f"  {table}: renamed {after} feature columns "
+                f"(had {before}, kept metadata + {after} features)"
+            )
+            dupes = df.columns[df.columns.duplicated()].tolist()
+            if dupes:
+                logger.warning(
+                    f"  {table}: dropping {len(dupes)} duplicate column(s) "
+                    f"after rename: {dupes[:10]}"
+                )
+                df = df.loc[:, ~df.columns.duplicated(keep="first")]
+        else:
+            logger.warning(
+                f"  {table}: column map unavailable — "
+                "T-1 features will be NaN in model (not ideal but won't crash)"
+            )
+        return df
 
     frames = []
 
-    for table, label, prefix, multiday_df in TABLE_CONFIG:
+    for close_table, open_table, label, multiday_df in PAIR_CONFIG:
         try:
-            df = fetch_table_paginated(client, table)
-            if df.empty:
+            close_df = _load_and_rename(close_table, prefix="t1_close")
+            open_df  = _load_and_rename(open_table,  prefix="t1_open")
+
+            if close_df.empty and open_df.empty:
                 continue
 
-            df["label"]  = label
-            df["source"] = table
-
-            # ── Rename intraday columns to t1_close_* / t1_open_* ────────────
-            if T1_MAP_AVAILABLE:
-                before = len(df.columns)
-                df     = rename_t1_columns(df, prefix=prefix)
-                after  = len([c for c in df.columns if c.startswith(prefix)])
-                logger.info(
-                    f"  {table}: renamed {after} feature columns "
-                    f"(had {before}, kept metadata + {after} features)"
-                )
-
-                dupes = df.columns[df.columns.duplicated()].tolist()
-                if dupes:
-                    logger.warning(
-                        f"  {table}: dropping {len(dupes)} duplicate column(s) "
-                        f"after rename: {dupes[:10]}"
-                    )
-                    df = df.loc[:, ~df.columns.duplicated(keep="first")]
-            else:
+            if close_df.empty:
+                # Only open data available — no close features, proceed with open only
                 logger.warning(
-                    f"  {table}: column map unavailable — "
-                    "T-1 features will be NaN in model (not ideal but won't crash)"
+                    f"  {close_table}: empty — using open-only rows for label={label}"
                 )
+                merged = open_df
+            elif open_df.empty:
+                # Only close data available
+                logger.warning(
+                    f"  {open_table}: empty — using close-only rows for label={label}"
+                )
+                merged = close_df
+            else:
+                # ── Merge close + open into one row per (symbol, detection_date) ──
+                # Keep only t1_open_* feature columns from open_df (drop shared
+                # metadata so we don't get _x/_y suffixes after the merge).
+                open_feature_cols = [c for c in open_df.columns if c.startswith("t1_open_")]
+                join_key = ["symbol", "detection_date"]
+                # Guard: only keep join keys that actually exist in open_df
+                open_key_cols = [c for c in join_key if c in open_df.columns]
+                open_slim = open_df[open_key_cols + open_feature_cols]
+
+                merged = close_df.merge(
+                    open_slim,
+                    on=open_key_cols,
+                    how="outer",       # keep rows that exist in only one table
+                    suffixes=("", "_open_dup"),
+                )
+                # Drop any accidental duplicate suffix columns
+                dup_cols = [c for c in merged.columns if c.endswith("_open_dup")]
+                if dup_cols:
+                    merged = merged.drop(columns=dup_cols)
+
+                # Deduplicate within this label's merged frame (outer join can
+                # introduce duplicates when join keys match multiple times)
+                sym_col_local = next(
+                    (c for c in ["symbol", "ticker"] if c in merged.columns), None
+                )
+                if sym_col_local and "detection_date" in merged.columns:
+                    before_n = len(merged)
+                    merged = merged.drop_duplicates(
+                        subset=[sym_col_local, "detection_date"], keep="first"
+                    )
+                    if len(merged) < before_n:
+                        logger.info(
+                            f"  label={label}: dropped {before_n - len(merged)} "
+                            "intra-label duplicates after close+open merge"
+                        )
+
+                logger.info(
+                    f"  label={label}: merged {len(close_df)} close rows + "
+                    f"{len(open_df)} open rows → {len(merged)} unique events"
+                )
+
+            merged["label"]  = label
+            merged["source"] = close_table   # canonical source for this label group
 
             # ── Join multiday (t3/t5/t10) features ───────────────────────────
-            df = _join_multiday(df, multiday_df, table)
+            merged = _join_multiday(merged, multiday_df, close_table)
 
-            frames.append(df)
+            frames.append(merged)
 
         except Exception as e:
-            logger.warning(f"Could not load '{table}': {e}")
+            logger.warning(f"Could not load T-1 pair ({close_table}, {open_table}): {e}")
 
     if not frames:
         logger.warning("No T-1 data found. Training on base data only.")
@@ -788,6 +861,11 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     causing the model to overfit to repeated examples. We keep the T-1
     version (which has richer features) when duplicates exist.
 
+    When both detection_date (T-1 rows) and event_date (base-CSV rows) are
+    present we deduplicate each partition by its own date key separately,
+    so residual within-source duplicates are still eliminated without
+    incorrectly treating the two date columns as interchangeable.
+
     NOTE: mistake samples should be added AFTER this function returns,
     so their custom sample_weights (3.0 / 2.0) are not overwritten here.
     """
@@ -812,11 +890,20 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     # T-1 first so it takes priority in dedup
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
-    # Safe dedup: only deduplicate if BOTH sources use the same date column name.
+    # Deduplication strategy:
+    #
+    # T-1 rows use detection_date; base-CSV rows use event_date.  When both
+    # columns are present we cannot use a single (symbol, date_col) key to
+    # deduplicate *across* the two sources — but we must still deduplicate
+    # *within* each source separately so that any residual duplicate events
+    # (e.g. a symbol that appeared in both the close and open tables before
+    # the merge step, or a symbol present in both a snapshot and a later
+    # re-fetch) are eliminated.
     sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
     date_cols_present = [c for c in ["detection_date", "event_date"] if c in combined.columns]
 
     if sym_col and len(date_cols_present) == 1:
+        # Simple case: single date column → deduplicate globally.
         date_col = date_cols_present[0]
         before_dedup = len(combined)
         combined = combined.drop_duplicates(subset=[sym_col, date_col], keep="first")
@@ -824,10 +911,34 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         if n_dropped > 0:
             logger.info(f"Deduplication: removed {n_dropped} duplicate rows ({before_dedup} → {len(combined)})")
     elif sym_col and len(date_cols_present) == 2:
-        logger.info(
-            "Skipping deduplication: base CSV (event_date) and T-1 data (detection_date) "
-            "use different date columns — no cross-source duplicates possible"
+        # Two date columns: deduplicate each source by its own date key, then
+        # re-concatenate.  T-1 rows have detection_date populated (event_date
+        # may be NaN); base-CSV rows have event_date populated (detection_date
+        # is NaN).  We split on which date column is non-null.
+        before_dedup = len(combined)
+
+        t1_mask   = combined["detection_date"].notna()
+        base_mask = ~t1_mask
+
+        t1_part   = combined[t1_mask].drop_duplicates(
+            subset=[sym_col, "detection_date"], keep="first"
         )
+        base_part = combined[base_mask].drop_duplicates(
+            subset=[sym_col, "event_date"], keep="first"
+        )
+
+        combined  = pd.concat([t1_part, base_part], ignore_index=True, sort=False)
+        n_dropped = before_dedup - len(combined)
+        if n_dropped > 0:
+            logger.info(
+                f"Deduplication (split by date column): removed {n_dropped} duplicate "
+                f"rows ({before_dedup} → {len(combined)})"
+            )
+        else:
+            logger.info(
+                "Deduplication (split by date column): no duplicates found within "
+                "T-1 (detection_date) or base-CSV (event_date) partitions"
+            )
 
     n_pos = int((combined["label"] == 1).sum())
     n_neg = int((combined["label"] == 0).sum())
