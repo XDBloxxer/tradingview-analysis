@@ -905,9 +905,14 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 # Scaling
 # ---------------------------------------------------------------------------
 
-def build_scaler(X: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
+def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     """
-    Fit scaler on non-NaN values per column. Returns scaler + scaled DataFrame.
+    Fit scaler on train-split rows only. Returns scaler + scaled X_train.
+
+    LEAKAGE FIX: The scaler is now fit exclusively on X_train so that
+    validation-set rows never influence the scaler's mean_ / std_ parameters.
+    Call scale_with_fitted_scaler(scaler, X_val) to transform the val set
+    (or any other split) using the same, already-fitted scaler.
 
     NaN positions are filled with 0.0 after scaling (0.0 == column mean in
     standardised space).  This matches exactly what _scale_features() does at
@@ -921,17 +926,39 @@ def build_scaler(X: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     for any feature that is genuinely absent at inference time (e.g. t10_ features
     for stocks with fewer than 10 days of data).
     """
-    scaler    = StandardScaler()
-    col_means = X.mean()
-    X_filled  = X.fillna(col_means)
-    scaler.fit(X_filled)
+    scaler        = StandardScaler()
+    col_means     = X_train.mean()           # computed on train rows only
+    X_filled      = X_train.fillna(col_means)
+    scaler.fit(X_filled)                     # fit on train rows only — no val leakage
 
     X_scaled_vals = scaler.transform(X_filled)
-    X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+    X_scaled      = pd.DataFrame(X_scaled_vals, columns=X_train.columns, index=X_train.index)
     # Fill any remaining NaN (e.g. columns with all-NaN that have no mean) with 0.
     X_scaled      = X_scaled.fillna(0.0)
 
     return scaler, X_scaled
+
+
+def scale_with_fitted_scaler(
+    scaler: StandardScaler,
+    X: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Transform X using an already-fitted scaler (e.g. to scale the val set or
+    to reassemble a full scaled DataFrame for the gain regressor).
+
+    NaN handling mirrors build_scaler: fill with the scaler's own mean_ before
+    transforming (equivalent to filling with 0.0 in standardised space), then
+    zero-fill any remaining NaN columns.
+    """
+    col_means = pd.Series(scaler.mean_, index=X.columns)
+    X_filled  = X.fillna(col_means)
+
+    X_scaled_vals = scaler.transform(X_filled)
+    X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+    X_scaled      = X_scaled.fillna(0.0)
+
+    return X_scaled
 
 
 # ---------------------------------------------------------------------------
@@ -1214,10 +1241,10 @@ def train_gain_regressor(
     Train a regression model to predict actual % gain for stocks the
     classifier labels as winners.
 
-    ISSUE #1 FIX: X_scaled and combined_df now contain only the TRAINING split
-      rows (passed from main() after train_val_split). Previously the full
-      dataset was passed, meaning val-set rows were seen during regressor
-      training and val MAE / R² metrics were meaningless.
+    ISSUE #1 (historical): X_scaled passed here contains ALL rows (train + val)
+      because the gain regressor manages its own internal time-based val split
+      and is a separate model from the classifier.  The classifier's val set
+      does not constitute leakage for the gain regressor.
 
     RC1 FIX: Broaden training set beyond just winners.
       - Winners from daily_winners (with corrected actual_high_pct via prev_close)
@@ -1787,13 +1814,25 @@ def main() -> int:
     feature_names = list(X.columns)
 
     # ── Scale ─────────────────────────────────────────────────────────────────
-    logger.info("Fitting scaler...")
-    scaler, X_scaled = build_scaler(X)
-
-    # ── FIX 1: Time-based train/val split ─────────────────────────────────────
-    X_train, X_val, y_train, y_val, w_train, w_val, train_idx = train_val_split(
-        X_scaled, y, w, combined_df
+    # ── FIX 1: Time-based train/val split (on RAW features, before scaling) ───────
+    # Split first so the scaler is fit on train rows only (no val leakage).
+    X_train_raw, X_val_raw, y_train, y_val, w_train, w_val, train_idx = train_val_split(
+        X, y, w, combined_df
     )
+
+    # ── Scale ───────────────────────────────────────────────────────────────────────────
+    # LEAKAGE FIX: fit scaler on X_train_raw only, then transform each split
+    # separately.  Previously build_scaler() was called on the full X (all rows),
+    # so the scaler's mean_ / std_ were computed using val-set rows, making AUC
+    # metrics slightly optimistic and the scaler non-reproducible on train-only data.
+    logger.info("Fitting scaler on train split only (leakage fix)...")
+    scaler, X_train = build_scaler(X_train_raw)                    # fit + transform train
+    X_val           = scale_with_fitted_scaler(scaler, X_val_raw)  # transform val only
+
+    # Reassemble a full scaled DataFrame (train + val, original row order) for
+    # the gain regressor, which manages its own internal train/val split and has
+    # no leakage concern with respect to the classifier's val set.
+    X_scaled = pd.concat([X_train, X_val]).loc[X.index]  # restore original row order
 
     # ── Train-set size guard ──────────────────────────────────────────────────
     # The MIN_VAL_POSITIVES check (inside train_val_split) only guards the val
