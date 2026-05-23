@@ -711,7 +711,22 @@ class ExplosionPredictor:
         # ------------------------------------------------------------------
         if self.regressor is not None:
             try:
-                predicted_gains = self.regressor.predict(X_scaled)
+                predicted_gains_raw = self.regressor.predict(X_scaled)
+
+                # RC7 FIX: If the regressor was trained on a log1p-transformed
+                # target (flagged by _log_transformed_target=True), invert the
+                # transform so predictions are back in % space.  Models saved
+                # before RC7 lack this attribute and are treated as raw-% models
+                # for backward compatibility.
+                if getattr(self.regressor, "_log_transformed_target", False):
+                    import numpy as _np
+                    predicted_gains = _np.expm1(predicted_gains_raw)
+                    self.logger.info(
+                        "RC7: Applied expm1() to convert log-space predictions → % space"
+                    )
+                else:
+                    predicted_gains = predicted_gains_raw
+
                 gain_std  = float(predicted_gains.std())
                 gain_mean = float(predicted_gains.mean())
                 n_preds   = len(predicted_gains)
