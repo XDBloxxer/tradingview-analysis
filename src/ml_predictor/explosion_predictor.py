@@ -553,9 +553,20 @@ class ExplosionPredictor:
         else:
             mean_series = pd.Series(self.scaler.mean_, index=X.columns)
 
+        # Fill NaN with column means before transforming so the scaler receives
+        # no NaN input (StandardScaler.transform raises on NaN).  After scaling,
+        # column-mean inputs map to exactly 0.0, so fillna(0) post-transform is
+        # numerically identical — but we use fillna(mean) pre-transform to stay
+        # compatible with scaler internals and then fillna(0) post-transform to
+        # handle any edge-case all-NaN columns whose mean is itself NaN.
+        # This matches build_scaler() in ml_retrain_model.py: both training and
+        # inference now produce 0.0 for missing features in standardised space,
+        # so XGBoost's split branches are learned on the same representation
+        # they receive at prediction time.
         X_filled      = X.fillna(mean_series)
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+        X_scaled      = X_scaled.fillna(0.0)  # handles all-NaN columns with no mean
 
         return X_scaled
 
