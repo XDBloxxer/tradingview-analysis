@@ -132,11 +132,48 @@ BASE_CSV_WEIGHT         = 1.5
 T1_WEIGHT               = 1.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
-# FIX 1: Fixed validation cutoff date — keeps the val set stable across retrains.
-# Everything on or after this date becomes the val set; everything before is train.
-# Update this date roughly every quarter as your dataset grows, ensuring at least
-# MIN_VAL_POSITIVES winner examples fall after the cutoff.
-VAL_CUTOFF_DATE = "2025-10-01"
+# Validation window — the most recent N weeks of labelled data are reserved for
+# validation; everything before that window is used for training.
+#
+# Why dynamic instead of a fixed date:
+#   A hardcoded date causes the val set to grow every week as new T-1 rows
+#   accumulate, which shifts scale_pos_weight, changes the early-stopping signal,
+#   and makes week-over-week metric comparisons unreliable.  Pinning to "the last
+#   N weeks" keeps the val window the same size every retrain regardless of when
+#   the job runs.
+#
+# Tune VAL_WEEKS to taste:
+#   • Too small  → noisy AUC / unstable early stopping.
+#   • Too large  → less training data, slower to adapt to recent market regimes.
+#   8 weeks (≈ 2 months) is a reasonable starting point.
+VAL_WEEKS = 8
+
+def _compute_val_cutoff(df_with_dates: "pd.DataFrame") -> "pd.Timestamp":
+    """Return the cutoff Timestamp that keeps the most recent VAL_WEEKS of data
+    as the validation set.
+
+    The cutoff is derived from the actual data rather than wall-clock time so
+    that the val window stays stable even when the training job is backfilled or
+    run on stale data.  Falls back to (today − VAL_WEEKS) if no valid dates are
+    found in the dataframe.
+    """
+    import pandas as _pd
+
+    date_series: "_pd.Series | None" = None
+    for col in ("detection_date", "event_date", "date"):
+        if col in df_with_dates.columns:
+            parsed = _pd.to_datetime(df_with_dates[col], errors="coerce")
+            if parsed.notna().any():
+                date_series = parsed
+                break
+
+    if date_series is not None and date_series.notna().any():
+        max_date = date_series.max()
+    else:
+        max_date = _pd.Timestamp.today().normalize()
+
+    cutoff = max_date - _pd.Timedelta(weeks=VAL_WEEKS)
+    return cutoff
 
 # FIX 3: Minimum number of positive examples required in the val set before
 # training proceeds. If the cutoff date produces fewer than this many winners,
@@ -1239,23 +1276,25 @@ def train_val_split(
     """
     FIXED train/val split with three stability improvements:
 
-    FIX 1 — Fixed cutoff date (VAL_CUTOFF_DATE) instead of a floating fraction.
-      The old approach used the most-recent 20% of rows, which shifts every
-      retrain as new T-1 data accumulates. That means the val set is a different
-      slice of the market each week, so early stopping fires at a different
-      iteration each time. A fixed date gives the same val window every run.
+    FIX 1 — Dynamic cutoff date (VAL_WEEKS most recent weeks) instead of a
+      hardcoded date or a floating fraction.
+      • A hardcoded date caused the val set to grow every week as new T-1 rows
+        accumulated, shifting scale_pos_weight and the early-stopping signal.
+      • The old 20%-of-rows approach gave a different market slice each retrain.
+      • Pinning to "the last VAL_WEEKS weeks of data" keeps the val window the
+        same size every run.  The cutoff is computed from the maximum date found
+        in the training dataframe (not wall-clock time), so backfills are stable.
 
     FIX 2 — Mistake samples (rows with NaT dates) are forced into the train set.
       Previously NaT rows sorted to the end and landed in the val set, biasing
       AUC on the model's own hardest errors rather than a general held-out period.
 
     FIX 3 — Hard minimum on val positives (MIN_VAL_POSITIVES).
-      If the fixed cutoff leaves fewer than MIN_VAL_POSITIVES winner rows in val,
-      training aborts with a clear message rather than producing a junk model
+      If the dynamic cutoff leaves fewer than MIN_VAL_POSITIVES winner rows in
+      val, training aborts with a clear message rather than producing a junk model
       (previously the code only warned and then continued).
 
-    Update VAL_CUTOFF_DATE in the configuration block roughly every quarter,
-    once enough new labelled data has accumulated after the cutoff.
+    To change the val window size, adjust VAL_WEEKS in the configuration block.
     """
     df_work = df_with_dates.copy()
 
