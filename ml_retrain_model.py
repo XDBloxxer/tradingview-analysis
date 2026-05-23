@@ -869,7 +869,8 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
     Extract feature matrix X, labels y, and sample weights w.
 
     Returns:
-        X: DataFrame of features (NaN allowed — XGBoost handles natively)
+        X: DataFrame of features (NaN preserved here; build_scaler fills to 0.0
+           after standardisation so training and inference use the same representation)
         y: Series of labels (0/1)
         w: Series of sample weights
     """
@@ -908,18 +909,27 @@ def build_scaler(X: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     """
     Fit scaler on non-NaN values per column. Returns scaler + scaled DataFrame.
 
-    NaN positions are PRESERVED after scaling so XGBoost can use its native
-    missing-value routing.
+    NaN positions are filled with 0.0 after scaling (0.0 == column mean in
+    standardised space).  This matches exactly what _scale_features() does at
+    inference time, so XGBoost's internal missing-value split branches are
+    learned on the same representation they will receive during prediction.
+
+    Previously NaN was restored after scaling during training while inference
+    filled with the column mean *before* scaling (producing 0.0 after scaling).
+    These are numerically equivalent but XGBoost treats explicit NaN and 0.0
+    differently when routing samples through trees, causing misrouted predictions
+    for any feature that is genuinely absent at inference time (e.g. t10_ features
+    for stocks with fewer than 10 days of data).
     """
     scaler    = StandardScaler()
     col_means = X.mean()
     X_filled  = X.fillna(col_means)
     scaler.fit(X_filled)
 
-    nan_mask       = X.isna()
-    X_scaled_vals  = scaler.transform(X_filled)
-    X_scaled       = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-    X_scaled[nan_mask] = np.nan  # restore NaN so XGBoost routes correctly
+    X_scaled_vals = scaler.transform(X_filled)
+    X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
+    # Fill any remaining NaN (e.g. columns with all-NaN that have no mean) with 0.
+    X_scaled      = X_scaled.fillna(0.0)
 
     return scaler, X_scaled
 
@@ -1447,7 +1457,11 @@ def train_gain_regressor(
     y_reg_valid = y_reg[valid_gain_mask]
     w_reg_valid = w_reg[valid_gain_mask]
 
-    # Fill NaN in scaled features with 0 (mean after scaling = 0)
+    # Fill NaN in scaled features with 0 (mean after scaling = 0).
+    # X_reg is already StandardScaler output, so 0.0 == column mean.
+    # This is consistent with build_scaler() which also fills with 0.0 after
+    # scaling, ensuring all three paths (classifier training, regressor training,
+    # and inference) treat missing values identically.
     X_reg_fill = X_reg_valid.fillna(0.0)
 
     # ------------------------------------------------------------------
