@@ -733,21 +733,32 @@ def _compute_correct_actual_high_pct(
     denominator, not the same-day close (which produces near-zero values and
     was the root cause of the compressed gain range in the regressor).
 
-    For each winner row we need the previous day's close. We approximate this
-    using the daily_winners table itself: sort by (symbol, detection_date) and
-    shift by one row per symbol to get prev_close.
-
-    If prev_close is unavailable we fall back to the same-day open as a
-    reasonable proxy (at minimum this is far better than same-day close).
+    prev_close source priority (tracked and logged separately):
+      1. prev_close_db  — a dedicated column already present in winners_df
+         (e.g. stored by the daily pipeline at insertion time). This is the
+         most reliable source and does not depend on the symbol appearing on
+         consecutive days.
+      2. shift(1) within symbol group — only valid when the same symbol
+         appears on back-to-back days in daily_winners. For one-off small-cap
+         winners this produces NaN for every row, so we track how many rows
+         actually benefit from it.
+      3. same-day open — last-resort fallback. Noisier than a true prev_close
+         but still far better than same-day close. We log a WARNING when this
+         fallback fires for more than OPEN_FALLBACK_WARN_PCT of rows, because
+         a high fallback rate signals that shift(1) is not providing real data.
 
     Args:
         winners_df: DataFrame from daily_winners with columns:
                     symbol, detection_date, price (same-day close),
-                    high, open, close
+                    high, open, close, and optionally prev_close_db.
 
     Returns:
         winners_df with corrected actual_high_pct column added/overwritten
+        and a '_prev_close_source' diagnostic column (dropped before return).
     """
+    # Fraction of rows allowed to use the open fallback before we warn.
+    OPEN_FALLBACK_WARN_PCT = 0.20  # warn if >20 % of rows fall back to open
+
     if winners_df.empty:
         return winners_df
 
@@ -763,19 +774,83 @@ def _compute_correct_actual_high_pct(
     df["detection_date"] = pd.to_datetime(df["detection_date"], errors="coerce")
     df = df.sort_values(["symbol", "detection_date"])
 
-    # Compute prev_close by shifting close within each symbol group
-    if "close" in df.columns:
-        df["prev_close"] = df.groupby("symbol")["close"].shift(1)
-    elif "price" in df.columns:
-        df["prev_close"] = df.groupby("symbol")["price"].shift(1)
+    n_total = len(df)
+    df["prev_close"] = np.nan
+    df["_prev_close_source"] = "none"
+
+    # ── Source 1: explicit prev_close_db column stored at insertion time ──────
+    # This is the most reliable source: no assumption about consecutive rows.
+    if "prev_close_db" in df.columns:
+        db_vals = pd.to_numeric(df["prev_close_db"], errors="coerce")
+        mask_db = db_vals.notna() & (db_vals > 0)
+        df.loc[mask_db, "prev_close"] = db_vals[mask_db]
+        df.loc[mask_db, "_prev_close_source"] = "db"
+        n_db = int(mask_db.sum())
+        logger.info(f"RC2: prev_close_db column supplied {n_db}/{n_total} rows")
     else:
-        df["prev_close"] = np.nan
+        n_db = 0
 
-    # Fallback: use same-day open as proxy when prev_close is NaN
+    # ── Source 2: shift(1) within consecutive symbol rows ────────────────────
+    # Only fills rows that still have no prev_close (not already set by db).
+    # For symbols that appear only once in daily_winners, shift produces NaN
+    # and we get nothing — that is expected and correct behaviour; do not
+    # treat these NaNs as the open-fallback trigger.
+    close_col = "close" if "close" in df.columns else ("price" if "price" in df.columns else None)
+    if close_col:
+        shifted = df.groupby("symbol")[close_col].shift(1)
+        shifted_numeric = pd.to_numeric(shifted, errors="coerce")
+        # Apply only where prev_close is still missing
+        mask_shift = (
+            df["_prev_close_source"] == "none"
+        ) & shifted_numeric.notna() & (shifted_numeric > 0)
+        df.loc[mask_shift, "prev_close"] = shifted_numeric[mask_shift]
+        df.loc[mask_shift, "_prev_close_source"] = "shift"
+        n_shift = int(mask_shift.sum())
+
+        # Rows where shift produced NaN (one-off symbols): count them explicitly
+        mask_shift_nan = (df["_prev_close_source"] == "none") & shifted_numeric.isna()
+        n_shift_nan_oneoff = int(mask_shift_nan.sum())
+        if n_shift_nan_oneoff > 0:
+            logger.info(
+                f"RC2: shift(1) produced NaN for {n_shift_nan_oneoff}/{n_total} rows "
+                f"(symbols appear only once in daily_winners — open fallback will be used)"
+            )
+    else:
+        n_shift = 0
+
+    # ── Source 3: same-day open as last-resort fallback ──────────────────────
     if "open" in df.columns:
-        df["prev_close"] = df["prev_close"].fillna(df["open"])
+        open_numeric = pd.to_numeric(df["open"], errors="coerce")
+        mask_open = (
+            df["_prev_close_source"] == "none"
+        ) & open_numeric.notna() & (open_numeric > 0)
+        df.loc[mask_open, "prev_close"] = open_numeric[mask_open]
+        df.loc[mask_open, "_prev_close_source"] = "open"
+        n_open = int(mask_open.sum())
+    else:
+        n_open = 0
 
-    # Compute corrected actual_high_pct
+    n_none = int((df["_prev_close_source"] == "none").sum())
+
+    logger.info(
+        f"RC2: prev_close sources — db:{n_db}  shift:{n_shift}  "
+        f"open_fallback:{n_open}  missing:{n_none}  total:{n_total}"
+    )
+
+    # Warn loudly when the open fallback is carrying the majority of rows,
+    # because that means shift(1) is not providing real prev_close data.
+    n_non_db = n_total - n_db  # rows that couldn't use the reliable db source
+    if n_non_db > 0 and n_open / n_total > OPEN_FALLBACK_WARN_PCT:
+        logger.warning(
+            f"RC2 WARNING: {n_open}/{n_total} rows ({n_open / n_total:.1%}) are using "
+            f"same-day open as prev_close proxy. This is a noisy fallback. "
+            f"Consider storing prev_close_db in the daily_winners table at insertion "
+            f"time (e.g. from the yfinance previous-day close) to improve accuracy. "
+            f"shift(1) only helps when the same symbol appears on consecutive days in "
+            f"daily_winners, which is rare for one-off small-cap winners."
+        )
+
+    # ── Compute corrected actual_high_pct ────────────────────────────────────
     high_vals = pd.to_numeric(df["high"], errors="coerce")
     prev_close_vals = pd.to_numeric(df["prev_close"], errors="coerce")
 
@@ -793,18 +868,22 @@ def _compute_correct_actual_high_pct(
         )
 
     n_corrected = int(valid_mask.sum())
-    n_total = len(df)
     if n_corrected > 0:
         pct_range = df.loc[valid_mask, "actual_high_pct"]
+        # Break down corrected rows by source for transparency
+        src_counts = df.loc[valid_mask, "_prev_close_source"].value_counts().to_dict()
         logger.info(
             f"RC2: Corrected actual_high_pct for {n_corrected}/{n_total} winner rows "
             f"(range: {pct_range.min():.1f}%–{pct_range.max():.1f}%, "
-            f"mean: {pct_range.mean():.1f}%)"
+            f"mean: {pct_range.mean():.1f}%) | sources: {src_counts}"
         )
     else:
         logger.warning(
             "RC2: Could not compute corrected actual_high_pct — no prev_close data available"
         )
+
+    # Drop diagnostic column before returning
+    df = df.drop(columns=["_prev_close_source"], errors="ignore")
 
     # Restore string dates
     df["detection_date"] = df["detection_date"].dt.strftime("%Y-%m-%d")
