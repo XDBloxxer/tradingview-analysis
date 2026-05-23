@@ -1170,8 +1170,29 @@ def compute_feature_importance(
 
 
 # ---------------------------------------------------------------------------
-# RC1 + RC3 FIX: Gain regressor — broader training set, correct scale input
+# RC1 + RC3 + RC7 FIX: Gain regressor — broader training set, correct scale input,
+#                       log-transform target, matched hyperparams, higher gain cap
 # ---------------------------------------------------------------------------
+
+# Gains above this percentile are winsorized to prevent a handful of 5000%
+# outliers from dominating the loss.  We keep extreme winners in training
+# (they are the most valuable signal) but cap their label so XGBoost can
+# still split on them meaningfully.  Log-transforming the target (RC7) reduces
+# the distortion from outliers far more than a hard cap.
+_GAIN_WINSOR_PCT = 99.5   # winsorize above this percentile
+
+# Weight multiplier applied to winner rows in regressor training.
+# The training set is overwhelmingly non-winners (label=0, gain≈0-5%).
+# Without boosting winner weights the regressor learns "predict ~5%" for
+# everything and never reaches 50%+ territory.
+_WINNER_WEIGHT_MULTIPLIER = 5.0
+
+# Additional multiplier for large-gain winners (actual_high_pct > this threshold).
+# These are the stocks that "soar" and we specifically want the regressor to
+# predict high values for them.
+_HIGH_GAIN_THRESHOLD  = 50.0   # %
+_HIGH_GAIN_MULTIPLIER = 3.0    # stacked on top of _WINNER_WEIGHT_MULTIPLIER
+
 
 def train_gain_regressor(
     X_scaled: pd.DataFrame,           # RC3 FIX: receive pre-scaled features
@@ -1209,6 +1230,27 @@ def train_gain_regressor(
     MODERATE ISSUE #5 FIX: Internal val split is now time-based (matching the
       classifier split) rather than random, preventing future gain patterns
       from leaking into regressor training.
+
+    RC7 FIX: Three changes to stop gain predictions collapsing below 50%:
+      1. Log-transform the gain target (log1p / expm1) so that 5% and 500%
+         gains don't live on wildly different scales.  This gives XGBoost a
+         smoother loss landscape and lets it place splits that distinguish
+         "moderate" from "large" gains without being dominated by rare 5000%
+         outliers.
+      2. Winsorize the log-transformed target at the 99.5th percentile so the
+         handful of extreme outliers don't pull every tree towards them.
+      3. Heavily up-weight winner rows (5×) and extra-large-gain winners (15×
+         combined) so the regressor is penalised much more for under-predicting
+         high-gain stocks than for over-predicting low-gain ones.  Previously
+         the 2× winner bonus was far too weak given the severe class imbalance
+         in gain magnitude (most training rows have gain ≈ 0–5%).
+      4. Match classifier hyperparameters: n_estimators=300, max_depth=5,
+         gamma=1.0, reg_alpha/lambda matching XGBOOST_PARAMS.  The old
+         regressor used looser settings (200 trees, depth 4, no gamma) which
+         caused it to overfit to the abundant low-gain rows.
+      5. Raise the gain cap from 500% to 10 000% so extreme winners are NOT
+         silently excluded from training.  The log transform handles their
+         scale.
     """
     from xgboost import XGBRegressor
 
@@ -1335,10 +1377,14 @@ def train_gain_regressor(
             logger.info(f"RC1: Filled {filled_count} additional gain targets from accuracy table")
 
     # ------------------------------------------------------------------
-    # Build training mask: all rows with a valid gain target
-    # (not just winners — RC1 fix to broaden training set)
+    # RC7 FIX: Raise gain cap from 500% → 10 000%.
+    # The old 500% cap silently excluded the best-performing stocks from
+    # training (the logs showed a max of 5329.6%).  The log transform below
+    # handles the scale of extreme values; we only need to drop obvious data
+    # errors (negative gains > -100% are physically impossible; gains in the
+    # millions are likely bad data).
     # ------------------------------------------------------------------
-    valid_gain_mask = gain_targets.notna() & (gain_targets.abs() < 500)
+    valid_gain_mask = gain_targets.notna() & (gain_targets > -100.0) & (gain_targets < 10_000.0)
     n_valid = int(valid_gain_mask.sum())
     n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
     n_non_winners_with_gain = n_valid - n_winners_with_gain
@@ -1347,7 +1393,7 @@ def train_gain_regressor(
         f"\n── Training gain regressor on {n_valid} rows with gain data ──\n"
         f"  Winners:     {n_winners_with_gain}\n"
         f"  Non-winners: {n_non_winners_with_gain} (RC1: broader training set)\n"
-        f"  Target:      {gain_col}"
+        f"  Target:      {gain_col} (RC7: cap raised to 10 000%, log-transformed)"
     )
 
     if n_valid < 30:
@@ -1375,11 +1421,27 @@ def train_gain_regressor(
         else pd.Series(1.0, index=combined_df.index)
     )
 
-    # Boost weight for winner rows — their gain prediction is more important
-    winner_bonus_mask = (combined_df["label"] == 1) & valid_gain_mask
-    if winner_bonus_mask.any():
+    # ------------------------------------------------------------------
+    # RC7 FIX: Heavily up-weight winner rows, especially large-gain ones.
+    # The training set has far more non-winner rows (gain ≈ 0–5%) than
+    # winner rows (gain can be 50–5000%).  A 2× winner bonus is lost in
+    # the noise — we need a much stronger signal for the regressor to
+    # learn that high-gain stocks are a distinct regime.
+    # ------------------------------------------------------------------
+    winner_mask_valid = (combined_df["label"] == 1) & valid_gain_mask
+    high_gain_mask = winner_mask_valid & (gain_targets >= _HIGH_GAIN_THRESHOLD)
+
+    if winner_mask_valid.any():
         w_reg = w_reg.copy()
-        w_reg[winner_bonus_mask] *= 2.0
+        w_reg[winner_mask_valid] *= _WINNER_WEIGHT_MULTIPLIER
+        if high_gain_mask.any():
+            w_reg[high_gain_mask] *= _HIGH_GAIN_MULTIPLIER
+            logger.info(
+                f"  RC7: up-weighted {winner_mask_valid.sum()} winner rows ×{_WINNER_WEIGHT_MULTIPLIER}, "
+                f"{high_gain_mask.sum()} high-gain (≥{_HIGH_GAIN_THRESHOLD}%) rows ×{_WINNER_WEIGHT_MULTIPLIER * _HIGH_GAIN_MULTIPLIER:.0f} total"
+            )
+        else:
+            logger.info(f"  RC7: up-weighted {winner_mask_valid.sum()} winner rows ×{_WINNER_WEIGHT_MULTIPLIER}")
 
     X_reg_valid = X_reg[valid_gain_mask]
     y_reg_valid = y_reg[valid_gain_mask]
@@ -1387,6 +1449,31 @@ def train_gain_regressor(
 
     # Fill NaN in scaled features with 0 (mean after scaling = 0)
     X_reg_fill = X_reg_valid.fillna(0.0)
+
+    # ------------------------------------------------------------------
+    # RC7 FIX: Log-transform the gain target.
+    # Gain % has a heavily right-skewed distribution: most values cluster
+    # near 0–20%, but winners can reach 5000%.  Training XGBoost directly
+    # on raw % means the squared-error loss is dominated by a handful of
+    # extreme values, causing trees to split on "is this stock an outlier?"
+    # rather than on signals that generalise.  log1p(max(gain, 0)) maps:
+    #   0%    → 0.0    200%  → 1.099
+    #   5%    → 0.049  500%  → 1.792
+    #   50%   → 0.405  5000% → 3.912
+    # The regressor predicts in log-space; at inference time we expm1() back.
+    # Winsorize at the 99.5th percentile in log-space to prevent the
+    # remaining extreme values from dominating.
+    # ------------------------------------------------------------------
+    y_log = np.log1p(np.maximum(y_reg_valid.values, 0.0))
+    winsor_cap = np.percentile(y_log, _GAIN_WINSOR_PCT)
+    y_log_winsor = np.minimum(y_log, winsor_cap)
+    n_winsorized = int((y_log > winsor_cap).sum())
+    if n_winsorized > 0:
+        logger.info(
+            f"  RC7: Winsorized {n_winsorized} values above {np.expm1(winsor_cap):.1f}% "
+            f"({_GAIN_WINSOR_PCT}th percentile in log-space)"
+        )
+    y_reg_log = pd.Series(y_log_winsor, index=y_reg_valid.index)
 
     # Time-based split for the regressor (mirrors the classifier split).
     # Using a random split here would allow future gain patterns to leak into
@@ -1407,9 +1494,11 @@ def train_gain_regressor(
             _va_idx = _sorted_idx[_split_pos:]
             X_tr   = X_reg_fill.loc[_tr_idx]
             X_va   = X_reg_fill.loc[_va_idx]
-            y_tr   = y_reg_valid.loc[_tr_idx]
-            y_va   = y_reg_valid.loc[_va_idx]
+            y_tr   = y_reg_log.loc[_tr_idx]
+            y_va   = y_reg_log.loc[_va_idx]
             w_tr   = w_reg_valid.loc[_tr_idx]
+            # Keep raw (non-log) val targets for human-readable MAE reporting
+            y_va_raw = y_reg_valid.loc[_va_idx]
             logger.info(
                 f"  Gain regressor time-based split: "
                 f"{len(X_tr)} train / {len(X_va)} val"
@@ -1419,48 +1508,67 @@ def train_gain_regressor(
             _split_pos = int(len(X_reg_fill) * 0.8)
             X_tr = X_reg_fill.iloc[:_split_pos]
             X_va = X_reg_fill.iloc[_split_pos:]
-            y_tr = y_reg_valid.iloc[:_split_pos]
-            y_va = y_reg_valid.iloc[_split_pos:]
+            y_tr = y_reg_log.iloc[:_split_pos]
+            y_va = y_reg_log.iloc[_split_pos:]
             w_tr = w_reg_valid.iloc[:_split_pos]
+            y_va_raw = y_reg_valid.iloc[_split_pos:]
             logger.info(
                 f"  Gain regressor sequential split (no date column): "
                 f"{len(X_tr)} train / {len(X_va)} val"
             )
     else:
         X_tr, X_va, y_tr, y_va, w_tr = (
-            X_reg_fill, X_reg_fill, y_reg_valid, y_reg_valid, w_reg_valid
+            X_reg_fill, X_reg_fill, y_reg_log, y_reg_log, w_reg_valid
         )
+        y_va_raw = y_reg_valid
 
-    # Log gain distribution to diagnose compression
-    y_tr_arr = y_tr.values if hasattr(y_tr, 'values') else y_tr
+    # Log gain distribution (in original % space) to diagnose compression
+    y_tr_raw_arr = np.expm1(y_tr.values if hasattr(y_tr, "values") else y_tr)
     logger.info(
-        f"  Gain target distribution (train set):\n"
-        f"    min={float(y_tr_arr.min()):.1f}%  "
-        f"max={float(y_tr_arr.max()):.1f}%  "
-        f"mean={float(y_tr_arr.mean()):.1f}%  "
-        f"std={float(y_tr_arr.std()):.1f}%  "
-        f"median={float(np.median(y_tr_arr)):.1f}%"
+        f"  Gain target distribution — train set (original % space):\n"
+        f"    min={float(y_tr_raw_arr.min()):.1f}%  "
+        f"max={float(y_tr_raw_arr.max()):.1f}%  "
+        f"mean={float(y_tr_raw_arr.mean()):.1f}%  "
+        f"std={float(y_tr_raw_arr.std()):.1f}%  "
+        f"median={float(np.median(y_tr_raw_arr)):.1f}%"
+    )
+    logger.info(
+        f"  Gain target distribution — train set (log space, what regressor sees):\n"
+        f"    min={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).min()):.3f}  "
+        f"max={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).max()):.3f}  "
+        f"std={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).std()):.3f}"
     )
 
-    if float(y_tr_arr.std()) < 2.0:
+    if float(y_tr_raw_arr.std()) < 2.0:
         logger.warning(
-            f"  ⚠️  Gain target std={float(y_tr_arr.std()):.2f}% is very low. "
+            f"  ⚠️  Gain target std={float(y_tr_raw_arr.std()):.2f}% is very low. "
             "The gain distribution is compressed — predictions will be flat. "
             "Check RC2 fix (prev_close denominator) is working correctly."
         )
 
+    # ------------------------------------------------------------------
+    # RC7 FIX: Match classifier hyperparameters more closely.
+    # The old regressor used n_estimators=200, max_depth=4, min_child_weight=5,
+    # no gamma, weak regularisation.  The result was a shallower, looser model
+    # that over-generalised toward the mean of the (overwhelmingly low-gain)
+    # training set.  Using the same depth/regularisation as the classifier
+    # forces the regressor to find more specific gain-relevant patterns.
+    # ------------------------------------------------------------------
     regressor = XGBRegressor(
-        n_estimators=200,
-        max_depth=4,
+        n_estimators=300,
+        max_depth=5,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        min_child_weight=5,
+        min_child_weight=10,
+        gamma=1.0,
+        reg_alpha=0.5,
+        reg_lambda=2.0,
         objective="reg:squarederror",
         eval_metric="rmse",
         random_state=42,
         n_jobs=-1,
-        early_stopping_rounds=20,
+        early_stopping_rounds=30,
     )
     regressor.fit(
         X_tr, y_tr,
@@ -1469,27 +1577,37 @@ def train_gain_regressor(
         verbose=False,
     )
 
-    val_pred = regressor.predict(X_va)
-    from sklearn.metrics import mean_absolute_error, r2_score
-    mae = mean_absolute_error(y_va, val_pred)
-    r2  = r2_score(y_va, val_pred) if len(y_va) > 1 else float("nan")
-    pred_std = float(val_pred.std())
-    logger.info(
-        f"  Gain regressor — val MAE: {mae:.2f}%  R²: {r2:.3f}  "
-        f"pred_std: {pred_std:.2f}%"
-    )
-    logger.info(
-        f"  Predicted gains range: {val_pred.min():.1f}% – {val_pred.max():.1f}%"
-    )
+    # Evaluate in original % space for interpretability
+    val_pred_log = regressor.predict(X_va)
+    val_pred_pct = np.expm1(val_pred_log)           # inverse of log1p
+    y_va_raw_arr = y_va_raw.values if hasattr(y_va_raw, "values") else np.array(y_va_raw)
 
-    if pred_std < 0.5:
+    from sklearn.metrics import mean_absolute_error, r2_score
+    mae    = mean_absolute_error(y_va_raw_arr, val_pred_pct)
+    # R² in log-space (what the model was actually trained on) is more meaningful
+    r2_log = r2_score(y_va.values if hasattr(y_va, "values") else y_va, val_pred_log) if len(y_va) > 1 else float("nan")
+    pred_std_pct = float(val_pred_pct.std())
+    logger.info(
+        f"  Gain regressor — val MAE (% space): {mae:.2f}%  "
+        f"R² (log space): {r2_log:.3f}  "
+        f"pred_std (% space): {pred_std_pct:.2f}%"
+    )
+    logger.info(
+        f"  Predicted gains range (% space): {val_pred_pct.min():.1f}% – {val_pred_pct.max():.1f}%"
+    )
+    logger.info(f"  Best iteration: {regressor.best_iteration}")
+
+    if pred_std_pct < 0.5:
         logger.warning(
-            f"  ⚠️  Regressor prediction std={pred_std:.3f}% is very flat. "
-            "Root causes: too few training samples, compressed gain targets (RC2), "
-            "or scaled vs unscaled feature mismatch (RC3). "
+            f"  ⚠️  Regressor prediction std={pred_std_pct:.3f}% is very flat even after RC7 fixes. "
+            "Root causes: too few training samples with gain data, or "
+            "scaled vs unscaled feature mismatch (RC3). "
             "The explosion_predictor will use the relaxed std guard (0.5) "
             "rather than disabling immediately."
         )
+
+    # Store a flag so explosion_predictor.py knows to apply expm1 at inference
+    regressor._log_transformed_target = True  # type: ignore[attr-defined]
 
     return regressor
 
@@ -1535,7 +1653,7 @@ def save_outputs(
         "best_val_logloss":      float(model.best_score),
         "gain_regressor_trained": gain_regressor is not None,
         "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
-                                  "RC3_scaled_features", "RC6_mistake_enrichment"],
+                                  "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
         **training_stats,
     }
     with open(METADATA_PATH, "w") as f:
@@ -1716,13 +1834,13 @@ def main() -> int:
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
 
-    # ── RC1+RC2+RC3+RC6 FIX: Train gain regressor with corrected inputs ───────
+    # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
     # NOTE: X_scaled and combined_df contain ALL rows (train + val).  The gain
     # regressor is a separate model with a different target (actual_gain_pct) and
     # no leakage concern — it is evaluated on its own internal time-based val
     # split (see train_gain_regressor), not on the classifier's val set.
     logger.info("\n" + "=" * 60)
-    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6 fixes applied)")
+    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
         X_scaled=X_scaled,       # use ALL rows — gain regressor is a separate model
@@ -1792,7 +1910,7 @@ def main() -> int:
         "gain_regressor_trained":  gain_regressor is not None,
         "split_method":            f"fixed_cutoff:{VAL_CUTOFF_DATE}",
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
-                                    "RC3_scaled_input", "RC6_mistake_enrichment"],
+                                    "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
@@ -1819,7 +1937,7 @@ def main() -> int:
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
     logger.info(f"  Split method        : fixed cutoff {VAL_CUTOFF_DATE} (val = everything after)")
-    logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6 fixed)' if gain_regressor else '— skipped'}")
+    logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6+RC7 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
     logger.info("Files written:")
     logger.info(f"  {MODEL_PATH}")
