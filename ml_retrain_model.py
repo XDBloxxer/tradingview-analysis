@@ -313,13 +313,41 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
         logger.error(f"'{TABLE_BASE}' has no 'label' column.")
         sys.exit(1)
 
+    # Normalise the stock identifier column to "symbol" so that combine_datasets
+    # and all downstream deduplication logic uses a single consistent column name.
+    # ml_training_base stores the ticker under the column "ticker" while T-1 tables
+    # use "symbol".  Without this rename, after pd.concat the base rows have
+    # symbol=NaN (the T-1 column) and ticker=<value>, causing drop_duplicates on
+    # (symbol, event_date) to treat every ticker on the same date as the same stock,
+    # collapsing all per-date base rows into a single row.
+    if "symbol" not in df.columns and "ticker" in df.columns:
+        df = df.rename(columns={"ticker": "symbol"})
+        logger.info("  Renamed 'ticker' -> 'symbol' for consistency with T-1 tables")
+    elif "symbol" not in df.columns:
+        logger.warning("  Neither 'symbol' nor 'ticker' column found in base data — deduplication may be incorrect")
+
     if "sample_weight" not in df.columns:
         df["sample_weight"] = BASE_CSV_WEIGHT
     df["source"] = df.get("source", "base_csv")
 
-    logger.info(f"Base data: {len(df)} rows, "
-                f"pos={int((df['label']==1).sum())}, "
-                f"neg={int((df['label']==0).sum())}")
+    n_pos = int((df['label']==1).sum())
+    n_neg = int((df['label']==0).sum())
+    pos_rate = n_pos / max(1, len(df))
+    logger.info(f"Base data: {len(df)} rows, pos={n_pos}, neg={n_neg}, pos_rate={pos_rate:.1%}")
+
+    # Warn if the base data positive rate is unexpectedly high.
+    # Expected range is ~5-20% for explosive-stock prediction.
+    # If this number jumps week-over-week, the base table may have had extra
+    # winner rows inserted (or negative rows deleted) outside of the normal
+    # upload_base_training_data.py workflow.
+    if pos_rate > 0.25:
+        logger.warning(
+            f"BASE DATA WARNING: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows). "
+            "Expected ~5-20%. If this increased since the last run, check whether "
+            "extra rows were inserted into ml_training_base (e.g. by intraday_high_labels "
+            "or a backfill script), or whether negative rows were accidentally deleted."
+        )
+
     return df
 
 def audit_base_data(base_df: pd.DataFrame) -> None:
@@ -1040,12 +1068,20 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         # T-1 rows have source values like "winners_day_prior_close" etc.
         before_dedup = len(combined)
 
+        # Known T-1 source names — anything written by the daily accumulation pipeline.
+        # Any source not in this set is treated as base data (uses event_date for dedup).
+        T1_SOURCES = {
+            "winners_day_prior_close", "non_winners_day_prior_close",
+            "winners_day_prior_open",  "non_winners_day_prior_open",
+            "backfill_winner",         "backfill_non_winner",
+        }
         if "source" in combined.columns:
-            base_mask = combined["source"] == "base_csv"
-            t1_mask   = ~base_mask
+            t1_mask   = combined["source"].isin(T1_SOURCES)
+            base_mask = ~t1_mask
             logger.info(
                 f"Deduplication: splitting by source column — "
-                f"base_csv={base_mask.sum()}, T-1={t1_mask.sum()}"
+                f"T-1={t1_mask.sum()} ({sorted(combined.loc[t1_mask, 'source'].unique().tolist())}), "
+                f"base={base_mask.sum()} ({sorted(combined.loc[base_mask, 'source'].unique().tolist())[:5]}...)"
             )
         else:
             # Fallback: if source column is missing, use detection_date.notna()
@@ -1058,21 +1094,33 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
             t1_mask   = combined["detection_date"].notna()
             base_mask = ~t1_mask
 
-        t1_part   = combined[t1_mask].drop_duplicates(
-            subset=[sym_col, "detection_date"], keep="first"
+        # For T-1 rows: always use "symbol" (set by T-1 loading code).
+        t1_sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns
+                           and combined.loc[t1_mask, c].notna().any()), sym_col)
+        t1_part = combined[t1_mask].drop_duplicates(
+            subset=[t1_sym_col, "detection_date"], keep="first"
         )
 
-        # Base CSV rows: deduplicate by event_date when available, otherwise
-        # detection_date.  Multiple stocks can legitimately share the same date
-        # (they are different symbols), so the dedup key is always (symbol, date).
-        if "event_date" in combined.columns and combined.loc[base_mask, "event_date"].notna().any():
+        # For base CSV rows: use whichever identifier column is actually populated.
+        # After the ticker->symbol rename in load_base_training_data this should
+        # always be "symbol", but we fall back gracefully in case of legacy data.
+        base_sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns
+                             and combined.loc[base_mask, c].notna().any()), sym_col)
+        if base_sym_col is None:
+            logger.warning("Deduplication: no non-null identifier column found in base partition — skipping base dedup")
+            base_part = combined[base_mask]
+        elif "event_date" in combined.columns and combined.loc[base_mask, "event_date"].notna().any():
             base_part = combined[base_mask].drop_duplicates(
-                subset=[sym_col, "event_date"], keep="first"
+                subset=[base_sym_col, "event_date"], keep="first"
             )
         else:
             base_part = combined[base_mask].drop_duplicates(
-                subset=[sym_col, "detection_date"], keep="first"
+                subset=[base_sym_col, "detection_date"], keep="first"
             )
+        logger.info(
+            f"Deduplication: T-1 sym_col='{t1_sym_col}', base sym_col='{base_sym_col}' "
+            f"(base date key: {'event_date' if 'event_date' in combined.columns and combined.loc[base_mask, 'event_date'].notna().any() else 'detection_date'})"
+        )
 
         combined  = pd.concat([t1_part, base_part], ignore_index=True, sort=False)
         n_dropped = before_dedup - len(combined)
