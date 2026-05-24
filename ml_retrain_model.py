@@ -84,6 +84,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 from supabase import create_client, Client
 from xgboost import XGBClassifier
@@ -1277,8 +1278,20 @@ def train_model(
     w_train: pd.Series,
     X_val: pd.DataFrame,
     y_val: pd.Series,
-) -> XGBClassifier:
-    """Train XGBClassifier from scratch with early stopping."""
+    X_cal: pd.DataFrame = None,
+    y_cal: pd.Series = None,
+) -> object:
+    """Train XGBClassifier from scratch with early stopping.
+
+    RC6: If X_cal/y_cal are supplied (a held-out calibration set),
+    the raw XGBoost model is wrapped with CalibratedClassifierCV
+    (isotonic regression, cv='prefit') before being returned. This
+    corrects the extreme probability clustering caused by AUC training
+    + heavy scale_pos_weight, pulling predictions away from 0/1 and
+    restoring meaningful separation across the SIGNAL_THRESHOLDS.
+    The calibrator is fitted on X_cal/y_cal (not X_train) so that no
+    training data leaks into the calibration fit.
+    """
     params = XGBOOST_PARAMS.copy()
 
     n_pos = int((y_train == 1).sum())
@@ -1340,6 +1353,50 @@ def train_model(
             f"  ⚠️  Val AUC={model.best_score:.4f} is suspiciously high. "
             "This may indicate data leakage or label overlap. "
             "Check that the validation set does not overlap with training dates."
+        )
+
+    # RC6: Post-training probability calibration
+    # AUC training + scale_pos_weight together push probabilities toward
+    # extremes, causing 60%+ of post-screener stocks to cluster at STRONG BUY.
+    # Fitting an isotonic calibrator on a clean held-out calibration set corrects
+    # this without affecting AUC / rank order (isotonic regression is rank-preserving).
+    if X_cal is not None and y_cal is not None:
+        n_cal_pos = int((y_cal == 1).sum())
+        n_cal_neg = int((y_cal == 0).sum())
+        if n_cal_pos >= 10 and n_cal_neg >= 10:
+            logger.info(
+                f"RC6: Fitting isotonic probability calibrator on "
+                f"{len(y_cal)} calibration samples "
+                f"({n_cal_pos} pos / {n_cal_neg} neg)."
+            )
+            calibrated_model = CalibratedClassifierCV(
+                model, method="isotonic", cv="prefit"
+            )
+            calibrated_model.fit(X_cal, y_cal)
+            # Sanity-check: log how calibration shifted the distribution
+            raw_proba = model.predict_proba(X_cal)[:, 1]
+            cal_proba = calibrated_model.predict_proba(X_cal)[:, 1]
+            logger.info(
+                f"  Raw proba  — mean={raw_proba.mean():.3f}  "
+                f"std={raw_proba.std():.3f}  "
+                f"pct>=0.90: {(raw_proba>=0.90).mean():.1%}"
+            )
+            logger.info(
+                f"  Cal proba  — mean={cal_proba.mean():.3f}  "
+                f"std={cal_proba.std():.3f}  "
+                f"pct>=0.90: {(cal_proba>=0.90).mean():.1%}"
+            )
+            return calibrated_model
+        else:
+            logger.warning(
+                f"RC6: Calibration set too small or imbalanced "
+                f"({n_cal_pos} pos / {n_cal_neg} neg) — "
+                "skipping isotonic calibration. Returning raw model."
+            )
+    else:
+        logger.info(
+            "RC6: No calibration set provided — returning raw (uncalibrated) model. "
+            "Pass X_cal/y_cal to train_model() to enable isotonic calibration."
         )
 
     return model
@@ -1486,11 +1543,20 @@ def train_val_split(
 # ---------------------------------------------------------------------------
 
 def compute_feature_importance(
-    model: XGBClassifier,
+    model,
     feature_names: list[str],
 ) -> pd.DataFrame:
-    """Generate feature_importance.csv using gain importance."""
-    booster = model.get_booster()
+    """Generate feature_importance.csv using gain importance.
+
+    RC6: model may be a CalibratedClassifierCV wrapping an XGBClassifier.
+    We unwrap it to access the underlying booster for feature importances.
+    """
+    # RC6: unwrap CalibratedClassifierCV to get the raw XGBClassifier
+    xgb_model = model
+    if hasattr(model, "calibrated_classifiers_"):
+        # CalibratedClassifierCV stores list of (estimator, calibrator) pairs
+        xgb_model = model.calibrated_classifiers_[0].estimator
+    booster = xgb_model.get_booster()
     scores  = booster.get_score(importance_type="gain")
 
     importance_list = []
@@ -2205,8 +2271,44 @@ def main() -> int:
             f"pos_rate={train_pos/train_rows:.1%}) — size looks adequate."
         )
 
+    # ── RC6: Carve calibration set from train split ─────────────────────────
+    # To fit the isotonic calibrator, we need a held-out set that XGBoost never
+    # saw during weight updates.  We use the oldest CAL_FRACTION of the training
+    # rows (earliest dates) as the calibration set.  The remaining rows form the
+    # actual XGBoost training set.  This is temporally safe: calibration data
+    # precedes training data, so there is no future leakage.
+    CAL_FRACTION = 0.15   # 15% of train rows → calibration; 85% → XGBoost
+    n_cal = max(0, int(len(X_train) * CAL_FRACTION))
+    cal_min_pos = 10       # need at least 10 positives to fit isotonic meaningfully
+    X_cal_fit, y_cal_fit = None, None
+    if n_cal > 0:
+        # X_train is already sorted oldest-first (train_val_split preserves order)
+        X_cal_fit  = X_train.iloc[:n_cal]
+        y_cal_fit  = y_train.iloc[:n_cal]
+        w_train_xgb = w_train.iloc[n_cal:]
+        X_train_xgb = X_train.iloc[n_cal:]
+        y_train_xgb = y_train.iloc[n_cal:]
+        cal_pos = int((y_cal_fit == 1).sum())
+        cal_neg = int((y_cal_fit == 0).sum())
+        logger.info(
+            f"RC6: Reserved {n_cal} rows for isotonic calibration "
+            f"({cal_pos} pos / {cal_neg} neg). "
+            f"XGBoost training on remaining {len(X_train_xgb)} rows."
+        )
+        if cal_pos < cal_min_pos:
+            logger.warning(
+                f"RC6: Calibration slice has only {cal_pos} positives "
+                f"(need ≥ {cal_min_pos}) — isotonic calibration will be skipped. "
+                "Consider a larger dataset or increasing CAL_FRACTION."
+            )
+            X_cal_fit, y_cal_fit = None, None
+            X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
+    else:
+        X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
+
     # ── Train ─────────────────────────────────────────────────────────────────
-    model = train_model(X_train, y_train, w_train, X_val, y_val)
+    model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val, y_val,
+                        X_cal=X_cal_fit, y_cal=y_cal_fit)
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
