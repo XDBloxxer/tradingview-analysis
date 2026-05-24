@@ -512,6 +512,18 @@ class ExplosionPredictor:
                 f"but features were built with '{self._model_feature_prefix}' prefix."
             )
 
+        # ── FIX (Bug 2): has_t1_features flag for live inference ────────────────
+        # During retraining, prepare_features() in ml_retrain_model.py adds a
+        # 'has_t1_features' binary column (1 for T-1 rows, 0 for base CSV rows)
+        # so XGBoost can learn a distinct decision branch for each data regime.
+        # At inference time, live predictions ALWAYS have real T-1 intraday data,
+        # so we unconditionally set has_t1_features = 1.0.
+        # This must happen AFTER the feature_data loop (which would set it to 0.0
+        # via _get_default_value if it is listed in self.feature_names) so that
+        # we always override with the correct live-inference value.
+        if "has_t1_features" in self.feature_names:
+            feature_df["has_t1_features"] = 1.0
+
         if not self._diag_done:
             self._log_feature_diagnostics(feature_df, match_log)
             self._diag_done = True
