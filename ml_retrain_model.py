@@ -1794,12 +1794,22 @@ _GAIN_WINSOR_PCT = 99.5   # winsorize above this percentile
 # The training set is overwhelmingly non-winners (label=0, gain≈0-5%).
 # Without boosting winner weights the regressor learns "predict ~5%" for
 # everything and never reaches 50%+ territory.
-_WINNER_WEIGHT_MULTIPLIER = 8.0    # Raised from 5.0 — the training set is overwhelmingly
-                                    # non-winner rows.  5x was insufficient to teach the
-                                    # regressor that 100%+ gains are a real regime.
+_WINNER_WEIGHT_MULTIPLIER = 3.0    # FIX #9: Reduced from 8.0.
+                                    # With ~15% positive rate, 8× was equivalent to
+                                    # training on a ~59% winner dataset (8×15% / (8×15%+85%)),
+                                    # causing the regressor to underfit non-winner rows.
+                                    # This explains the suspiciously high gain floor (~22%)
+                                    # seen in prediction logs — even the worst-ranked stock
+                                    # received a high predicted gain because non-winner rows
+                                    # were barely seen during training.
+                                    # 3× gives ~35% effective winner rate, a more balanced
+                                    # training signal while still teaching the regressor that
+                                    # high-gain regimes exist.
 
 _HIGH_GAIN_THRESHOLD  = 30.0    # Lowered from 50% — more winners qualify for the boost
-_HIGH_GAIN_MULTIPLIER = 5.0     # Raised from 3.0 — total 40x for big winners (was 15x)
+_HIGH_GAIN_MULTIPLIER = 3.0     # FIX #9: Reduced from 5.0 (was 40x total, now 9x total).
+                                 # 40× weight made high-gain outliers dominate the loss
+                                 # surface and pushed all predictions toward the high end.
 
 
 def train_gain_regressor(
@@ -1877,8 +1887,38 @@ def train_gain_regressor(
     accuracy_gain_map: dict = {}
     try:
         logger.info("RC1: Fetching gain data from ml_prediction_accuracy for non-winner rows...")
-        from datetime import timedelta
-        start_date = (datetime.now().date() - timedelta(days=120)).isoformat()
+        # FIX #7: Derive start_date from the earliest date in combined_df rather
+        # than datetime.now() - 120 days.  Using wall-clock time caused two problems:
+        #   (a) Inconsistency: the classifier uses a LOOKBACK env var (e.g. 90 days)
+        #       but the gain regressor was silently fetching a wider 120-day window.
+        #   (b) Future-data leakage: in backfill runs datetime.now() is today, so
+        #       the query could return accuracy rows that post-date the training data.
+        # Using the earliest date in combined_df anchors the window to the training
+        # period, keeping both models aligned and backfill-safe.
+        date_col = next(
+            (c for c in ("detection_date", "explosion_date", "prediction_date", "date")
+             if c in combined_df.columns),
+            None,
+        )
+        if date_col is not None:
+            try:
+                start_date = pd.to_datetime(combined_df[date_col], errors="coerce").min()
+                start_date = start_date.date().isoformat() if pd.notna(start_date) else None
+            except Exception:
+                start_date = None
+        else:
+            start_date = None
+        if start_date is None:
+            # Fallback: should not normally occur; use LOOKBACK env var if set
+            import os
+            from datetime import timedelta
+            lookback_days = int(os.environ.get("LOOKBACK", "90"))
+            start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
+            logger.warning(
+                f"RC1: Could not derive start_date from combined_df; "
+                f"falling back to LOOKBACK={lookback_days} days from today ({start_date})"
+            )
+        logger.info(f"RC1: Querying ml_prediction_accuracy from {start_date}")
         resp = (
             client.table("ml_prediction_accuracy")
             .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
