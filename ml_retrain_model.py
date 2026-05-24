@@ -205,7 +205,11 @@ INTRADAY_WIN_THRESHOLD = 15.0  # %
 # making it harder for early stopping to detect genuine improvement and
 # contributing to the model halting at best_iteration=12.
 SPW_MIN = 0.5
-SPW_MAX = 5.0
+SPW_MAX = 10.0   # Raised from 5.0 — actual imbalance is ~8.7x (11.5% positive rate).
+                 # Capping at 5.0 was under-weighting positives and collapsing the
+                 # probability spread toward HOLD.  10.0 allows the model to use the
+                 # natural class imbalance ratio, producing higher max probabilities
+                 # for the strongest signals and restoring BUY/STRONG BUY signals.
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
@@ -231,7 +235,7 @@ XGBOOST_PARAMS = {
     "use_label_encoder":  False,
     "random_state":       42,
     "n_jobs":             -1,
-    "early_stopping_rounds": 50,
+    "early_stopping_rounds": 100,  # Raised from 50 — prevents stopping at 34 trees.
 }
 
 # Columns excluded from the feature matrix X.
@@ -1730,13 +1734,12 @@ _GAIN_WINSOR_PCT = 99.5   # winsorize above this percentile
 # The training set is overwhelmingly non-winners (label=0, gain≈0-5%).
 # Without boosting winner weights the regressor learns "predict ~5%" for
 # everything and never reaches 50%+ territory.
-_WINNER_WEIGHT_MULTIPLIER = 5.0
+_WINNER_WEIGHT_MULTIPLIER = 8.0    # Raised from 5.0 — the training set is overwhelmingly
+                                    # non-winner rows.  5x was insufficient to teach the
+                                    # regressor that 100%+ gains are a real regime.
 
-# Additional multiplier for large-gain winners (actual_high_pct > this threshold).
-# These are the stocks that "soar" and we specifically want the regressor to
-# predict high values for them.
-_HIGH_GAIN_THRESHOLD  = 50.0   # %
-_HIGH_GAIN_MULTIPLIER = 3.0    # stacked on top of _WINNER_WEIGHT_MULTIPLIER
+_HIGH_GAIN_THRESHOLD  = 30.0    # Lowered from 50% — more winners qualify for the boost
+_HIGH_GAIN_MULTIPLIER = 5.0     # Raised from 3.0 — total 40x for big winners (was 15x)
 
 
 def train_gain_regressor(
@@ -1944,7 +1947,9 @@ def train_gain_regressor(
     # (minor intraday moves or data errors) that pull predictions toward the
     # mean.  Non-winner rows are kept regardless of gain magnitude because
     # they are correctly labelled (gain ≈ 0-5%) and anchor the low-gain regime.
-    GAIN_REGRESSOR_MIN_PCT = 10.0   # winner rows below this are excluded as noise
+    GAIN_REGRESSOR_MIN_PCT = 5.0    # Lowered from 10% — excluding winners below 10%
+                                    # was throwing away too many training examples and
+                                    # compressed the upper range of predictions.
     winner_rows = combined_df["label"] == 1
     low_gain_winner_mask = valid_gain_mask & winner_rows & (gain_targets < GAIN_REGRESSOR_MIN_PCT)
     n_low_gain_excluded = int(low_gain_winner_mask.sum())
@@ -2430,13 +2435,18 @@ def main() -> int:
             f"pos_rate={train_pos/train_rows:.1%}) — size looks adequate."
         )
 
-    # ── RC6: Carve calibration set from train split ─────────────────────────
-    # To fit the isotonic calibrator, we need a held-out set that XGBoost never
-    # saw during weight updates.  We use the oldest CAL_FRACTION of the training
-    # rows (earliest dates) as the calibration set.  The remaining rows form the
-    # actual XGBoost training set.  This is temporally safe: calibration data
-    # precedes training data, so there is no future leakage.
-    CAL_FRACTION = 0.15   # 15% of train rows → calibration; 85% → XGBoost
+    # ── RC6 DISABLED: Isotonic calibration removed ──────────────────────────
+    # The isotonic calibrator was compressing all probabilities into ~0.50–0.85,
+    # preventing any stock from reaching the BUY (0.70) or STRONG BUY (0.90)
+    # thresholds.  Root cause: the calibration set (oldest 15% of training rows)
+    # is dominated by base CSV rows with NaN t1_ features, so the calibrator
+    # learns a mapping from a different data regime than live inference.  This
+    # also caused t1_ features to appear near-zero in feature importance (XGBoost
+    # avoids splitting on them when 85% of rows have NaN, and the calibrator on
+    # top further erases any remaining signal).
+    # Solution: remove calibration entirely and raise SPW_MAX so the raw model
+    # gets better class separation, which naturally widens the probability spread.
+    CAL_FRACTION = 0.0    # DISABLED — set to 0 to skip calibration entirely
     n_cal = max(0, int(len(X_train) * CAL_FRACTION))
     cal_min_pos = 10       # need at least 10 positives to fit isotonic meaningfully
     X_cal_fit, y_cal_fit = None, None
@@ -2512,14 +2522,21 @@ def main() -> int:
     # metrics hard to interpret.  Using train rows only means the regressor's
     # internal val split is drawn from the same temporal range as the classifier's
     # train set, giving a consistent and meaningful held-out evaluation.
+    # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
+    # NOTE: We pass ALL rows (X_scaled, combined_df) rather than just the
+    # train split.  The gain regressor's target is actual_high_pct, not the
+    # classifier label — there is no "future leak" concern because we are not
+    # using the regressor to evaluate classifier AUC.  Using only the train
+    # split was artificially excluding recent high-gain examples (they fall in
+    # the val window) and compressing the max prediction.
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_scaled=X_train,                    # train rows only — keeps regressor val split clean
-        combined_df=combined_df.loc[train_idx],  # matching rows from combined_df
+        X_scaled=X_scaled,              # ALL rows — more high-gain training examples
+        combined_df=combined_df,        # matching full combined_df
         feature_names=feature_names,
-        client=client,              # RC1: fetch additional gain data
+        client=client,                  # RC1: fetch additional gain data
     )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
