@@ -2291,7 +2291,6 @@ def main() -> int:
             if not t1_df.empty else False
         ),
         "gain_regressor_trained":  gain_regressor is not None,
-        "split_method":            f"fixed_cutoff:{VAL_CUTOFF_DATE}",
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
                                     "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
     }
@@ -2319,7 +2318,6 @@ def main() -> int:
     logger.info(f"  Validation AUC      : {auc:.4f}")
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
-    logger.info(f"  Split method        : fixed cutoff {VAL_CUTOFF_DATE} (val = everything after)")
     logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6+RC7 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
     logger.info("Files written:")
