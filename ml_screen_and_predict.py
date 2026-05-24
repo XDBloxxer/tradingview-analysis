@@ -690,8 +690,12 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ema12_v = ind.get("ema12") or float(c.mean())
     ema26_v = ind.get("ema26") or float(c.mean())
 
-    if sma20_v: ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100
-    if ema20_v: ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100
+    # Always compute price-vs-MA derivatives; the denominator is never zero
+    # because sma20_v/ema20_v fall back to c.mean() which is non-zero in
+    # practice.  Writing unconditionally eliminates any residual risk of the
+    # key being absent in the open window (train/test skew).
+    ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100 if sma20_v else 0.0
+    ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100 if ema20_v else 0.0
     ind["ema_12_26_diff"] = ema12_v - ema26_v
     ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
 
@@ -766,9 +770,14 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["donchian_middle"] = safe(dc_mid, close_v)
 
     # ── Volume ─────────────────────────────────────────────────────────────
-    vm5  = v.rolling(5).mean()
-    vm10 = v.rolling(10).mean()
-    vm20 = v.rolling(20).mean()
+    # Use min_periods=1 so that partial windows (e.g. the open window with
+    # only 12 bars) still produce a real rolling mean rather than NaN — this
+    # avoids the safe() default (v.mean()) silently replacing the indicator
+    # and keeps the feature distribution closer to what the model was trained
+    # on (where full 20-bar windows were always available at close time).
+    vm5  = v.rolling(5,  min_periods=1).mean()
+    vm10 = v.rolling(10, min_periods=1).mean()
+    vm20 = v.rolling(20, min_periods=1).mean()
     ind["volume_sma5"]  = safe(vm5,  float(v.mean()))
     ind["volume_sma10"] = safe(vm10, float(v.mean()))
     ind["volume_sma20"] = safe(vm20, float(v.mean()))
@@ -784,8 +793,14 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["obv"] = float(obv_vals[-1])
 
     # ── CMF ────────────────────────────────────────────────────────────────
-    mf_mult   = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
-    ind["cmf"] = safe(mf_mult * v / v.rolling(20).sum().replace(0, np.nan), 0.0)
+    # With <20 bars v.rolling(20).sum() is all-NaN, causing safe() to return
+    # 0.0 (instead of a real Chaikin Money Flow value).  Use the full
+    # available window (v.sum()) as the denominator when fewer than 20 bars
+    # are present so the feature carries a real signal.
+    mf_mult = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    _cmf_win = min(20, len(v))
+    _v_roll_sum = v.rolling(_cmf_win).sum().replace(0, np.nan)
+    ind["cmf"] = safe(mf_mult * v / _v_roll_sum, 0.0)
 
     # ── CCI ────────────────────────────────────────────────────────────────
     tp    = (h + l + c) / 3
@@ -835,12 +850,23 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
             ind["gap_%"] = (float(o.iloc[0]) / prev_bar - 1) * 100
 
     # ── Aroon ──────────────────────────────────────────────────────────────
-    if len(h) >= 26:
-        hi_idx = h.rolling(26).apply(lambda x: float(np.argmax(x)), raw=True)
-        lo_idx = l.rolling(26).apply(lambda x: float(np.argmin(x)), raw=True)
-        ind["aroon_up"]        = safe(hi_idx / 25 * 100, 50.0)
-        ind["aroon_down"]      = safe(lo_idx / 25 * 100, 50.0)
+    # Always compute Aroon regardless of bar count to avoid train/test skew.
+    # When fewer than 26 bars are available (e.g. the open window with ~12
+    # bars), we use the actual available window length so that a real signal
+    # is produced instead of being silently omitted and later filled with the
+    # model's _get_default_value() fallback (typically 0 or median).
+    aroon_win = min(26, len(h))
+    if aroon_win >= 2:
+        hi_idx = h.rolling(aroon_win).apply(lambda x: float(np.argmax(x)), raw=True)
+        lo_idx = l.rolling(aroon_win).apply(lambda x: float(np.argmin(x)), raw=True)
+        aroon_denom = float(aroon_win - 1) if aroon_win > 1 else 1.0
+        ind["aroon_up"]        = safe(hi_idx / aroon_denom * 100, 50.0)
+        ind["aroon_down"]      = safe(lo_idx / aroon_denom * 100, 50.0)
         ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
+    else:
+        ind["aroon_up"]        = 50.0
+        ind["aroon_down"]      = 50.0
+        ind["aroon_indicator"] = 0.0
 
     # VWAP
     try:
@@ -872,8 +898,7 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
 
     # ── Price vs SMA50 ───────────────────────────────────────────────────
     sma50_v = ind.get("sma50") or float(c.mean())
-    if sma50_v:
-        ind["price_vs_sma50"] = (close_v / sma50_v - 1) * 100
+    ind["price_vs_sma50"] = (close_v / sma50_v - 1) * 100 if sma50_v else 0.0
 
     # ── Slope indicators (5-bar linear slope) ────────────────────────────
     def _slope(series, n=5):
@@ -945,8 +970,16 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["cci"] = safe((tp14 - tp_ma14) / (0.015 * tp_md14.replace(0, np.nan)), 0.0)
 
     # ── OBV SMA20 ─────────────────────────────────────────────────────────
+    # With <20 bars (typical in the open window) rolling(20) is all-NaN.
+    # Fall back to the mean of whatever OBV values we do have so the feature
+    # is populated with a real signal rather than 0.0, which would introduce
+    # train/test skew vs. the full-session close window.
     obv_series = pd.Series(obv_vals, index=c.index)
-    ind["obv_sma20"] = safe(obv_series.rolling(20).mean(), 0.0)
+    obv_sma20_raw = obv_series.rolling(20).mean()
+    _obv_sma20_val = safe(obv_sma20_raw, float("nan"))
+    if _obv_sma20_val != _obv_sma20_val:  # isnan check without import
+        _obv_sma20_val = float(obv_series.mean()) if len(obv_series) > 0 else 0.0
+    ind["obv_sma20"] = _obv_sma20_val
 
     # ── ADXR (ADX smoothed) ───────────────────────────────────────────────
     adx_series = dx.rolling(14).mean()
