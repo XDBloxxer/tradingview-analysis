@@ -587,20 +587,32 @@ class ExplosionPredictor:
         else:
             mean_series = pd.Series(self.scaler.mean_, index=X.columns)
 
-        # Fill NaN with column means before transforming so the scaler receives
-        # no NaN input (StandardScaler.transform raises on NaN).  After scaling,
-        # column-mean inputs map to exactly 0.0, so fillna(0) post-transform is
-        # numerically identical — but we use fillna(mean) pre-transform to stay
-        # compatible with scaler internals and then fillna(0) post-transform to
-        # handle any edge-case all-NaN columns whose mean is itself NaN.
-        # This matches build_scaler() in ml_retrain_model.py: both training and
-        # inference now produce 0.0 for missing features in standardised space,
-        # so XGBoost's split branches are learned on the same representation
-        # they receive at prediction time.
+        # NaN RESTORATION FIX: mirrors build_scaler() in ml_retrain_model.py.
+        # Sparse columns (t1_ intraday features) had NaN restored after scaling
+        # during training so XGBoost learns native missing-value branches for them.
+        # At inference, live predictions always supply real t1_ data, so in practice
+        # there are no NaN values to restore here.  However, if a t1_ column is
+        # genuinely missing for a particular stock (e.g. insufficient history),
+        # we must pass NaN rather than 0.0 so XGBoost routes it through the same
+        # "missing" branch it learned during training — not the "value=mean" path.
+        SPARSE_THRESHOLD = 0.5  # must match build_scaler() in ml_retrain_model.py
+
+        # Capture NaN mask BEFORE filling (only for sparse columns)
+        coverage = X.notna().mean()
+        sparse_cols = [
+            c for c in coverage[coverage < SPARSE_THRESHOLD].index
+            if c != "has_t1_features"
+        ]
+        nan_mask_sparse = X[sparse_cols].isna() if sparse_cols else None
+
         X_filled      = X.fillna(mean_series)
         X_scaled_vals = self.scaler.transform(X_filled)
         X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
         X_scaled      = X_scaled.fillna(0.0)  # handles all-NaN columns with no mean
+
+        # Restore NaN for sparse columns so XGBoost uses its learned missing-value branch
+        if nan_mask_sparse is not None and sparse_cols:
+            X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask_sparse, other=np.nan)
 
         return X_scaled
 
