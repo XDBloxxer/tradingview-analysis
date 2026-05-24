@@ -341,12 +341,26 @@ def load_base_training_data(client: Client) -> pd.DataFrame:
     # If this number jumps week-over-week, the base table may have had extra
     # winner rows inserted (or negative rows deleted) outside of the normal
     # upload_base_training_data.py workflow.
+    #
+    # Two-tier warning:
+    #   >20%: advisory — rate is above the expected ceiling but not critical.
+    #         Likely causes: short LOOKBACK window over-representing a recent
+    #         winning streak, or mild label drift.
+    #   >25%: stronger warning — investigate before relying on this model.
     if pos_rate > 0.25:
         logger.warning(
             f"BASE DATA WARNING: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows). "
             "Expected ~5-20%. If this increased since the last run, check whether "
             "extra rows were inserted into ml_training_base (e.g. by intraday_high_labels "
             "or a backfill script), or whether negative rows were accidentally deleted."
+        )
+    elif pos_rate > 0.20:
+        logger.warning(
+            f"BASE DATA ADVISORY: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows), "
+            "above the expected ~5-20% ceiling. This is not yet critical, but may indicate "
+            "that a short LOOKBACK window is over-representing recent winning periods, or "
+            "that mild label drift has occurred. Monitor week-over-week; if the rate "
+            "continues rising, investigate ml_training_base for label imbalance."
         )
 
     return df
@@ -1062,6 +1076,16 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     n_base_before = len(base_df)
     n_t1_before   = len(t1_df)
 
+    # Capture label counts before dedup so we can audit what was dropped.
+    base_pos_before = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
+    base_neg_before = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
+    base_rate_before = base_pos_before / max(1, base_pos_before + base_neg_before)
+    logger.info(
+        f"Base data pre-dedup: {n_base_before} rows, "
+        f"pos={base_pos_before}, neg={base_neg_before}, "
+        f"pos_rate={base_rate_before:.1%}"
+    )
+
     if base_sym and "event_date" in base_df.columns:
         base_df = base_df.drop_duplicates(subset=[base_sym, "event_date"], keep="last")
     elif base_sym and "detection_date" in base_df.columns:
@@ -1073,12 +1097,41 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     n_base_dropped = n_base_before - len(base_df)
     n_t1_dropped   = n_t1_before   - len(t1_df)
 
+    # Compute per-label dedup impact so we can detect asymmetric row loss.
+    # If dedup disproportionately drops negatives (e.g. many t3/t5/t10 snapshots
+    # exist only for non-winners), the post-dedup positive rate will be inflated
+    # relative to the pre-dedup rate, and the model will train on a skewed set.
+    base_pos_after = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
+    base_neg_after = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
+    base_pos_dropped = base_pos_before - base_pos_after
+    base_neg_dropped = base_neg_before - base_neg_after
+
     logger.info(
         f"Pre-concat dedup — base: {n_base_before} → {len(base_df)} "
-        f"(dropped {n_base_dropped}, key={base_sym}+event_date); "
+        f"(dropped {n_base_dropped} rows: {base_pos_dropped} pos + {base_neg_dropped} neg, "
+        f"key={base_sym}+event_date); "
         f"T-1: {n_t1_before} → {len(t1_df)} "
         f"(dropped {n_t1_dropped}, key={t1_sym}+detection_date)"
     )
+
+    # Warn when dedup removes a disproportionate share of one label.
+    # A healthy dedup should drop roughly equal fractions of positives and
+    # negatives.  When negatives are dropped at a much higher rate the post-dedup
+    # positive rate rises, leading to an under-estimated scale_pos_weight and a
+    # model that under-penalises false positives.
+    if n_base_dropped > 0 and base_pos_before > 0 and base_neg_before > 0:
+        frac_pos_dropped = base_pos_dropped / base_pos_before
+        frac_neg_dropped = base_neg_dropped / base_neg_before
+        if frac_neg_dropped > frac_pos_dropped + 0.10:
+            logger.warning(
+                f"DEDUP ASYMMETRY WARNING: dedup dropped {frac_neg_dropped:.1%} of "
+                f"negatives but only {frac_pos_dropped:.1%} of positives from base data. "
+                f"({base_neg_dropped} neg rows vs {base_pos_dropped} pos rows removed.) "
+                "This raises the post-dedup positive rate and may cause scale_pos_weight "
+                "to underestimate the true class imbalance. Likely cause: multiple "
+                "snapshot rows (t3/t5/t10) exist only for non-winner events. "
+                "Check whether ml_training_base stores extra rows for non-winners."
+            )
 
     # Log base label distribution post-dedup so we can catch label imbalance early
     base_pos = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
@@ -1095,6 +1148,22 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
             "If winners and non-winners share the same (symbol, event_date) with "
             "different labels, keep=last may be selecting winners over non-winners. "
             "Consider auditing ml_training_base for conflicting label rows."
+        )
+    elif base_rate > 0.20:
+        # Rate is in the 20–30% amber zone.  Log with context so the operator
+        # can decide whether to investigate.  Key risk: a short LOOKBACK window
+        # (e.g. 90 days) covering a recent period with unusually many winners
+        # will inflate positive rate without any data corruption.
+        logger.warning(
+            f"Base data post-dedup positive rate is {base_rate:.1%} "
+            f"({base_pos} pos / {base_neg} neg). "
+            "This is above the expected ~5-20% ceiling. "
+            "Possible causes: (1) short LOOKBACK window covering an unusually "
+            "winner-heavy period — the model may over-represent recent market "
+            "conditions; (2) asymmetric dedup dropped more negatives than positives "
+            "(see DEDUP ASYMMETRY WARNING above if present); "
+            "(3) mild label drift in ml_training_base. "
+            "Check the pre-dedup vs post-dedup counts above to isolate the cause."
         )
 
     # ── Step 2: Concat (T-1 first so it wins any cross-source duplicates) ─────
@@ -2417,6 +2486,28 @@ def main() -> int:
         )
     logger.info(f"  Mistake samples     : {training_stats['n_mistake_samples']}")
     logger.info(f"  Positive rate       : {training_stats['positive_rate']:.1%}")
+
+    # Surface a summary-level advisory when the final positive rate is above the
+    # expected ceiling, even if it didn't trip the >25% threshold earlier.
+    # This is the number that lands in the retrain log and is easiest to monitor.
+    final_pos_rate = training_stats["positive_rate"]
+    if 0.20 < final_pos_rate <= 0.25:
+        logger.warning(
+            f"  ⚠️  Positive rate {final_pos_rate:.1%} is above the expected ~5-20% ceiling. "
+            "The model is training on a dataset where roughly 1 in 4 samples is a winner. "
+            "Possible causes: short LOOKBACK window over-representing a recent winning streak, "
+            "asymmetric deduplication dropping more negatives than positives, or label drift. "
+            "scale_pos_weight is computed from the training split class balance and will "
+            "partially compensate, but a structurally skewed dataset may still cause the "
+            "model to over-predict wins in a normal market. Review the pre/post-dedup "
+            "label counts logged above before deploying this model."
+        )
+    elif final_pos_rate > 0.25:
+        logger.warning(
+            f"  ⚠️  Positive rate {final_pos_rate:.1%} exceeds the 25% caution threshold. "
+            "This model may be over-fitted to recent market conditions. Investigate "
+            "before deploying — see dedup diagnostics logged earlier in this run."
+        )
     logger.info(f"  Validation AUC      : {auc:.4f}")
     logger.info(f"  Best iteration      : {model.best_iteration}")
     logger.info(f"  Features            : {len(feature_names)}")
