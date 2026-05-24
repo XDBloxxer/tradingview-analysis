@@ -1031,109 +1031,98 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
             f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
         )
 
-    # T-1 first so it takes priority in dedup
+    # ── Step 1: Deduplicate each frame independently, using its own natural key ──
+    #
+    # Deduplicate BEFORE concat so we never need to re-split the combined frame.
+    # This avoids every previous attempt to infer which rows belong to which
+    # source after the fact (via source column, detection_date.notna(), etc.) —
+    # all of which broke because ml_training_base contains rows from multiple
+    # pipelines with mixed source values and mixed date columns.
+    #
+    # base_df key  : (symbol, event_date)   — base rows are identified by when
+    #                the stock event happened, not when they were collected.
+    #                Multiple snapshot rows for the same event (t3/t5/t10 intervals
+    #                stored as separate rows) share the same (symbol, event_date)
+    #                and are correctly collapsed here to one row.
+    # t1_df key    : (symbol, detection_date) — T-1 rows are identified by the
+    #                day-prior detection date.  The close+open merge in
+    #                load_t1_data() already produces one row per event, but we
+    #                dedup again here as a safety net.
+    #
+    # keep="last": within base_df, later snapshots (t10 > t5 > t3) carry more
+    # history and should be preferred.  Supabase pagination returns rows in
+    # insertion order, so t10 rows (inserted last) tend to come last.
+
+    base_sym = next((c for c in ["symbol", "ticker"] if c in base_df.columns
+                     and base_df[c].notna().any()), None)
+    t1_sym   = next((c for c in ["symbol", "ticker"] if c in t1_df.columns
+                     and t1_df[c].notna().any()), None)
+
+    n_base_before = len(base_df)
+    n_t1_before   = len(t1_df)
+
+    if base_sym and "event_date" in base_df.columns:
+        base_df = base_df.drop_duplicates(subset=[base_sym, "event_date"], keep="last")
+    elif base_sym and "detection_date" in base_df.columns:
+        base_df = base_df.drop_duplicates(subset=[base_sym, "detection_date"], keep="last")
+
+    if t1_sym and "detection_date" in t1_df.columns:
+        t1_df = t1_df.drop_duplicates(subset=[t1_sym, "detection_date"], keep="first")
+
+    n_base_dropped = n_base_before - len(base_df)
+    n_t1_dropped   = n_t1_before   - len(t1_df)
+
+    logger.info(
+        f"Pre-concat dedup — base: {n_base_before} → {len(base_df)} "
+        f"(dropped {n_base_dropped}, key={base_sym}+event_date); "
+        f"T-1: {n_t1_before} → {len(t1_df)} "
+        f"(dropped {n_t1_dropped}, key={t1_sym}+detection_date)"
+    )
+
+    # Log base label distribution post-dedup so we can catch label imbalance early
+    base_pos = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
+    base_neg = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
+    base_rate = base_pos / max(1, base_pos + base_neg)
+    logger.info(
+        f"Base data after dedup: {len(base_df)} rows, "
+        f"pos={base_pos}, neg={base_neg}, pos_rate={base_rate:.1%}"
+    )
+    if base_rate > 0.30:
+        logger.warning(
+            f"Base data post-dedup positive rate is {base_rate:.1%}. "
+            "Each (symbol, event_date) pair should have one canonical label. "
+            "If winners and non-winners share the same (symbol, event_date) with "
+            "different labels, keep=last may be selecting winners over non-winners. "
+            "Consider auditing ml_training_base for conflicting label rows."
+        )
+
+    # ── Step 2: Concat (T-1 first so it wins any cross-source duplicates) ─────
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
-    # Deduplication strategy:
-    #
-    # T-1 rows use detection_date; base-CSV rows use event_date.  When both
-    # columns are present we cannot use a single (symbol, date_col) key to
-    # deduplicate *across* the two sources — but we must still deduplicate
-    # *within* each source separately so that any residual duplicate events
-    # (e.g. a symbol that appeared in both the close and open tables before
-    # the merge step, or a symbol present in both a snapshot and a later
-    # re-fetch) are eliminated.
-    sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    date_cols_present = [c for c in ["detection_date", "event_date"] if c in combined.columns]
-
-    if sym_col and len(date_cols_present) == 1:
-        # Simple case: single date column → deduplicate globally.
-        date_col = date_cols_present[0]
-        before_dedup = len(combined)
-        combined = combined.drop_duplicates(subset=[sym_col, date_col], keep="first")
-        n_dropped = before_dedup - len(combined)
-        if n_dropped > 0:
-            logger.info(f"Deduplication: removed {n_dropped} duplicate rows ({before_dedup} → {len(combined)})")
-    elif sym_col and len(date_cols_present) == 2:
-        # Two date columns present.
-        #
-        # IMPORTANT: We cannot use detection_date.notna() to identify T-1 rows
-        # because ml_training_base also has a detection_date column (it has 302
-        # columns including detection_date).  Using notna() was causing ~21k base
-        # rows to be mis-classified as T-1 and deduped against each other via
-        # (symbol, detection_date), wiping almost all base data (24111 → 2456).
-        #
-        # Correct approach: use the 'source' column that is set to "base_csv" for
-        # all rows loaded from ml_training_base (see load_base_training_data).
-        # T-1 rows have source values like "winners_day_prior_close" etc.
-        before_dedup = len(combined)
-
-        # Known T-1 source names — anything written by the daily accumulation pipeline.
-        # Any source not in this set is treated as base data (uses event_date for dedup).
-        T1_SOURCES = {
-            "winners_day_prior_close", "non_winners_day_prior_close",
-            "winners_day_prior_open",  "non_winners_day_prior_open",
-            "backfill_winner",         "backfill_non_winner",
-        }
-        if "source" in combined.columns:
-            t1_mask   = combined["source"].isin(T1_SOURCES)
-            base_mask = ~t1_mask
-            logger.info(
-                f"Deduplication: splitting by source column — "
-                f"T-1={t1_mask.sum()} ({sorted(combined.loc[t1_mask, 'source'].unique().tolist())}), "
-                f"base={base_mask.sum()} ({sorted(combined.loc[base_mask, 'source'].unique().tolist())[:5]}...)"
-            )
-        else:
-            # Fallback: if source column is missing, use detection_date.notna()
-            # (original behaviour, kept for backwards compat with unusual datasets).
-            logger.warning(
-                "Deduplication: 'source' column missing — falling back to "
-                "detection_date.notna() split. If ml_training_base has a "
-                "detection_date column this may incorrectly wipe base rows."
-            )
-            t1_mask   = combined["detection_date"].notna()
-            base_mask = ~t1_mask
-
-        # For T-1 rows: always use "symbol" (set by T-1 loading code).
-        t1_sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns
-                           and combined.loc[t1_mask, c].notna().any()), sym_col)
-        t1_part = combined[t1_mask].drop_duplicates(
-            subset=[t1_sym_col, "detection_date"], keep="first"
+    # ── Step 3: Cross-source dedup — T-1 beats base for the same event ────────
+    # A stock may appear in both T-1 (detection_date) and base (event_date) for
+    # the same real-world day.  We prefer the T-1 row (richer features).
+    # We only do this cross-source dedup when detection_date is populated, using
+    # it as the unified date key.  Base rows that have only event_date (no
+    # detection_date) are never incorrectly dropped here.
+    cross_sym = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
+    if cross_sym and "detection_date" in combined.columns:
+        n_before_cross = len(combined)
+        # Only dedup rows that actually have a detection_date (T-1 rows and any
+        # base rows that happen to have detection_date populated).
+        has_det = combined["detection_date"].notna()
+        cross_deduped = combined[has_det].drop_duplicates(
+            subset=[cross_sym, "detection_date"], keep="first"
         )
-
-        # For base CSV rows: use whichever identifier column is actually populated.
-        # After the ticker->symbol rename in load_base_training_data this should
-        # always be "symbol", but we fall back gracefully in case of legacy data.
-        base_sym_col = next((c for c in ["symbol", "ticker"] if c in combined.columns
-                             and combined.loc[base_mask, c].notna().any()), sym_col)
-        if base_sym_col is None:
-            logger.warning("Deduplication: no non-null identifier column found in base partition — skipping base dedup")
-            base_part = combined[base_mask]
-        elif "event_date" in combined.columns and combined.loc[base_mask, "event_date"].notna().any():
-            base_part = combined[base_mask].drop_duplicates(
-                subset=[base_sym_col, "event_date"], keep="first"
-            )
-        else:
-            base_part = combined[base_mask].drop_duplicates(
-                subset=[base_sym_col, "detection_date"], keep="first"
-            )
-        logger.info(
-            f"Deduplication: T-1 sym_col='{t1_sym_col}', base sym_col='{base_sym_col}' "
-            f"(base date key: {'event_date' if 'event_date' in combined.columns and combined.loc[base_mask, 'event_date'].notna().any() else 'detection_date'})"
-        )
-
-        combined  = pd.concat([t1_part, base_part], ignore_index=True, sort=False)
-        n_dropped = before_dedup - len(combined)
-        if n_dropped > 0:
+        combined = pd.concat([cross_deduped, combined[~has_det]], ignore_index=True, sort=False)
+        n_cross_dropped = n_before_cross - len(combined)
+        if n_cross_dropped > 0:
             logger.info(
-                f"Deduplication (split by source): removed {n_dropped} duplicate "
-                f"rows ({before_dedup} → {len(combined)})"
+                f"Cross-source dedup: removed {n_cross_dropped} rows where T-1 and base "
+                f"shared the same (symbol, detection_date) ({n_before_cross} → {len(combined)})"
             )
-        else:
-            logger.info(
-                "Deduplication (split by source): no duplicates found within "
-                "T-1 (detection_date) or base-CSV (event_date) partitions"
-            )
+
+    logger.info(f"Combined dataset: {len(combined)} rows")
 
     n_pos = int((combined["label"] == 1).sum())
     n_neg = int((combined["label"] == 0).sum())
