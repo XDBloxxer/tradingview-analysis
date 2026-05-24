@@ -194,14 +194,29 @@ def _fetch_t1_snapshots_for_symbols(
     Returns a DataFrame with columns renamed to model long-form names and
     prefixed by `prefix` (e.g. 't1_close_RSI_14').  rename_t1_columns() is
     applied so the feature names match what the model was trained on.
+
+    Date tolerance: also queries dates ±1 business day around each requested
+    date, because prediction_date in ml_accuracy_details sometimes differs by
+    one day from detection_date in the T-1 snapshot tables (e.g. when a
+    prediction runs after market close and detection is dated to the next day).
     """
     if not symbol_date_pairs:
         return pd.DataFrame()
 
-    # Batch queries by date to stay within URL-length limits.
-    # Each chunk sends ALL unique symbols for that date slice; since dates
-    # don't overlap between chunks there can be no duplicate rows.
-    dates   = list({pair[1] for pair in symbol_date_pairs})
+    # Build an expanded date set: each requested date ± 1 business day
+    import pandas as _pd
+    _requested_dates = {pair[1] for pair in symbol_date_pairs}
+    _expanded_dates: set[str] = set()
+    for _d in _requested_dates:
+        try:
+            _ts = _pd.Timestamp(_d)
+            _expanded_dates.add(_d)
+            _expanded_dates.add((_ts - _pd.tseries.offsets.BDay(1)).strftime("%Y-%m-%d"))
+            _expanded_dates.add((_ts + _pd.tseries.offsets.BDay(1)).strftime("%Y-%m-%d"))
+        except Exception:
+            _expanded_dates.add(_d)
+
+    dates   = sorted(_expanded_dates)
     symbols = list({pair[0] for pair in symbol_date_pairs})
 
     rows = []
@@ -225,11 +240,26 @@ def _fetch_t1_snapshots_for_symbols(
 
     df = pd.DataFrame(rows)
 
-    # Keep only the (symbol, detection_date) pairs we actually asked for
-    pair_set = set(symbol_date_pairs)
+    # Keep only rows where (symbol, detection_date) is within ±1 bday of a
+    # requested pair — use the expanded set so ±1 day matches are included.
     if "detection_date" in df.columns and "symbol" in df.columns:
+        # Build a mapping: symbol → set of acceptable dates (requested ± 1 bday)
+        sym_to_dates: dict[str, set[str]] = {}
+        for sym, req_date in symbol_date_pairs:
+            if sym not in sym_to_dates:
+                sym_to_dates[sym] = set()
+            try:
+                _ts = _pd.Timestamp(req_date)
+                sym_to_dates[sym].add(req_date)
+                sym_to_dates[sym].add((_ts - _pd.tseries.offsets.BDay(1)).strftime("%Y-%m-%d"))
+                sym_to_dates[sym].add((_ts + _pd.tseries.offsets.BDay(1)).strftime("%Y-%m-%d"))
+            except Exception:
+                sym_to_dates[sym].add(req_date)
+
         df = df[df.apply(
-            lambda r: (r["symbol"], r["detection_date"]) in pair_set, axis=1
+            lambda r: r["symbol"] in sym_to_dates
+                      and r["detection_date"] in sym_to_dates[r["symbol"]],
+            axis=1,
         )].copy()
 
     if df.empty:
@@ -426,18 +456,32 @@ def build_mistake_training_samples(
     # ── 3. Fetch T-1 close snapshots ──────────────────────────────────────
     logger.info("Fetching T-1 close snapshots for mistakes...")
 
-    # False positives: NOT in winners table → check non_winners first
+    # False positives: they were predicted as winners but weren't.
+    # They could be in either non_winners_day_prior_close (if that symbol was
+    # screened as a non-winner on another day) OR not in any T-1 table at all
+    # (if they were only in the prediction set, not the winners/non-winners
+    # collection).  Search both tables and merge the results.
     fp_close_df = pd.DataFrame()
     if fp_pairs:
-        fp_close_df = _fetch_t1_snapshots_for_symbols(
+        fp_close_non = _fetch_t1_snapshots_for_symbols(
             client, "non_winners_day_prior_close", fp_pairs, "t1_close"
         )
-        if fp_close_df.empty:
-            logger.debug("  FP: not in non_winners_close, trying winners_close...")
-            fp_close_df = _fetch_t1_snapshots_for_symbols(
-                client, "winners_day_prior_close", fp_pairs, "t1_close"
-            )
-        logger.info(f"  FP T-1 close snapshots: {len(fp_close_df)}")
+        fp_close_win = _fetch_t1_snapshots_for_symbols(
+            client, "winners_day_prior_close", fp_pairs, "t1_close"
+        )
+        # Prefer non_winners rows where both exist (FP is by definition a non-winner)
+        if not fp_close_non.empty and not fp_close_win.empty:
+            fp_close_df = pd.concat([fp_close_non, fp_close_win], ignore_index=True)
+            if "symbol" in fp_close_df.columns and "detection_date" in fp_close_df.columns:
+                fp_close_df = fp_close_df.drop_duplicates(
+                    subset=["symbol", "detection_date"], keep="first"
+                )
+        elif not fp_close_non.empty:
+            fp_close_df = fp_close_non
+        elif not fp_close_win.empty:
+            fp_close_df = fp_close_win
+        logger.info(f"  FP T-1 close snapshots: {len(fp_close_df)}"
+                    f" (from non_winners: {len(fp_close_non)}, from winners: {len(fp_close_win)})")
 
     # False negatives: ARE winners → check winners table first
     fn_close_df = pd.DataFrame()
@@ -458,9 +502,22 @@ def build_mistake_training_samples(
     if use_all_timepoints:
         logger.info("Fetching T-1 open snapshots for mistakes...")
         if fp_pairs:
-            fp_open_df = _fetch_t1_snapshots_for_symbols(
+            fp_open_non = _fetch_t1_snapshots_for_symbols(
                 client, "non_winners_day_prior_open", fp_pairs, "t1_open"
             )
+            fp_open_win = _fetch_t1_snapshots_for_symbols(
+                client, "winners_day_prior_open", fp_pairs, "t1_open"
+            )
+            if not fp_open_non.empty and not fp_open_win.empty:
+                fp_open_df = pd.concat([fp_open_non, fp_open_win], ignore_index=True)
+                if "symbol" in fp_open_df.columns and "detection_date" in fp_open_df.columns:
+                    fp_open_df = fp_open_df.drop_duplicates(
+                        subset=["symbol", "detection_date"], keep="first"
+                    )
+            elif not fp_open_non.empty:
+                fp_open_df = fp_open_non
+            elif not fp_open_win.empty:
+                fp_open_df = fp_open_win
             logger.info(f"  FP T-1 open snapshots: {len(fp_open_df)}")
         if fn_pairs:
             fn_open_df = _fetch_t1_snapshots_for_symbols(
