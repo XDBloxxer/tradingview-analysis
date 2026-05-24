@@ -1739,23 +1739,28 @@ def main():
             (predictions_df['target_gain_pct'].abs() < 0.5) |
             (predictions_df['target_gain_pct'] > 500)
         )
-        if bad_gain_mask.any():
-            n_bad = bad_gain_mask.sum()
-            logger.info(f"  Individual gain fallback applied to {n_bad} stocks")
-            predictions_df.loc[bad_gain_mask, 'target_gain_pct'] = (
-                predictions_df.loc[bad_gain_mask, 'explosion_probability']
+        # Never repopulate suppressed gains for HOLD/AVOID rows.
+        fallback_mask = bad_gain_mask.copy()
+        if 'signal' in predictions_df.columns:
+            fallback_mask &= ~predictions_df['signal'].isin(['HOLD', 'AVOID'])
+
+        if fallback_mask.any():
+            n_bad = fallback_mask.sum()
+            logger.info(f"  Individual gain fallback applied to {n_bad} BUY/STRONG BUY stocks")
+            predictions_df.loc[fallback_mask, 'target_gain_pct'] = (
+                predictions_df.loc[fallback_mask, 'explosion_probability']
                 .apply(_get_calibrated_gain_estimate)
             )
-            predictions_df.loc[bad_gain_mask, 'target_gain_low']  = (
+            predictions_df.loc[fallback_mask, 'target_gain_low']  = (
                 predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 0.5
             )
-            predictions_df.loc[bad_gain_mask, 'target_gain_high'] = (
+            predictions_df.loc[fallback_mask, 'target_gain_high'] = (
                 predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 1.8
             )
             # Tag individual-fallback rows so they're distinguishable
             if 'gain_source' not in predictions_df.columns:
                 predictions_df['gain_source'] = 'model'
-            predictions_df.loc[bad_gain_mask, 'gain_source'] = 'individual_fallback'
+            predictions_df.loc[fallback_mask, 'gain_source'] = 'individual_fallback'
 
         predictions_df = _apply_gain_rank_correction(
             predictions_df, features_df, model_prefix, logger
