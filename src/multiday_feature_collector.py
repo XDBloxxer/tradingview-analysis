@@ -128,6 +128,8 @@ TIMEFRAMES = {
 # ---------------------------------------------------------------------------
 DB_COLUMNS: set = {
     "symbol", "detection_date",
+    # Short-history quality flags (set when bars_available < MIN_BARS_WARN)
+    "insufficient_history", "bars_available",
     # ── t10 ──────────────────────────────────────────────────────────────────
     "t10_adx_14", "t10_adxr_14_2", "t10_ao", "t10_aroond_25", "t10_aroonosc_25",
     "t10_aroonu_25", "t10_atr_14", "t10_atr_14_slope", "t10_atr_20", "t10_atr_7",
@@ -205,6 +207,85 @@ DB_COLUMNS: set = {
 MAX_WORKERS = 5
 LOOKBACK_BARS = 260   # ~1 year of daily bars — enough for SMA_200
 
+# Minimum trading-day history thresholds
+MIN_BARS_FULL    = 50   # Need this many bars for SMA_50 / EMA_50
+MIN_BARS_VIABLE  = 20   # Below this, most multi-period indicators are meaningless
+MIN_BARS_WARN    = 50   # Emit a warning and set insufficient_history flag
+
+# Map each strategy indicator to the minimum number of bars it needs.
+# Indicators not listed here have a min-bar of 1 (they work on any length).
+# These minimums match the indicator's own look-back period (period + warmup).
+_INDICATOR_MIN_BARS: Dict[str, int] = {
+    # RSI variants (need period + 1 warmup)
+    "rsi_14":        15,
+    "rsi_7":          8,
+    "rsi_21":        22,
+    "rsi_28":        29,
+    # SMAs
+    "sma_5":          5,
+    "sma_10":        10,
+    "sma_20":        20,
+    "sma_50":        50,
+    # EMAs (technically work sooner but values are unreliable before period bars)
+    "ema_5":          5,
+    "ema_10":        10,
+    "ema_12":        12,
+    "ema_20":        20,
+    "ema_26":        26,
+    "ema_50":        50,
+    # WMA / HMA / VWMA
+    "wma_10":        10,
+    "wma_20":        20,
+    "hma_9":          9,
+    "hma_20":        20,
+    "vwma_20":       20,
+    # MACD needs slow EMA + signal warmup
+    "macd_12_26_9":  35,   # 26 + 9
+    "macd_6_13_5":   18,   # 13 + 5
+    # Stochastic (k period + smooth_k + d)
+    "stoch_14_3_3":  20,   # 14 + 3 + 3
+    "stoch_5_3_1":    9,   # 5  + 3 + 1
+    # Bollinger Bands
+    "bbands_20":     20,
+    # ATR
+    "atr_14":        14,
+    "atr_7":          7,
+    "atr_20":        20,
+    # ADX (needs 2× period internally)
+    "adx_14":        28,
+    # CCI
+    "cci_14":        14,
+    "cci_20":        20,
+    # Williams %R
+    "willr_14":      14,
+    # Momentum / ROC
+    "mom_10":        10,
+    "mom_20":        20,
+    "roc_10":        10,
+    "roc_20":        20,
+    # Aroon
+    "aroon_25":      25,
+    # Awesome Oscillator (uses 34-period SMA internally)
+    "ao":            34,
+    # MFI
+    "mfi_14":        14,
+    # Ultimate Oscillator
+    "uo":            28,   # longest period is 28
+    # TSI (slow + signal)
+    "tsi_13_25_13":  38,   # 25 + 13
+    # CMF
+    "cmf_20":        20,
+    # Donchian / Keltner
+    "donchian_20":   20,
+    "kc_20":         20,
+    # OBV — no min
+    # Supertrend
+    "supertrend_10": 10,
+    # Stoch RSI (rsi_length + stoch k + d)
+    "stochrsi_14":   31,   # 14 + 14 + 3
+    # VWAP — daily anchor, works with 1 bar
+}
+
 
 # ---------------------------------------------------------------------------
 # Core indicator calculation  (daily bars → single-row snapshot)
@@ -236,87 +317,121 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
 
     df["volume"] = df["volume"].replace(0, np.nan)
 
-    # ── Run pandas_ta strategy ──────────────────────────────────────────────
-    try:
-        df.ta.strategy(
-            ta.Strategy(
-                "multiday",
-                [
-                    # RSI
-                    {"kind": "rsi",       "length": 14},
-                    {"kind": "rsi",       "length": 7},
-                    {"kind": "rsi",       "length": 21},
-                    {"kind": "rsi",       "length": 28},
-                    # SMA / EMA / WMA / HMA / VWMA
-                    {"kind": "sma",       "length": 5},
-                    {"kind": "sma",       "length": 10},
-                    {"kind": "sma",       "length": 20},
-                    {"kind": "sma",       "length": 50},
-                    {"kind": "ema",       "length": 5},
-                    {"kind": "ema",       "length": 10},
-                    {"kind": "ema",       "length": 12},
-                    {"kind": "ema",       "length": 20},
-                    {"kind": "ema",       "length": 26},
-                    {"kind": "ema",       "length": 50},
-                    {"kind": "wma",       "length": 10},
-                    {"kind": "wma",       "length": 20},
-                    {"kind": "hma",       "length": 9},
-                    {"kind": "hma",       "length": 20},
-                    {"kind": "vwma",      "length": 20},
-                    # MACD (standard + fast)
-                    {"kind": "macd",      "fast": 12, "slow": 26, "signal": 9},
-                    {"kind": "macd",      "fast": 6,  "slow": 13, "signal": 5},
-                    # Stochastic (two param sets)
-                    {"kind": "stoch",     "k": 14, "d": 3, "smooth_k": 3},
-                    {"kind": "stoch",     "k": 5,  "d": 3, "smooth_k": 1},
-                    # Bollinger Bands
-                    {"kind": "bbands",    "length": 20, "std": 2.0},
-                    # ATR
-                    {"kind": "atr",       "length": 14},
-                    {"kind": "atr",       "length": 7},
-                    {"kind": "atr",       "length": 20},
-                    # ADX
-                    {"kind": "adx",       "length": 14},
-                    # CCI (two periods)
-                    {"kind": "cci",       "length": 14},
-                    {"kind": "cci",       "length": 20},
-                    # Williams %R
-                    {"kind": "willr",     "length": 14},
-                    # Momentum / ROC (two periods)
-                    {"kind": "mom",       "length": 10},
-                    {"kind": "mom",       "length": 20},
-                    {"kind": "roc",       "length": 10},
-                    {"kind": "roc",       "length": 20},
-                    # Aroon
-                    {"kind": "aroon",     "length": 25},
-                    # Awesome Oscillator
-                    {"kind": "ao"},
-                    # MFI
-                    {"kind": "mfi",       "length": 14},
-                    # Ultimate Oscillator
-                    {"kind": "uo"},
-                    # TSI
-                    {"kind": "tsi",       "fast": 13, "slow": 25, "signal": 13},
-                    # CMF
-                    {"kind": "cmf",       "length": 20},
-                    # Donchian Channels
-                    {"kind": "donchian",  "lower_length": 20, "upper_length": 20},
-                    # Keltner Channels
-                    {"kind": "kc",        "length": 20, "scalar": 2},
-                    # OBV
-                    {"kind": "obv"},
-                    # Supertrend
-                    {"kind": "supertrend","length": 10, "multiplier": 3.0},
-                    # Stoch RSI
-                    {"kind": "stochrsi",  "length": 14, "rsi_length": 14, "k": 3, "d": 3},
-                    # VWAP
-                    {"kind": "vwap"},
-                ]
-            ),
-            verbose=False,
+    n_bars = len(df)
+
+    # ── Build the indicator list, skipping any whose look-back exceeds n_bars.
+    #
+    # Root fix for the pandas_ta "iloc cannot enlarge its target object" bug:
+    # when a DataFrame is shorter than an indicator's period, pandas_ta tries
+    # to write results into a pre-allocated (too-small) slice and raises an
+    # IndexError.  Instead of catching the error after the fact (which silently
+    # drops ALL indicators), we exclude under-qualified indicators up front so
+    # the remaining ones compute cleanly.
+    # -------------------------------------------------------------------------
+    def _meets_min_bars(spec: dict) -> bool:
+        """Return True if n_bars satisfies the indicator's minimum look-back."""
+        kind   = spec.get("kind", "")
+        length = spec.get("length", spec.get("slow", spec.get("upper_length", 1)))
+        for key, min_b in _INDICATOR_MIN_BARS.items():
+            if key.startswith(kind) and key.endswith(str(length)):
+                return n_bars >= min_b
+        # Generic fallback: require at least the dominant period.
+        return n_bars >= max(int(length), 1)
+
+    all_indicators = [
+        # RSI
+        {"kind": "rsi",       "length": 14},
+        {"kind": "rsi",       "length": 7},
+        {"kind": "rsi",       "length": 21},
+        {"kind": "rsi",       "length": 28},
+        # SMA / EMA / WMA / HMA / VWMA
+        {"kind": "sma",       "length": 5},
+        {"kind": "sma",       "length": 10},
+        {"kind": "sma",       "length": 20},
+        {"kind": "sma",       "length": 50},
+        {"kind": "ema",       "length": 5},
+        {"kind": "ema",       "length": 10},
+        {"kind": "ema",       "length": 12},
+        {"kind": "ema",       "length": 20},
+        {"kind": "ema",       "length": 26},
+        {"kind": "ema",       "length": 50},
+        {"kind": "wma",       "length": 10},
+        {"kind": "wma",       "length": 20},
+        {"kind": "hma",       "length": 9},
+        {"kind": "hma",       "length": 20},
+        {"kind": "vwma",      "length": 20},
+        # MACD (standard + fast)
+        {"kind": "macd",      "fast": 12, "slow": 26, "signal": 9},
+        {"kind": "macd",      "fast": 6,  "slow": 13, "signal": 5},
+        # Stochastic (two param sets)
+        {"kind": "stoch",     "k": 14, "d": 3, "smooth_k": 3},
+        {"kind": "stoch",     "k": 5,  "d": 3, "smooth_k": 1},
+        # Bollinger Bands
+        {"kind": "bbands",    "length": 20, "std": 2.0},
+        # ATR
+        {"kind": "atr",       "length": 14},
+        {"kind": "atr",       "length": 7},
+        {"kind": "atr",       "length": 20},
+        # ADX
+        {"kind": "adx",       "length": 14},
+        # CCI (two periods)
+        {"kind": "cci",       "length": 14},
+        {"kind": "cci",       "length": 20},
+        # Williams %R
+        {"kind": "willr",     "length": 14},
+        # Momentum / ROC (two periods)
+        {"kind": "mom",       "length": 10},
+        {"kind": "mom",       "length": 20},
+        {"kind": "roc",       "length": 10},
+        {"kind": "roc",       "length": 20},
+        # Aroon
+        {"kind": "aroon",     "length": 25},
+        # Awesome Oscillator
+        {"kind": "ao"},
+        # MFI
+        {"kind": "mfi",       "length": 14},
+        # Ultimate Oscillator
+        {"kind": "uo"},
+        # TSI
+        {"kind": "tsi",       "fast": 13, "slow": 25, "signal": 13},
+        # CMF
+        {"kind": "cmf",       "length": 20},
+        # Donchian Channels
+        {"kind": "donchian",  "lower_length": 20, "upper_length": 20},
+        # Keltner Channels
+        {"kind": "kc",        "length": 20, "scalar": 2},
+        # OBV
+        {"kind": "obv"},
+        # Supertrend
+        {"kind": "supertrend","length": 10, "multiplier": 3.0},
+        # Stoch RSI
+        {"kind": "stochrsi",  "length": 14, "rsi_length": 14, "k": 3, "d": 3},
+        # VWAP
+        {"kind": "vwap"},
+    ]
+
+    eligible = [s for s in all_indicators if _meets_min_bars(s)]
+    skipped  = [s["kind"] for s in all_indicators if not _meets_min_bars(s)]
+    if skipped:
+        logger.debug(
+            f"_compute_indicators: {n_bars} bars available — skipping "
+            f"{len(skipped)} indicator(s) that need more history: {skipped}"
         )
-    except Exception as exc:
-        logger.debug(f"pandas_ta strategy error: {exc}")
+
+    # ── Run pandas_ta strategy (only eligible indicators) ───────────────────────
+    if eligible:
+        try:
+            df.ta.strategy(
+                ta.Strategy("multiday", eligible),
+                verbose=False,
+            )
+        except Exception as exc:
+            # The iloc bug should no longer fire because we pre-filtered, but
+            # keep a catch-all so any other unexpected error degrades gracefully.
+            logger.warning(
+                f"pandas_ta strategy error ({n_bars} bars, "
+                f"{len(eligible)} indicators): {exc}"
+            )
 
     # ── Raw OHLCV snapshot ───────────────────────────────────────────────────
     close  = df["close"]
@@ -406,6 +521,10 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
             val = last.get(raw_col, np.nan)
             result[base_name] = None if (pd.isna(val) or np.isinf(val)) else float(val)
 
+    # Internal metadata — not written to DB (stripped by _sanitize), but used
+    # by _process_symbol to detect stocks with insufficient trading history.
+    result["_bar_count"] = n_bars
+
     return result
 
 
@@ -463,14 +582,31 @@ def _process_symbol(
 
         raw.index = pd.to_datetime(raw.index).tz_localize(None)
 
+        # ── Detect stocks with insufficient trading history ─────────────────
+        # Count bars up to detection_date (excluding the future).
+        bars_available = int((raw.index <= detection_date).sum())
+        is_short_history = bars_available < MIN_BARS_WARN
+        if is_short_history:
+            logger.warning(
+                f"{symbol}: only {bars_available} trading day(s) of history "
+                f"(need {MIN_BARS_WARN} for full feature set). "
+                f"Long-period indicators (SMA_50, EMA_50, MACD, ADX, ...) will "
+                f"be NaN/absent.  Model score should be treated as LOW CONFIDENCE."
+            )
+
         row: Dict[str, Any] = {
-            "symbol":         symbol,
-            "detection_date": detection_date.date().isoformat(),
+            "symbol":               symbol,
+            "detection_date":       detection_date.date().isoformat(),
+            "insufficient_history": is_short_history,
+            "bars_available":       bars_available,
         }
 
         for prefix, offset in TIMEFRAMES.items():
             snap = _snapshot_for_offset(raw, detection_date, offset)
             for base_name, val in snap.items():
+                # Strip internal metadata keys — they are not DB columns.
+                if base_name.startswith("_"):
+                    continue
                 row[f"{prefix}_{base_name}"] = val
 
         return row
