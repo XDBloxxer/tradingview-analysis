@@ -1270,6 +1270,38 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 
     X = X.replace([np.inf, -np.inf], np.nan)
 
+    # ── FIX: has_t1_features binary flag ────────────────────────────────────
+    # T-1 rows (from winners_day_prior_close / non_winners_day_prior_close)
+    # have a 'source' column containing 'day_prior'.  Base CSV rows do not.
+    # XGBoost handles missingness natively but only when values are actually NaN.
+    # After fillna(col_mean), all base rows receive the same imputed constant
+    # for every t1_ column, making those features look constant for 85% of rows
+    # and causing XGBoost to ignore them entirely in feature importance.
+    # Adding a binary 'has_t1_features' column lets XGBoost build a distinct
+    # decision branch for "rows where t1_ data is real" vs "rows where it is
+    # imputed", restoring t1_ signal without any schema or scaler changes.
+    # At inference time (explosion_predictor.py) this column is always set to
+    # 1.0 because live predictions always have T-1 intraday data.
+    if "source" in df.columns:
+        X["has_t1_features"] = (
+            df["source"].str.contains("day_prior", na=False).astype(float)
+        )
+    else:
+        # Fallback: infer from NaN coverage of t1_ columns — if >50% of t1_
+        # columns are populated for a row it is almost certainly a T-1 row.
+        t1_cols = [c for c in X.columns if c.startswith(("t1_close_", "t1_open_"))]
+        if t1_cols:
+            X["has_t1_features"] = (X[t1_cols].notna().mean(axis=1) > 0.5).astype(float)
+        else:
+            X["has_t1_features"] = 0.0
+
+    n_t1_rows = int(X["has_t1_features"].sum())
+    n_base_rows = len(X) - n_t1_rows
+    logger.info(
+        f"has_t1_features flag: {n_t1_rows} T-1 rows (flag=1), "
+        f"{n_base_rows} base rows (flag=0)"
+    )
+
     logger.info(f"Feature matrix: {X.shape[0]} rows × {X.shape[1]} features")
     nan_pct = X.isna().mean().mean() * 100
     logger.info(f"Overall NaN rate: {nan_pct:.1f}% (expected for cross-lag rows)")
@@ -1872,6 +1904,27 @@ def train_gain_regressor(
     # millions are likely bad data).
     # ------------------------------------------------------------------
     valid_gain_mask = gain_targets.notna() & (gain_targets > -100.0) & (gain_targets < 10_000.0)
+
+    # ── FIX (Bug 3): Exclude low-gain winner noise rows from regressor training ──
+    # When prev_close_db is unavailable, same-day open is used as a proxy
+    # (RC2 fallback), inflating gains for gap-up stocks and producing
+    # systematically wrong labels for many of the best winners.
+    # Additionally, winner rows with actual_high_pct < 10% are mostly noise
+    # (minor intraday moves or data errors) that pull predictions toward the
+    # mean.  Non-winner rows are kept regardless of gain magnitude because
+    # they are correctly labelled (gain ≈ 0-5%) and anchor the low-gain regime.
+    GAIN_REGRESSOR_MIN_PCT = 10.0   # winner rows below this are excluded as noise
+    winner_rows = combined_df["label"] == 1
+    low_gain_winner_mask = valid_gain_mask & winner_rows & (gain_targets < GAIN_REGRESSOR_MIN_PCT)
+    n_low_gain_excluded = int(low_gain_winner_mask.sum())
+    if n_low_gain_excluded > 0:
+        valid_gain_mask = valid_gain_mask & ~low_gain_winner_mask
+        logger.info(
+            f"Bug3 FIX: Excluded {n_low_gain_excluded} winner rows with "
+            f"gain < {GAIN_REGRESSOR_MIN_PCT}% as noisy training targets. "
+            f"Non-winner rows are kept regardless of gain magnitude."
+        )
+
     n_valid = int(valid_gain_mask.sum())
     n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
     n_non_winners_with_gain = n_valid - n_winners_with_gain
@@ -2357,12 +2410,41 @@ def main() -> int:
     cal_min_pos = 10       # need at least 10 positives to fit isotonic meaningfully
     X_cal_fit, y_cal_fit = None, None
     if n_cal > 0:
-        # X_train is already sorted oldest-first (train_val_split preserves order)
-        X_cal_fit  = X_train.iloc[:n_cal]
-        y_cal_fit  = y_train.iloc[:n_cal]
-        w_train_xgb = w_train.iloc[n_cal:]
-        X_train_xgb = X_train.iloc[n_cal:]
-        y_train_xgb = y_train.iloc[n_cal:]
+        # BUG FIX: X_train is NOT sorted oldest-first.  pd.concat([t1_df, base_df])
+        # puts T-1 rows first, so iloc[:n_cal] would take recent T-1 rows (50%
+        # positive rate) instead of the oldest base rows (11% positive rate).
+        # That gives the isotonic calibrator a ~27% positive rate, causing it to
+        # squash all probabilities above ~0.7 and making STRONG BUY unreachable.
+        # Fix: sort X_train by _sort_date (oldest first) before carving the cal set.
+        _sort_dates = pd.to_datetime(
+            combined_df.loc[X_train.index, "_sort_date"]
+            if "_sort_date" in combined_df.columns
+            else combined_df.loc[X_train.index, "detection_date"]
+            if "detection_date" in combined_df.columns
+            else pd.Series(pd.NaT, index=X_train.index),
+            errors="coerce",
+        )
+        _sorted_train_idx = _sort_dates.sort_values(na_position="last").index
+        X_train_sorted   = X_train.loc[_sorted_train_idx]
+        y_train_sorted   = y_train.loc[_sorted_train_idx]
+        w_train_sorted   = w_train.loc[_sorted_train_idx]
+
+        X_cal_fit   = X_train_sorted.iloc[:n_cal]
+        y_cal_fit   = y_train_sorted.iloc[:n_cal]
+        w_train_xgb = w_train_sorted.iloc[n_cal:]
+        X_train_xgb = X_train_sorted.iloc[n_cal:]
+        y_train_xgb = y_train_sorted.iloc[n_cal:]
+
+        cal_date_range = (
+            f"{_sort_dates.loc[X_cal_fit.index].min().date()} → "
+            f"{_sort_dates.loc[X_cal_fit.index].max().date()}"
+            if _sort_dates.loc[X_cal_fit.index].notna().any() else "unknown dates"
+        )
+        logger.info(
+            f"RC6 FIX: Calibration set sorted oldest-first. "
+            f"Cal date range: {cal_date_range}. "
+            f"Cal positive rate: {y_cal_fit.mean():.1%} (should be ~10%, not ~27%)"
+        )
         cal_pos = int((y_cal_fit == 1).sum())
         cal_neg = int((y_cal_fit == 0).sum())
         logger.info(
