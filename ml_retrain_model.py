@@ -1555,7 +1555,7 @@ def train_model(
     # RC6: Post-training probability calibration
     # AUC training + scale_pos_weight together push probabilities toward
     # extremes, causing 60%+ of post-screener stocks to cluster at STRONG BUY.
-    # Fitting an isotonic calibrator on a clean held-out calibration set corrects
+    # Fitting a sigmoid calibrator on a clean held-out calibration set corrects
     # this without affecting AUC / rank order (isotonic regression is rank-preserving).
     if X_cal is not None and y_cal is not None:
         n_cal_pos = int((y_cal == 1).sum())
@@ -1567,7 +1567,7 @@ def train_model(
                 f"({n_cal_pos} pos / {n_cal_neg} neg)."
             )
             calibrated_model = CalibratedClassifierCV(
-                model, method="isotonic", cv="prefit"
+                model, method="sigmoid", cv="prefit"
             )
             calibrated_model.fit(X_cal, y_cal)
             # Sanity-check: log how calibration shifted the distribution
@@ -1588,12 +1588,12 @@ def train_model(
             logger.warning(
                 f"RC6: Calibration set too small or imbalanced "
                 f"({n_cal_pos} pos / {n_cal_neg} neg) — "
-                "skipping isotonic calibration. Returning raw model."
+                "skipping sigmoid calibration. Returning raw model."
             )
     else:
         logger.info(
             "RC6: No calibration set provided — returning raw (uncalibrated) model. "
-            "Pass X_cal/y_cal to train_model() to enable isotonic calibration."
+            "Pass X_cal/y_cal to train_model() to enable sigmoid calibration."
         )
 
     return model
