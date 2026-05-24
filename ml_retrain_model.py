@@ -2513,30 +2513,36 @@ def main() -> int:
 
     # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
     # EVALUATION INTEGRITY FIX: Pass only X_train (classifier's train split) and
-    # train_idx so the gain regressor builds its own internal val split exclusively
-    # from the classifier's training period.  Previously X_scaled (all rows) was
-    # passed in, causing the regressor's internal "val" window to be a mixed-regime
-    # slice that overlapped both the classifier's train and val rows.  This did not
-    # affect classifier correctness, but the regressor's reported val MAE/R² was
-    # measured on that mixed window instead of a clean future period, making the
-    # metrics hard to interpret.  Using train rows only means the regressor's
-    # internal val split is drawn from the same temporal range as the classifier's
-    # train set, giving a consistent and meaningful held-out evaluation.
-    # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
-    # NOTE: We pass ALL rows (X_scaled, combined_df) rather than just the
-    # train split.  The gain regressor's target is actual_high_pct, not the
-    # classifier label — there is no "future leak" concern because we are not
-    # using the regressor to evaluate classifier AUC.  Using only the train
-    # split was artificially excluding recent high-gain examples (they fall in
-    # the val window) and compressing the max prediction.
+    # combined_df.loc[train_idx] so the gain regressor builds its own internal val
+    # split exclusively from the classifier's training period.
+    #
+    # Passing X_scaled (all rows) here causes the regressor's internal time-based
+    # 80/20 split (inside train_gain_regressor, ~line 1895) to draw from the full
+    # dataset.  Because the classifier's val rows (the most recent ~VAL_WEEKS of
+    # data) are in that pool, the regressor's internal validation window overlaps
+    # the classifier's validation period.  This inflates the regressor's reported
+    # MAE/R² (it is evaluated on data it has effectively trained on) and means the
+    # combined system is optimising on partially future-seen data.
+    #
+    # The earlier rationalisation ("gain targets aren't classifier labels, so no
+    # leak") is incorrect: the gain regressor is trained on the same rows as the
+    # classifier, and its internal split draws from the same timeline.  Leakage
+    # occurs not through label identity but through temporal overlap.
+    #
+    # Using train rows only means the regressor's internal val split is drawn
+    # exclusively from the classifier's training period, giving a consistent and
+    # meaningful held-out evaluation with no future-data contamination.
+    #
+    # If excluding the most-recent ~VAL_WEEKS compresses the gain distribution too
+    # much, lower VAL_WEEKS (e.g. from 8 to 4) rather than reverting this fix.
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled,              # ALL rows — more high-gain training examples
-        combined_df=combined_df,        # matching full combined_df
+        X_scaled=X_train,                           # train rows only — no val-period leakage
+        combined_df=combined_df.loc[train_idx],     # matching train-split rows
         feature_names=feature_names,
-        client=client,                  # RC1: fetch additional gain data
+        client=client,                              # RC1: fetch additional gain data
     )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
