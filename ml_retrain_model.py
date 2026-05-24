@@ -249,6 +249,21 @@ NON_FEATURE_COLS = {
     # Training metadata: table bookkeeping columns, not predictive signals
     "snapshot_date", "snapshot_type", "snapshot_time",
     "event_date", "days_since_event", "interval",
+    # ── Raw OHLCV multiday features (t3/t5/t10) ──────────────────────────────
+    # These are price-level features that do not generalise out-of-sample:
+    #   • Affected by stock splits, reverse splits, and delistings.
+    #   • Susceptible to survivor bias in historical training data.
+    #   • t3_high alone held 19.2 % feature importance, indicating the model
+    #     was learning "high-priced stocks explode" rather than a real signal.
+    # The multiday_feature_collector no longer writes these columns for new rows.
+    # They are explicitly excluded here so that any legacy historical rows that
+    # still carry them in the DB do not leak back into future retrains.
+    # Derived / normalised indicators (price_vs_sma20, volume_ratio, hv_*, etc.)
+    # that depend on price internally are still included — they capture the
+    # signal without exposing the raw price level.
+    "t3_open", "t3_high", "t3_low", "t3_close", "t3_volume",
+    "t5_open", "t5_high", "t5_low", "t5_close", "t5_volume",
+    "t10_open", "t10_high", "t10_low", "t10_close", "t10_volume",
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
