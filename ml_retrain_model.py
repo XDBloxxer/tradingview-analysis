@@ -1006,16 +1006,59 @@ def apply_intraday_high_labels(
     The label was wrong.
 
     Only upgrades label from 0→1 (never downgrades 1→0).
+
+    SELECTION-BIAS FIX: Relabelling is restricted to rows that originated from
+    the winners_day_prior_* tables (true winners where only the close was
+    missed).  Rows from non_winners_day_prior_* are excluded because
+    actual_high_pct is only populated for stocks that passed the screener on
+    that day.  Allowing screener-passing non-winners to be relabelled creates
+    a circular feature-label correlation: the model learns "screener passers
+    with high volatility → winner", which does not generalise to stocks the
+    screener never saw.  Restricting to winners_day_prior rows avoids this
+    bias while still correcting genuine mislabels (big intraday moves that
+    simply didn't close in the top-N).
     """
     if "actual_high_pct" not in combined_df.columns:
         return combined_df
 
+    combined_df = combined_df.copy()
+
     before = int((combined_df["label"] == 1).sum())
+
+    # Build the eligible-rows mask: only rows from winners_day_prior tables.
+    # The "source" column is set to the originating table name in load_t1_data()
+    # (e.g. "winners_day_prior_close" / "winners_day_prior_open").
+    # Base-CSV rows carry source="base_csv" and are also excluded because
+    # actual_high_pct on base rows suffers from the same screener selection
+    # bias as non_winners rows.
+    if "source" in combined_df.columns:
+        from_winners_table = combined_df["source"].str.contains(
+            "winners_day_prior", na=False
+        ) & ~combined_df["source"].str.contains(
+            "non_winners", na=False
+        )
+        n_eligible = int(from_winners_table.sum())
+        n_excluded = int((~from_winners_table).sum())
+        logger.info(
+            f"Intraday-high relabelling: {n_eligible} rows eligible "
+            f"(winners_day_prior only); {n_excluded} rows excluded "
+            f"(non_winners_day_prior / base_csv) to prevent selection bias."
+        )
+    else:
+        # No source column — fall back to relabelling all rows but warn loudly
+        # so the operator knows the bias guard is inactive.
+        logger.warning(
+            "Intraday-high relabelling: 'source' column not found. "
+            "Applying relabelling to ALL rows — selection-bias guard inactive. "
+            "Ensure load_t1_data() sets df['source'] = table_name."
+        )
+        from_winners_table = pd.Series(True, index=combined_df.index)
+
     mask = (
         (combined_df["label"] == 0) &
+        from_winners_table &
         (pd.to_numeric(combined_df["actual_high_pct"], errors="coerce") >= threshold)
     )
-    combined_df = combined_df.copy()
     combined_df.loc[mask, "label"] = 1
 
     # Bump sample weight for these relabelled rows — they're high-signal examples
@@ -1025,8 +1068,10 @@ def apply_intraday_high_labels(
     if after > before:
         logger.info(
             f"Intraday-high relabelling: {after - before} rows upgraded to label=1 "
-            f"(actual_high_pct >= {threshold}%)"
+            f"(actual_high_pct >= {threshold}%, winners_day_prior rows only)"
         )
+    else:
+        logger.info("Intraday-high relabelling: no rows upgraded (none met criteria).")
     return combined_df
 
 
