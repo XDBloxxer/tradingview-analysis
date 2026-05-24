@@ -2141,7 +2141,7 @@ def save_outputs(
         "features":              feature_names,
         "feature_names_sample":  feature_names[:20],
         "best_iteration":        int(model.best_iteration),
-        "best_val_logloss":      float(model.best_score),
+        "best_val_auc":          float(model.best_score),  # renamed from best_val_logloss; metric is AUC (eval_metric="auc")
         "gain_regressor_trained": gain_regressor is not None,
         "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
                                   "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
