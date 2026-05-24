@@ -213,15 +213,15 @@ SPW_MAX = 10.0   # Raised from 5.0 — actual imbalance is ~8.7x (11.5% positive
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
-    "max_depth":          5,       # reduced from 6 → less overfitting
+    "max_depth":          3,       # reduced from 6 → less overfitting
     "learning_rate":      0.05,
     "subsample":          0.8,
     "colsample_bytree":   0.8,
     "min_child_weight":   10,      # raised from 3 → requires more samples per leaf
-    "gamma":              1.0,     # raised from 0.1 → higher minimum gain to split
+    "gamma":              2.0,     # raised from 0.1 → higher minimum gain to split
     "reg_alpha":          0.5,     # raised from 0.1 → more L1 regularisation
     "reg_lambda":         2.0,     # raised from 1.0 → more L2 regularisation
-    "scale_pos_weight":   1,       # overridden at train time (clamped to SPW_MIN/MAX)
+    "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
     "objective":          "binary:logistic",
     # eval_metric changed from "logloss" to "auc":
     # logloss is sensitive to predicted probability calibration.  When the val
