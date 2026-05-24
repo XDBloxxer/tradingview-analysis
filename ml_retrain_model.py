@@ -1322,18 +1322,16 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     Call scale_with_fitted_scaler(scaler, X_val) to transform the val set
     (or any other split) using the same, already-fitted scaler.
 
-    NaN positions are filled with 0.0 after scaling (0.0 == column mean in
-    standardised space).  This matches exactly what _scale_features() does at
-    inference time, so XGBoost's internal missing-value split branches are
-    learned on the same representation they will receive during prediction.
-
-    Previously NaN was restored after scaling during training while inference
-    filled with the column mean *before* scaling (producing 0.0 after scaling).
-    These are numerically equivalent but XGBoost treats explicit NaN and 0.0
-    differently when routing samples through trees, causing misrouted predictions
-    for any feature that is genuinely absent at inference time (e.g. t10_ features
-    for stocks with fewer than 10 days of data).
+    NaN RESTORATION FIX (t1_ features): Sparse columns (coverage < SPARSE_THRESHOLD)
+    have NaN restored AFTER scaling so XGBoost can use its native missing-value
+    branch logic.  Previously fillna(col_mean) → scale → fillna(0.0) made these
+    columns appear as the constant 0.0 for 85% of rows, hiding them from gain-based
+    feature importance entirely.  StandardScaler still receives NaN-free input
+    (required), but XGBoost receives NaN for genuinely absent values, matching the
+    inference path in _scale_features() in explosion_predictor.py.
     """
+    SPARSE_THRESHOLD = 0.5   # columns with < 50% coverage get NaN restored post-scale
+
     scaler        = StandardScaler()
     col_means     = X_train.mean()           # computed on train rows only
     X_filled      = X_train.fillna(col_means)
@@ -1344,20 +1342,45 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     # Fill any remaining NaN (e.g. columns with all-NaN that have no mean) with 0.
     X_scaled      = X_scaled.fillna(0.0)
 
+    # ── Restore NaN for sparse (t1_) columns so XGBoost uses missing-value branches ──
+    # Identify columns with low coverage in the training set.  These are almost
+    # always t1_ intraday columns which are NaN for every base-CSV row.
+    # Restoring NaN lets XGBoost route base rows through its learned "missing"
+    # branch rather than treating them as "value = column mean", which was causing
+    # all t1_ features to appear constant for 85% of rows and be ignored.
+    coverage = X_train.notna().mean()
+    sparse_cols = coverage[coverage < SPARSE_THRESHOLD].index.tolist()
+    # has_t1_features is binary (0/1) and always dense — never restore NaN on it
+    sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
+    if sparse_cols:
+        nan_mask = X_train[sparse_cols].isna()
+        X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask, other=np.nan)
+        logger.info(
+            f"NaN restored for {len(sparse_cols)} sparse columns "
+            f"(coverage < {SPARSE_THRESHOLD:.0%}) so XGBoost uses native missing-value branches. "
+            f"Examples: {sparse_cols[:5]}"
+        )
+
     return scaler, X_scaled
 
 
 def scale_with_fitted_scaler(
     scaler: StandardScaler,
     X: pd.DataFrame,
+    sparse_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
     Transform X using an already-fitted scaler (e.g. to scale the val set or
     to reassemble a full scaled DataFrame for the gain regressor).
 
-    NaN handling mirrors build_scaler: fill with the scaler's own mean_ before
-    transforming (equivalent to filling with 0.0 in standardised space), then
-    zero-fill any remaining NaN columns.
+    NaN RESTORATION FIX: mirrors build_scaler — sparse columns (those whose
+    scaler mean_ was computed from < sparse_threshold coverage) have NaN restored
+    after scaling so XGBoost receives genuinely missing values rather than 0.0.
+    The threshold is inferred from scaler.n_samples_seen_ and the non-zero
+    count stored in scaler.mean_ (columns that were all-NaN get mean_=0).
+    Simpler: we restore NaN wherever the INPUT X had NaN, for all columns whose
+    overall NaN rate in X exceeds (1 - sparse_threshold).  This is consistent
+    with build_scaler which uses X_train coverage to decide.
     """
     col_means = pd.Series(scaler.mean_, index=X.columns)
     X_filled  = X.fillna(col_means)
@@ -1365,6 +1388,14 @@ def scale_with_fitted_scaler(
     X_scaled_vals = scaler.transform(X_filled)
     X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
     X_scaled      = X_scaled.fillna(0.0)
+
+    # ── Restore NaN for sparse columns (mirrors build_scaler logic) ────────────
+    coverage = X.notna().mean()
+    sparse_cols = coverage[coverage < sparse_threshold].index.tolist()
+    sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
+    if sparse_cols:
+        nan_mask = X[sparse_cols].isna()
+        X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask, other=np.nan)
 
     return X_scaled
 
