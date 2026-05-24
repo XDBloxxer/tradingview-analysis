@@ -469,6 +469,14 @@ class ExplosionPredictor:
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
+        # FIX #6: Explicitly set has_t1_features = 1.0 in the input data BEFORE
+        # the feature loop so the column is found via a direct match and never
+        # appears in missing_names / the "MISSING features" log line.
+        # Live inference always has real T-1 intraday data, so this is always 1.
+        if "has_t1_features" in self.feature_names:
+            data_df = data_df.copy()
+            data_df["has_t1_features"] = 1.0
+
         input_norm_to_col: Dict[str, str] = {_norm(c): c for c in data_df.columns}
 
         feature_data: dict = {}
@@ -515,17 +523,9 @@ class ExplosionPredictor:
                 f"but features were built with '{self._model_feature_prefix}' prefix."
             )
 
-        # ── FIX (Bug 2): has_t1_features flag for live inference ────────────────
-        # During retraining, prepare_features() in ml_retrain_model.py adds a
-        # 'has_t1_features' binary column (1 for T-1 rows, 0 for base CSV rows)
-        # so XGBoost can learn a distinct decision branch for each data regime.
-        # At inference time, live predictions ALWAYS have real T-1 intraday data,
-        # so we unconditionally set has_t1_features = 1.0.
-        # This must happen AFTER the feature_data loop (which would set it to 0.0
-        # via _get_default_value if it is listed in self.feature_names) so that
-        # we always override with the correct live-inference value.
-        if "has_t1_features" in self.feature_names:
-            feature_df["has_t1_features"] = 1.0
+        # Note: has_t1_features is injected into data_df at the top of this
+        # method (before the feature loop) so it is picked up via a direct match
+        # and never lands in missing_names.  No post-loop override needed.
 
         if not self._diag_done:
             self._log_feature_diagnostics(feature_df, match_log)
@@ -749,11 +749,18 @@ class ExplosionPredictor:
             f"std={probabilities.std():.6f}"
         )
 
-        self._is_bimodal = self._detect_bimodal(probabilities)
+        self._is_bimodal = True   # FIX #8: relative ranking is always active.
+        # The screener deliberately filters for high-volatility / high-volume
+        # candidates, which means the model's post-screener probability
+        # distribution almost always clusters at the high end (≥0.90 for 50%+
+        # of stocks), making absolute SIGNAL_THRESHOLDS a dead code path.
+        # Rather than keep two divergent paths where one is never reached,
+        # we make percentile-based (relative) ranking the sole mode.
+        # _detect_bimodal() is retained below for diagnostic logging only.
+        self._detect_bimodal(probabilities)   # log only — result is ignored
 
         prob_series = pd.Series(probabilities, index=data_df.index)
-        signals     = (self._classify_signals_relative(prob_series) if self._is_bimodal
-                       else prob_series.apply(self._classify_signal_absolute))
+        signals     = self._classify_signals_relative(prob_series)
 
         result_df = pd.DataFrame({
             "explosion_probability": probabilities,
