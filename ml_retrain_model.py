@@ -1325,6 +1325,7 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
     feature_cols = [
         c for c in df.columns
         if any(c.startswith(pfx) for pfx in FEATURE_PREFIXES)
+        and c not in NON_FEATURE_COLS  # exclude raw OHLCV and other non-predictive cols
     ]
 
     X = df[feature_cols].copy()
@@ -1700,6 +1701,59 @@ def train_val_split(
     y_val   = y.loc[val_idx]
     w_train = w.loc[train_idx]
     w_val   = w.loc[val_idx]
+
+    logger.info(
+        f"Train/val split (before rebalance): {len(X_train)} train "
+        f"(pos={int((y_train==1).sum())}, neg={int((y_train==0).sum())}), "
+        f"{len(X_val)} val "
+        f"(pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())})"
+    )
+
+    # ── VAL REBALANCE: cap val positive rate to match real-world base rate ────
+    # The 8-week val window is dominated by T-1 rows, which are stored at ~50%
+    # positive rate (equal counts of winners and non-winners per day).  The train
+    # set reflects the real base rate (~10%).  This mismatch makes the val
+    # classification report and probability calibration misleading, and is the
+    # root cause of Mode D (high-prob clustering) firing on every prediction run.
+    #
+    # Fix: compute the positive rate of the TRAIN set and trim val positives
+    # (moving excess to train) until val positive rate ≤ train positive rate + 2pp.
+    # We move rows rather than downsample so no data is thrown away.
+    #
+    # "2pp headroom" allows T-1 rows to contribute a slightly higher positive
+    # rate without requiring us to bleed positives all the way to 9%.
+    _train_pos_rate = int((y_train == 1).sum()) / max(1, len(y_train))
+    _val_pos_rate   = int((y_val == 1).sum())   / max(1, len(y_val))
+    _MAX_VAL_POS_RATE = _train_pos_rate + 0.02   # 2 pp headroom
+
+    if _val_pos_rate > _MAX_VAL_POS_RATE:
+        # How many positives to keep in val so rate == _MAX_VAL_POS_RATE
+        _val_neg = int((y_val == 0).sum())
+        _target_val_pos = max(
+            MIN_VAL_POSITIVES,
+            int(_val_neg * _MAX_VAL_POS_RATE / max(1 - _MAX_VAL_POS_RATE, 1e-9)),
+        )
+        _excess_pos_idx = y_val[y_val == 1].index[_target_val_pos:]  # move these to train
+
+        if len(_excess_pos_idx) > 0:
+            # Move excess val positives → train
+            val_idx   = [i for i in val_idx   if i not in set(_excess_pos_idx)]
+            train_idx = list(train_idx) + list(_excess_pos_idx)
+
+            X_train = X.loc[train_idx]
+            X_val   = X.loc[val_idx]
+            y_train = y.loc[train_idx]
+            y_val   = y.loc[val_idx]
+            w_train = w.loc[train_idx]
+            w_val   = w.loc[val_idx]
+
+            logger.info(
+                f"VAL REBALANCE: moved {len(_excess_pos_idx)} excess positives from val → train "
+                f"(val rate was {_val_pos_rate:.1%} vs train rate {_train_pos_rate:.1%}). "
+                f"New val: {len(X_val)} rows, "
+                f"pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())}, "
+                f"pos_rate={int((y_val==1).sum())/max(1,len(y_val)):.1%}"
+            )
 
     logger.info(
         f"Train/val split: {len(X_train)} train "
@@ -2535,77 +2589,58 @@ def main() -> int:
             f"pos_rate={train_pos/train_rows:.1%}) — size looks adequate."
         )
 
-    # ── RC6 DISABLED: Isotonic calibration removed ──────────────────────────
-    # The isotonic calibrator was compressing all probabilities into ~0.50–0.85,
-    # preventing any stock from reaching the BUY (0.70) or STRONG BUY (0.90)
-    # thresholds.  Root cause: the calibration set (oldest 15% of training rows)
-    # is dominated by base CSV rows with NaN t1_ features, so the calibrator
-    # learns a mapping from a different data regime than live inference.  This
-    # also caused t1_ features to appear near-zero in feature importance (XGBoost
-    # avoids splitting on them when 85% of rows have NaN, and the calibrator on
-    # top further erases any remaining signal).
-    # Solution: remove calibration entirely and raise SPW_MAX so the raw model
-    # gets better class separation, which naturally widens the probability spread.
-    CAL_FRACTION = 0.0    # DISABLED — set to 0 to skip calibration entirely
-    n_cal = max(0, int(len(X_train) * CAL_FRACTION))
-    cal_min_pos = 10       # need at least 10 positives to fit isotonic meaningfully
+    # ── RC6: Isotonic calibration from a VAL-set stratified holdout ──────────
+    # Previous attempts carved the cal set from the oldest training rows, which
+    # are dominated by base CSV rows with NaN t1_ features — a different data
+    # regime from inference.  That caused the calibrator to compress all
+    # probabilities into ~0.50–0.85 and was correctly disabled.
+    #
+    # Fix: carve the calibration set from the VAL set instead.  Val rows are
+    # recent T-1 data (same regime as inference: all t1_ features present).
+    # We reserve half the val set for calibration and use the remaining half
+    # for early-stopping AUC.  Both halves still come entirely from after the
+    # cutoff date, so there is no temporal leakage into training.
+    #
+    # Minimum requirements: ≥10 positives in each half after the split.
+    CAL_MIN_POS = 10
     X_cal_fit, y_cal_fit = None, None
-    if n_cal > 0:
-        # BUG FIX: X_train is NOT sorted oldest-first.  pd.concat([t1_df, base_df])
-        # puts T-1 rows first, so iloc[:n_cal] would take recent T-1 rows (50%
-        # positive rate) instead of the oldest base rows (11% positive rate).
-        # That gives the isotonic calibrator a ~27% positive rate, causing it to
-        # squash all probabilities above ~0.7 and making STRONG BUY unreachable.
-        # Fix: sort X_train by _sort_date (oldest first) before carving the cal set.
-        _sort_dates = pd.to_datetime(
-            combined_df.loc[X_train.index, "_sort_date"]
-            if "_sort_date" in combined_df.columns
-            else combined_df.loc[X_train.index, "detection_date"]
-            if "detection_date" in combined_df.columns
-            else pd.Series(pd.NaT, index=X_train.index),
-            errors="coerce",
-        )
-        _sorted_train_idx = _sort_dates.sort_values(na_position="last").index
-        X_train_sorted   = X_train.loc[_sorted_train_idx]
-        y_train_sorted   = y_train.loc[_sorted_train_idx]
-        w_train_sorted   = w_train.loc[_sorted_train_idx]
+    X_val_xgb, y_val_xgb = X_val, y_val
 
-        X_cal_fit   = X_train_sorted.iloc[:n_cal]
-        y_cal_fit   = y_train_sorted.iloc[:n_cal]
-        w_train_xgb = w_train_sorted.iloc[n_cal:]
-        X_train_xgb = X_train_sorted.iloc[n_cal:]
-        y_train_xgb = y_train_sorted.iloc[n_cal:]
+    _val_pos_idx  = y_val[y_val == 1].index.tolist()
+    _val_neg_idx  = y_val[y_val == 0].index.tolist()
+    _n_cal_pos    = len(_val_pos_idx) // 2
+    _n_cal_neg    = len(_val_neg_idx) // 2
 
-        cal_date_range = (
-            f"{_sort_dates.loc[X_cal_fit.index].min().date()} → "
-            f"{_sort_dates.loc[X_cal_fit.index].max().date()}"
-            if _sort_dates.loc[X_cal_fit.index].notna().any() else "unknown dates"
-        )
-        logger.info(
-            f"RC6 FIX: Calibration set sorted oldest-first. "
-            f"Cal date range: {cal_date_range}. "
-            f"Cal positive rate: {y_cal_fit.mean():.1%} (should be ~10%, not ~27%)"
-        )
+    if _n_cal_pos >= CAL_MIN_POS and _n_cal_neg >= CAL_MIN_POS:
+        # Stratified split of val: first half → calibration, second half → early-stop
+        _cal_idx  = _val_pos_idx[:_n_cal_pos]  + _val_neg_idx[:_n_cal_neg]
+        _stop_idx = _val_pos_idx[_n_cal_pos:]  + _val_neg_idx[_n_cal_neg:]
+
+        X_cal_fit    = X_val.loc[_cal_idx]
+        y_cal_fit    = y_val.loc[_cal_idx]
+        X_val_xgb    = X_val.loc[_stop_idx]
+        y_val_xgb    = y_val.loc[_stop_idx]
+
         cal_pos = int((y_cal_fit == 1).sum())
         cal_neg = int((y_cal_fit == 0).sum())
         logger.info(
-            f"RC6: Reserved {n_cal} rows for isotonic calibration "
-            f"({cal_pos} pos / {cal_neg} neg). "
-            f"XGBoost training on remaining {len(X_train_xgb)} rows."
+            f"RC6: Calibration set carved from val (same T-1 regime as inference). "
+            f"Cal: {len(X_cal_fit)} rows ({cal_pos} pos / {cal_neg} neg, "
+            f"rate={cal_pos/max(1,len(X_cal_fit)):.1%}). "
+            f"Early-stop val: {len(X_val_xgb)} rows "
+            f"({int((y_val_xgb==1).sum())} pos / {int((y_val_xgb==0).sum())} neg)."
         )
-        if cal_pos < cal_min_pos:
-            logger.warning(
-                f"RC6: Calibration slice has only {cal_pos} positives "
-                f"(need ≥ {cal_min_pos}) — isotonic calibration will be skipped. "
-                "Consider a larger dataset or increasing CAL_FRACTION."
-            )
-            X_cal_fit, y_cal_fit = None, None
-            X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
     else:
-        X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
+        logger.info(
+            f"RC6: Val set too small to split for calibration "
+            f"({_n_cal_pos} pos / {_n_cal_neg} neg per half, need ≥{CAL_MIN_POS} each). "
+            "Training without isotonic calibration."
+        )
+
+    X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val, y_val,
+    model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val_xgb, y_val_xgb,
                         X_cal=X_cal_fit, y_cal=y_cal_fit)
 
     # ── Feature importance ────────────────────────────────────────────────────
