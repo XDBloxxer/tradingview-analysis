@@ -1470,10 +1470,15 @@ def train_gain_regressor(
     Train a regression model to predict actual % gain for stocks the
     classifier labels as winners.
 
-    ISSUE #1 (historical): X_scaled passed here contains ALL rows (train + val)
-      because the gain regressor manages its own internal time-based val split
-      and is a separate model from the classifier.  The classifier's val set
-      does not constitute leakage for the gain regressor.
+    ISSUE #1 (historical): X_scaled was previously passed here with ALL rows
+      (train + val), causing the regressor's own internal time-based val split
+      to be a mixed-regime window that overlapped the classifier's val rows.
+      This was not a correctness issue for the classifier, but it made the
+      regressor's reported val MAE/R² meaningless as an evaluation signal.
+    EVALUATION INTEGRITY FIX: The caller now passes only the classifier's
+      train rows (X_train + combined_df.loc[train_idx]), so the regressor's
+      internal 80/20 split is entirely within the training period and the
+      held-out val window reflects a clean, future-relative evaluation.
 
     RC1 FIX: Broaden training set beyond just winners.
       - Winners from daily_winners (with corrected actual_high_pct via prev_close)
@@ -2068,9 +2073,8 @@ def main() -> int:
     scaler, X_train = build_scaler(X_train_raw)                    # fit + transform train
     X_val           = scale_with_fitted_scaler(scaler, X_val_raw)  # transform val only
 
-    # Reassemble a full scaled DataFrame (train + val, original row order) for
-    # the gain regressor, which manages its own internal train/val split and has
-    # no leakage concern with respect to the classifier's val set.
+    # Reassemble a full scaled DataFrame (train + val, original row order) kept
+    # for any downstream use that genuinely needs all rows.
     X_scaled = pd.concat([X_train, X_val]).loc[X.index]  # restore original row order
 
     # ── Train-set size guard ──────────────────────────────────────────────────
@@ -2127,16 +2131,22 @@ def main() -> int:
     fi_df = compute_feature_importance(model, feature_names)
 
     # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
-    # NOTE: X_scaled and combined_df contain ALL rows (train + val).  The gain
-    # regressor is a separate model with a different target (actual_gain_pct) and
-    # no leakage concern — it is evaluated on its own internal time-based val
-    # split (see train_gain_regressor), not on the classifier's val set.
+    # EVALUATION INTEGRITY FIX: Pass only X_train (classifier's train split) and
+    # train_idx so the gain regressor builds its own internal val split exclusively
+    # from the classifier's training period.  Previously X_scaled (all rows) was
+    # passed in, causing the regressor's internal "val" window to be a mixed-regime
+    # slice that overlapped both the classifier's train and val rows.  This did not
+    # affect classifier correctness, but the regressor's reported val MAE/R² was
+    # measured on that mixed window instead of a clean future period, making the
+    # metrics hard to interpret.  Using train rows only means the regressor's
+    # internal val split is drawn from the same temporal range as the classifier's
+    # train set, giving a consistent and meaningful held-out evaluation.
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
     logger.info("=" * 60)
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled,       # use ALL rows — gain regressor is a separate model
-        combined_df=combined_df, # with a different target (actual_gain_pct), no leakage concern
+        X_scaled=X_train,                    # train rows only — keeps regressor val split clean
+        combined_df=combined_df.loc[train_idx],  # matching rows from combined_df
         feature_names=feature_names,
         client=client,              # RC1: fetch additional gain data
     )
