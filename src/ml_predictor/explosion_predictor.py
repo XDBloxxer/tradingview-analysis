@@ -1,7 +1,7 @@
 """
 Explosion Predictor
 
-FIXES IN THIS VERSION (2026-03-02 v4 + 2026 RC4/RC5 gain fixes):
+FIXES IN THIS VERSION (2026-03-02 v4 + 2026 RC4/RC5/RC6 gain fixes):
 
 FIX 1 — Auto-detect which feature prefix the loaded model uses.
 
@@ -20,6 +20,22 @@ RC4 FIX — Relaxed std guard:
   even modest variation is kept rather than discarded. Additionally, the
   guard now logs a warning rather than silently nulling self.regressor, so
   the disable is visible in logs.
+
+RC6 FIX — High-probability clustering detection (post-filter calibration problem):
+  AUC training + scale_pos_weight pushes probabilities high for most candidates
+  that pass the screener filters. The previous _detect_bimodal only caught
+  LOW-end compression (>85% below 0.50) and narrow bands (std < 0.02). It
+  missed the mirror-image case where probabilities cluster at the HIGH end,
+  causing SIGNAL_THRESHOLDS["STRONG BUY"]=0.90 to trigger for 60%+ of stocks
+  and become meaningless.
+
+  Mode D: High-probability clustering — if ≥50% of predictions score ≥0.90
+  (the STRONG BUY threshold), absolute thresholds are no longer discriminating
+  and relative ranking is activated.
+
+  Mode E: High mean probability — if mean probability ≥0.80, the model's
+  decision boundary has shifted so far up that absolute thresholds lose
+  meaning even if clustering isn't strictly above 0.90.
 
 RC5 FIX — Isotonic regression calibration for the gain fallback:
   The previous fallback bucketed predictions into Low/Medium/High/Very High
@@ -62,6 +78,12 @@ RELATIVE_HOLD_PCT       = 0.75   # top 10-25%
 # Compression detection thresholds
 COMPRESSION_THRESHOLD      = 0.85   # >85% below 0.50 → use relative ranking
 NARROW_BAND_STD_THRESHOLD  = 0.02   # std < 0.02 regardless of level → use relative ranking
+
+# RC6: High-probability clustering detection (post-filter calibration problem)
+# AUC training + scale_pos_weight pushes most post-screener predictions high,
+# making the absolute STRONG BUY threshold (0.90) trivially easy to trigger.
+HIGH_PROB_CLUSTERING_RATE  = 0.50   # ≥50% at or above STRONG BUY → relative ranking
+HIGH_PROB_MEAN_THRESHOLD   = 0.80   # mean ≥0.80 → absolute thresholds meaningless
 
 # Original mid-range sparsity check (bimodal toward extremes)
 BIMODAL_MIDRANGE             = (0.15, 0.85)
@@ -603,6 +625,34 @@ class ExplosionPredictor:
             self.logger.warning(
                 f"BIMODAL COLLAPSE: only {mid_count} predictions in mid-range. "
                 "Switching to percentile-based signals."
+            )
+            return True
+
+        # RC6 Mode D: High-probability clustering
+        # AUC training + heavy scale_pos_weight pushes post-screener predictions
+        # high. When >=50% of stocks hit the STRONG BUY threshold (>=0.90),
+        # the absolute threshold is no longer discriminating within today's batch.
+        strong_buy_threshold = SIGNAL_THRESHOLDS["STRONG BUY"]
+        above_threshold_rate = float((probabilities >= strong_buy_threshold).mean())
+        if above_threshold_rate >= HIGH_PROB_CLUSTERING_RATE:
+            self.logger.warning(
+                f"HIGH-PROB CLUSTERING (RC6 Mode D): {above_threshold_rate:.1%} of predictions "
+                f"are at or above the STRONG BUY threshold ({strong_buy_threshold}). "
+                f"Absolute thresholds are not discriminating today's batch. "
+                f"Switching to percentile-based signals."
+            )
+            return True
+
+        # RC6 Mode E: High mean probability
+        # Even without clustering above 0.90, a mean >=0.80 indicates the model's
+        # decision boundary has shifted far from training calibration and
+        # absolute thresholds have become nearly trivially satisfied.
+        prob_mean = float(np.mean(probabilities))
+        if prob_mean >= HIGH_PROB_MEAN_THRESHOLD:
+            self.logger.warning(
+                f"HIGH-PROB MEAN (RC6 Mode E): mean probability={prob_mean:.3f} "
+                f">= {HIGH_PROB_MEAN_THRESHOLD}. Absolute thresholds have lost "
+                f"discriminative power. Switching to percentile-based signals."
             )
             return True
 
