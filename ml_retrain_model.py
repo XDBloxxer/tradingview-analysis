@@ -2133,6 +2133,12 @@ def save_outputs(
     fi_df.to_csv(FEATURE_IMPORTANCE_PATH, index=False)
     logger.info(f"Saved feature importance → {FEATURE_IMPORTANCE_PATH}")
 
+    # RC6: model may be a CalibratedClassifierCV wrapping the raw XGBClassifier.
+    # best_iteration / best_score live on the raw booster, not the wrapper.
+    _raw_model = model
+    if hasattr(model, "calibrated_classifiers_"):
+        _raw_model = model.calibrated_classifiers_[0].estimator
+
     metadata = {
         "trained_at":            datetime.now(timezone.utc).isoformat(),
         "source":                "ml_retrain_model.py",
@@ -2140,8 +2146,8 @@ def save_outputs(
         "n_features":            len(feature_names),
         "features":              feature_names,
         "feature_names_sample":  feature_names[:20],
-        "best_iteration":        int(model.best_iteration),
-        "best_val_auc":          float(model.best_score),  # renamed from best_val_logloss; metric is AUC (eval_metric="auc")
+        "best_iteration":        int(_raw_model.best_iteration),
+        "best_val_auc":          float(_raw_model.best_score),  # renamed from best_val_logloss; metric is AUC (eval_metric="auc")
         "gain_regressor_trained": gain_regressor is not None,
         "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
                                   "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
@@ -2509,7 +2515,9 @@ def main() -> int:
             "before deploying — see dedup diagnostics logged earlier in this run."
         )
     logger.info(f"  Validation AUC      : {auc:.4f}")
-    logger.info(f"  Best iteration      : {model.best_iteration}")
+    _best_iter = (model.calibrated_classifiers_[0].estimator.best_iteration
+                  if hasattr(model, "calibrated_classifiers_") else model.best_iteration)
+    logger.info(f"  Best iteration      : {_best_iter}")
     logger.info(f"  Features            : {len(feature_names)}")
     logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6+RC7 fixed)' if gain_regressor else '— skipped'}")
     logger.info("")
