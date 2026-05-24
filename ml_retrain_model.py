@@ -1408,8 +1408,10 @@ def train_val_split(
         )
 
     # ── FIX 1: Dynamic cutoff — last VAL_WEEKS weeks of data held out for val ──
+    VAL_CUTOFF_DATE = "unknown"  # default; overwritten below when date_col is present
     if date_col is not None:
         cutoff = _compute_val_cutoff(df_work)
+        VAL_CUTOFF_DATE = cutoff.date()  # stored for metadata/logging
         dates  = pd.to_datetime(df_work[date_col], errors="coerce")
 
         # FIX 2 applied here: NaT → train regardless of cutoff
