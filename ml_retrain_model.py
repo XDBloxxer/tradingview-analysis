@@ -2015,10 +2015,20 @@ def main() -> int:
             if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
         ]
 
+        # Load multiday tables so mistake rows get t3_/t5_/t10_ features,
+        # matching the enrichment applied to all regular T-1 rows in load_t1_data().
+        # Without this, mistake samples land in combined_df with every multiday
+        # feature as NaN while still carrying 3×/2× sample weights — giving the
+        # model a strong but half-blind corrective signal.
+        logger.info("Loading multiday tables for mistake-sample enrichment...")
+        _mistake_winners_md, _mistake_non_winners_md = load_multiday_data(client)
+
         mistake_df = build_mistake_training_samples(
             lookback_days=90,
             use_all_timepoints=True,
             existing_features=proto_features,
+            winners_multiday=_mistake_winners_md,
+            non_winners_multiday=_mistake_non_winners_md,
         )
 
         if not mistake_df.empty:
