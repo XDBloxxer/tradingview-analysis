@@ -1027,32 +1027,63 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         if n_dropped > 0:
             logger.info(f"Deduplication: removed {n_dropped} duplicate rows ({before_dedup} → {len(combined)})")
     elif sym_col and len(date_cols_present) == 2:
-        # Two date columns: deduplicate each source by its own date key, then
-        # re-concatenate.  T-1 rows have detection_date populated (event_date
-        # may be NaN); base-CSV rows have event_date populated (detection_date
-        # is NaN).  We split on which date column is non-null.
+        # Two date columns present.
+        #
+        # IMPORTANT: We cannot use detection_date.notna() to identify T-1 rows
+        # because ml_training_base also has a detection_date column (it has 302
+        # columns including detection_date).  Using notna() was causing ~21k base
+        # rows to be mis-classified as T-1 and deduped against each other via
+        # (symbol, detection_date), wiping almost all base data (24111 → 2456).
+        #
+        # Correct approach: use the 'source' column that is set to "base_csv" for
+        # all rows loaded from ml_training_base (see load_base_training_data).
+        # T-1 rows have source values like "winners_day_prior_close" etc.
         before_dedup = len(combined)
 
-        t1_mask   = combined["detection_date"].notna()
-        base_mask = ~t1_mask
+        if "source" in combined.columns:
+            base_mask = combined["source"] == "base_csv"
+            t1_mask   = ~base_mask
+            logger.info(
+                f"Deduplication: splitting by source column — "
+                f"base_csv={base_mask.sum()}, T-1={t1_mask.sum()}"
+            )
+        else:
+            # Fallback: if source column is missing, use detection_date.notna()
+            # (original behaviour, kept for backwards compat with unusual datasets).
+            logger.warning(
+                "Deduplication: 'source' column missing — falling back to "
+                "detection_date.notna() split. If ml_training_base has a "
+                "detection_date column this may incorrectly wipe base rows."
+            )
+            t1_mask   = combined["detection_date"].notna()
+            base_mask = ~t1_mask
 
         t1_part   = combined[t1_mask].drop_duplicates(
             subset=[sym_col, "detection_date"], keep="first"
         )
-        base_part = combined[base_mask].drop_duplicates(
-            subset=[sym_col, "event_date"], keep="first"
-        )
+
+        # Base CSV rows: deduplicate by event_date when available, otherwise
+        # detection_date.  Multiple stocks can legitimately share the same date
+        # (they are different symbols), so the dedup key is always (symbol, date).
+        if "event_date" in combined.columns and combined.loc[base_mask, "event_date"].notna().any():
+            base_part = combined[base_mask].drop_duplicates(
+                subset=[sym_col, "event_date"], keep="first"
+            )
+        else:
+            base_part = combined[base_mask].drop_duplicates(
+                subset=[sym_col, "detection_date"], keep="first"
+            )
 
         combined  = pd.concat([t1_part, base_part], ignore_index=True, sort=False)
         n_dropped = before_dedup - len(combined)
         if n_dropped > 0:
             logger.info(
-                f"Deduplication (split by date column): removed {n_dropped} duplicate "
+                f"Deduplication (split by source): removed {n_dropped} duplicate "
                 f"rows ({before_dedup} → {len(combined)})"
             )
         else:
             logger.info(
-                "Deduplication (split by date column): no duplicates found within "
+                "Deduplication (split by source): no duplicates found within "
                 "T-1 (detection_date) or base-CSV (event_date) partitions"
             )
 
@@ -1060,11 +1091,22 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     n_neg = int((combined["label"] == 0).sum())
 
     if n_pos > 0 and n_pos / (n_pos + n_neg) > 0.40:
+        # Log a breakdown by source to diagnose which data source is causing the imbalance.
+        if "source" in combined.columns:
+            logger.error("Positive rate breakdown by source:")
+            for src, grp in combined.groupby("source"):
+                grp_pos = int((grp["label"] == 1).sum())
+                grp_neg = int((grp["label"] == 0).sum())
+                grp_rate = grp_pos / max(1, grp_pos + grp_neg)
+                logger.error(f"  {src}: {len(grp)} rows, pos={grp_pos}, neg={grp_neg}, rate={grp_rate:.1%}")
         logger.error(
-          f"ABORTING: positive rate {n_pos/(n_pos+n_neg):.1%} is too high. "
-          "The base training data likely has corrupt labels. "
-          "Check ml_training_base — it should have ~5-20% positives."
-      )
+            f"ABORTING: positive rate {n_pos/(n_pos+n_neg):.1%} is too high. "
+            "Expected ~5-20% for explosive-stock prediction. "
+            "Likely causes: (1) deduplication wiped most negative rows — check "
+            "that the 'source' column is populated on base rows; "
+            "(2) ml_training_base itself has corrupt/missing negatives; "
+            "(3) intraday_high_labels relabelled too many negatives as winners."
+        )
         sys.exit(1)
 
     logger.info(
