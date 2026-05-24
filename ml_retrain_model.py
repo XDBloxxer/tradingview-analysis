@@ -1328,9 +1328,9 @@ def train_val_split(
             "forcing them into the train set so they don't pollute val AUC."
         )
 
-    # ── FIX 1: Split on fixed date rather than a floating fraction ────────────
+    # ── FIX 1: Dynamic cutoff — last VAL_WEEKS weeks of data held out for val ──
     if date_col is not None:
-        cutoff = pd.Timestamp(VAL_CUTOFF_DATE)
+        cutoff = _compute_val_cutoff(df_work)
         dates  = pd.to_datetime(df_work[date_col], errors="coerce")
 
         # FIX 2 applied here: NaT → train regardless of cutoff
@@ -1344,7 +1344,7 @@ def train_val_split(
         val_dates   = dates.loc[val_idx].dropna()
 
         logger.info(
-            f"FIX 1 — Fixed-cutoff split on {VAL_CUTOFF_DATE}: "
+            f"FIX 1 — Dynamic cutoff ({VAL_WEEKS}-week val window): cutoff={cutoff.date()}: "
             f"train {train_dates.min().date() if not train_dates.empty else '?'} "
             f"→ {train_dates.max().date() if not train_dates.empty else '?'}, "
             f"val {val_dates.min().date() if not val_dates.empty else '?'} "
@@ -1354,7 +1354,7 @@ def train_val_split(
         # No date column at all — fall back to sequential split (last resort)
         logger.warning(
             "No date column found — falling back to sequential split. "
-            "Set VAL_CUTOFF_DATE and ensure detection_date/event_date columns exist."
+            "Ensure detection_date/event_date columns exist."
         )
         split_pos = int(len(X) * (1 - val_fraction))
         train_idx = X.index[:split_pos]
