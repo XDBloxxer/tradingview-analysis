@@ -71,9 +71,12 @@ SIGNAL_THRESHOLDS = {
 }
 
 # Relative-ranking percentile thresholds (used when _is_bimodal = True)
-RELATIVE_STRONG_BUY_PCT = 0.98   # top 2%
-RELATIVE_BUY_PCT        = 0.90   # top 2-10%
-RELATIVE_HOLD_PCT       = 0.75   # top 10-25%
+# With batches of ~48 stocks, RELATIVE_STRONG_BUY_PCT=0.98 means only the
+# #1 stock ever qualifies (0.98 * 48 = 47.04, so only rank 48 qualifies).
+# Lowered so that a typical 48-stock batch gets 1-2 STRONG BUY, 3-5 BUY.
+RELATIVE_STRONG_BUY_PCT = 0.95   # top 5%  (~2-3 stocks per 48)
+RELATIVE_BUY_PCT        = 0.80   # top 5-20% (~7-8 stocks per 48)
+RELATIVE_HOLD_PCT       = 0.60   # top 20-40%
 
 # Compression detection thresholds
 COMPRESSION_THRESHOLD      = 0.85   # >85% below 0.50 → use relative ranking
@@ -1004,23 +1007,15 @@ class ExplosionPredictor:
 
     def _estimate_target_gain(self, probability: float) -> float:
         """
-        Rule-based gain estimate.  Used only as the final backstop when both
-        the gain regressor and RC5 isotonic calibrator are unavailable (or when
-        filling individual NaN rows after the main gain pipeline).
-
-        Values are aligned with ml_screen_and_predict._GAIN_CURVE so both
-        files produce consistent estimates when falling back to rule-based
-        logic.  The ceiling is deliberately uncapped at the top end because
-        STRONG BUY stocks (p ≥ 0.95) genuinely produce 100 %+ intraday highs.
-        RC5 applies an additional rank-adjustment multiplier on top of these
-        base values to ensure spread within each probability bucket.
+        Rule-based gain estimate backstop.  Values are uncapped because
+        STRONG BUY stocks historically produce 100%+ intraday highs.
         """
-        if probability >= 0.95: return 100.0
-        if probability >= 0.90:  return 60.0
-        if probability >= 0.85:  return 45.0
-        if probability >= 0.80:  return 35.0
-        if probability >= 0.75:  return 28.0
-        if probability >= 0.70:  return 22.0
+        if probability >= 0.95: return 150.0
+        if probability >= 0.90:  return 80.0
+        if probability >= 0.85:  return 55.0
+        if probability >= 0.80:  return 40.0
+        if probability >= 0.75:  return 30.0
+        if probability >= 0.70:  return 23.0
         if probability >= 0.65:  return 17.0
         if probability >= 0.60:  return 13.0
         if probability >= 0.55:  return 10.0
