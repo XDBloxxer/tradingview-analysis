@@ -252,6 +252,95 @@ def _fetch_t1_snapshots_for_symbols(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# MULTIDAY FEATURE JOIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _join_multiday_onto_mistakes(
+    samples_df: pd.DataFrame,
+    multiday_df: pd.DataFrame,
+    label: str,
+) -> pd.DataFrame:
+    """
+    Left-join t3_/t5_/t10_ multiday features onto a mistake-sample DataFrame.
+
+    Mirrors the logic of _join_multiday() in ml_retrain_model.py so that
+    mistake rows end up with the same full feature set as regular T-1 rows.
+
+    Args:
+        samples_df:   DataFrame of mistake samples (symbol + detection_date are
+                      the join keys).
+        multiday_df:  One of winners_multiday / non_winners_multiday, already
+                      reduced to (symbol, detection_date, t3_*, t5_*, t10_*).
+        label:        Human-readable label used only for log messages
+                      (e.g. "false_positive", "false_negative").
+
+    Returns:
+        samples_df enriched with multiday columns where a match exists.
+        Rows without a match keep NaN for those columns — XGBoost handles
+        this natively, so no rows are dropped.
+    """
+    if samples_df.empty:
+        return samples_df
+
+    if multiday_df is None or multiday_df.empty:
+        logger.warning(
+            f"  {label}: no multiday data supplied — "
+            "t3_/t5_/t10_ features will remain NaN for these mistake rows"
+        )
+        return samples_df
+
+    if "detection_date" not in multiday_df.columns or "symbol" not in multiday_df.columns:
+        logger.warning(
+            f"  {label}: multiday_df is missing symbol/detection_date — skipping join"
+        )
+        return samples_df
+
+    # Normalise detection_date to plain YYYY-MM-DD strings on both sides
+    df = samples_df.copy()
+    df["detection_date"] = pd.to_datetime(
+        df["detection_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    md = multiday_df.copy()
+    md["detection_date"] = pd.to_datetime(
+        md["detection_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+
+    # Only keep key + feature columns from multiday table
+    md_feature_cols = [c for c in md.columns if c.startswith(("t3_", "t5_", "t10_"))]
+    if not md_feature_cols:
+        logger.warning(
+            f"  {label}: multiday_df has no t3_/t5_/t10_ columns — skipping join"
+        )
+        return samples_df
+
+    md = md[["symbol", "detection_date"] + md_feature_cols].drop_duplicates(
+        subset=["symbol", "detection_date"], keep="last"
+    )
+
+    merged = df.merge(
+        md,
+        on=["symbol", "detection_date"],
+        how="left",
+        suffixes=("", "_md"),
+    )
+
+    # Drop any _md duplicate columns that crept in (shouldn't happen, but be safe)
+    md_dupe_cols = [c for c in merged.columns if c.endswith("_md")]
+    if md_dupe_cols:
+        merged = merged.drop(columns=md_dupe_cols)
+
+    n_matched = merged[md_feature_cols[0]].notna().sum() if md_feature_cols else 0
+    coverage_pct = n_matched / len(merged) * 100 if len(merged) else 0
+    logger.info(
+        f"  {label}: joined {len(md_feature_cols)} multiday columns, "
+        f"{n_matched}/{len(merged)} rows matched "
+        f"({coverage_pct:.0f}% coverage)"
+    )
+    return merged
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # MAIN PUBLIC FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -260,6 +349,8 @@ def build_mistake_training_samples(
     use_all_timepoints: bool = True,
     existing_features: list[str] = None,
     min_fp_confidence: float = FP_CONFIDENCE_THRESHOLD,
+    winners_multiday: Optional[pd.DataFrame] = None,
+    non_winners_multiday: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Build a DataFrame of training samples derived from the model's own mistakes.
@@ -267,23 +358,33 @@ def build_mistake_training_samples(
     Each row contains:
       - All T-1 open/close indicator features (same schema as retrain_model.py,
         with model long-form names via t1_column_map)
+      - t3_/t5_/t10_ multiday features (joined from winners_multiday /
+        non_winners_multiday, exactly as load_t1_data() does for normal rows)
       - label  (0 = false positive,  1 = false negative)
       - sample_weight  (higher than standard samples — preserved by caller)
       - mistake_type   (string label for logging — excluded from feature matrix
                         by NON_FEATURE_COLS in ml_retrain_model.py)
 
-    The caller (ml_retrain_model.py) should concatenate this with the
-    standard combined_df AFTER combine_datasets() so that sample_weight
-    values (3.0 / 2.0) are NOT overwritten by T1_WEIGHT.
+    The caller (ml_retrain_model.py) should:
+      1. Load multiday tables via load_multiday_data() before calling this.
+      2. Pass them in as winners_multiday / non_winners_multiday.
+      3. Concatenate the result with the standard combined_df AFTER
+         combine_datasets() so that sample_weight values (3.0 / 2.0) are NOT
+         overwritten by T1_WEIGHT.
 
     Args:
-        lookback_days:      How many days back to search for mistakes.
-        use_all_timepoints: Include both T-1 close AND T-1 open snapshots.
-        existing_features:  Feature list from model_metadata.json (used to
-                            ensure consistent column set). If None, raw
-                            features are returned without padding.
-        min_fp_confidence:  Only include false positives where the model
-                            predicted with at least this probability.
+        lookback_days:         How many days back to search for mistakes.
+        use_all_timepoints:    Include both T-1 close AND T-1 open snapshots.
+        existing_features:     Feature list from model_metadata.json (used to
+                               ensure consistent column set). If None, raw
+                               features are returned without padding.
+        min_fp_confidence:     Only include false positives where the model
+                               predicted with at least this probability.
+        winners_multiday:      Pre-loaded winners_multiday DataFrame
+                               (symbol, detection_date, t3_*, t5_*, t10_*).
+                               Pass None to skip multiday join for winners.
+        non_winners_multiday:  Pre-loaded non_winners_multiday DataFrame.
+                               Pass None to skip multiday join for non-winners.
 
     Returns:
         DataFrame of training samples, or empty DataFrame if no mistakes found.
@@ -447,6 +548,57 @@ def build_mistake_training_samples(
         return pd.DataFrame()
 
     result = pd.DataFrame(all_samples)
+
+    # ── 5b. Join multiday (t3_/t5_/t10_) features ────────────────────────────
+    # Without this step, mistake rows land in combined_df with every t3_/t5_/t10_
+    # feature as NaN.  Because mistakes are up-weighted at 3×/2×, the model was
+    # being pushed hard to learn from half-blind rows.  We now join the same
+    # multiday tables that load_t1_data() uses, routing each mistake type to the
+    # appropriate table (FP → non_winners_multiday, FN → winners_multiday).
+    if winners_multiday is not None or non_winners_multiday is not None:
+        logger.info("Joining multiday (t3_/t5_/t10_) features onto mistake samples...")
+
+        # Split by mistake type so each group is joined to the right table
+        fp_result = result[result["mistake_type"] == "false_positive"].copy()
+        fn_result = result[result["mistake_type"] == "false_negative"].copy()
+
+        if not fp_result.empty:
+            # False positives are non-winners → use non_winners_multiday
+            fp_result = _join_multiday_onto_mistakes(
+                fp_result,
+                non_winners_multiday,
+                label="false_positive",
+            )
+
+        if not fn_result.empty:
+            # False negatives are missed winners → use winners_multiday
+            fn_result = _join_multiday_onto_mistakes(
+                fn_result,
+                winners_multiday,
+                label="false_negative",
+            )
+
+        # Reassemble — preserve original row order as closely as possible
+        if not fp_result.empty and not fn_result.empty:
+            result = pd.concat([fp_result, fn_result], ignore_index=True, sort=False)
+        elif not fp_result.empty:
+            result = fp_result
+        elif not fn_result.empty:
+            result = fn_result
+
+        multiday_cols = [c for c in result.columns if c.startswith(("t3_", "t5_", "t10_"))]
+        n_with_multiday = result[multiday_cols].notna().any(axis=1).sum() if multiday_cols else 0
+        logger.info(
+            f"Multiday join complete: {n_with_multiday}/{len(result)} mistake rows "
+            f"now have t3_/t5_/t10_ features ({len(multiday_cols)} columns added)"
+        )
+    else:
+        logger.warning(
+            "No multiday DataFrames supplied to build_mistake_training_samples() — "
+            "t3_/t5_/t10_ features will be NaN for all mistake rows. "
+            "Pass winners_multiday and non_winners_multiday from load_multiday_data() "
+            "to fix this."
+        )
 
     # ── 6. Pad to full feature set ────────────────────────────────────────
     # Only pads columns that are genuinely missing; never overwrites real data.
