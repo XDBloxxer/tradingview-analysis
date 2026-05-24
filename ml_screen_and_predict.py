@@ -1656,12 +1656,21 @@ def main():
     logger.info("=" * 80)
 
     features_df  = pd.DataFrame(enriched_stocks)
-    model_cols   = [c for c in features_df.columns if c.startswith(f"{model_prefix}_")]
+    # Count only columns that are actual model features (i.e. listed in
+    # predictor.feature_names), not all raw columns with the prefix.
+    # Raw columns like current_price, _meta_t3_count, symbol, etc. are
+    # present in the DataFrame but are silently ignored by prepare_features();
+    # including them in the logged count causes the log to show an inflated
+    # number (e.g. 98) vs. what the model actually expects (e.g. 57).
+    model_feature_set = set(predictor.feature_names)
+    model_cols   = [c for c in features_df.columns
+                    if c.startswith(f"{model_prefix}_") and c in model_feature_set]
     t3_cols      = [c for c in features_df.columns if c.startswith("t3_")]
     t1_open_cols = [c for c in features_df.columns if c.startswith("t1_open_")]
 
     logger.info(f"✓ Feature matrix: {len(features_df)} stocks × {len(features_df.columns)} raw columns")
-    logger.info(f"  {model_prefix}_ features present: {len(model_cols)}")
+    logger.info(f"  {model_prefix}_ features matched to model: {len(model_cols)} "
+                f"(model expects {sum(1 for f in predictor.feature_names if f.startswith(f'{model_prefix}_'))})")
     logger.info(f"  t3_ features present:       {len(t3_cols)}")
     logger.info(f"  t1_open_ features present:  {len(t1_open_cols)}")
 
