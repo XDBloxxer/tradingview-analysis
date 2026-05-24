@@ -949,6 +949,23 @@ class ExplosionPredictor:
             predictions.loc[nan_gain, "target_gain_high"] = (
                 predictions.loc[nan_gain, "target_gain_pct"] * 1.5)
 
+        # Suppress gain estimates for AVOID and HOLD signals.
+        # The gain regressor is trained almost entirely on winner rows, so its
+        # predictions for non-winner stocks (AVOID/HOLD) are extrapolation noise.
+        # Setting them to NaN prevents misleading "+25%" gain labels appearing
+        # next to stocks the model has no confidence in.
+        if "signal" in predictions.columns:
+            _no_gain_mask = predictions["signal"].isin(["AVOID", "HOLD"])
+            if _no_gain_mask.any():
+                for _gcol in ("target_gain_pct", "target_gain_low", "target_gain_high",
+                              "target_price", "target_price_low", "target_price_high"):
+                    if _gcol in predictions.columns:
+                        predictions.loc[_no_gain_mask, _gcol] = np.nan
+                self.logger.info(
+                    f"Suppressed gain estimates for {_no_gain_mask.sum()} AVOID/HOLD signals "
+                    "(regressor trained on winners only — non-winner predictions are noise)."
+                )
+
         # Current price lookup
         if "symbol" in predictions.columns:
             current_price = self._extract_current_price(data_df, predictions)
