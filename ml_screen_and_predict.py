@@ -1551,6 +1551,11 @@ def main():
         default=5,
         help="Number of parallel threads for T-1 yfinance fetches (default: 5).",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even if today is a US market holiday (bypasses holiday guard).",
+    )
 
     args   = parser.parse_args()
     logger = setup_logging(args.verbose)
@@ -1558,6 +1563,23 @@ def main():
     logger.info("=" * 80)
     logger.info("ML SCREENING & PREDICTION")
     logger.info("=" * 80)
+
+    # ── Holiday guard ─────────────────────────────────────────────────────────
+    # If the market is closed today there is nothing to predict for, and writing
+    # predictions would poison the accuracy tracker (it would see predictions
+    # made but no winners ever confirmed, dragging down model metrics).
+    # Exit 0 (success) so GitHub Actions does not mark the run as failed.
+    if not args.force:
+        import pytz as _pytz
+        _est  = _pytz.timezone("America/New_York")
+        _today = datetime.now(_est).date()
+        if not _is_trading_day(_today):
+            logger.info(
+                f"Today ({_today}, {_today.strftime('%A')}) is not a trading day "
+                f"— market is closed. Skipping prediction run. "
+                f"Use --force to override."
+            )
+            return 0
 
     screener = SmartScreener(logger=logger)
 
