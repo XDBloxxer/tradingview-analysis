@@ -27,6 +27,11 @@ on:
         required: false
         default: '5'
         type: string
+      force:
+        description: 'Run even on market holidays (bypasses holiday guard)'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   screen-and-predict:
@@ -60,16 +65,21 @@ jobs:
           TOP_N="${{ github.event.inputs.top_n }}"
           T1_LIMIT="${{ github.event.inputs.t1_limit }}"
           T1_WORKERS="${{ github.event.inputs.t1_workers }}"
+          FORCE="${{ github.event.inputs.force }}"
 
           if [ -z "$TOP_N" ];     then TOP_N="50";    fi
           if [ -z "$T1_LIMIT" ];  then T1_LIMIT="500"; fi
           if [ -z "$T1_WORKERS" ]; then T1_WORKERS="5"; fi
+
+          FORCE_FLAG=""
+          if [ "$FORCE" = "true" ]; then FORCE_FLAG="--force"; fi
 
           python ml_screen_and_predict.py \
             --max-results 1500 \
             --top-n "$TOP_N" \
             --t1-limit "$T1_LIMIT" \
             --t1-workers "$T1_WORKERS" \
+            $FORCE_FLAG \
             --verbose
       
       - name: Upload screening results
