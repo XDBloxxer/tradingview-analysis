@@ -298,24 +298,116 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
     logger.info("")
 
 
+def _us_market_holidays(year: int) -> set:
+    """
+    Return the set of NYSE/Nasdaq market holidays for the given year.
+
+    Covers all 9 full-day closures observed by both exchanges.
+    Early-close days (Black Friday, Christmas Eve) are NOT included because
+    the market is still open — only full-day closures matter here.
+
+    Rules used:
+      New Year's Day       Jan 1  (observed Mon if Sun, Fri if Sat)
+      MLK Day              3rd Mon in Jan
+      Presidents Day       3rd Mon in Feb
+      Good Friday          Friday before Easter (computed via anonymous gregor.)
+      Memorial Day         Last Mon in May
+      Juneteenth           Jun 19 (observed Mon if Sun, Fri if Sat)
+      Independence Day     Jul 4  (observed Mon if Sun, Fri if Sat)
+      Labor Day            1st Mon in Sep
+      Thanksgiving         4th Thu in Nov
+      Christmas Day        Dec 25 (observed Mon if Sun, Fri if Sat)
+    """
+    from datetime import date
+    import calendar
+
+    def _observed(d: date) -> date:
+        """If holiday falls on Sat → Fri; Sun → Mon."""
+        if d.weekday() == 5:   # Saturday
+            return d - timedelta(days=1)
+        if d.weekday() == 6:   # Sunday
+            return d + timedelta(days=1)
+        return d
+
+    def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+        """Return the n-th occurrence (1-based) of weekday in month/year."""
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + timedelta(days=offset + (n - 1) * 7)
+
+    def _last_weekday(year: int, month: int, weekday: int) -> date:
+        """Return the last occurrence of weekday in month/year."""
+        last = date(year, month, calendar.monthrange(year, month)[1])
+        offset = (last.weekday() - weekday) % 7
+        return last - timedelta(days=offset)
+
+    def _easter(year: int) -> date:
+        """Anonymous Gregorian algorithm for Easter Sunday."""
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        month = (h + l - 7 * m + 114) // 31
+        day   = ((h + l - 7 * m + 114) % 31) + 1
+        return date(year, month, day)
+
+    holidays = {
+        _observed(date(year, 1, 1)),                          # New Year's Day
+        _nth_weekday(year, 1, 0, 3),                          # MLK Day (3rd Mon Jan)
+        _nth_weekday(year, 2, 0, 3),                          # Presidents Day (3rd Mon Feb)
+        _easter(year) - timedelta(days=2),                    # Good Friday
+        _last_weekday(year, 5, 0),                            # Memorial Day (last Mon May)
+        _observed(date(year, 6, 19)),                         # Juneteenth
+        _observed(date(year, 7, 4)),                          # Independence Day
+        _nth_weekday(year, 9, 0, 1),                          # Labor Day (1st Mon Sep)
+        _nth_weekday(year, 11, 3, 4),                         # Thanksgiving (4th Thu Nov)
+        _observed(date(year, 12, 25)),                        # Christmas Day
+    }
+    return holidays
+
+
+def _is_trading_day(d) -> bool:
+    """Return True if d is a weekday that is not a US market holiday."""
+    from datetime import date as date_type
+    if isinstance(d, datetime):
+        d = d.date()
+    if d.weekday() >= 5:   # weekend
+        return False
+    # Check holidays for this year and (for Jan 1 edge case) prior year
+    if d in _us_market_holidays(d.year):
+        return False
+    return True
+
+
 def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
     """
-    FIX 10: Determine the prediction date as the next trading weekday after
-    the most recent detection_date in daily_winners.
-
-    This is more reliable than deriving the date from wall-clock time because
-    GitHub Actions can run late, early, or on the wrong side of midnight.
+    Determine the prediction date for the current run.
 
     Logic:
-      1. Query daily_winners for the latest detection_date.
-      2. Add one calendar day.
-      3. Skip forward over weekends until we land on a weekday.
-         e.g. last_winners = Friday → +1 = Saturday → skip → Monday ✓
+      1. Query daily_winners for the latest detection_date (last day winners
+         were actually tracked).
+      2. Advance one calendar day at a time past that date, skipping weekends
+         AND US market holidays, until we reach the next valid trading day.
+      3. Clamp to today: if the script is running on a valid trading day and
+         the calculated next day is still in the future, return today instead.
+         This handles the case where the winners tracker hasn't been updated
+         yet for the most recent session (e.g. a holiday pushed detection_date
+         one day behind).
 
-    Fallback: if the table is empty or the query fails, fall back to the
-    original time-based approach so the workflow never hard-crashes.
+    Fallback: if the table is empty or the query fails, use today (or the
+    most recent past trading day) so the workflow never hard-crashes.
     """
     logger = logging.getLogger(__name__)
+    est = pytz.timezone('America/New_York')
+    today = datetime.now(est).date()
 
     try:
         response = (
@@ -328,9 +420,23 @@ def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
         if response.data:
             last_date_str = response.data[0]["detection_date"]
             last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+
+            # Advance past last_date, skipping weekends + holidays
             prediction_day = last_date + timedelta(days=1)
-            while prediction_day.weekday() >= 5:  # 5=Sat, 6=Sun
+            while not _is_trading_day(prediction_day):
                 prediction_day += timedelta(days=1)
+
+            # Clamp: if the calculated day is in the future but today is
+            # already a valid trading day, use today instead.
+            # This happens when a holiday sat between last_date and today.
+            if prediction_day > today and _is_trading_day(today):
+                logger.info(
+                    f"Prediction date derived from daily_winners: "
+                    f"last={last_date}  →  next trading day={prediction_day} "
+                    f"(clamped to today={today})"
+                )
+                return today.isoformat()
+
             logger.info(
                 f"Prediction date derived from daily_winners: "
                 f"last={last_date}  →  next trading day={prediction_day}"
@@ -339,14 +445,12 @@ def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
     except Exception as e:
         logger.warning(f"Could not fetch most recent winners date: {e}")
 
-    # ── Fallback: wall-clock based ────────────────────────────────────────
+    # ── Fallback: use today if it's a trading day, else most recent past day ─
     logger.warning("Falling back to time-based prediction date.")
-    est = pytz.timezone('America/New_York')
-    now_est = datetime.now(est)
-    prediction_day = now_est + timedelta(days=1)
-    while prediction_day.weekday() >= 5:
-        prediction_day += timedelta(days=1)
-    return prediction_day.date().isoformat()
+    fallback = today
+    while not _is_trading_day(fallback):
+        fallback -= timedelta(days=1)
+    return fallback.isoformat()
 
 
 # ---------------------------------------------------------------------------
