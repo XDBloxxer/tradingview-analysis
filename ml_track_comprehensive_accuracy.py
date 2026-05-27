@@ -27,6 +27,19 @@ FIXES vs previous version:
      empty-DataFrame check so the script completes and writes accuracy records
      even when winners data is absent.
 
+  5. (NEW) Signal inversion fix: predicted_positive was derived from the raw
+     XGBoost binary (prediction == 1, i.e. probability > 0.5).  After
+     scale_pos_weight was raised to up to 10x, virtually every post-screener
+     stock scores above 0.5, making prediction=1 for almost everyone and
+     rendering the binary useless as a BUY/AVOID discriminator.  Meanwhile
+     the published signal is percentile-ranked within the batch, so a stock
+     can be prediction=1 (raw above 0.5) yet signal=AVOID (bottom 20% of
+     the batch).  This caused AVOID stocks that won big (e.g. VCIG +118%)
+     to be counted as true negatives (prediction_correct=True) in the
+     accuracy tracker, silently inflating reported accuracy.
+     Fix: predicted_positive is now True only when signal ∈ {BUY, STRONG BUY},
+     which matches exactly what the published recommendation said.
+
 IMPROVEMENTS (carried from previous version):
 1. Finds most recent prediction date automatically
 2. Validates data exists before fetching
@@ -693,8 +706,18 @@ class ComprehensiveAccuracyTracker:
         intraday_winners = 0
 
         for _, pred in predictions_df.iterrows():
-            symbol             = pred["symbol"]
-            predicted_positive = pred["prediction"] == 1
+            symbol = pred["symbol"]
+            # FIX: Use signal (percentile-ranked label) instead of raw XGBoost binary
+            # prediction.  After FIX #8 (scale_pos_weight up to 10x), most post-screener
+            # stocks score above the 0.5 threshold so prediction=1 for nearly everyone —
+            # making it useless as a BUY/AVOID discriminator.  The signal column reflects
+            # the actual published recommendation (STRONG BUY / BUY vs HOLD / AVOID),
+            # so outcome classification (TP/FP/TN/FN) must be based on signal, not the
+            # raw binary.  This also fixes prediction_correct=True for AVOID stocks that
+            # won big: their prediction column was 1 (above 0.5) while signal was AVOID
+            # (bottom percentile within the batch) — making the tracker silently count
+            # them as true negatives even though the published call was wrong.
+            predicted_positive = pred.get("signal", "") in ("BUY", "STRONG BUY")
             became_winner      = symbol in winners_set
 
             yf_data = yfinance_gains.get(symbol, {})
