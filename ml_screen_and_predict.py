@@ -1873,10 +1873,11 @@ def main():
             (predictions_df['target_gain_pct'].abs() < 0.5) |
             (predictions_df['target_gain_pct'] > 500)
         )
-        # Never repopulate suppressed gains for HOLD/AVOID rows.
-        fallback_mask = bad_gain_mask.copy()
-        if 'signal' in predictions_df.columns:
-            fallback_mask &= ~predictions_df['signal'].isin(['HOLD', 'AVOID'])
+        # Apply fallback to ALL signals — HOLD/AVOID stocks get regressor-based
+        # gain estimates too, so the gain column is always populated and useful
+        # for comparison (e.g. confirming that AVOID stocks really were projected
+        # lower than BUY stocks).
+        fallback_mask = bad_gain_mask
 
         if fallback_mask.any():
             n_bad = fallback_mask.sum()
