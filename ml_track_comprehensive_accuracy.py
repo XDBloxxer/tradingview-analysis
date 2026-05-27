@@ -79,7 +79,9 @@ FILTER_LOOKBACK_DAYS = 90
 MIN_SAMPLES_FOR_FILTER = 20
 YFINANCE_MAX_WORKERS = 10
 
-INTRADAY_WIN_THRESHOLD = 15.0
+# A stock is considered a winner if its intraday high on prediction date
+# reached this threshold above the prior close — regardless of where it closed.
+INTRADAY_WIN_THRESHOLD = 20.0
 
 # FIX 1: Keys are now lowercase to match what load_feature_importance() produces
 # after stripping the t3_/t5_/t10_ prefix from lowercase model feature names.
@@ -673,22 +675,23 @@ class ComprehensiveAccuracyTracker:
         if not winners_df.empty:
             self.logger.info(f"Winner columns: {winners_df.columns.tolist()}")
 
-        # ── FIX 4: Guard against empty winners_df before building winners_set ──
-        # Previously: winners_set = set(winners_df["symbol"].tolist())
-        # This crashed with KeyError when winners_df was empty (e.g. a weekend
-        # date or a date where the daily_winners table had no rows yet).
+        # winners_set is used only to look up supplementary price/volume data
+        # from the daily_winners table — it no longer determines became_winner.
+        # became_winner is now derived purely from actual_high_pct ≥
+        # INTRADAY_WIN_THRESHOLD so that stocks which exploded intraday but
+        # pulled back before close are still counted as winners.
         if not winners_df.empty and "symbol" in winners_df.columns:
             winners_set = set(winners_df["symbol"].tolist())
         else:
             winners_set = set()
             if winners_df.empty:
                 self.logger.warning(
-                    "winners_df is empty — all predictions will be scored as "
-                    "non-winners. Run again after daily_winners is populated."
+                    "winners_df is empty — daily_winners price data unavailable. "
+                    "became_winner will be determined from yfinance actual_high_pct only."
                 )
             else:
                 self.logger.warning(
-                    "winners_df has no 'symbol' column — cannot match winners. "
+                    "winners_df has no 'symbol' column — cannot look up winner price data. "
                     f"Available columns: {winners_df.columns.tolist()}"
                 )
 
@@ -702,72 +705,76 @@ class ComprehensiveAccuracyTracker:
 
         accuracy_records = []
         details_records  = []
-        true_positives   = false_positives = true_negatives = 0
-        intraday_winners = 0
+        true_positives = false_positives = true_negatives = false_negatives = 0
 
         for _, pred in predictions_df.iterrows():
             symbol = pred["symbol"]
-            # FIX: Use signal (percentile-ranked label) instead of raw XGBoost binary
-            # prediction.  After FIX #8 (scale_pos_weight up to 10x), most post-screener
-            # stocks score above the 0.5 threshold so prediction=1 for nearly everyone —
-            # making it useless as a BUY/AVOID discriminator.  The signal column reflects
-            # the actual published recommendation (STRONG BUY / BUY vs HOLD / AVOID),
-            # so outcome classification (TP/FP/TN/FN) must be based on signal, not the
-            # raw binary.  This also fixes prediction_correct=True for AVOID stocks that
-            # won big: their prediction column was 1 (above 0.5) while signal was AVOID
-            # (bottom percentile within the batch) — making the tracker silently count
-            # them as true negatives even though the published call was wrong.
+            # Use signal (percentile-ranked label) rather than the raw XGBoost binary.
+            # See FIX 5 in the module docstring for full rationale.
             predicted_positive = pred.get("signal", "") in ("BUY", "STRONG BUY")
-            became_winner      = symbol in winners_set
 
             yf_data = yfinance_gains.get(symbol, {})
 
-            if became_winner and not winners_df.empty:
+            # Resolve actual price data — prefer yfinance (uses prev_close denominator)
+            # and fall back to the daily_winners row where available.
+            in_winners_table = symbol in winners_set
+            if in_winners_table and not winners_df.empty:
                 winner_row   = winners_df[winners_df["symbol"] == symbol].iloc[0]
                 actual_gain  = float(winner_row["change_pct"])
                 actual_price = float(winner_row["price"])
-                if yf_data.get("actual_high_pct") is not None:
-                    actual_high_pct = yf_data["actual_high_pct"]
-                else:
-                    w_high = winner_row.get("high", actual_price)
-                    actual_high_pct = (
-                        ((float(w_high) / actual_price) - 1) * 100
-                        if actual_price and actual_price > 0 else None
-                    )
                 actual_volume = (
                     int(winner_row["volume"])
                     if pd.notna(winner_row.get("volume"))
                     else yf_data.get("actual_volume")
                 )
             else:
-                actual_gain     = yf_data.get("actual_gain_pct")
-                actual_price    = yf_data.get("actual_close") or pred.get("current_price", 0)
-                actual_high_pct = yf_data.get("actual_high_pct")
-                actual_volume   = yf_data.get("actual_volume")
+                actual_gain   = yf_data.get("actual_gain_pct")
+                actual_price  = yf_data.get("actual_close") or pred.get("current_price", 0)
+                actual_volume = yf_data.get("actual_volume")
 
-            intraday_hit = (
+            # Always prefer yfinance for actual_high_pct (prev_close denominator).
+            # Fall back to the daily_winners high column only if yfinance has no data.
+            if yf_data.get("actual_high_pct") is not None:
+                actual_high_pct = yf_data["actual_high_pct"]
+            elif in_winners_table and not winners_df.empty:
+                winner_row  = winners_df[winners_df["symbol"] == symbol].iloc[0]
+                w_high      = winner_row.get("high", actual_price)
+                actual_high_pct = (
+                    ((float(w_high) / actual_price) - 1) * 100
+                    if actual_price and actual_price > 0 else None
+                )
+            else:
+                actual_high_pct = None
+
+            # ── Winner definition ────────────────────────────────────────────
+            # A stock is a winner if its intraday high on prediction date reached
+            # INTRADAY_WIN_THRESHOLD (20%) above the prior close.  Close price is
+            # irrelevant — stocks that exploded and then pulled back still count.
+            became_winner = (
                 actual_high_pct is not None
                 and actual_high_pct >= INTRADAY_WIN_THRESHOLD
             )
 
+            # ── Correctness ──────────────────────────────────────────────────
+            # Correct = signal matched the outcome:
+            #   BUY / STRONG BUY  → stock hit ≥20% intraday high  (true positive)
+            #   HOLD / AVOID      → stock did NOT hit ≥20% intraday high  (true negative)
             prediction_correct = (predicted_positive and became_winner) or (
                 not predicted_positive and not became_winner
             )
 
-            predicted_gain = pred.get("target_gain_pct", 0)
-            if became_winner and predicted_gain and predicted_gain > 0 and actual_gain is not None:
-                gain_error       = abs(predicted_gain - actual_gain)
-                gain_error_ratio = gain_error / actual_gain if actual_gain != 0 else 0
+            # Gain error — compare predicted target gain vs actual intraday high
+            # (the figure that matters for momentum traders entering at open).
+            predicted_gain = pred.get("target_gain_pct") or 0
+            if predicted_gain and predicted_gain > 0 and actual_high_pct is not None:
+                gain_error       = abs(predicted_gain - actual_high_pct)
+                gain_error_ratio = gain_error / actual_high_pct if actual_high_pct != 0 else 0
             else:
                 gain_error = gain_error_ratio = None
 
             if predicted_positive and became_winner:
                 outcome_type = "true_positive"
                 true_positives += 1
-            elif predicted_positive and not became_winner and intraday_hit:
-                outcome_type       = "intraday_winner"
-                intraday_winners  += 1
-                prediction_correct = True
             elif predicted_positive and not became_winner:
                 outcome_type = "false_positive"
                 false_positives += 1
@@ -776,6 +783,7 @@ class ComprehensiveAccuracyTracker:
                 true_negatives += 1
             else:
                 outcome_type = "false_negative"
+                false_negatives += 1
 
             accuracy_records.append({
                 "symbol":                 symbol,
@@ -807,28 +815,25 @@ class ComprehensiveAccuracyTracker:
                 "failure_reason":        None,
             })
 
-        total              = len(predictions_df)
-        predicted_buys     = true_positives + false_positives + intraday_winners
-        strict_correct     = true_positives + true_negatives
-        adjusted_correct   = strict_correct + intraday_winners
-        strict_accuracy    = (strict_correct   / total * 100) if total > 0 else 0
-        adjusted_accuracy  = (adjusted_correct / total * 100) if total > 0 else 0
-        strict_precision   = (true_positives / predicted_buys * 100) if predicted_buys > 0 else 0
-        adjusted_precision = ((true_positives + intraday_winners) / predicted_buys * 100) if predicted_buys > 0 else 0
+        total          = len(predictions_df)
+        predicted_buys = true_positives + false_positives
+        all_correct    = true_positives + true_negatives
+        accuracy       = (all_correct    / total * 100) if total > 0 else 0
+        precision      = (true_positives / predicted_buys * 100) if predicted_buys > 0 else 0
+        recall         = (true_positives / (true_positives + false_negatives) * 100) if (true_positives + false_negatives) > 0 else 0
 
         gain_populated = sum(1 for r in accuracy_records if r.get("actual_gain_pct") is not None)
         high_populated = sum(1 for r in accuracy_records if r.get("actual_high_pct") is not None)
 
-        self.logger.info(f"\nPrediction Accuracy:")
-        self.logger.info(f"  Total:                     {total}")
-        self.logger.info(f"  True Positives (closed):   {true_positives}")
-        self.logger.info(f"  Intraday Winners:          {intraday_winners}  ← hit {INTRADAY_WIN_THRESHOLD}%+ intraday")
-        self.logger.info(f"  False Positives (strict):  {false_positives}")
-        self.logger.info(f"  True Negatives:            {true_negatives}")
-        self.logger.info(f"  Accuracy  (strict):        {strict_accuracy:.2f}%")
-        self.logger.info(f"  Accuracy  (w/ intraday):   {adjusted_accuracy:.2f}%")
-        self.logger.info(f"  Precision (strict):        {strict_precision:.2f}%")
-        self.logger.info(f"  Precision (w/ intraday):   {adjusted_precision:.2f}%")
+        self.logger.info(f"\nPrediction Accuracy (winner = intraday high ≥ {INTRADAY_WIN_THRESHOLD}%):")
+        self.logger.info(f"  Total predictions:         {total}")
+        self.logger.info(f"  True Positives:            {true_positives}  ← BUY/STRONG BUY + hit {INTRADAY_WIN_THRESHOLD}%+ intraday")
+        self.logger.info(f"  False Positives:           {false_positives}  ← BUY/STRONG BUY + did NOT hit {INTRADAY_WIN_THRESHOLD}%+")
+        self.logger.info(f"  True Negatives:            {true_negatives}  ← HOLD/AVOID + did NOT hit {INTRADAY_WIN_THRESHOLD}%+")
+        self.logger.info(f"  False Negatives:           {false_negatives}  ← HOLD/AVOID + DID hit {INTRADAY_WIN_THRESHOLD}%+")
+        self.logger.info(f"  Accuracy:                  {accuracy:.2f}%")
+        self.logger.info(f"  Precision:                 {precision:.2f}%")
+        self.logger.info(f"  Recall:                    {recall:.2f}%")
         self.logger.info(f"  actual_gain_pct populated: {gain_populated}/{total} ({gain_populated/total*100:.1f}%)")
         self.logger.info(f"  actual_high_pct populated: {high_populated}/{total} ({high_populated/total*100:.1f}%)")
 
