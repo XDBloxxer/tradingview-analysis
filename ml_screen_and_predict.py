@@ -52,6 +52,14 @@ FIX 10 — get_next_trading_day now queries the daily_winners table for the most
   deriving the date from wall-clock time. This prevents mis-dating when GitHub
   Actions runs late or on the wrong side of midnight. Falls back to the
   original time-based logic if no winners data exists yet.
+
+FIX 11 — The stored `prediction` integer is now derived from `signal` rather
+  than from the raw XGBoost binary output.  With scale_pos_weight up to 10x,
+  the 0.5 decision boundary was satisfied by nearly every post-screener stock,
+  so `int(row['prediction'])` was 1 for almost all rows — making the column
+  useless as a BUY/AVOID discriminator in the accuracy tracker and in any
+  downstream query.  The field now stores 1 iff signal ∈ {BUY, STRONG BUY},
+  consistent with what the tracker (and the human reader) expects.
 """
 
 import argparse
@@ -1958,7 +1966,13 @@ def main():
             'exchange':              row.get('exchange', 'NASDAQ'),
             'prediction_date':       prediction_date,
             'explosion_probability': float(row['explosion_probability']),
-            'prediction':            int(row['prediction']),
+            # FIX: store prediction as 1 for BUY/STRONG BUY, 0 otherwise —
+            # derived from signal (percentile rank) rather than the raw XGBoost
+            # 0.5 threshold.  With scale_pos_weight up to 10x the raw model
+            # output is 1 for almost every post-screener stock, so storing it
+            # directly made prediction useless as a BUY/AVOID discriminator and
+            # caused the accuracy tracker to misclassify outcomes (see tracker fix).
+            'prediction':            1 if row.get('signal', '') in ('BUY', 'STRONG BUY') else 0,
             'signal':                row['signal'],
             'target_gain_pct':       float(row.get('target_gain_pct', 0)),
             'target_gain_low':       float(row.get('target_gain_low', 0)),
