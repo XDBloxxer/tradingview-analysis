@@ -2447,6 +2447,22 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     except Exception:
         return df
 
+    if logger:
+        logger.info("=" * 80)
+        logger.info("FILTER-AWARE SELECTION RESULTS")
+        try:
+            logger.info(f"Hard selected={hard_selected_count:,}")
+            logger.info(f"Random selected={random_selected_count:,}")
+        except Exception:
+            pass
+        logger.info("=" * 80)
+        logger.info("FILTER-AWARE NEGATIVE SAMPLING ENABLED")
+        logger.info(f"Loaded filters from {filters_path}")
+        for k, v in filters.items():
+            if not str(k).startswith("_"):
+                logger.info(f"FILTER {k}={v}")
+        logger.info("=" * 80)
+
     winners = df[df["label"] == 1].copy()
     negatives = df[df["label"] == 0].copy()
 
@@ -2484,6 +2500,20 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     hard_neg = negatives[mask].copy()
     easy_neg = negatives[~mask].copy()
 
+    if logger:
+        logger.info("=" * 80)
+        logger.info("FILTER-AWARE SELECTION RESULTS")
+        try:
+            logger.info(f"Hard selected={hard_selected_count:,}")
+            logger.info(f"Random selected={random_selected_count:,}")
+        except Exception:
+            pass
+        logger.info(
+            f"Negative universe={len(negatives):,}, "
+            f"hard_negatives={len(hard_neg):,} ({len(hard_neg)/max(len(negatives),1):.1%}), "
+            f"easy_negatives={len(easy_neg):,} ({len(easy_neg)/max(len(negatives),1):.1%})"
+        )
+
     date_col = next(
         (c for c in ["detection_date", "event_date", "trade_date", "date"]
          if c in df.columns),
@@ -2494,6 +2524,8 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         selected_neg = hard_neg.copy()
     else:
         selected_parts = []
+        hard_selected_count = 0
+        random_selected_count = 0
 
         for dt, winner_group in winners.groupby(date_col):
             target_negatives = max(len(winner_group) * 4, 8)
@@ -2518,6 +2550,16 @@ def apply_filter_aware_negative_sampling(df, logger=None):
             selected_parts.append(chosen_hard)
             selected_parts.append(chosen_easy)
 
+            hard_selected_count += len(chosen_hard)
+            random_selected_count += len(chosen_easy)
+
+            if logger and len(chosen_hard) < preferred_target:
+                logger.info(
+                    f"[{dt}] hard-negative shortage: "
+                    f"wanted={preferred_target}, available={len(hard_dt)}, "
+                    f"backfilled={len(chosen_easy)}"
+                )
+
         selected_neg = (
             pd.concat(selected_parts, ignore_index=True)
             if selected_parts else hard_neg
@@ -2531,6 +2573,13 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     result = pd.concat([winners, selected_neg], ignore_index=True)
 
     if logger:
+        logger.info("=" * 80)
+        logger.info("FILTER-AWARE SELECTION RESULTS")
+        try:
+            logger.info(f"Hard selected={hard_selected_count:,}")
+            logger.info(f"Random selected={random_selected_count:,}")
+        except Exception:
+            pass
         logger.info(
             f"Filter-aware retraining active: "
             f"winners={len(winners)}, "
