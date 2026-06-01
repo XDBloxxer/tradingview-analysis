@@ -2420,6 +2420,128 @@ def save_outputs(
 # Main
 # ---------------------------------------------------------------------------
 
+
+
+def apply_filter_aware_negative_sampling(df, logger=None):
+    """
+    Retraining enhancement:
+    - Keep all winners.
+    - Prefer non-winners that pass learned_filters.json.
+    - Backfill with same-date random negatives.
+    - Upweight filter-passing negatives.
+    - Preserve existing mistake-learner weights.
+    """
+    import json
+    from pathlib import Path
+    import pandas as pd
+
+    if df is None or df.empty or "label" not in df.columns:
+        return df
+
+    filters_path = Path("ml_models/learned_filters.json")
+    if not filters_path.exists():
+        return df
+
+    try:
+        filters = json.loads(filters_path.read_text())
+    except Exception:
+        return df
+
+    winners = df[df["label"] == 1].copy()
+    negatives = df[df["label"] == 0].copy()
+
+    if negatives.empty:
+        return df
+
+    mask = pd.Series(True, index=negatives.index)
+
+    filter_map = [
+        ("close", "min_price", "max_price"),
+        ("price", "min_price", "max_price"),
+        ("volume", "min_volume", None),
+        ("hv10", "min_hv10", None),
+        ("hv20", "min_hv20", None),
+        ("relative_volume", "min_relative_volume", None),
+        ("volume_ratio", "min_volume_ratio", None),
+    ]
+
+    used_filter=False
+    for col, min_key, max_key in filter_map:
+        if col not in negatives.columns:
+            continue
+
+        if min_key and min_key in filters:
+            mask &= negatives[col].fillna(-1e9) >= filters[min_key]
+            used_filter=True
+
+        if max_key and max_key in filters:
+            mask &= negatives[col].fillna(1e9) <= filters[max_key]
+            used_filter=True
+
+    if not used_filter:
+        return df
+
+    hard_neg = negatives[mask].copy()
+    easy_neg = negatives[~mask].copy()
+
+    date_col = next(
+        (c for c in ["detection_date", "event_date", "trade_date", "date"]
+         if c in df.columns),
+        None
+    )
+
+    if date_col is None:
+        selected_neg = hard_neg.copy()
+    else:
+        selected_parts = []
+
+        for dt, winner_group in winners.groupby(date_col):
+            target_negatives = max(len(winner_group) * 4, 8)
+
+            hard_dt = hard_neg[hard_neg[date_col] == dt]
+            easy_dt = easy_neg[easy_neg[date_col] == dt]
+
+            preferred_target = int(target_negatives * 0.80)
+
+            chosen_hard = (
+                hard_dt.sample(min(len(hard_dt), preferred_target), random_state=42)
+                if len(hard_dt) else hard_dt
+            )
+
+            remaining = target_negatives - len(chosen_hard)
+
+            chosen_easy = (
+                easy_dt.sample(min(len(easy_dt), remaining), random_state=42)
+                if remaining > 0 and len(easy_dt) else easy_dt.iloc[0:0]
+            )
+
+            selected_parts.append(chosen_hard)
+            selected_parts.append(chosen_easy)
+
+        selected_neg = (
+            pd.concat(selected_parts, ignore_index=True)
+            if selected_parts else hard_neg
+        )
+
+    if "sample_weight" in selected_neg.columns:
+        selected_neg.loc[:, "sample_weight"] = (
+            selected_neg["sample_weight"].fillna(1.0) * 1.75
+        )
+
+    result = pd.concat([winners, selected_neg], ignore_index=True)
+
+    if logger:
+        logger.info(
+            f"Filter-aware retraining active: "
+            f"winners={len(winners)}, "
+            f"hard_negatives_available={len(hard_neg)}, "
+            f"selected_negatives={len(selected_neg)}"
+        )
+
+    return result
+
+
+
 def main() -> int:
     logger.info("=" * 60)
     logger.info("ML RETRAIN — FULL RETRAIN FROM SCRATCH")
@@ -2432,6 +2554,7 @@ def main() -> int:
     base_df     = load_base_training_data(client)
     t1_df       = load_t1_data(client)
     combined_df = combine_datasets(base_df, t1_df)
+    combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
 
     # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
     # Use prev_close as denominator instead of same-day close
