@@ -749,18 +749,23 @@ class ExplosionPredictor:
             f"std={probabilities.std():.6f}"
         )
 
-        self._is_bimodal = True   # FIX #8: relative ranking is always active.
-        # The screener deliberately filters for high-volatility / high-volume
-        # candidates, which means the model's post-screener probability
-        # distribution almost always clusters at the high end (≥0.90 for 50%+
-        # of stocks), making absolute SIGNAL_THRESHOLDS a dead code path.
-        # Rather than keep two divergent paths where one is never reached,
-        # we make percentile-based (relative) ranking the sole mode.
-        # _detect_bimodal() is retained below for diagnostic logging only.
-        self._detect_bimodal(probabilities)   # log only — result is ignored
+        # Detect whether the probability distribution is degenerate (compressed,
+        # narrow-band, bimodal, or high-probability clustered).  When it is,
+        # absolute thresholds lose discriminative power and we fall back to
+        # percentile-based (relative) ranking.  When the distribution is healthy
+        # — which should become the common case once non-winners are drawn from
+        # the same screened universe — absolute SIGNAL_THRESHOLDS are used so
+        # that a stock genuinely needs to clear the calibrated bar to be called
+        # STRONG BUY / BUY / HOLD.
+        self._is_bimodal = self._detect_bimodal(probabilities)
 
         prob_series = pd.Series(probabilities, index=data_df.index)
-        signals     = self._classify_signals_relative(prob_series)
+        if self._is_bimodal:
+            self.logger.info("Using percentile-based (relative) signal classification.")
+            signals = self._classify_signals_relative(prob_series)
+        else:
+            self.logger.info("Distribution looks healthy — using absolute probability thresholds.")
+            signals = prob_series.map(self._classify_signal_absolute)
 
         result_df = pd.DataFrame({
             "explosion_probability": probabilities,
