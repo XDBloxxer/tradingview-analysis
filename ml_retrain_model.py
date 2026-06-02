@@ -266,6 +266,16 @@ NON_FEATURE_COLS = {
     "t3_open", "t3_high", "t3_low", "t3_close", "t3_volume",
     "t5_open", "t5_high", "t5_low", "t5_close", "t5_volume",
     "t10_open", "t10_high", "t10_low", "t10_close", "t10_volume",
+    # ── Raw OHLCV T-1 features ────────────────────────────────────────────────
+    # The same price-level generalisation problem applies to T-1 snapshots.
+    # A $2 stock and a $50 stock have fundamentally different volatility regimes;
+    # including the raw price teaches the model price-level patterns rather than
+    # true momentum signals.  Derived indicators (RSI, ATR%, MACD, etc.) that
+    # are internally price-normalised are retained — they capture the signal
+    # without exposing the absolute price level.
+    # Both the close-snapshot and open-snapshot variants are excluded.
+    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open",
+    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
