@@ -32,7 +32,11 @@ FIXES IN THIS VERSION:
 
   3. scale_pos_weight capped at [0.5, 5.0] — avoids extreme corrections when the
      training set happens to be very imbalanced in either direction.
-     (SPW_MAX raised from 3.0 → 5.0 to better handle the ~8.8x production imbalance.)
+     SPW_MAX is intentionally kept at 5.0 even though the raw imbalance is ~8.7x:
+     combining SPW=10 with eval_metric="auc" pushes raw probabilities so high that
+     STRONG_BUY thresholds become meaningless.  Base-rate mismatch between the val
+     calibration set and the screened inference universe is corrected via prior-
+     probability correction in train_model() instead of via a higher SPW.
 
   4. Intraday-high label support — if actual_high_pct is available and exceeds
      INTRADAY_WIN_THRESHOLD, those rows are also treated as winners (label=1).
@@ -207,11 +211,64 @@ INTRADAY_WIN_THRESHOLD = 20.0  # %
 # making it harder for early stopping to detect genuine improvement and
 # contributing to the model halting at best_iteration=12.
 SPW_MIN = 0.5
-SPW_MAX = 10.0   # Raised from 5.0 — actual imbalance is ~8.7x (11.5% positive rate).
-                 # Capping at 5.0 was under-weighting positives and collapsing the
-                 # probability spread toward HOLD.  10.0 allows the model to use the
-                 # natural class imbalance ratio, producing higher max probabilities
-                 # for the strongest signals and restoring BUY/STRONG BUY signals.
+SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
+                 #
+                 # Root-cause analysis: the jump to 10.0 was intended to restore
+                 # BUY/STRONG BUY signals that were being suppressed.  The real cause
+                 # of that suppression was the isotonic calibrator being fitted on a
+                 # val set whose positive rate (~10–25%) was far below the screened
+                 # inference universe's positive rate, not an insufficient SPW.
+                 #
+                 # At SPW=10 with eval_metric="auc" (rank-based, ignores calibration),
+                 # XGBoost pushes raw probabilities so high that 50–60%+ of post-screener
+                 # stocks cluster at ≥0.90, making STRONG_BUY / BUY thresholds trivially
+                 # easy to satisfy and effectively meaningless as absolute cutoffs.
+                 # The RC6 _detect_bimodal workaround detects this and falls back to
+                 # percentile-based ranking, but that means the absolute probability
+                 # output is no longer interpretable at all.
+                 #
+                 # The correct fix is:
+                 #   1. Keep SPW ≤ 5.0 to prevent over-weighting positives when
+                 #      eval_metric="auc" is used (AUC training amplifies the effect).
+                 #   2. Apply prior-probability correction in the calibration step
+                 #      (see SCREENER_POSITIVE_RATE and the corrected train_model())
+                 #      to account for the base-rate mismatch between val set and the
+                 #      screened inference universe.  This restores interpretable
+                 #      absolute probabilities without inflating them globally.
+
+# Prior-probability correction for post-training isotonic calibration.
+#
+# Background:
+#   The calibration set is carved from the val split, which has a positive rate
+#   matching roughly the unscreened (or lightly screened) universe — typically
+#   ~10–25%.  But at inference time, every stock passed through the screener
+#   first.  The screener raises the effective positive rate to ~30–50%.
+#
+#   Isotonic calibration fits a monotone mapping from raw score → probability
+#   using the calibration set's base rate as an implicit anchor.  When that
+#   anchor is far below the inference base rate, the calibrator systematically
+#   under-estimates probabilities for screened stocks.
+#
+#   Prior-probability correction (Bayes odds-ratio adjustment) shifts the
+#   calibrated output to account for this mismatch without refitting the model:
+#
+#       odds_corrected = odds_calibrated * (p_inf / (1 - p_inf))
+#                                        / (p_cal / (1 - p_cal))
+#
+#   where p_inf is the estimated positive rate of the screened inference universe
+#   and p_cal is the positive rate of the calibration set.
+#
+#   Set SCREENER_POSITIVE_RATE to the observed fraction of screened candidates
+#   that eventually become winners (i.e. hit >=INTRADAY_WIN_THRESHOLD).
+#   Query ml_prediction_accuracy to estimate this from production history:
+#       SELECT COUNT(*) FILTER (WHERE became_winner) * 1.0 / COUNT(*)
+#       FROM ml_prediction_accuracy
+#       WHERE prediction_date >= NOW() - INTERVAL '90 days';
+#   If this query is unavailable, 0.35 is a conservative starting estimate
+#   for a well-tuned screener targeting 20%+ intraday gains.
+#
+#   Set to None to disable prior correction (falls back to raw isotonic output).
+SCREENER_POSITIVE_RATE: float | None = 0.35
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
@@ -1599,37 +1656,54 @@ def train_model(
             "Check that the validation set does not overlap with training dates."
         )
 
-    # RC6: Post-training probability calibration
-    # AUC training + scale_pos_weight together push probabilities toward
-    # extremes, causing 60%+ of post-screener stocks to cluster at STRONG BUY.
+    # RC6 (revised): Post-training probability calibration with prior correction.
     #
-    # CALIBRATION METHOD: isotonic (not sigmoid).
-    # Sigmoid (Platt scaling) fits a logistic function that anchors to the
-    # calibration set's positive base rate.  When the calibration set is carved
-    # from the val split (~10–25% positive rate) but inference runs on a
-    # pre-screened universe with a much higher base rate, sigmoid compresses all
-    # inference probabilities downward — which is exactly the suppression to
-    # 0.50–0.68 that was observed.
+    # CALIBRATION STRATEGY:
+    #   Step 1 — Isotonic calibration: fit a rank-preserving monotone mapping
+    #     from raw XGBoost scores to probabilities on the held-out calibration
+    #     set.  Isotonic is preferred over sigmoid (Platt scaling) because
+    #     sigmoid anchors to the calibration set's positive base rate, which
+    #     suppresses all inference probabilities when the screened inference
+    #     universe has a higher base rate than the val/cal set.
     #
-    # Isotonic regression is rank-preserving and fits a monotone step function
-    # directly to the (raw_score, label) pairs without anchoring to a global
-    # base rate.  It preserves relative ordering while correcting non-linearity
-    # in the probability outputs, and is robust to the base-rate mismatch
-    # between the val calibration set and the screened inference universe.
+    #   Step 2 — Prior-probability correction (Bayes odds-ratio adjustment):
+    #     Even isotonic calibration implicitly anchors to the calibration set's
+    #     base rate.  When the calibration set is carved from the val split
+    #     (positive rate ~10–25%) but inference runs on a screened universe
+    #     (positive rate ~30–50%), the isotonic output is systematically too
+    #     low for screened stocks.
+    #
+    #     Correction formula (Saerens et al. 2002 / du Plessis & Sugiyama 2014):
+    #
+    #       Let p_c = calibration-set positive rate (known from y_cal)
+    #           p_i = screened inference positive rate (SCREENER_POSITIVE_RATE)
+    #           q   = raw isotonic-calibrated probability
+    #
+    #       odds_corrected = (q / (1 - q)) * (p_i / (1 - p_i)) / (p_c / (1 - p_c))
+    #       p_corrected    = odds_corrected / (1 + odds_corrected)
+    #
+    #     This is applied element-wise at inference time via a thin wrapper that
+    #     calls the underlying CalibratedClassifierCV and then shifts odds.
+    #     The wrapper is transparent to the rest of the codebase (it still
+    #     implements predict_proba / predict / classes_).
+    #
+    #     SCREENER_POSITIVE_RATE is configurable at the top of this file.
+    #     Set it to None to disable prior correction and use raw isotonic output.
     if X_cal is not None and y_cal is not None:
         n_cal_pos = int((y_cal == 1).sum())
         n_cal_neg = int((y_cal == 0).sum())
         if n_cal_pos >= 10 and n_cal_neg >= 10:
+            p_cal = n_cal_pos / max(1, n_cal_pos + n_cal_neg)
             logger.info(
                 f"RC6: Fitting isotonic probability calibrator on "
                 f"{len(y_cal)} calibration samples "
-                f"({n_cal_pos} pos / {n_cal_neg} neg, "
-                f"rate={n_cal_pos/max(1,n_cal_pos+n_cal_neg):.1%})."
+                f"({n_cal_pos} pos / {n_cal_neg} neg, rate={p_cal:.1%})."
             )
             calibrated_model = CalibratedClassifierCV(
                 model, method="isotonic", cv="prefit"
             )
             calibrated_model.fit(X_cal, y_cal)
+
             # Sanity-check: log how calibration shifted the distribution
             raw_proba = model.predict_proba(X_cal)[:, 1]
             cal_proba = calibrated_model.predict_proba(X_cal)[:, 1]
@@ -1643,19 +1717,89 @@ def train_model(
                 f"std={cal_proba.std():.3f}  "
                 f"pct>=0.90: {(cal_proba>=0.90).mean():.1%}"
             )
-            # Warn if isotonic calibration is still substantially suppressing
-            # probabilities — this would indicate the val calibration set's
-            # base rate is still too far from the inference screener's base rate.
-            if cal_proba.max() < 0.75 and raw_proba.max() > 0.80:
-                logger.warning(
-                    f"  ⚠️  RC6: Isotonic calibration is suppressing probabilities "
-                    f"(raw max={raw_proba.max():.3f} → cal max={cal_proba.max():.3f}). "
-                    "The calibration set positive rate may still be much lower than "
-                    "the inference screener's positive rate.  Consider building the "
-                    "calibration set from ml_prediction_accuracy production data "
-                    "to match the actual post-screener base rate."
+
+            # Step 2: Prior-probability correction for base-rate mismatch.
+            p_inf = SCREENER_POSITIVE_RATE
+            if p_inf is not None and 0.0 < p_inf < 1.0 and 0.0 < p_cal < 1.0:
+                # Bayes odds-ratio correction factor
+                odds_ratio = (p_inf / (1.0 - p_inf)) / (p_cal / (1.0 - p_cal))
+                logger.info(
+                    f"  Prior correction: p_cal={p_cal:.3f} → p_inf={p_inf:.3f}  "
+                    f"odds_ratio={odds_ratio:.3f}"
                 )
-            return calibrated_model
+
+                # Compute corrected probabilities on the cal set for logging
+                raw_odds = cal_proba / np.clip(1.0 - cal_proba, 1e-9, None)
+                corr_odds = raw_odds * odds_ratio
+                corr_proba = corr_odds / (1.0 + corr_odds)
+                logger.info(
+                    f"  Corrected proba — mean={corr_proba.mean():.3f}  "
+                    f"std={corr_proba.std():.3f}  "
+                    f"pct>=0.90: {(corr_proba>=0.90).mean():.1%}"
+                )
+
+                # Warn if correction is so large it may be unreliable
+                if odds_ratio > 10.0:
+                    logger.warning(
+                        f"  ⚠️  RC6: Prior correction odds_ratio={odds_ratio:.2f} is very "
+                        f"large.  Verify that SCREENER_POSITIVE_RATE={p_inf} reflects the "
+                        f"actual fraction of screened candidates that become winners. "
+                        f"Run: SELECT COUNT(*) FILTER (WHERE became_winner)*1.0/COUNT(*) "
+                        f"FROM ml_prediction_accuracy WHERE prediction_date >= NOW()-'90 days'::interval"
+                    )
+
+                # Wrap calibrated_model with prior correction so predict_proba()
+                # automatically applies the Bayes odds-ratio shift at inference.
+                # The wrapper is a thin class — no stored arrays, just the factor.
+                _odds_ratio = float(odds_ratio)  # capture for closure
+
+                class _PriorCorrectedModel:
+                    """
+                    Thin wrapper around a CalibratedClassifierCV that applies
+                    Bayes prior-probability correction to predict_proba output.
+
+                    Preserves the classes_ attribute so downstream code that
+                    checks model.classes_ (e.g. compute_feature_importance) works
+                    without modification.
+                    """
+                    def __init__(self, base, odds_ratio):
+                        self._base       = base
+                        self._odds_ratio = odds_ratio
+                        self.classes_    = base.classes_
+                        # Forward attributes needed by CalibratedClassifierCV unwrap
+                        # logic in explosion_predictor.py and compute_feature_importance.
+                        if hasattr(base, "calibrated_classifiers_"):
+                            self.calibrated_classifiers_ = base.calibrated_classifiers_
+
+                    def predict_proba(self, X):
+                        raw = self._base.predict_proba(X)
+                        p   = raw[:, 1]
+                        odds = p / np.clip(1.0 - p, 1e-9, None) * self._odds_ratio
+                        p_corr = odds / (1.0 + odds)
+                        return np.column_stack([1.0 - p_corr, p_corr])
+
+                    def predict(self, X):
+                        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+                    # Forward any other attribute lookups to the base model so
+                    # code that probes e.g. best_iteration still works.
+                    def __getattr__(self, name):
+                        return getattr(self._base, name)
+
+                return _PriorCorrectedModel(calibrated_model, _odds_ratio)
+            else:
+                if p_inf is None:
+                    logger.info(
+                        "  Prior correction disabled (SCREENER_POSITIVE_RATE=None). "
+                        "Returning raw isotonic-calibrated model."
+                    )
+                else:
+                    logger.warning(
+                        f"  Prior correction skipped: invalid "
+                        f"SCREENER_POSITIVE_RATE={p_inf} or p_cal={p_cal:.3f}. "
+                        "Must be strictly between 0 and 1."
+                    )
+                return calibrated_model
         else:
             logger.warning(
                 f"RC6: Calibration set too small or imbalanced "
