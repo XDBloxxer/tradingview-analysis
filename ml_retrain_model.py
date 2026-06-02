@@ -2797,6 +2797,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description="ML weekly full retrain from scratch.")
     parser.add_argument(
+        "--verbose",
         action="store_true",
         help="Set log level to DEBUG (default: INFO).",
     )
