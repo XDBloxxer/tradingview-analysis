@@ -29,11 +29,28 @@ RC6 FIX — High-probability clustering detection (post-filter calibration probl
   causing SIGNAL_THRESHOLDS["STRONG BUY"]=0.90 to trigger for 60%+ of stocks
   and become meaningless.
 
-  Mode D: High-probability clustering — if ≥50% of predictions score ≥0.90
+  The root cause was a two-part miscalibration in ml_retrain_model.py:
+    (a) SPW_MAX=10.0 over-weighted positives, pushing raw scores too high.
+    (b) Isotonic calibration on the val set (positive rate ~10-25%) was not
+        adjusted for the screened inference universe's higher positive rate
+        (~30-50%), so it under-corrected the systematic over-confidence.
+
+  Both causes are now fixed in ml_retrain_model.py (RC6 revised):
+    (a) SPW_MAX restored to 5.0.
+    (b) Prior-probability correction (Bayes odds-ratio shift) applied on top
+        of isotonic calibration to account for the base-rate mismatch.
+
+  The _detect_bimodal modes D and E below are retained as a runtime safety net
+  in case the calibration is misconfigured (e.g. SCREENER_POSITIVE_RATE is
+  stale) or the model is loaded from a pkl that pre-dates the RC6 fix. When
+  they fire, relative ranking is used as a fallback so that signals remain
+  meaningful even with a miscalibrated model.
+
+  Mode D: High-probability clustering — if >=50% of predictions score >=0.90
   (the STRONG BUY threshold), absolute thresholds are no longer discriminating
   and relative ranking is activated.
 
-  Mode E: High mean probability — if mean probability ≥0.80, the model's
+  Mode E: High mean probability — if mean probability >=0.80, the model's
   decision boundary has shifted so far up that absolute thresholds lose
   meaning even if clustering isn't strictly above 0.90.
 
@@ -82,11 +99,12 @@ RELATIVE_HOLD_PCT       = 0.60   # top 20-40%
 COMPRESSION_THRESHOLD      = 0.85   # >85% below 0.50 → use relative ranking
 NARROW_BAND_STD_THRESHOLD  = 0.02   # std < 0.02 regardless of level → use relative ranking
 
-# RC6: High-probability clustering detection (post-filter calibration problem)
-# AUC training + scale_pos_weight pushes most post-screener predictions high,
-# making the absolute STRONG BUY threshold (0.90) trivially easy to trigger.
-HIGH_PROB_CLUSTERING_RATE  = 0.50   # ≥50% at or above STRONG BUY → relative ranking
-HIGH_PROB_MEAN_THRESHOLD   = 0.80   # mean ≥0.80 → absolute thresholds meaningless
+# RC6: High-probability clustering detection — runtime safety net.
+# With a correctly calibrated model (SPW_MAX=5.0 + prior correction in
+# ml_retrain_model.py) these thresholds should rarely be hit. They are retained
+# to catch models loaded from pre-RC6 pkl files or misconfigured SCREENER_POSITIVE_RATE.
+HIGH_PROB_CLUSTERING_RATE  = 0.50   # >=50% at or above STRONG BUY → relative ranking
+HIGH_PROB_MEAN_THRESHOLD   = 0.80   # mean >=0.80 → absolute thresholds likely meaningless
 
 # Original mid-range sparsity check (bimodal toward extremes)
 BIMODAL_MIDRANGE             = (0.15, 0.85)
@@ -655,10 +673,14 @@ class ExplosionPredictor:
             )
             return True
 
-        # RC6 Mode D: High-probability clustering
-        # AUC training + heavy scale_pos_weight pushes post-screener predictions
-        # high. When >=50% of stocks hit the STRONG BUY threshold (>=0.90),
-        # the absolute threshold is no longer discriminating within today's batch.
+        # RC6 Mode D: High-probability clustering (safety net).
+        # With properly calibrated models (SPW_MAX=5.0 + prior correction) this
+        # mode should rarely fire.  It is retained as a runtime safety net for:
+        #   - models loaded from pkl files pre-dating the RC6 calibration fix
+        #   - misconfigured SCREENER_POSITIVE_RATE causing under-correction
+        # When >=50% of stocks hit the STRONG BUY threshold (>=0.90), the
+        # absolute threshold is no longer discriminating within today's batch
+        # and relative ranking is activated.
         strong_buy_threshold = SIGNAL_THRESHOLDS["STRONG BUY"]
         above_threshold_rate = float((probabilities >= strong_buy_threshold).mean())
         if above_threshold_rate >= HIGH_PROB_CLUSTERING_RATE:
