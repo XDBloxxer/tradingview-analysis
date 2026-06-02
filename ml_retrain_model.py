@@ -270,6 +270,50 @@ SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
 #   Set to None to disable prior correction (falls back to raw isotonic output).
 SCREENER_POSITIVE_RATE: float | None = 0.35
 
+
+class _PriorCorrectedModel:
+    """
+    Thin wrapper around a CalibratedClassifierCV that applies Bayes
+    prior-probability correction to predict_proba output.
+
+    Must be defined at module level (not inside a function) so that joblib
+    can pickle it via its fully-qualified name.
+
+    The correction shifts calibrated probabilities to account for the
+    base-rate mismatch between the val/calibration set (positive rate ~10-25%)
+    and the screened inference universe (positive rate ~30-50%):
+
+        odds_corrected = odds_calibrated * odds_ratio
+        p_corrected    = odds_corrected / (1 + odds_corrected)
+
+    where odds_ratio = (p_inf / (1-p_inf)) / (p_cal / (1-p_cal)).
+    """
+
+    def __init__(self, base, odds_ratio: float):
+        self._base       = base
+        self._odds_ratio = float(odds_ratio)
+        self.classes_    = base.classes_
+        # Forward attributes needed by CalibratedClassifierCV unwrap logic in
+        # explosion_predictor.py and compute_feature_importance.
+        if hasattr(base, "calibrated_classifiers_"):
+            self.calibrated_classifiers_ = base.calibrated_classifiers_
+
+    def predict_proba(self, X):
+        raw    = self._base.predict_proba(X)
+        p      = raw[:, 1]
+        odds   = p / np.clip(1.0 - p, 1e-9, None) * self._odds_ratio
+        p_corr = odds / (1.0 + odds)
+        return np.column_stack([1.0 - p_corr, p_corr])
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+    def __getattr__(self, name):
+        # Forward any other attribute lookups to the base model so code that
+        # probes e.g. best_iteration, best_score, feature_importances_ works.
+        return getattr(self._base, name)
+
+
 XGBOOST_PARAMS = {
     "n_estimators":       300,
     "max_depth":          3,       # reduced from 6 → less overfitting
@@ -1750,43 +1794,9 @@ def train_model(
 
                 # Wrap calibrated_model with prior correction so predict_proba()
                 # automatically applies the Bayes odds-ratio shift at inference.
-                # The wrapper is a thin class — no stored arrays, just the factor.
-                _odds_ratio = float(odds_ratio)  # capture for closure
-
-                class _PriorCorrectedModel:
-                    """
-                    Thin wrapper around a CalibratedClassifierCV that applies
-                    Bayes prior-probability correction to predict_proba output.
-
-                    Preserves the classes_ attribute so downstream code that
-                    checks model.classes_ (e.g. compute_feature_importance) works
-                    without modification.
-                    """
-                    def __init__(self, base, odds_ratio):
-                        self._base       = base
-                        self._odds_ratio = odds_ratio
-                        self.classes_    = base.classes_
-                        # Forward attributes needed by CalibratedClassifierCV unwrap
-                        # logic in explosion_predictor.py and compute_feature_importance.
-                        if hasattr(base, "calibrated_classifiers_"):
-                            self.calibrated_classifiers_ = base.calibrated_classifiers_
-
-                    def predict_proba(self, X):
-                        raw = self._base.predict_proba(X)
-                        p   = raw[:, 1]
-                        odds = p / np.clip(1.0 - p, 1e-9, None) * self._odds_ratio
-                        p_corr = odds / (1.0 + odds)
-                        return np.column_stack([1.0 - p_corr, p_corr])
-
-                    def predict(self, X):
-                        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-                    # Forward any other attribute lookups to the base model so
-                    # code that probes e.g. best_iteration still works.
-                    def __getattr__(self, name):
-                        return getattr(self._base, name)
-
-                return _PriorCorrectedModel(calibrated_model, _odds_ratio)
+                # _PriorCorrectedModel is defined at module level (not inside this
+                # function) so that joblib can pickle it by fully-qualified name.
+                return _PriorCorrectedModel(calibrated_model, float(odds_ratio))
             else:
                 if p_inf is None:
                     logger.info(
