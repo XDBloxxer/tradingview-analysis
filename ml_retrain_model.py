@@ -274,10 +274,29 @@ T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
+# logging.basicConfig() is a no-op if any handler already exists on the root
+# logger (e.g. the GitHub Actions runner pre-configures one).  Explicitly
+# installing a StreamHandler guarantees our format and level are always applied,
+# regardless of the calling environment.
+#
+# --verbose / --lookback-days / --use-all-timepoints are parsed in main() via
+# argparse; here we only set up the handler at INFO level.  main() will call
+# _configure_logging(logging.DEBUG) when --verbose is passed.
+def _configure_logging(level: int = logging.INFO) -> None:
+    """Install a stdout StreamHandler on the root logger (idempotent)."""
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Remove any existing handlers so we own the format completely.
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(level)
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+    root.addHandler(handler)
+
+_configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -1497,10 +1516,13 @@ def train_model(
 
     RC6: If X_cal/y_cal are supplied (a held-out calibration set),
     the raw XGBoost model is wrapped with CalibratedClassifierCV
-    (isotonic regression, cv='prefit') before being returned. This
-    corrects the extreme probability clustering caused by AUC training
-    + heavy scale_pos_weight, pulling predictions away from 0/1 and
-    restoring meaningful separation across the SIGNAL_THRESHOLDS.
+    (method='isotonic', cv='prefit') before being returned.  Isotonic
+    regression fits a rank-preserving monotone step function to the
+    calibration data and does NOT anchor to the calibration set's base
+    rate — making it robust to the mismatch between the val-set positive
+    rate (~10–25%) and the screened inference universe's higher positive
+    rate.  Sigmoid (Platt scaling) anchors to the cal-set base rate and
+    was suppressing all inference probabilities to 0.50–0.68.
     The calibrator is fitted on X_cal/y_cal (not X_train) so that no
     training data leaks into the calibration fit.
     """
@@ -1570,8 +1592,20 @@ def train_model(
     # RC6: Post-training probability calibration
     # AUC training + scale_pos_weight together push probabilities toward
     # extremes, causing 60%+ of post-screener stocks to cluster at STRONG BUY.
-    # Fitting a sigmoid calibrator on a clean held-out calibration set corrects
-    # this without affecting AUC / rank order (isotonic regression is rank-preserving).
+    #
+    # CALIBRATION METHOD: isotonic (not sigmoid).
+    # Sigmoid (Platt scaling) fits a logistic function that anchors to the
+    # calibration set's positive base rate.  When the calibration set is carved
+    # from the val split (~10–25% positive rate) but inference runs on a
+    # pre-screened universe with a much higher base rate, sigmoid compresses all
+    # inference probabilities downward — which is exactly the suppression to
+    # 0.50–0.68 that was observed.
+    #
+    # Isotonic regression is rank-preserving and fits a monotone step function
+    # directly to the (raw_score, label) pairs without anchoring to a global
+    # base rate.  It preserves relative ordering while correcting non-linearity
+    # in the probability outputs, and is robust to the base-rate mismatch
+    # between the val calibration set and the screened inference universe.
     if X_cal is not None and y_cal is not None:
         n_cal_pos = int((y_cal == 1).sum())
         n_cal_neg = int((y_cal == 0).sum())
@@ -1579,10 +1613,11 @@ def train_model(
             logger.info(
                 f"RC6: Fitting isotonic probability calibrator on "
                 f"{len(y_cal)} calibration samples "
-                f"({n_cal_pos} pos / {n_cal_neg} neg)."
+                f"({n_cal_pos} pos / {n_cal_neg} neg, "
+                f"rate={n_cal_pos/max(1,n_cal_pos+n_cal_neg):.1%})."
             )
             calibrated_model = CalibratedClassifierCV(
-                model, method="sigmoid", cv="prefit"
+                model, method="isotonic", cv="prefit"
             )
             calibrated_model.fit(X_cal, y_cal)
             # Sanity-check: log how calibration shifted the distribution
@@ -1598,17 +1633,29 @@ def train_model(
                 f"std={cal_proba.std():.3f}  "
                 f"pct>=0.90: {(cal_proba>=0.90).mean():.1%}"
             )
+            # Warn if isotonic calibration is still substantially suppressing
+            # probabilities — this would indicate the val calibration set's
+            # base rate is still too far from the inference screener's base rate.
+            if cal_proba.max() < 0.75 and raw_proba.max() > 0.80:
+                logger.warning(
+                    f"  ⚠️  RC6: Isotonic calibration is suppressing probabilities "
+                    f"(raw max={raw_proba.max():.3f} → cal max={cal_proba.max():.3f}). "
+                    "The calibration set positive rate may still be much lower than "
+                    "the inference screener's positive rate.  Consider building the "
+                    "calibration set from ml_prediction_accuracy production data "
+                    "to match the actual post-screener base rate."
+                )
             return calibrated_model
         else:
             logger.warning(
                 f"RC6: Calibration set too small or imbalanced "
                 f"({n_cal_pos} pos / {n_cal_neg} neg) — "
-                "skipping sigmoid calibration. Returning raw model."
+                "skipping isotonic calibration. Returning raw model."
             )
     else:
         logger.info(
             "RC6: No calibration set provided — returning raw (uncalibrated) model. "
-            "Pass X_cal/y_cal to train_model() to enable sigmoid calibration."
+            "Pass X_cal/y_cal to train_model() to enable isotonic calibration."
         )
 
     return model
@@ -2592,8 +2639,32 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
 
 def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="ML weekly full retrain from scratch.")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Set log level to DEBUG (default: INFO).",
+    )
+    parser.add_argument(
+        "--lookback-days", type=int, default=90, metavar="N",
+        help="How many days of T-1 data to use for training (default: 90).",
+    )
+    parser.add_argument(
+        "--use-all-timepoints", action="store_true", default=True,
+        help="Use both day_prior_close and day_prior_open T-1 tables (default: True).",
+    )
+    args = parser.parse_args()
+
+    if args.verbose:
+        _configure_logging(logging.DEBUG)
+        logger.debug("Verbose logging enabled.")
+
     logger.info("=" * 60)
     logger.info("ML RETRAIN — FULL RETRAIN FROM SCRATCH")
+    logger.info(f"  lookback_days      : {args.lookback_days}")
+    logger.info(f"  use_all_timepoints : {args.use_all_timepoints}")
+    logger.info(f"  verbose            : {args.verbose}")
     logger.info("=" * 60)
 
     # ── Connect ──────────────────────────────────────────────────────────────
@@ -2787,6 +2858,15 @@ def main() -> int:
     # We reserve half the val set for calibration and use the remaining half
     # for early-stopping AUC.  Both halves still come entirely from after the
     # cutoff date, so there is no temporal leakage into training.
+    #
+    # IMPORTANT — method='isotonic' (not 'sigmoid'):
+    # Sigmoid (Platt scaling) anchors to the calibration set's positive base
+    # rate.  Because the val set is rebalanced to ~train_rate+2pp (~10–25%
+    # positive), sigmoid compresses all inference probabilities downward when
+    # the screened inference universe has a higher base rate.  This was the
+    # root cause of max probabilities being suppressed to ~0.68.
+    # Isotonic regression fits a rank-preserving step function without anchoring
+    # to any global base rate, so it is robust to this mismatch.
     #
     # Minimum requirements: ≥10 positives in each half after the split.
     CAL_MIN_POS = 10
