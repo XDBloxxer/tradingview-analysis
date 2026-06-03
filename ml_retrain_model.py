@@ -61,6 +61,15 @@ GAIN REGRESSOR FIXES (2026 update):
        enriched with actual_gain_pct from ml_prediction_accuracy before being added
        to combined_df, so they contribute to regressor training.
 
+LABEL FIX (2026):
+  RC3-label. Non-winner actual_high_pct backfill: the RC2 join only matches
+       daily_winners rows, so non_winners_day_prior rows exit RC2 with
+       actual_high_pct = NULL. apply_intraday_high_labels() requires
+       (label==0) & (actual_high_pct >= threshold) and could never fire for the
+       ~476 explosive non-winner rows, leaving them mislabelled as 0. A new block
+       inserted between RC2 and FIX 4 fetches ml_prediction_accuracy.actual_high_pct
+       for all remaining NULL rows and fills them before relabelling runs.
+
 NOTE ON CLASS BALANCE:
   ml_training_base contains both winners (label=1) and non-winners (label=0) from
   the original CSV, all with t3_/t5_/t10_ features from daily bars.
@@ -3003,6 +3012,102 @@ def main() -> int:
                     )
     except Exception as e:
         logger.warning(f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited")
+
+    # ── RC3 FIX: Backfill actual_high_pct for non-winner rows from ml_prediction_accuracy ──
+    # PROBLEM: The RC2 block above only joins daily_winners rows, so non_winners_day_prior
+    # rows always have actual_high_pct = NULL after RC2.  apply_intraday_high_labels()
+    # requires (label==0) & (actual_high_pct >= threshold), which can NEVER fire for
+    # non-winner rows — leaving ~476 explosive non-winner stocks permanently mislabelled
+    # as label=0 and poisoning the negative class.
+    #
+    # FIX: fetch ml_prediction_accuracy.actual_high_pct for all symbols/dates present
+    # in combined_df that still have actual_high_pct = NULL, then fill those values in.
+    # This runs BEFORE apply_intraday_high_labels so the mask can actually trigger.
+    logger.info("RC3: Backfilling actual_high_pct for non-winner rows from ml_prediction_accuracy...")
+    try:
+        _symbol_col = next(
+            (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
+        )
+        _date_col = next(
+            (c for c in ["detection_date_x", "detection_date", "event_date"]
+             if c in combined_df.columns), None
+        )
+        _null_mask = (
+            combined_df.get("actual_high_pct", pd.Series(dtype=float)).isna()
+            if "actual_high_pct" in combined_df.columns
+            else pd.Series(True, index=combined_df.index)
+        )
+        n_null_before = int(_null_mask.sum())
+        logger.info(f"RC3: {n_null_before} rows have actual_high_pct = NULL before backfill")
+
+        if _symbol_col and _date_col and n_null_before > 0:
+            # Derive earliest date in the null rows to bound the query
+            _min_date = pd.to_datetime(
+                combined_df.loc[_null_mask, _date_col], errors="coerce"
+            ).min()
+            _start_date = (
+                _min_date.date().isoformat() if pd.notna(_min_date) else None
+            )
+
+            _acc_resp = (
+                client.table("ml_prediction_accuracy")
+                .select("symbol, prediction_date, actual_high_pct")
+                .not_.is_("actual_high_pct", "null")
+                .gte("prediction_date", _start_date)
+                .execute()
+            ) if _start_date else None
+
+            if _acc_resp and _acc_resp.data:
+                _acc_df = pd.DataFrame(_acc_resp.data)
+                _acc_df["prediction_date"] = pd.to_datetime(
+                    _acc_df["prediction_date"], errors="coerce"
+                ).dt.date.astype(str)
+                _acc_df["actual_high_pct"] = pd.to_numeric(
+                    _acc_df["actual_high_pct"], errors="coerce"
+                )
+                _acc_df = _acc_df.dropna(subset=["actual_high_pct"])
+
+                # Normalise date column for join
+                _combined_dates = pd.to_datetime(
+                    combined_df[_date_col], errors="coerce"
+                ).dt.date.astype(str)
+
+                # Build lookup: (symbol, date) → actual_high_pct
+                _acc_lookup = _acc_df.set_index(["symbol", "prediction_date"])["actual_high_pct"]
+
+                # Vectorised fill: only update rows that are still NULL
+                if "actual_high_pct" not in combined_df.columns:
+                    combined_df["actual_high_pct"] = np.nan
+
+                _update_idx = combined_df.index[_null_mask]
+                _keys = list(zip(
+                    combined_df.loc[_update_idx, _symbol_col],
+                    _combined_dates.loc[_update_idx],
+                ))
+                _filled_values = pd.array(
+                    [_acc_lookup.get(k, np.nan) for k in _keys],
+                    dtype=float,
+                )
+                combined_df.loc[_update_idx, "actual_high_pct"] = _filled_values
+
+                n_filled = int(
+                    pd.to_numeric(combined_df.loc[_update_idx, "actual_high_pct"], errors="coerce")
+                    .notna().sum()
+                )
+                logger.info(
+                    f"RC3: Filled actual_high_pct for {n_filled}/{n_null_before} "
+                    f"previously-NULL rows from ml_prediction_accuracy "
+                    f"({len(_acc_df)} accuracy records available from {_start_date})"
+                )
+            else:
+                logger.warning("RC3: ml_prediction_accuracy returned no rows with actual_high_pct — non-winner relabelling will not fire")
+        else:
+            if not _symbol_col or not _date_col:
+                logger.warning("RC3: Could not identify symbol/date columns — skipping non-winner backfill")
+            else:
+                logger.info("RC3: No NULL actual_high_pct rows to backfill — skipping")
+    except Exception as _e:
+        logger.warning(f"RC3: Could not backfill actual_high_pct for non-winner rows: {_e}")
 
     # ── FIX 4: Relabel rows with strong intraday moves as winners ─────────────
     combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
