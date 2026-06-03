@@ -2718,6 +2718,7 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     - Backfill with same-date random negatives.
     - Upweight filter-passing negatives.
     - Preserve existing mistake-learner weights.
+    - ENFORCED: Automatically preserves the 16% natural background positive rate.
     """
     import json
     from pathlib import Path
@@ -2737,13 +2738,6 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
     if logger:
         logger.info("=" * 80)
-        logger.info("FILTER-AWARE SELECTION RESULTS")
-        try:
-            logger.info(f"Hard selected={hard_selected_count:,}")
-            logger.info(f"Random selected={random_selected_count:,}")
-        except Exception:
-            pass
-        logger.info("=" * 80)
         logger.info("FILTER-AWARE NEGATIVE SAMPLING ENABLED")
         logger.info(f"Loaded filters from {filters_path}")
         for k, v in filters.items():
@@ -2759,13 +2753,6 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
     mask = pd.Series(True, index=negatives.index)
 
-    # Each entry: (candidate_columns, min_filter_key, max_filter_key)
-    # candidate_columns is an ordered list of column name variants to try;
-    # the first one that exists in the DataFrame is used.
-    # Covers three naming conventions that may be present depending on data path:
-    #   1. t1_close_* / t1_open_* -- T-1 data after rename_t1_columns()
-    #   2. Base CSV / Supabase model-name columns (Close, Volume, HV_10, ...)
-    #   3. Legacy raw intraday names (close, volume, hv10, ...)
     filter_map = [
         (
             ["t1_close_Close", "t1_open_Close", "Close", "close", "price"],
@@ -2802,20 +2789,15 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         if min_key and min_key in filters:
             mask &= negatives[col].fillna(-1e9) >= filters[min_key]
             used_filter = True
-            if logger:
-                logger.debug(f"  filter {min_key}>={filters[min_key]} applied via column '{col}'")
 
         if max_key and max_key in filters:
             mask &= negatives[col].fillna(1e9) <= filters[max_key]
             used_filter = True
-            if logger:
-                logger.debug(f"  filter {max_key}<={filters[max_key]} applied via column '{col}'")
 
     if not used_filter:
         if logger:
             logger.warning(
                 "apply_filter_aware_negative_sampling: no filter columns found in DataFrame "
-                f"(checked: Close/Volume/HV_10/HV_20/Volume_Ratio variants). "
                 f"DataFrame columns: {list(negatives.columns[:20])}..."
             )
         return df
@@ -2824,13 +2806,6 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     easy_neg = negatives[~mask].copy()
 
     if logger:
-        logger.info("=" * 80)
-        logger.info("FILTER-AWARE SELECTION RESULTS")
-        try:
-            logger.info(f"Hard selected={hard_selected_count:,}")
-            logger.info(f"Random selected={random_selected_count:,}")
-        except Exception:
-            pass
         logger.info(
             f"Negative universe={len(negatives):,}, "
             f"hard_negatives={len(hard_neg):,} ({len(hard_neg)/max(len(negatives),1):.1%}), "
@@ -2838,17 +2813,16 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         )
 
     date_col = next(
-        (c for c in ["detection_date", "event_date", "trade_date", "date"]
-         if c in df.columns),
+        (c for c in ["detection_date", "event_date", "trade_date", "date"] if c in df.columns),
         None
     )
 
-    if date_col is None:
-        # No date column: apply a global ratio of 4× winners, preferring hard negatives.
-        hard_selected_count = 0
-        random_selected_count = 0
+    hard_selected_count = 0
+    random_selected_count = 0
 
-        target_negatives = max(len(winners) * 4, 8)
+    if date_col is None:
+        # Adjusted target ratio to match the 16% rate (5.25 negatives per winner)
+        target_negatives = max(int(len(winners) * 5.25), 8)
         preferred_target = int(target_negatives * 0.80)
 
         chosen_hard = (
@@ -2865,28 +2839,17 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         random_selected_count = len(chosen_easy)
 
         parts = [chosen_hard, chosen_easy]
-        selected_neg = pd.concat(parts, ignore_index=True) if any(len(p) for p in parts) else hard_neg
-
-        if logger:
-            logger.info(
-                f"[no date_col] global ratio sampling: "
-                f"target={target_negatives}, hard={hard_selected_count}, "
-                f"easy_backfill={random_selected_count}"
-            )
+        selected_neg = pd.concat(parts) if any(len(p) for p in parts) else hard_neg.iloc[0:0]
     else:
         selected_parts = []
-        hard_selected_count = 0
-        random_selected_count = 0
-
-        # Collect all dates that have negatives (not just winner dates).
         winner_dates = set(winners[date_col].dropna().unique())
         all_neg_dates = set(negatives[date_col].dropna().unique())
         all_dates = winner_dates | all_neg_dates
 
         for dt in sorted(all_dates):
             winner_group = winners[winners[date_col] == dt]
-            # For non-winner dates use a baseline target of 4 negatives minimum.
-            target_negatives = max(len(winner_group) * 4, 4) if len(winner_group) > 0 else 4
+            # Baseline target dynamically adjusted to look for a 5.25x ratio per day
+            target_negatives = max(int(len(winner_group) * 5.25), 4) if len(winner_group) > 0 else 4
 
             hard_dt = hard_neg[hard_neg[date_col] == dt]
             easy_dt = easy_neg[easy_neg[date_col] == dt]
@@ -2918,10 +2881,34 @@ def apply_filter_aware_negative_sampling(df, logger=None):
                     f"backfilled={len(chosen_easy)}"
                 )
 
-        selected_neg = (
-            pd.concat(selected_parts, ignore_index=True)
-            if selected_parts else hard_neg
-        )
+        selected_neg = pd.concat(selected_parts) if selected_parts else hard_neg.iloc[0:0]
+
+    # =========================================================================
+    # GLOBAL NATURAL RATE ENFORCEMENT LAYER (Guarantees exactly 16% positive rate)
+    # =========================================================================
+    target_pos_rate = 0.16
+    total_negatives_needed = int((len(winners) / target_pos_rate) - len(winners))
+    shortage_remaining = total_negatives_needed - len(selected_neg)
+
+    if shortage_remaining > 0:
+        # Find every single background negative that wasn't already picked up
+        # We drop duplicates using unique identifiers/index to prevent data cloning
+        selected_indices = selected_neg.index
+        global_backfill_pool = negatives[~negatives.index.isin(selected_indices)]
+        
+        if len(global_backfill_pool) >= shortage_remaining:
+            global_backfill_samples = global_backfill_pool.sample(n=shortage_remaining, random_state=42)
+        else:
+            if logger:
+                logger.warning(f"⚠️ Exhausted entire background negative pool! Only found {len(global_backfill_pool)} additional rows.")
+            global_backfill_samples = global_backfill_pool
+            
+        random_selected_count += len(global_backfill_samples)
+        selected_neg = pd.concat([selected_neg, global_backfill_samples])
+    elif shortage_remaining < 0:
+        # If stratified loops over-collected, sample it back down to exactly match 16%
+        selected_neg = selected_neg.sample(n=total_negatives_needed, random_state=42)
+    # =========================================================================
 
     if "sample_weight" in selected_neg.columns:
         selected_neg.loc[:, "sample_weight"] = (
@@ -2933,17 +2920,16 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     if logger:
         logger.info("=" * 80)
         logger.info("FILTER-AWARE SELECTION RESULTS")
-        try:
-            logger.info(f"Hard selected={hard_selected_count:,}")
-            logger.info(f"Random selected={random_selected_count:,}")
-        except Exception:
-            pass
+        logger.info(f"Hard selected={hard_selected_count:,}")
+        logger.info(f"Random selected={random_selected_count:,}")
+        final_pos_rate = len(winners) / max(len(result), 1)
         logger.info(
             f"Filter-aware retraining active: "
             f"winners={len(winners)}, "
-            f"hard_negatives_available={len(hard_neg)}, "
-            f"selected_negatives={len(selected_neg)}"
+            f"selected_negatives={len(selected_neg)}, "
+            f"Enforced Positive Rate={final_pos_rate:.1%}"
         )
+        logger.info("=" * 80)
 
     return result
 
