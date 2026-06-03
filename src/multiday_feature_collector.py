@@ -132,8 +132,6 @@ TIMEFRAMES = {
 # ---------------------------------------------------------------------------
 DB_COLUMNS: set = {
     "symbol", "detection_date",
-    # Short-history quality flags (set when bars_available < MIN_BARS_WARN)
-    "insufficient_history", "bars_available",
     # ── t10 ──────────────────────────────────────────────────────────────────
     "t10_adx_14", "t10_adxr_14_2", "t10_ao", "t10_aroond_25", "t10_aroonosc_25",
     "t10_aroonu_25", "t10_atr_14", "t10_atr_14_slope", "t10_atr_20", "t10_atr_7",
@@ -595,8 +593,6 @@ def _process_symbol(
         row: Dict[str, Any] = {
             "symbol":               symbol,
             "detection_date":       detection_date.date().isoformat(),
-            "insufficient_history": is_short_history,
-            "bars_available":       bars_available,
         }
 
         for prefix, offset in TIMEFRAMES.items():
