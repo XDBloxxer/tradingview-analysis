@@ -1979,7 +1979,16 @@ def train_val_split(
             MIN_VAL_POSITIVES,
             int(_val_neg * _MAX_VAL_POS_RATE / max(1 - _MAX_VAL_POS_RATE, 1e-9)),
         )
-        _excess_pos_idx = y_val[y_val == 1].index[_target_val_pos:]  # move these to train
+        # BUG 5 FIX: move the OLDEST excess positives to train, not the newest.
+        # y_val is time-ordered (val rows are sorted by _sort_date ascending), so
+        # index[_target_val_pos:] selects the most recent excess rows and moves them
+        # to train — leaving the oldest rows in val.  That is exactly backwards:
+        # the purpose of a time-based split is to validate on the most recent period.
+        # Fix: keep the last _target_val_pos positives in val (most recent) and move
+        # the first excess (oldest) ones to train.
+        _all_val_pos_idx = y_val[y_val == 1].index.tolist()
+        _n_excess        = len(_all_val_pos_idx) - _target_val_pos
+        _excess_pos_idx  = pd.Index(_all_val_pos_idx[:_n_excess])   # oldest → train
 
         if len(_excess_pos_idx) > 0:
             # Move excess val positives → train.
