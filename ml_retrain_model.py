@@ -2402,12 +2402,60 @@ def train_gain_regressor(
     n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
     n_non_winners_with_gain = n_valid - n_winners_with_gain
 
+    # FIX 3: Log how many rows valid_gain_mask drops vs the full combined_df the
+    # classifier trained on.  The regressor's effective training population is much
+    # smaller because most base-CSV and non-winner rows have no gain target.
+    # Surfacing this gap makes it obvious in the logs when the regressor is working
+    # from a very different (and smaller) slice of data than the classifier.
+    n_total_in = len(combined_df)
+    n_dropped  = n_total_in - n_valid
     logger.info(
         f"\n── Training gain regressor on {n_valid} rows with gain data ──\n"
-        f"  Winners:     {n_winners_with_gain}\n"
-        f"  Non-winners: {n_non_winners_with_gain} (RC1: broader training set)\n"
+        f"  Input rows (classifier train split): {n_total_in}\n"
+        f"  Dropped (no gain target / out-of-range): {n_dropped} "
+        f"({n_dropped / max(n_total_in, 1):.1%} of classifier train set)\n"
+        f"  Winners with gain:     {n_winners_with_gain}\n"
+        f"  Non-winners with gain: {n_non_winners_with_gain} (RC1: broader training set)\n"
         f"  Target:      {gain_col} (RC7: cap raised to 10 000%, log-transformed)"
     )
+
+    # FIX 2: Log gain-target source populations so scale divergence between the
+    # RC2 prev_close-corrected winners and the accuracy-table backfill is visible.
+    # When RC2 and the accuracy table compute actual_high_pct with different
+    # denominators (prev_close vs same-day close), the two populations will have
+    # visibly different distribution statistics here — a clear signal to investigate.
+    if valid_gain_mask.any() and "source" in combined_df.columns:
+        _gt_valid  = gain_targets[valid_gain_mask]
+        _src_valid = combined_df.loc[valid_gain_mask, "source"]
+        _is_winner = combined_df.loc[valid_gain_mask, "label"] == 1
+        for _src_group, _src_label in [
+            (_src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False), "daily_winners (RC2 enriched)"),
+            (_src_valid.str.contains("non_winners_day_prior", na=False), "non_winners (accuracy-table backfill)"),
+            (~_src_valid.str.contains("day_prior", na=False), "base_csv / mistake rows"),
+        ]:
+            _grp_vals = _gt_valid[_src_group]
+            if len(_grp_vals) == 0:
+                continue
+            logger.info(
+                f"  Gain source [{_src_label}]: n={len(_grp_vals)}, "
+                f"min={_grp_vals.min():.1f}%, max={_grp_vals.max():.1f}%, "
+                f"mean={_grp_vals.mean():.1f}%, std={_grp_vals.std():.1f}%"
+            )
+        # Warn when the two primary sources have very different mean gains —
+        # a strong signal that they are using incompatible denominators.
+        _rc2_vals  = _gt_valid[_src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False)]
+        _acc_vals  = _gt_valid[_src_valid.str.contains("non_winners_day_prior", na=False)]
+        if len(_rc2_vals) >= 5 and len(_acc_vals) >= 5:
+            _mean_diff = abs(_rc2_vals.mean() - _acc_vals.mean())
+            if _mean_diff > 20.0:
+                logger.warning(
+                    f"  ⚠️  FIX2: Mean gain differs by {_mean_diff:.1f}pp between RC2-enriched "
+                    f"winners ({_rc2_vals.mean():.1f}%) and accuracy-table non-winners "
+                    f"({_acc_vals.mean():.1f}%). This suggests the two sources are computing "
+                    f"actual_high_pct with different denominators (prev_close vs same-day close). "
+                    f"Investigate _compute_correct_actual_high_pct and enrich_mistakes_with_gains "
+                    f"to ensure both use the same base."
+                )
 
     if n_valid < 30:
         logger.warning(f"Only {n_valid} rows with gain data — need ≥30. Skipping gain regressor.")
@@ -2525,10 +2573,28 @@ def train_gain_regressor(
             _dates = pd.to_datetime(
                 combined_df.loc[valid_gain_mask, _date_col], errors="coerce"
             )
-            _sorted_idx = _dates.sort_values(na_position="last").index
-            _split_pos  = int(len(_sorted_idx) * 0.8)
-            _tr_idx = _sorted_idx[:_split_pos]
-            _va_idx = _sorted_idx[_split_pos:]
+            # FIX 1: Mirror train_val_split's FIX 2 — NaT rows are mistake samples
+            # (they have no detection_date/event_date).  sort_values(na_position="last")
+            # previously pushed them to the END of the sorted index, meaning they landed
+            # in the val set (the last 20%).  That contaminated early-stopping RMSE with
+            # the model's own hardest, highest-weight error examples and made val MAE
+            # meaningless as an evaluation signal.
+            # Fix: separate NaT rows explicitly and always append them to the train split.
+            _nat_mask_reg  = _dates.isna()
+            _n_nat_reg     = int(_nat_mask_reg.sum())
+            _dated_idx_reg = _dates[~_nat_mask_reg].sort_values().index   # chronological
+            _nat_idx_reg   = _dates[_nat_mask_reg].index                  # mistake rows
+
+            _split_pos = int(len(_dated_idx_reg) * 0.8)
+            _tr_idx    = _dated_idx_reg[:_split_pos].append(_nat_idx_reg)  # NaT → train
+            _va_idx    = _dated_idx_reg[_split_pos:]
+
+            if _n_nat_reg > 0:
+                logger.info(
+                    f"  FIX1: {_n_nat_reg} NaT rows (mistake samples) pinned to regressor "
+                    f"train split (previously leaked into val via na_position='last')."
+                )
+
             X_tr   = X_reg_fill.loc[_tr_idx]
             X_va   = X_reg_fill.loc[_va_idx]
             y_tr   = y_reg_log.loc[_tr_idx]
