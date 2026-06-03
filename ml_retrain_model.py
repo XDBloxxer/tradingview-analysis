@@ -90,6 +90,12 @@ import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
+
+# _PriorCorrectedModel lives in a stable shared module so that joblib can
+# always resolve it by fully-qualified name regardless of which script is
+# __main__ at load time.  Import it here so the name is available in this
+# module's namespace (used below when wrapping the calibrated model).
+from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
 from supabase import create_client, Client
 from xgboost import XGBClassifier
 
@@ -271,48 +277,13 @@ SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
 SCREENER_POSITIVE_RATE: float | None = 0.35
 
 
-class _PriorCorrectedModel:
-    """
-    Thin wrapper around a CalibratedClassifierCV that applies Bayes
-    prior-probability correction to predict_proba output.
 
-    Must be defined at module level (not inside a function) so that joblib
-    can pickle it via its fully-qualified name.
-
-    The correction shifts calibrated probabilities to account for the
-    base-rate mismatch between the val/calibration set (positive rate ~10-25%)
-    and the screened inference universe (positive rate ~30-50%):
-
-        odds_corrected = odds_calibrated * odds_ratio
-        p_corrected    = odds_corrected / (1 + odds_corrected)
-
-    where odds_ratio = (p_inf / (1-p_inf)) / (p_cal / (1-p_cal)).
-    """
-
-    def __init__(self, base, odds_ratio: float):
-        self._base       = base
-        self._odds_ratio = float(odds_ratio)
-        self.classes_    = base.classes_
-        # Forward attributes needed by CalibratedClassifierCV unwrap logic in
-        # explosion_predictor.py and compute_feature_importance.
-        if hasattr(base, "calibrated_classifiers_"):
-            self.calibrated_classifiers_ = base.calibrated_classifiers_
-
-    def predict_proba(self, X):
-        raw    = self._base.predict_proba(X)
-        p      = raw[:, 1]
-        odds   = p / np.clip(1.0 - p, 1e-9, None) * self._odds_ratio
-        p_corr = odds / (1.0 + odds)
-        return np.column_stack([1.0 - p_corr, p_corr])
-
-    def predict(self, X):
-        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
-
-    def __getattr__(self, name):
-        # Forward any other attribute lookups to the base model so code that
-        # probes e.g. best_iteration, best_score, feature_importances_ works.
-        return getattr(self._base, name)
-
+# _PriorCorrectedModel was previously defined inline here, which caused
+# a pickle deserialization failure: joblib recorded the class path as
+# __main__._PriorCorrectedModel when ml_retrain_model.py was __main__ at
+# save time, then failed to find it when __main__ was ml_screen_and_predict.py
+# at load time.  The class now lives in src/ml_predictor/prior_corrected_model.py
+# and is imported at the top of this file; call-sites below are unchanged.
 
 XGBOOST_PARAMS = {
     "n_estimators":       300,
