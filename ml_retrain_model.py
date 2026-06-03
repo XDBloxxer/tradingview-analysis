@@ -2137,6 +2137,7 @@ def train_gain_regressor(
     combined_df: pd.DataFrame,
     feature_names: list[str],
     client: Client,
+    accuracy_gain_map: "Optional[dict]" = None,  # ISSUE 2 FIX: pre-fetched from main() to avoid redundant DB query
 ) -> "Optional[object]":
     """
     Train a regression model to predict actual % gain for stocks the
@@ -2198,64 +2199,58 @@ def train_gain_regressor(
     from xgboost import XGBRegressor
 
     # ------------------------------------------------------------------
-    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy FIRST.
-    # This must happen before the gain-column check because the accuracy
-    # table is often the primary source of gain labels (the base CSV rows
-    # have no gain data at all).  Previously this fetch ran after the check,
-    # so the function returned early before RC1 could supply any data.
+    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy.
+    # ISSUE 2 FIX: if the caller already fetched this data (main() passes it
+    # via accuracy_gain_map after the RC3 backfill query), reuse it directly
+    # to avoid a redundant round-trip.  Fall back to fetching here only when
+    # the caller did not supply it (e.g. when called from other contexts).
     # ------------------------------------------------------------------
-    accuracy_gain_map: dict = {}
-    try:
-        logger.info("RC1: Fetching gain data from ml_prediction_accuracy for non-winner rows...")
-        # FIX #7: Derive start_date from the earliest date in combined_df rather
-        # than datetime.now() - 120 days.  Using wall-clock time caused two problems:
-        #   (a) Inconsistency: the classifier uses a LOOKBACK env var (e.g. 90 days)
-        #       but the gain regressor was silently fetching a wider 120-day window.
-        #   (b) Future-data leakage: in backfill runs datetime.now() is today, so
-        #       the query could return accuracy rows that post-date the training data.
-        # Using the earliest date in combined_df anchors the window to the training
-        # period, keeping both models aligned and backfill-safe.
-        date_col = next(
-            (c for c in ("detection_date", "explosion_date", "prediction_date", "date")
-             if c in combined_df.columns),
-            None,
-        )
-        if date_col is not None:
-            try:
-                start_date = pd.to_datetime(combined_df[date_col], errors="coerce").min()
-                start_date = start_date.date().isoformat() if pd.notna(start_date) else None
-            except Exception:
-                start_date = None
-        else:
-            start_date = None
-        if start_date is None:
-            # Fallback: should not normally occur; use LOOKBACK env var if set
-            import os
-            from datetime import timedelta
-            lookback_days = int(os.environ.get("LOOKBACK", "90"))
-            start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
-            logger.warning(
-                f"RC1: Could not derive start_date from combined_df; "
-                f"falling back to LOOKBACK={lookback_days} days from today ({start_date})"
+    if accuracy_gain_map is None:
+        accuracy_gain_map = {}
+        try:
+            logger.info("RC1: Fetching gain data from ml_prediction_accuracy (no pre-fetched data supplied)...")
+            date_col = next(
+                (c for c in ("detection_date", "explosion_date", "prediction_date", "date")
+                 if c in combined_df.columns),
+                None,
             )
-        logger.info(f"RC1: Querying ml_prediction_accuracy from {start_date}")
-        resp = (
-            client.table("ml_prediction_accuracy")
-            .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-            .gte("prediction_date", start_date)
-            .not_.is_("actual_gain_pct", "null")
-            .execute()
-        )
-        if resp.data:
-            for row in resp.data:
-                key = (row["symbol"], row["prediction_date"])
-                accuracy_gain_map[key] = {
-                    "actual_gain_pct": row.get("actual_gain_pct"),
-                    "actual_high_pct": row.get("actual_high_pct"),
-                }
-            logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
-    except Exception as e:
-        logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
+            if date_col is not None:
+                try:
+                    start_date = pd.to_datetime(combined_df[date_col], errors="coerce").min()
+                    start_date = start_date.date().isoformat() if pd.notna(start_date) else None
+                except Exception:
+                    start_date = None
+            else:
+                start_date = None
+            if start_date is None:
+                import os
+                from datetime import timedelta
+                lookback_days = int(os.environ.get("LOOKBACK", "90"))
+                start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
+                logger.warning(
+                    f"RC1: Could not derive start_date from combined_df; "
+                    f"falling back to LOOKBACK={lookback_days} days from today ({start_date})"
+                )
+            logger.info(f"RC1: Querying ml_prediction_accuracy from {start_date}")
+            resp = (
+                client.table("ml_prediction_accuracy")
+                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+                .gte("prediction_date", start_date)
+                .not_.is_("actual_gain_pct", "null")
+                .execute()
+            )
+            if resp.data:
+                for row in resp.data:
+                    key = (row["symbol"], row["prediction_date"])
+                    accuracy_gain_map[key] = {
+                        "actual_gain_pct": row.get("actual_gain_pct"),
+                        "actual_high_pct": row.get("actual_high_pct"),
+                    }
+                logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
+        except Exception as e:
+            logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
+    else:
+        logger.info(f"RC1: Reusing {len(accuracy_gain_map)} pre-fetched gain records from caller (no redundant DB query)")
 
     # ------------------------------------------------------------------
     # Determine gain target column — evaluated AFTER the RC1 fetch so
@@ -3007,7 +3002,7 @@ def main() -> int:
                     (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
                 )
                 date_col = next(
-                    (c for c in ["detection_date_x", "detection_date", "event_date"]
+                    (c for c in ["detection_date", "event_date"]
                      if c in combined_df.columns), None
                 )
 
@@ -3045,6 +3040,10 @@ def main() -> int:
         logger.warning(f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited")
 
     # ── RC3 FIX: Backfill actual_high_pct for non-winner rows from ml_prediction_accuracy ──
+    # ISSUE 2 FIX: _accuracy_gain_map is built here and passed to train_gain_regressor so
+    # it can skip its own redundant ml_prediction_accuracy fetch.  Initialise to an empty
+    # dict as a safe default in case the try block below raises before populating it.
+    _accuracy_gain_map: dict = {}
     # PROBLEM: The RC2 block above only joins daily_winners rows, so non_winners_day_prior
     # rows always have actual_high_pct = NULL after RC2.  apply_intraday_high_labels()
     # requires (label==0) & (actual_high_pct >= threshold), which can NEVER fire for
@@ -3060,7 +3059,7 @@ def main() -> int:
             (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
         )
         _date_col = next(
-            (c for c in ["detection_date_x", "detection_date", "event_date"]
+            (c for c in ["detection_date", "event_date"]
              if c in combined_df.columns), None
         )
         _null_mask = (
@@ -3082,11 +3081,21 @@ def main() -> int:
 
             _acc_resp = (
                 client.table("ml_prediction_accuracy")
-                .select("symbol, prediction_date, actual_high_pct")
+                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
                 .not_.is_("actual_high_pct", "null")
                 .gte("prediction_date", _start_date)
                 .execute()
             ) if _start_date else None
+
+            # ISSUE 2 FIX: build accuracy_gain_map here so it can be passed
+            # to train_gain_regressor, eliminating its redundant DB fetch.
+            _accuracy_gain_map: dict = {}
+            if _acc_resp and _acc_resp.data:
+                for _r in _acc_resp.data:
+                    _accuracy_gain_map[(_r["symbol"], _r["prediction_date"])] = {
+                        "actual_gain_pct": _r.get("actual_gain_pct"),
+                        "actual_high_pct": _r.get("actual_high_pct"),
+                    }
 
             if _acc_resp and _acc_resp.data:
                 _acc_df = pd.DataFrame(_acc_resp.data)
@@ -3369,7 +3378,8 @@ def main() -> int:
         X_scaled=X_train,                           # train rows only — no val-period leakage
         combined_df=combined_df.loc[train_idx],     # matching train-split rows
         feature_names=feature_names,
-        client=client,                              # RC1: fetch additional gain data
+        client=client,                              # RC1: fallback fetch if map not supplied
+        accuracy_gain_map=_accuracy_gain_map,       # ISSUE 2 FIX: reuse RC3 fetch, no redundant DB query
     )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
