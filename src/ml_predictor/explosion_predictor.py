@@ -1,7 +1,7 @@
 """
 Explosion Predictor
 
-FIXES IN THIS VERSION (2026-03-02 v4 + 2026 RC4/RC5/RC6 gain fixes):
+FIXES IN THIS VERSION (2026-03-02 v4 + 2026 RC4/RC5/RC6 gain fixes + 2026-06-03 RC7/RC8/RC9):
 
 FIX 1 — Auto-detect which feature prefix the loaded model uses.
 
@@ -68,6 +68,38 @@ RC5 FIX — Isotonic regression calibration for the gain fallback:
   preserves rank order across the probability range.
 
   The rule-based _estimate_target_gain() is retained as the final backstop.
+
+RC7 FIX — Tie-breaking bug in _classify_signals_relative (2026-06-03):
+  ROOT CAUSE: When many stocks share the same probability (e.g. 25/44 stocks
+  all saturating at 0.9098 due to miscalibrated _odds_ratio in the pkl), the
+  default rank(pct=True) uses method='average', which averages the ranks of
+  all tied entries. Stocks ranked 20–44 (all with prob=0.9098) receive an
+  averaged percentile of ~0.73, placing them between RELATIVE_HOLD_PCT=0.60
+  and RELATIVE_BUY_PCT=0.80. Result: 25 STRONG BUY stocks from the probability
+  histogram were all demoted to HOLD, and the signal breakdown showed 0 STRONG
+  BUY / 0 BUY / 25 HOLD — the opposite of what the distribution implied.
+
+  FIX: Use method='max' so all tied entries receive the HIGHEST rank in their
+  tie group. Every stock tied at the top gets percentile=1.0, correctly placing
+  them in the STRONG BUY or BUY bucket. This also ensures that when
+  probabilities are healthy and ties are rare, behaviour is unchanged.
+
+RC8 FIX — RELATIVE_STRONG_BUY_PCT lowered from 0.95 → 0.90 (2026-06-03):
+  With method='average' (the old default) and a 44-stock batch, 0.95 required
+  the top 2.2 stocks to qualify — fine in theory but rounding meant only 2
+  ever got STRONG BUY, and with ties the count could drop to 0. Lowering to
+  0.90 (top 10%) gives ~4–5 STRONG BUY picks in a typical 44-stock batch,
+  which is still selective (top decile) while being robust to small batch sizes
+  and minor rank ties. RELATIVE_BUY_PCT is unchanged at 0.80 (top 10–20%).
+
+RC9 FIX — Mode D threshold tightened from 0.50 → 0.40 (2026-06-03):
+  The previous threshold (>=50% of stocks at STRONG BUY level) was too
+  permissive: a model needed to be severely miscalibrated before relative
+  ranking activated. Lowering to 0.40 catches the saturated-probability case
+  earlier (e.g. 25/44 = 56.8% in the failing run, which should have triggered
+  relative ranking but the method='average' tie bug masked the effect). With
+  RC7's method='max' fix in place, the two changes together ensure both the
+  detection and the classification are correct.
 """
 
 import json
@@ -96,11 +128,13 @@ SIGNAL_THRESHOLDS = {
 }
 
 # Relative-ranking percentile thresholds (used when _is_bimodal = True)
-# With batches of ~48 stocks, RELATIVE_STRONG_BUY_PCT=0.98 means only the
-# #1 stock ever qualifies (0.98 * 48 = 47.04, so only rank 48 qualifies).
-# Lowered so that a typical 48-stock batch gets 1-2 STRONG BUY, 3-5 BUY.
-RELATIVE_STRONG_BUY_PCT = 0.95   # top 5%  (~2-3 stocks per 48)
-RELATIVE_BUY_PCT        = 0.80   # top 5-20% (~7-8 stocks per 48)
+# RC8 FIX: Lowered RELATIVE_STRONG_BUY_PCT from 0.95 → 0.90.
+# With method='average' (old default) and a 44-stock batch, 0.95 meant only
+# the top ~2 stocks qualified. Rank ties could reduce this to 0. At 0.90
+# (top 10%) a typical 44-stock batch yields ~4 STRONG BUY, which is still
+# selective while being robust to small batch sizes and minor rank ties.
+RELATIVE_STRONG_BUY_PCT = 0.90   # top 10% (~4-5 stocks per 44-stock batch)
+RELATIVE_BUY_PCT        = 0.80   # top 10-20% (~4-5 stocks per 44-stock batch)
 RELATIVE_HOLD_PCT       = 0.60   # top 20-40%
 
 # Compression detection thresholds
@@ -111,7 +145,13 @@ NARROW_BAND_STD_THRESHOLD  = 0.02   # std < 0.02 regardless of level → use rel
 # With a correctly calibrated model (SPW_MAX=5.0 + prior correction in
 # ml_retrain_model.py) these thresholds should rarely be hit. They are retained
 # to catch models loaded from pre-RC6 pkl files or misconfigured SCREENER_POSITIVE_RATE.
-HIGH_PROB_CLUSTERING_RATE  = 0.50   # >=50% at or above STRONG BUY → relative ranking
+# RC9 FIX: Tightened HIGH_PROB_CLUSTERING_RATE from 0.50 → 0.40.
+# The previous 0.50 was too permissive: a run where 56.8% of stocks scored
+# ≥0.90 should have been caught much earlier. At 0.40 the safety net
+# activates as soon as 40% of the batch saturates the STRONG BUY level,
+# switching to relative ranking before the distribution becomes completely
+# unusable as an absolute discriminator.
+HIGH_PROB_CLUSTERING_RATE  = 0.40   # >=40% at or above STRONG BUY → relative ranking
 HIGH_PROB_MEAN_THRESHOLD   = 0.80   # mean >=0.80 → absolute thresholds likely meaningless
 
 # Original mid-range sparsity check (bimodal toward extremes)
@@ -722,14 +762,29 @@ class ExplosionPredictor:
         return "AVOID"
 
     def _classify_signals_relative(self, probabilities: pd.Series) -> pd.Series:
-        """FIX 3: Rank-based signal classification on the FULL distribution."""
+        """FIX 3: Rank-based signal classification on the FULL distribution.
+
+        RC7 FIX: Use method='max' for rank() so that all tied entries receive
+        the HIGHEST rank in their tie group instead of the average.
+
+        With method='average' (the old default), stocks tied at probability
+        0.9098 (e.g. 25 out of 44 stocks due to saturated calibration) all
+        receive the averaged percentile rank of ~0.73, placing every one of
+        them in the HOLD bucket (0.60–0.80) and producing 0 STRONG BUY / 0 BUY
+        despite the model clearly preferring them. method='max' assigns all tied
+        stocks percentile=1.0 (the rank of the last tie), so they correctly fall
+        into STRONG BUY, with the lower-probability stocks correctly ranked below.
+        """
         n = len(probabilities)
         signals = pd.Series("AVOID", index=probabilities.index)
 
         if n == 0:
             return signals
 
-        ranks = probabilities.rank(pct=True)
+        # RC7 FIX: method='max' — tied entries receive the highest rank in
+        # their tie group, not the average. This ensures saturated-probability
+        # clusters are not erroneously demoted to HOLD.
+        ranks = probabilities.rank(pct=True, method='max')
 
         signals[ranks >= RELATIVE_STRONG_BUY_PCT] = "STRONG BUY"
         signals[(ranks >= RELATIVE_BUY_PCT) & (ranks < RELATIVE_STRONG_BUY_PCT)] = "BUY"
@@ -740,7 +795,7 @@ class ExplosionPredictor:
         hold_n       = (signals == "HOLD").sum()
 
         self.logger.info(
-            f"Relative signals (percentile-based): STRONG BUY={strong_buy_n}, BUY={buy_n}, "
+            f"Relative signals (percentile-based, method=max): STRONG BUY={strong_buy_n}, BUY={buy_n}, "
             f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n}"
         )
 
