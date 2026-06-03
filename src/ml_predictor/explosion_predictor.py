@@ -79,6 +79,14 @@ from typing import Dict, List, Optional, Tuple
 
 import joblib
 
+# Import _PriorCorrectedModel into this namespace so joblib/pickle can resolve
+# the class when loading a best_model.pkl that was saved by ml_retrain_model.py.
+# Without this import the load fails with:
+#   Can't get attribute '_PriorCorrectedModel' on <module '__main__' ...>
+# because pickle looks up the class by module path at unpickling time and
+# src.ml_predictor.prior_corrected_model must already be imported.
+from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
+
 _META_COLS = {"symbol", "exchange"}
 
 SIGNAL_THRESHOLDS = {
