@@ -2920,7 +2920,6 @@ def main() -> int:
     base_df     = load_base_training_data(client)
     t1_df       = load_t1_data(client)
     combined_df = combine_datasets(base_df, t1_df)
-    combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
 
     # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
     # Use prev_close as denominator instead of same-day close
@@ -2976,6 +2975,13 @@ def main() -> int:
 
     # ── FIX 4: Relabel rows with strong intraday moves as winners ─────────────
     combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
+
+    # ── Filter-aware negative sampling (must run AFTER intraday relabelling) ──
+    # apply_intraday_high_labels() promotes some label=0 rows to label=1.
+    # Sampling before that step would select "hard negatives" that are then
+    # relabelled as winners, corrupting the label/ratio and causing those rows
+    # to appear as both a selected negative and a winner in the same training set.
+    combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
 
     # ── Load mistake samples and append AFTER combine_datasets ───────────────
     mistake_df = pd.DataFrame()
