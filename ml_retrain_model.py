@@ -2311,43 +2311,65 @@ def train_gain_regressor(
         has_event     = "event_date" in combined_df.columns
 
         if sym_col and (has_detection or has_event):
-            filled_count = 0
-            for idx, row in combined_df.iterrows():
-                if pd.notna(gain_targets[idx]):
-                    continue  # already have a value
+            # ISSUE 3 FIX: replace O(n) iterrows loop with vectorised lookup.
+            # Build a Series of (symbol, date_str) lookup keys for each row, try
+            # detection_date first (T-1 rows), then fall back to event_date - 1 BDay
+            # (base CSV rows).  A single map() call replaces the per-row loop.
 
-                # Support both column naming conventions:
-                # T-1 rows use "symbol" + "detection_date"
-                # base CSV rows use "ticker" + "event_date"
-                sym = row.get("symbol") or row.get("ticker")
-                if not sym or str(sym) == "nan":
-                    continue
-                acc_data = None
+            # --- Build acc_lookup: (symbol, date_str) -> best gain value ----------
+            acc_lookup = {
+                k: (v.get("actual_high_pct") or v.get("actual_gain_pct"))
+                for k, v in accuracy_gain_map.items()
+            }
 
-                # Try detection_date first (T-1 rows -- direct match to prediction_date)
-                if has_detection:
-                    d = str(row.get("detection_date", ""))[:10]
-                    if d and d != "nan":
-                        acc_data = accuracy_gain_map.get((sym, d))
+            null_mask = gain_targets.isna()
+            valid_det = pd.array([], dtype=bool)  # pre-init; populated in Path 1 if has_detection
 
-                # Fall back to event_date - 1 business day (base CSV rows)
-                if acc_data is None and has_event:
-                    ev = row.get("event_date")
-                    if ev and str(ev) not in ("nan", "NaT", "None"):
-                        try:
-                            pred_date = (
-                                pd.Timestamp(ev) - pd.tseries.offsets.BDay(1)
-                            ).strftime("%Y-%m-%d")
-                            acc_data = accuracy_gain_map.get((sym, pred_date))
-                        except Exception:
-                            pass
+            # --- Path 1: detection_date rows (direct key match) -------------------
+            if has_detection and null_mask.any():
+                det_dates = pd.to_datetime(
+                    combined_df.loc[null_mask, "detection_date"], errors="coerce"
+                ).dt.strftime("%Y-%m-%d").fillna("")
+                keys_det = list(zip(combined_df.loc[null_mask, sym_col], det_dates))
+                filled_det = pd.array(
+                    [acc_lookup.get(k) for k in keys_det], dtype=object
+                )
+                valid_det = pd.array(
+                    [v is not None for v in filled_det], dtype=bool
+                )
+                update_idx = gain_targets.index[null_mask][valid_det]
+                gain_targets.loc[update_idx] = pd.to_numeric(
+                    pd.array(filled_det[valid_det], dtype=object), errors="coerce"
+                )
+                null_mask = gain_targets.isna()  # refresh for path 2
 
-                if acc_data:
-                    val = acc_data.get("actual_high_pct") or acc_data.get("actual_gain_pct")
-                    if val is not None:
-                        gain_targets[idx] = float(val)
-                        filled_count += 1
-            logger.info(f"RC1: Filled {filled_count} additional gain targets from accuracy table")
+            # --- Path 2: event_date - 1 BDay rows (base CSV rows) -----------------
+            n_filled_event = 0
+            if has_event and null_mask.any():
+                ev_raw = pd.to_datetime(
+                    combined_df.loc[null_mask, "event_date"], errors="coerce"
+                )
+                # Subtract 1 business day vectorially; NaT stays NaT
+                pred_dates = (ev_raw - pd.tseries.offsets.BDay(1)).dt.strftime("%Y-%m-%d").fillna("")
+                keys_ev = list(zip(combined_df.loc[null_mask, sym_col], pred_dates))
+                filled_ev = pd.array(
+                    [acc_lookup.get(k) for k in keys_ev], dtype=object
+                )
+                valid_ev = pd.array(
+                    [v is not None for v in filled_ev], dtype=bool
+                )
+                update_idx_ev = gain_targets.index[null_mask][valid_ev]
+                gain_targets.loc[update_idx_ev] = pd.to_numeric(
+                    pd.array(filled_ev[valid_ev], dtype=object), errors="coerce"
+                )
+                n_filled_event = int(valid_ev.sum())
+
+            n_filled_det   = int(valid_det.sum()) if has_detection else 0
+            filled_count   = n_filled_det + n_filled_event
+            logger.info(
+                f"RC1: Filled {filled_count} additional gain targets from accuracy table "
+                f"({n_filled_det} via detection_date, {n_filled_event} via event_date-1BDay)"
+            )
 
     # ------------------------------------------------------------------
     # RC7 FIX: Raise gain cap from 500% → 10 000%.
