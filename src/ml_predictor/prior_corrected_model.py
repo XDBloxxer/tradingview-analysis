@@ -69,13 +69,18 @@ class _PriorCorrectedModel:
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
+    # Explicit pickle support: without these, pickle calls __getattr__ during
+    # state restoration before __dict__ is populated, causing AttributeError.
+    def __getstate__(self):
+        return self.__dict__
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
     def __getattr__(self, name):
-        # Guard against infinite recursion during unpickling: if __dict__ is
-        # not yet populated (pickle calls __getattr__ before __setstate__/
-        # __init__ has run), raise AttributeError immediately rather than
-        # forwarding to self._base (which would call __getattr__ again).
-        if name.startswith("_") and "_base" not in self.__dict__:
+        # Only reached for attributes not in __dict__. After __setstate__
+        # runs, _base is in __dict__ so this is only hit for genuine forwards
+        # (e.g. feature_importances_, best_iteration).
+        if "_base" not in self.__dict__:
             raise AttributeError(name)
-        # Forward any other attribute lookups to the base model so code that
-        # probes e.g. best_iteration, best_score, feature_importances_ works.
         return getattr(self._base, name)
