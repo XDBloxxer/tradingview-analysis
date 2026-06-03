@@ -2367,35 +2367,52 @@ def train_gain_regressor(
             )
 
     # ------------------------------------------------------------------
-    # RC7 FIX: Raise gain cap from 500% → 10 000%.
-    # The old 500% cap silently excluded the best-performing stocks from
-    # training (the logs showed a max of 5329.6%).  The log transform below
-    # handles the scale of extreme values; we only need to drop obvious data
-    # errors (negative gains > -100% are physically impossible; gains in the
-    # millions are likely bad data).
+    # CORE FIX: Non-winner rows without actual_high_pct get gain target = 0.0.
+    #
+    # Root cause of poor regressor training (confirmed in logs):
+    #   - 10,340 rows in the classifier train split
+    #   - Only 1,001 had a gain target (982 winners + 19 non-winners)
+    #   - The regressor was training on 98% winners with mean gain 79.7%
+    #   - It had no low-end anchor, so predictions collapsed to ~22-119%
+    #
+    # The fix mirrors how the main classifier is trained: use ALL rows.
+    # Non-winner rows (label=0) that have no actual_high_pct genuinely did
+    # not produce a large intraday gain — their correct gain target IS ~0%.
+    # Filling NaN with 0.0 for non-winners is not an imputation; it is the
+    # true label.  This gives the regressor the same 84% non-winner majority
+    # the classifier sees, anchoring the low end of the prediction distribution.
+    #
+    # Winner rows with NaN actual_high_pct (no prev_close available) are
+    # excluded — we don't know their true gain so we cannot assign 0.0.
     # ------------------------------------------------------------------
+    non_winner_rows = combined_df["label"] == 0
+    winner_rows     = combined_df["label"] == 1
+
+    # Fill missing gain targets for non-winners with 0.0 (true label: no big move)
+    n_nonwinner_filled = int((non_winner_rows & gain_targets.isna()).sum())
+    if n_nonwinner_filled > 0:
+        gain_targets = gain_targets.copy()
+        gain_targets.loc[non_winner_rows & gain_targets.isna()] = 0.0
+        logger.info(
+            f"CORE FIX: Filled {n_nonwinner_filled} non-winner rows with gain=0.0 "
+            f"(their correct gain target — no large intraday move occurred). "
+            f"This aligns regressor training population with the classifier's."
+        )
+
+    # RC7 FIX: cap (not floor) — reject obvious data errors only
     valid_gain_mask = gain_targets.notna() & (gain_targets > -100.0) & (gain_targets < 10_000.0)
 
-    # ── FIX (Bug 3): Exclude low-gain winner noise rows from regressor training ──
-    # When prev_close_db is unavailable, same-day open is used as a proxy
-    # (RC2 fallback), inflating gains for gap-up stocks and producing
-    # systematically wrong labels for many of the best winners.
-    # Additionally, winner rows with actual_high_pct < 10% are mostly noise
-    # (minor intraday moves or data errors) that pull predictions toward the
-    # mean.  Non-winner rows are kept regardless of gain magnitude because
-    # they are correctly labelled (gain ≈ 0-5%) and anchor the low-gain regime.
-    GAIN_REGRESSOR_MIN_PCT = 5.0    # Lowered from 10% — excluding winners below 10%
-                                    # was throwing away too many training examples and
-                                    # compressed the upper range of predictions.
-    winner_rows = combined_df["label"] == 1
+    # Exclude winner rows with NaN-filled or unreliably low gain only.
+    # Non-winner rows with gain=0.0 are KEPT — they are the true low-end anchor.
+    GAIN_REGRESSOR_MIN_PCT = 5.0
     low_gain_winner_mask = valid_gain_mask & winner_rows & (gain_targets < GAIN_REGRESSOR_MIN_PCT)
     n_low_gain_excluded = int(low_gain_winner_mask.sum())
     if n_low_gain_excluded > 0:
         valid_gain_mask = valid_gain_mask & ~low_gain_winner_mask
         logger.info(
             f"Bug3 FIX: Excluded {n_low_gain_excluded} winner rows with "
-            f"gain < {GAIN_REGRESSOR_MIN_PCT}% as noisy training targets. "
-            f"Non-winner rows are kept regardless of gain magnitude."
+            f"gain < {GAIN_REGRESSOR_MIN_PCT}% as noisy winner targets. "
+            f"Non-winner rows with gain=0.0 are retained as the low-end anchor."
         )
 
     n_valid = int(valid_gain_mask.sum())
