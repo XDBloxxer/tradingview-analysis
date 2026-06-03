@@ -3276,9 +3276,15 @@ def main() -> int:
     _n_cal_neg    = len(_val_neg_idx) // 2
 
     if _n_cal_pos >= CAL_MIN_POS and _n_cal_neg >= CAL_MIN_POS:
-        # Stratified split of val: first half → calibration, second half → early-stop
-        _cal_idx  = _val_pos_idx[:_n_cal_pos]  + _val_neg_idx[:_n_cal_neg]
-        _stop_idx = _val_pos_idx[_n_cal_pos:]  + _val_neg_idx[_n_cal_neg:]
+        # ISSUE 1 FIX: interleave by position instead of taking first/second halves.
+        # y_val is time-ordered ascending, so a first/second-half split gives the
+        # calibrator the OLDEST val rows and early-stopping the NEWEST — two different
+        # market sub-periods.  Interleaving (even positions → cal, odd → early-stop)
+        # ensures both sets span the full val time window with the same regime mix,
+        # making the isotonic calibrator representative of the same period the
+        # early-stopping signal comes from.
+        _cal_idx  = _val_pos_idx[0::2] + _val_neg_idx[0::2]   # even positions → cal
+        _stop_idx = _val_pos_idx[1::2] + _val_neg_idx[1::2]   # odd positions  → early-stop
 
         X_cal_fit    = X_val.loc[_cal_idx]
         y_cal_fit    = y_val.loc[_cal_idx]
