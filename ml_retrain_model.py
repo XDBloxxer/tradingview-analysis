@@ -139,8 +139,21 @@ GAIN_REGRESSOR_PATH     = MODEL_DIR / "gain_regressor.pkl"
 METADATA_PATH           = MODEL_DIR / "model_metadata.json"
 FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 
-BASE_CSV_WEIGHT         = 1.5
-T1_WEIGHT               = 1.0
+# FIX (2026-06-03): Flipped weights so fresh T-1 intraday rows are trusted MORE
+# than the older base CSV daily-bar rows.
+#
+# Previously BASE_CSV_WEIGHT=1.5 / T1_WEIGHT=1.0 told XGBoost: "the older
+# daily-bar snapshots matter 50% more than today's live intraday data." That
+# caused t1_close_ and t1_open_ features to land near-zero in feature
+# importance (RSI_14=0.000155, Volume_Ratio=0.000769) despite being the
+# freshest, most actionable signal available at inference time.
+#
+# With BASE_CSV_WEIGHT=1.0 / T1_WEIGHT=2.0 the model will learn from the
+# intraday signal that actually drives same-day explosive moves. The base CSV
+# rows still contribute full signal for the t3_/t5_/t10_ daily features — they
+# are just no longer artificially inflated relative to the richer T-1 rows.
+BASE_CSV_WEIGHT         = 1.0
+T1_WEIGHT               = 2.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # Validation window — the most recent N weeks of labelled data are reserved for
@@ -273,8 +286,30 @@ SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
 #   If this query is unavailable, 0.35 is a conservative starting estimate
 #   for a well-tuned screener targeting 20%+ intraday gains.
 #
-#   Set to None to disable prior correction (falls back to raw isotonic output).
-SCREENER_POSITIVE_RATE: float | None = 0.35
+#   FIX (2026-06-03): Disabled prior correction (set to None).
+#
+#   SCREENER_POSITIVE_RATE was a manual knob that applied a Bayes odds-ratio
+#   shift to push probabilities upward at inference time, on the theory that
+#   the screened inference universe has a higher positive rate than the training
+#   set. In practice this introduces more problems than it solves:
+#
+#   1. The "correct" value is unknown and has to be guessed. A value that is
+#      even modestly too high inflates probabilities across the board and causes
+#      the saturation problem seen in the pre-RC6 logs (25/44 stocks hitting
+#      0.9098, all signals collapsing to HOLD after relative ranking).
+#
+#   2. The model's own isotonic calibration already accounts for any base-rate
+#      mismatch it can observe in the val set. Stacking a manual Bayes shift on
+#      top of that double-corrects and creates a miscalibrated pkl.
+#
+#   3. The right fix for base-rate mismatch is to make the training positive
+#      rate match the inference positive rate — which is achieved by tuning
+#      SPW_MAX and the sample weights, not by post-hoc probability shifting.
+#
+#   With SCREENER_POSITIVE_RATE=None the model returns raw isotonic-calibrated
+#   probabilities. The RC7/RC8/RC9 safety nets in explosion_predictor.py will
+#   catch any residual clustering if calibration drifts.
+SCREENER_POSITIVE_RATE: float | None = None
 
 
 
@@ -1214,12 +1249,17 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
 
     t1_count = len(t1_df)
     if t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT:
+        # FIX (2026-06-03): Previously this branch forced base weights to 1.0,
+        # overriding BASE_CSV_WEIGHT and accidentally making T-1 rows equal to
+        # (or lower than) base rows when T1_WEIGHT < BASE_CSV_WEIGHT. Now we
+        # always apply BASE_CSV_WEIGHT / T1_WEIGHT so the intentional weighting
+        # is respected regardless of how many T-1 rows are present.
         logger.info(
             f"T-1 data ({t1_count} rows) >= threshold ({MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
-            "Using equal sample weights (1.0 / 1.0)."
+            f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
         )
         base_df = base_df.copy()
-        base_df["sample_weight"] = 1.0
+        base_df["sample_weight"] = BASE_CSV_WEIGHT
     else:
         logger.info(
             f"T-1 data ({t1_count} rows) < threshold ({MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
