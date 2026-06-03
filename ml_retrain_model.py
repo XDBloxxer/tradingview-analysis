@@ -2693,30 +2693,65 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
     mask = pd.Series(True, index=negatives.index)
 
+    # Each entry: (candidate_columns, min_filter_key, max_filter_key)
+    # candidate_columns is an ordered list of column name variants to try;
+    # the first one that exists in the DataFrame is used.
+    # Covers three naming conventions that may be present depending on data path:
+    #   1. t1_close_* / t1_open_* -- T-1 data after rename_t1_columns()
+    #   2. Base CSV / Supabase model-name columns (Close, Volume, HV_10, ...)
+    #   3. Legacy raw intraday names (close, volume, hv10, ...)
     filter_map = [
-        ("close", "min_price", "max_price"),
-        ("price", "min_price", "max_price"),
-        ("volume", "min_volume", None),
-        ("hv10", "min_hv10", None),
-        ("hv20", "min_hv20", None),
-        ("relative_volume", "min_relative_volume", None),
-        ("volume_ratio", "min_volume_ratio", None),
+        (
+            ["t1_close_Close", "t1_open_Close", "Close", "close", "price"],
+            "min_price", "max_price",
+        ),
+        (
+            ["t1_close_Volume", "t1_open_Volume", "Volume", "volume"],
+            "min_volume", None,
+        ),
+        (
+            ["t1_close_HV_10", "t1_open_HV_10", "HV_10", "hv10", "volatility_10d", "historical_volatility_10"],
+            "min_hv10", "max_hv10",
+        ),
+        (
+            ["t1_close_HV_20", "t1_open_HV_20", "HV_20", "hv20", "volatility_20d", "historical_volatility_20"],
+            "min_hv20", "max_hv20",
+        ),
+        (
+            ["t1_close_Volume_Ratio", "t1_open_Volume_Ratio", "Volume_Ratio", "volume_ratio", "relative_volume", "Relative_Volume"],
+            "min_relative_volume", None,
+        ),
+        (
+            ["t1_close_Volume_Ratio", "t1_open_Volume_Ratio", "Volume_Ratio", "volume_ratio"],
+            "min_volume_ratio", None,
+        ),
     ]
 
-    used_filter=False
-    for col, min_key, max_key in filter_map:
-        if col not in negatives.columns:
+    used_filter = False
+    for candidates, min_key, max_key in filter_map:
+        col = next((c for c in candidates if c in negatives.columns), None)
+        if col is None:
             continue
 
         if min_key and min_key in filters:
             mask &= negatives[col].fillna(-1e9) >= filters[min_key]
-            used_filter=True
+            used_filter = True
+            if logger:
+                logger.debug(f"  filter {min_key}>={filters[min_key]} applied via column '{col}'")
 
         if max_key and max_key in filters:
             mask &= negatives[col].fillna(1e9) <= filters[max_key]
-            used_filter=True
+            used_filter = True
+            if logger:
+                logger.debug(f"  filter {max_key}<={filters[max_key]} applied via column '{col}'")
 
     if not used_filter:
+        if logger:
+            logger.warning(
+                "apply_filter_aware_negative_sampling: no filter columns found in DataFrame "
+                f"(checked: Close/Volume/HV_10/HV_20/Volume_Ratio variants). "
+                f"DataFrame columns: {list(negatives.columns[:20])}..."
+            )
         return df
 
     hard_neg = negatives[mask].copy()
