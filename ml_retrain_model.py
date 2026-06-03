@@ -2743,14 +2743,49 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     )
 
     if date_col is None:
-        selected_neg = hard_neg.copy()
+        # No date column: apply a global ratio of 4× winners, preferring hard negatives.
+        hard_selected_count = 0
+        random_selected_count = 0
+
+        target_negatives = max(len(winners) * 4, 8)
+        preferred_target = int(target_negatives * 0.80)
+
+        chosen_hard = (
+            hard_neg.sample(min(len(hard_neg), preferred_target), random_state=42)
+            if len(hard_neg) else hard_neg
+        )
+        remaining = target_negatives - len(chosen_hard)
+        chosen_easy = (
+            easy_neg.sample(min(len(easy_neg), remaining), random_state=42)
+            if remaining > 0 and len(easy_neg) else easy_neg.iloc[0:0]
+        )
+
+        hard_selected_count = len(chosen_hard)
+        random_selected_count = len(chosen_easy)
+
+        parts = [chosen_hard, chosen_easy]
+        selected_neg = pd.concat(parts, ignore_index=True) if any(len(p) for p in parts) else hard_neg
+
+        if logger:
+            logger.info(
+                f"[no date_col] global ratio sampling: "
+                f"target={target_negatives}, hard={hard_selected_count}, "
+                f"easy_backfill={random_selected_count}"
+            )
     else:
         selected_parts = []
         hard_selected_count = 0
         random_selected_count = 0
 
-        for dt, winner_group in winners.groupby(date_col):
-            target_negatives = max(len(winner_group) * 4, 8)
+        # Collect all dates that have negatives (not just winner dates).
+        winner_dates = set(winners[date_col].dropna().unique())
+        all_neg_dates = set(negatives[date_col].dropna().unique())
+        all_dates = winner_dates | all_neg_dates
+
+        for dt in sorted(all_dates):
+            winner_group = winners[winners[date_col] == dt]
+            # For non-winner dates use a baseline target of 4 negatives minimum.
+            target_negatives = max(len(winner_group) * 4, 4) if len(winner_group) > 0 else 4
 
             hard_dt = hard_neg[hard_neg[date_col] == dt]
             easy_dt = easy_neg[easy_neg[date_col] == dt]
@@ -2775,7 +2810,7 @@ def apply_filter_aware_negative_sampling(df, logger=None):
             hard_selected_count += len(chosen_hard)
             random_selected_count += len(chosen_easy)
 
-            if logger and len(chosen_hard) < preferred_target:
+            if logger and len(winner_group) > 0 and len(chosen_hard) < preferred_target:
                 logger.info(
                     f"[{dt}] hard-negative shortage: "
                     f"wanted={preferred_target}, available={len(hard_dt)}, "
