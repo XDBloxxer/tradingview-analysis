@@ -1973,9 +1973,20 @@ def train_val_split(
         _excess_pos_idx = y_val[y_val == 1].index[_target_val_pos:]  # move these to train
 
         if len(_excess_pos_idx) > 0:
-            # Move excess val positives → train
-            val_idx   = [i for i in val_idx   if i not in set(_excess_pos_idx)]
-            train_idx = list(train_idx) + list(_excess_pos_idx)
+            # Move excess val positives → train.
+            # BUG 4 FIX: rebuild train_idx as a pd.Index (not a plain list) so
+            # that the returned train_idx is always the same type and always
+            # contains the moved rows.  Previously train_idx was reassigned as
+            # list(train_idx) + list(_excess_pos_idx) but as a plain Python list
+            # rather than a pd.Index, creating a type inconsistency with the
+            # non-rebalance code paths where train_idx is a pd.Index.
+            # Using pd.Index(...) here makes the update explicit and ensures the
+            # returned train_idx is always a proper pd.Index containing the
+            # rebalanced rows.
+            _new_val_list   = [i for i in val_idx   if i not in set(_excess_pos_idx)]
+            _new_train_list = list(train_idx) + list(_excess_pos_idx)
+            val_idx   = pd.Index(_new_val_list)
+            train_idx = pd.Index(_new_train_list)
 
             X_train = X.loc[train_idx]
             X_val   = X.loc[val_idx]
@@ -2370,17 +2381,37 @@ def train_gain_regressor(
     # ------------------------------------------------------------------
     # RC3 FIX: Use X_scaled (already StandardScaler-transformed), not raw
     # ------------------------------------------------------------------
-    # X_scaled has the same row order as combined_df
-    if len(X_scaled) != len(combined_df):
+    # BUG 4 FIX: align X_scaled to combined_df by shared index labels rather
+    # than by position.  The previous code assumed "X_scaled has the same row
+    # order as combined_df" and then blindly force-assigned X_reg.index =
+    # combined_df.index.  After a VAL REBALANCE the rebalanced rows are
+    # appended to the end of train_idx, so X_train (which came from
+    # X.loc[train_idx]) and combined_df.loc[train_idx] both contain the
+    # rebalanced rows — but any future code change that produces even a tiny
+    # ordering difference between the two DataFrames would silently corrupt
+    # the feature→gain-target mapping.  Using .reindex() makes the alignment
+    # explicit and index-safe regardless of row order.
+    common_idx = X_scaled.index.intersection(combined_df.index)
+    if len(common_idx) == 0:
         logger.warning(
-            f"RC3: X_scaled length ({len(X_scaled)}) != combined_df ({len(combined_df)}) — "
+            f"RC3: X_scaled and combined_df share no index labels — "
             "cannot align. Skipping gain regressor."
         )
         return None
+    if len(common_idx) < len(combined_df):
+        logger.warning(
+            f"RC3: X_scaled covers {len(common_idx)} of {len(combined_df)} combined_df rows — "
+            "some rows will be excluded from gain regressor training."
+        )
 
-    # Align index so we can use valid_gain_mask safely
-    X_reg = X_scaled.copy()
-    X_reg.index = combined_df.index
+    # Narrow both to the common index so all downstream masks align correctly.
+    # Use reindex on gain_targets (preserves accuracy_gain_map fills from above)
+    # rather than re-deriving from combined_df[gain_col].
+    combined_df  = combined_df.loc[common_idx]
+    gain_targets = gain_targets.reindex(common_idx)
+
+    # Align features to the same index using label-based reindex (not positional).
+    X_reg = X_scaled.reindex(common_idx)
     y_reg = gain_targets.copy()
     w_reg = (
         combined_df["sample_weight"].astype(float)
