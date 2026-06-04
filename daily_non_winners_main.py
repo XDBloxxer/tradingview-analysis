@@ -59,6 +59,16 @@ def main():
         action="store_true",
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--allow-append",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow appending stocks to dates that already exist in the database. "
+            "Disabled by default to prevent accidental overwrites during scheduled runs. "
+            "Only use this flag when running manually."
+        )
+    )
 
     args = parser.parse_args()
 
@@ -100,6 +110,10 @@ def main():
         logger.info("DAILY NON-WINNERS TRACKER")
         logger.info(f"Target Date: {target_date_str}")
         logger.info(f"Top N: {args.top_n}")
+        if args.allow_append:
+            logger.warning("ALLOW APPEND: enabled — existing date records CAN be supplemented")
+        else:
+            logger.info("Allow Overwrite: disabled (safe default)")
         logger.info("=" * 60)
         logger.info("")
         logger.info("PURPOSE: Collect NEGATIVE examples for ML training")
@@ -126,7 +140,7 @@ def main():
 
         # Write non-winners to Supabase
         supabase = DailyNonWinnersSupabaseClient(config)
-        count = supabase.write_non_winners(non_winners)
+        count = supabase.write_non_winners(non_winners, allow_append=args.allow_append)
         logger.info(f"✓ Written {count} non-winners to Supabase")
 
         # Step 2: Collect Indicator Data
@@ -155,7 +169,7 @@ def main():
         logger.info(f"  - Day Prior Close (4pm T-1): {len(intraday_data['day_prior_close'])} symbols")
 
         # Write ALL intraday data to Supabase (all four timepoints)
-        counts = supabase.write_intraday_data(intraday_data)
+        counts = supabase.write_intraday_data(intraday_data, allow_append=args.allow_append)
         logger.info(f"✓ Written intraday data to Supabase:")
         for data_type, count in counts.items():
             logger.info(f"  - {data_type}: {count} rows")
@@ -169,6 +183,7 @@ def main():
         multiday_count = multiday_collector.collect_and_write(
             stocks=intraday_data["day_prior_close"],   # has symbol + detection_date
             table="non_winners_multiday",
+            allow_append=args.allow_append,
         )
         logger.info(f"✓ Written {multiday_count} multiday feature rows for non-winners")
 
