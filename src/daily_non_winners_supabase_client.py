@@ -168,37 +168,52 @@ class DailyNonWinnersSupabaseClient:
             self.logger.debug(f"Could not check existing symbols in {table_name}: {e}")
             return set()
     
-    def write_non_winners(self, non_winners: List[Dict[str, Any]]) -> int:
+    def write_non_winners(self, non_winners: List[Dict[str, Any]], allow_append: bool = False) -> int:
         """
-        Write daily non-winners to Supabase
-        ONLY writes NEW symbols that don't already exist for this date
-        
+        Write daily non-winners to Supabase.
+
+        By default (allow_append=False) only NEW symbols that don't already
+        exist for this date are inserted, protecting scheduled runs from
+        accidentally duplicating data.
+
+        Pass allow_append=True when running manually to allow adding stocks
+        to a date that already has records in the database.
+
         Args:
             non_winners: List of non-winner dictionaries
-            
+            allow_append: If True, skip the existing-symbol filter and write
+                             all provided stocks (subject to DB unique constraints).
+
         Returns:
             Number of rows written
         """
         if not non_winners:
             self.logger.warning("No non-winners to write")
             return 0
-        
+
         try:
             detection_date = non_winners[0].get('detection_date')
-            
-            # Get existing symbols for this date
-            existing_symbols = self._get_existing_symbols(self.tables["non_winners"], detection_date)
-            
-            if existing_symbols:
-                self.logger.info(f"Found {len(existing_symbols)} existing non-winners for {detection_date}")
-            
-            # Filter out symbols that already exist
-            new_non_winners = [nw for nw in non_winners if nw.get('symbol') not in existing_symbols]
-            
-            skipped_count = len(non_winners) - len(new_non_winners)
-            if skipped_count > 0:
-                self.logger.info(f"Skipping {skipped_count} non-winners that already exist in database")
-            
+
+            if allow_append:
+                self.logger.info(
+                    f"allow_append=True: skipping duplicate check for {detection_date}, "
+                    "writing all non-winners"
+                )
+                new_non_winners = non_winners
+            else:
+                # Get existing symbols for this date
+                existing_symbols = self._get_existing_symbols(self.tables["non_winners"], detection_date)
+
+                if existing_symbols:
+                    self.logger.info(f"Found {len(existing_symbols)} existing non-winners for {detection_date}")
+
+                # Filter out symbols that already exist
+                new_non_winners = [nw for nw in non_winners if nw.get('symbol') not in existing_symbols]
+
+                skipped_count = len(non_winners) - len(new_non_winners)
+                if skipped_count > 0:
+                    self.logger.info(f"Skipping {skipped_count} non-winners that already exist in database")
+
             if not new_non_winners:
                 self.logger.info("No new non-winners to write (all already exist)")
                 return 0
@@ -219,14 +234,20 @@ class DailyNonWinnersSupabaseClient:
             self.logger.error(f"Error writing non-winners: {str(e)}", exc_info=True)
             raise
     
-    def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]], allow_append: bool = False) -> Dict[str, int]:
         """
-        Write intraday indicator data to Supabase
-        ONLY writes NEW symbols that don't already exist for this date
-        
+        Write intraday indicator data to Supabase.
+
+        By default (allow_append=False) only NEW symbols that don't already
+        exist for this date are inserted.  Pass allow_append=True when
+        running manually to allow adding stocks to a date that already has
+        records.
+
         Args:
-            intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior_open', 'day_prior_close' keys
-            
+            intraday_data: Dictionary with 'market_open', 'market_close',
+                           'day_prior_open', 'day_prior_close' keys
+            allow_append: If True, skip the existing-symbol filter.
+
         Returns:
             Dictionary with counts for each table
         """
@@ -247,19 +268,26 @@ class DailyNonWinnersSupabaseClient:
             
             try:
                 detection_date = data[0].get('detection_date')
-                
-                # Get existing symbols for this date
-                existing_symbols = self._get_existing_symbols(self.tables[table_key], detection_date)
-                
-                if existing_symbols:
-                    self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
-                
-                # Filter out symbols that already exist
-                new_data = [d for d in data if d.get('symbol') not in existing_symbols]
-                
-                skipped_count = len(data) - len(new_data)
-                if skipped_count > 0:
-                    self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
+
+                if allow_append:
+                    self.logger.info(
+                        f"allow_append=True: skipping duplicate check for {data_type} "
+                        f"on {detection_date}, writing all records"
+                    )
+                    new_data = data
+                else:
+                    # Get existing symbols for this date
+                    existing_symbols = self._get_existing_symbols(self.tables[table_key], detection_date)
+
+                    if existing_symbols:
+                        self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
+
+                    # Filter out symbols that already exist
+                    new_data = [d for d in data if d.get('symbol') not in existing_symbols]
+
+                    skipped_count = len(data) - len(new_data)
+                    if skipped_count > 0:
+                        self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
                 
                 if not new_data:
                     self.logger.info(f"No new {data_type} data to write (all already exist)")
