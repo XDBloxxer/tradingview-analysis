@@ -815,6 +815,7 @@ class MultidayFeatureCollector:
         self,
         stocks: List[Dict[str, Any]],
         table: str,
+        allow_append: bool = False,
     ) -> int:
         """
         Compute multiday features for every stock in `stocks` and upsert
@@ -827,6 +828,11 @@ class MultidayFeatureCollector:
             - "detection_date" : str  (YYYY-MM-DD)  OR  datetime/Timestamp
         table  : Supabase table name
             e.g. "winners_multiday" or "non_winners_multiday"
+        allow_append : bool, default False
+            When False (the safe default for scheduled runs), symbols that
+            already exist for the date are skipped.  Set to True when running
+            manually to allow writing new stocks into a date that already has
+            records in the database.
 
         Returns
         -------
@@ -840,7 +846,15 @@ class MultidayFeatureCollector:
         # If all stocks share the same date (the normal daily-run case) we
         # only need one _existing_symbols check.
         date_str = str(stocks[0]["detection_date"])[:10]
-        existing = self._existing_symbols(table, date_str)
+
+        if allow_append:
+            self.logger.info(
+                f"MultidayFeatureCollector: allow_append=True — skipping "
+                f"duplicate check for {table} on {date_str}"
+            )
+            existing: set = set()
+        else:
+            existing = self._existing_symbols(table, date_str)
 
         tasks = []
         for s in stocks:
