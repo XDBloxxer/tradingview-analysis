@@ -15,6 +15,14 @@ on:
         description: 'Number of non-winners to track'
         required: false
         default: '60'
+      allow_append:
+        description: 'Allow appending stocks to dates that already exist in the database (manual runs only)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
 
 
 
@@ -51,6 +59,10 @@ jobs:
           
           if [ -n "${{ github.event.inputs.date }}" ]; then
             ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+          fi
+          
+          if [ "${{ github.event.inputs.allow_append }}" = "true" ]; then
+            ARGS="$ARGS --allow-append"
           fi
           
           echo "Running with args: $ARGS"
