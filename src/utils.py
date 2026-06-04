@@ -88,7 +88,23 @@ def setup_logging(level: str = "INFO", logging_config: Dict = None) -> logging.L
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)
-    
+
+    # Silence noisy third-party HTTP / networking libraries.
+    # They stay visible at WARNING+ so connection errors still surface.
+    _QUIET_LOGGERS = [
+        "urllib3", "urllib3.connectionpool",
+        "httpx",
+        "httpcore", "httpcore.http11", "httpcore.http2", "httpcore.connection",
+        "hpack", "h2",
+        "requests",
+        "charset_normalizer",
+        "postgrest", "gotrue", "realtime", "supabase",
+        "websockets", "websockets.client", "websockets.server",
+        "asyncio",
+    ]
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
     return logger
 
 
