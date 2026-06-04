@@ -220,11 +220,20 @@ class DailyNonWinnersSupabaseClient:
             
             # Sanitize all data
             sanitized_non_winners = [self._sanitize_dict(nw) for nw in new_non_winners]
-            
-            # Insert new data only
-            response = self.client.table(self.tables["non_winners"]).insert(
-                sanitized_non_winners
-            ).execute()
+
+            # When appending to an existing date, use upsert with ignore_duplicates=True
+            # so any symbols already in the DB are silently skipped rather than hard-erroring.
+            # Normal inserts don't need this because the pre-filter above already removed them.
+            if allow_append:
+                response = self.client.table(self.tables["non_winners"]).upsert(
+                    sanitized_non_winners,
+                    ignore_duplicates=True,
+                    on_conflict="symbol,detection_date",
+                ).execute()
+            else:
+                response = self.client.table(self.tables["non_winners"]).insert(
+                    sanitized_non_winners
+                ).execute()
             
             count = len(response.data) if response.data else 0
             self.logger.info(f"Wrote {count} NEW non-winners to Supabase")
@@ -296,11 +305,19 @@ class DailyNonWinnersSupabaseClient:
                 
                 # Sanitize all data (this removes 'id' and other auto-fields)
                 sanitized_data = [self._sanitize_dict(d) for d in new_data]
-                
-                # Insert new data only
-                response = self.client.table(self.tables[table_key]).insert(
-                    sanitized_data
-                ).execute()
+
+                # When appending to an existing date, use upsert with ignore_duplicates=True
+                # so any symbols already in the DB are silently skipped rather than hard-erroring.
+                if allow_append:
+                    response = self.client.table(self.tables[table_key]).upsert(
+                        sanitized_data,
+                        ignore_duplicates=True,
+                        on_conflict="symbol,detection_date",
+                    ).execute()
+                else:
+                    response = self.client.table(self.tables[table_key]).insert(
+                        sanitized_data
+                    ).execute()
                 
                 count = len(response.data) if response.data else 0
                 counts[data_type] = count
