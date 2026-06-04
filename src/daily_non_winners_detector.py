@@ -67,12 +67,23 @@ class DailyNonWinnersDetector:
         else:
             self.screener = None
 
-        # Load learned filters from ml_models/learned_filters.json (if available)
-        self.learned_filters = self._load_learned_filters()
-        
+        # Loosening config — edit these two values in config.yaml under non_winners:
+        #   loosening_passes:    how many extra screener attempts before hard fallback
+        #   loosening_step_pct:  how many percent to relax filters per pass
+        non_winners_config = config.get("non_winners", {})
+        self.loosening_passes   = int(non_winners_config.get("loosening_passes",   3))
+        self.loosening_step_pct = float(non_winners_config.get("loosening_step_pct", 20.0))
+        self.min_pool_factor    = float(non_winners_config.get("min_pool_factor",   1.5))
+
+        # NOTE: learned_filters are loaded fresh on each detect_non_winners() call
+        # so that changes to ml_models/learned_filters.json take effect immediately
+        # without restarting the process.
+
         self.logger.info(
             f"Non-Winners detector initialized: "
-            f"min_price={self.min_price}, min_volume={self.min_volume}"
+            f"min_price={self.min_price}, min_volume={self.min_volume}, "
+            f"loosening_passes={self.loosening_passes}, "
+            f"loosening_step_pct={self.loosening_step_pct}%"
         )
 
     def _load_learned_filters(self) -> dict:
@@ -106,128 +117,219 @@ class DailyNonWinnersDetector:
             self.logger.warning(f"Could not load learned_filters.json: {e} — using defaults")
         return defaults
     
+    def _loosen_filters(self, base_filters: dict, step_pct: float, pass_number: int) -> dict:
+        """
+        Return a new filter dict with thresholds loosened by (step_pct * pass_number) %.
+
+        For every min_* key the threshold is reduced, giving more stocks a chance to
+        pass.  For every max_* key the ceiling is raised for the same reason.
+
+        Example: step_pct=20, pass_number=1  →  min values drop by 20 %, max values
+        rise by 20 %.  pass_number=2 with the same step_pct drops/raises by 40 %, etc.
+
+        Args:
+            base_filters: The original learned filters (never mutated).
+            step_pct:     How many percent to relax per pass (set in config under
+                          non_winners.loosening_step_pct, default 20).
+            pass_number:  Which pass this is (1-based so pass 0 = full filters).
+        """
+        lf = dict(base_filters)
+        reduction = (step_pct / 100.0) * pass_number   # e.g. 0.20, 0.40, 0.60 …
+        min_factor = max(0.0, 1.0 - reduction)          # can't go below 0
+        max_factor = 1.0 + reduction                    # no upper bound needed
+
+        for key in list(lf.keys()):
+            if lf[key] is None or key.startswith("_"):
+                continue
+            if key.startswith("min_"):
+                lf[key] = lf[key] * min_factor
+            elif key.startswith("max_"):
+                lf[key] = lf[key] * max_factor
+
+        return lf
+
     def detect_non_winners(
         self, 
         top_n: int = 15, 
         target_date: datetime = None
     ) -> List[Dict[str, Any]]:
         """
-        Detect non-winners (negative examples)
-        
+        Detect non-winners (negative examples).
+
         Strategy:
-        1. Apply learned_filters to find a pool of stocks that *look like* they
-           could have been winners — but didn't gain ≥20 % intraday.
-        2. From that filtered pool, sample diverse categories the same way as
-           before (flat / slight-gain / slight-loss / big-loss).
-        3. If the filtered pool is too small to fill top_n, fall back to the
-           original random-liquid-stock approach for the remaining slots.
-        
+        1. Load learned_filters fresh from disk (picks up any changes automatically).
+        2. Apply filters to find a pool of stocks that look like winners but didn't
+           gain ≥20 % intraday.
+        3. If the pool is too small, loosen the filters by loosening_step_pct % per
+           pass and retry up to loosening_passes times, accumulating candidates.
+        4. Only after all passes are exhausted does it fall back to the original
+           random-liquid-stock approach for any remaining slots.
+
+        Tuning knobs (all in config.yaml under non_winners:):
+            loosening_passes   – number of extra screener attempts (default 3)
+            loosening_step_pct – % to relax filters per pass (default 20)
+            min_pool_factor    – minimum pool = top_n * this (default 1.5)
+
         Args:
             top_n: Number of non-winners to collect
             target_date: Target date
-            
+
         Returns:
             List of non-winner dictionaries
         """
         if target_date is None:
             target_date = datetime.now()
-        
+
         target_date_str = target_date.date().isoformat()
-        
+        min_pool = max(top_n, int(top_n * self.min_pool_factor))
+
+        # ── Load filters fresh every run ─────────────────────────────────────
+        # This means edits to learned_filters.json are picked up automatically
+        # without restarting anything.
+        base_filters = self._load_learned_filters()
+
         self.logger.info(f"Detecting non-winners for {target_date_str}...")
-        self.logger.info(f"Strategy: First apply learned filters, then sample {top_n} diverse non-winners")
-        
+        self.logger.info(
+            f"Strategy: up to {self.loosening_passes} loosening pass(es) at "
+            f"{self.loosening_step_pct}%/pass → need pool ≥ {min_pool}"
+        )
+
         # Get actual winners to exclude
         winners_symbols = self._get_winners_symbols(target_date)
         self.logger.info(f"Found {len(winners_symbols)} winners to exclude")
-        
-        # ── Phase 1: learned-filter candidates ──────────────────────────────
-        self.logger.info("Phase 1: Fetching candidates via learned filters...")
-        filtered_candidates = self._get_filtered_candidates(winners_symbols)
-        self.logger.info(f"  Learned-filter pool: {len(filtered_candidates)} stocks")
 
-        non_winners = []
+        # ── Phase 1: progressive learned-filter candidates ───────────────────
+        all_candidates: Dict[str, Dict] = {}   # symbol → data  (deduped across passes)
+        passes_needed = 0
+
+        # Pass 0 = full filters; passes 1…loosening_passes = progressively looser
+        for pass_idx in range(self.loosening_passes + 1):
+            if pass_idx == 0:
+                active_filters = base_filters
+                label = "full filters"
+            else:
+                active_filters = self._loosen_filters(
+                    base_filters, self.loosening_step_pct, pass_idx
+                )
+                relaxed_pct = self.loosening_step_pct * pass_idx
+                label = f"loosened {relaxed_pct:.0f}%"
+
+            def _fmt(v, spec):
+                return format(v, spec) if v is not None else "None"
+            self.logger.info(
+                f"Phase 1 pass {pass_idx} ({label}): fetching candidates "
+                f"[min_price={_fmt(active_filters.get('min_price'), '.3f')}, "
+                f"min_volume={_fmt(active_filters.get('min_volume'), '.0f')}, "
+                f"min_rvol={_fmt(active_filters.get('min_relative_volume'), '.2f')}]..."
+            )
+
+            new_candidates = self._get_filtered_candidates(winners_symbols, active_filters)
+
+            added = 0
+            for c in new_candidates:
+                if c["symbol"] not in all_candidates:
+                    all_candidates[c["symbol"]] = c
+                    added += 1
+
+            passes_needed = pass_idx
+            self.logger.info(
+                f"  Pass {pass_idx}: +{added} new symbols "
+                f"(cumulative pool: {len(all_candidates)})"
+            )
+
+            if len(all_candidates) >= min_pool:
+                self.logger.info(
+                    f"  Pool size {len(all_candidates)} ≥ {min_pool} — "
+                    f"stopping after pass {pass_idx} ({label})"
+                )
+                break
+
+        if passes_needed > 0:
+            self.logger.info(
+                f"  NOTE: needed {passes_needed} loosening pass(es) "
+                f"(filters relaxed by {self.loosening_step_pct * passes_needed:.0f}% total) "
+                f"to reach pool of {len(all_candidates)}"
+            )
+
+        filtered_candidates = list(all_candidates.values())
+        self.logger.info(f"  Final learned-filter pool: {len(filtered_candidates)} stocks")
+
+        non_winners: List[Dict] = []
 
         if filtered_candidates:
-            # Build a quick lookup by symbol for the filtered pool
-            filtered_map: Dict[str, Dict] = {c['symbol']: c for c in filtered_candidates}
+            filtered_map: Dict[str, Dict] = {c["symbol"]: c for c in filtered_candidates}
             filtered_syms = set(filtered_map.keys())
 
             def _pick_from_filtered(min_chg, max_chg, n):
                 picked = []
-                already = set(nw['symbol'] for nw in non_winners)
+                already = {nw["symbol"] for nw in non_winners}
                 for sym, data in filtered_map.items():
                     if sym in already:
                         continue
-                    if min_chg <= data['change_pct'] <= max_chg:
+                    if min_chg <= data["change_pct"] <= max_chg:
                         picked.append(data)
                     if len(picked) >= n:
                         break
                 return picked
 
-            # Category 1: Flat stocks (-2% to +2%)
-            flat_count = int(top_n * 0.3)
-            flat_stocks = _pick_from_filtered(-2.0, 2.0, flat_count)
+            flat_count        = int(top_n * 0.3)
+            slight_gain_count = int(top_n * 0.3)
+            slight_loss_count = int(top_n * 0.2)
+
+            flat_stocks    = _pick_from_filtered(-2.0,  2.0,  flat_count)
             non_winners.extend(flat_stocks)
             self.logger.info(f"  Flat  (-2% to +2%):  {len(flat_stocks)}/{flat_count} from filtered pool")
 
-            # Category 2: Slight gainers (+2% to +10%)
-            slight_gain_count = int(top_n * 0.3)
-            slight_gainers = _pick_from_filtered(2.0, 10.0, slight_gain_count)
+            slight_gainers = _pick_from_filtered(2.0,  10.0, slight_gain_count)
             non_winners.extend(slight_gainers)
             self.logger.info(f"  Slight gain (+2% to +10%): {len(slight_gainers)}/{slight_gain_count} from filtered pool")
 
-            # Category 3: Slight losers (-2% to -10%)
-            slight_loss_count = int(top_n * 0.2)
-            slight_losers = _pick_from_filtered(-10.0, -2.0, slight_loss_count)
+            slight_losers  = _pick_from_filtered(-10.0, -2.0, slight_loss_count)
             non_winners.extend(slight_losers)
             self.logger.info(f"  Slight loss (-2% to -10%): {len(slight_losers)}/{slight_loss_count} from filtered pool")
 
-            # Category 4: Bigger losers (< -10%)
             big_loss_count = top_n - len(non_winners)
-            big_losers = _pick_from_filtered(-50.0, -10.0, big_loss_count)
+            big_losers     = _pick_from_filtered(-50.0, -10.0, big_loss_count)
             non_winners.extend(big_losers)
             self.logger.info(f"  Big loss (< -10%): {len(big_losers)}/{big_loss_count} from filtered pool")
         else:
-            self.logger.info("  No filtered candidates returned — skipping Phase 1")
+            self.logger.info("  No filtered candidates returned from any pass — skipping Phase 1")
             filtered_syms = set()
 
-        # ── Phase 2: fallback for any shortage ──────────────────────────────
+        # ── Phase 2: fallback for any remaining shortage ─────────────────────
         if len(non_winners) < top_n:
             shortage = top_n - len(non_winners)
             self.logger.info(
-                f"Phase 2: Only {len(non_winners)}/{top_n} from filtered pool. "
-                f"Filling {shortage} slots via original random-liquid-stock method..."
+                f"Phase 2 (hard fallback): Only {len(non_winners)}/{top_n} after all loosening passes. "
+                f"Filling {shortage} slots via random-liquid-stock method..."
             )
 
-            already_syms = set(nw['symbol'] for nw in non_winners)
-            # Try category-by-category fallback first (mirrors original logic)
-            per_cat_needed = shortage // 4 or 1
+            already_syms = {nw["symbol"] for nw in non_winners}
+            per_cat_needed = max(shortage // 4, 1)
 
-            fallback = []
+            fallback: List[Dict] = []
             for min_chg, max_chg in [(-2.0, 2.0), (2.0, 10.0), (-10.0, -2.0), (-50.0, -10.0)]:
                 if len(fallback) >= shortage:
                     break
                 batch = self._get_stocks_by_change_range(
                     target_date, min_chg, max_chg,
                     per_cat_needed * 2,
-                    winners_symbols | already_syms | filtered_syms
+                    winners_symbols | already_syms | filtered_syms,
                 )
                 for stock in batch:
-                    if stock['symbol'] not in already_syms and stock['symbol'] not in filtered_syms:
+                    if stock["symbol"] not in already_syms and stock["symbol"] not in filtered_syms:
                         fallback.append(stock)
-                        already_syms.add(stock['symbol'])
+                        already_syms.add(stock["symbol"])
                     if len(fallback) >= shortage:
                         break
 
-            # If still short, use the fully random fallback
             if len(fallback) < shortage:
                 remaining = shortage - len(fallback)
-                self.logger.info(f"  Still {remaining} short — using random liquid stocks as final fallback")
+                self.logger.info(f"  Still {remaining} short — using fully random liquid stocks")
                 random_stocks = self._get_random_liquid_stocks(
                     target_date, remaining * 2,
                     winners_symbols,
-                    already_syms | filtered_syms
+                    already_syms | filtered_syms,
                 )
                 fallback.extend(random_stocks[:remaining])
 
@@ -255,15 +357,23 @@ class DailyNonWinnersDetector:
         
         return non_winners[:top_n]
     
-    def _get_filtered_candidates(self, exclude_symbols: set) -> List[Dict[str, Any]]:
+    def _get_filtered_candidates(
+        self,
+        exclude_symbols: set,
+        filters: dict = None,
+    ) -> List[Dict[str, Any]]:
         """
-        Fetch a pool of stocks that pass the learned filters but did NOT gain ≥20 % intraday.
+        Fetch a pool of stocks that pass the given filters but did NOT gain ≥20 % intraday.
 
-        Uses the TradingView screener when available (applying learned filter values as
-        screener constraints), otherwise falls back to yfinance on the liquid-stocks list.
+        Uses the TradingView screener when available (applying filter values as screener
+        constraints), otherwise falls back to yfinance on the liquid-stocks list.
         In both cases only stocks with change_pct < 20 % are returned.
+
+        Args:
+            exclude_symbols: Symbols to exclude (winners + already-selected)
+            filters: Filter dict to apply.  Defaults to self.learned_filters.
         """
-        lf = self.learned_filters
+        lf = filters if filters is not None else self.learned_filters
 
         # Map from learned_filters keys → (tv_column, operation)
         TV_FILTER_MAP = {
