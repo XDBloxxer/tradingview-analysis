@@ -3509,28 +3509,35 @@ def main() -> int:
     )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
+    # AUC is reported on X_val_xgb (the early-stopping half of the val set)
+    # rather than the full X_val.  The other half (X_cal_fit) was passed to
+    # CalibratedClassifierCV.fit(), so evaluating on it would be circular —
+    # the calibrated probability distribution has already seen those rows.
+    # X_val_xgb was held out from both training and calibration, making it a
+    # clean post-calibration holdout.  When calibration was skipped (val set
+    # too small), X_val_xgb == X_val so behaviour is unchanged.
     from sklearn.metrics import roc_auc_score, classification_report
 
-    val_proba = model.predict_proba(X_val)[:, 1]
+    val_proba = model.predict_proba(X_val_xgb)[:, 1]
     val_pred  = (val_proba >= 0.5).astype(int)
 
     try:
-        auc = roc_auc_score(y_val, val_proba)
-        logger.info(f"Validation AUC-ROC: {auc:.4f}")
+        auc = roc_auc_score(y_val_xgb, val_proba)
+        logger.info(f"Validation AUC-ROC: {auc:.4f} (evaluated on early-stop holdout, n={len(y_val_xgb)})")
     except Exception:
         auc = float("nan")
         logger.warning("Validation AUC-ROC: nan (only one class in val set)")
 
-    logger.info("Classification report (val):")
-    for line in classification_report(y_val, val_pred).split("\n"):
+    logger.info("Classification report (val — early-stop holdout):")
+    for line in classification_report(y_val_xgb, val_pred).split("\n"):
         if line.strip():
             logger.info(f"  {line}")
 
-    # Log probability distribution on val set
+    # Log probability distribution on val set (early-stop holdout only)
     val_proba_series = pd.Series(val_proba)
     bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     dist = pd.cut(val_proba_series, bins=bins).value_counts().sort_index()
-    logger.info("Val set probability distribution:")
+    logger.info("Val set probability distribution (early-stop holdout):")
     for bucket, count in dist.items():
         logger.info(f"  {str(bucket):<20} {count:>4}")
 
