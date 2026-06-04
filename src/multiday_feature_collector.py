@@ -460,17 +460,22 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         df["gap_pct"] = np.nan
 
     # ── Derived price metrics ─────────────────────────────────────────────────
+    # price_vs_* are computed here from raw dollar MAs — result is already %.
+    # sma_20_slope, ema_20_slope, ema_12_26_diff, sma_20_50_diff are computed
+    # here as intermediate dollar values but will be OVERWRITTEN later in the
+    # normalisation block (after MAs are converted to % of close), so their
+    # final stored values will be in %-point-per-bar / %-point-spread units.
     if "SMA_20" in df.columns:
         df["price_vs_sma20"]  = (close - df["SMA_20"])  / df["SMA_20"]  * 100
-        df["sma_20_slope"]    = df["SMA_20"].diff(1)
-        df["sma_20_50_diff"]  = df["SMA_20"] - df.get("SMA_50", np.nan)
+        df["sma_20_slope"]    = df["SMA_20"].diff(1)      # overwritten after normalisation
+        df["sma_20_50_diff"]  = df["SMA_20"] - df.get("SMA_50", np.nan)  # overwritten
     if "SMA_50" in df.columns:
         df["price_vs_sma50"]  = (close - df["SMA_50"])  / df["SMA_50"]  * 100
     if "EMA_20" in df.columns:
         df["price_vs_ema20"]  = (close - df["EMA_20"])  / df["EMA_20"]  * 100
-        df["ema_20_slope"]    = df["EMA_20"].diff(1)
+        df["ema_20_slope"]    = df["EMA_20"].diff(1)      # overwritten after normalisation
     if "EMA_12" in df.columns and "EMA_26" in df.columns:
-        df["ema_12_26_diff"]  = df["EMA_12"] - df["EMA_26"]
+        df["ema_12_26_diff"]  = df["EMA_12"] - df["EMA_26"]  # overwritten after normalisation
 
     # ── Slopes ───────────────────────────────────────────────────────────────
     if "ATRr_14" in df.columns:
@@ -507,6 +512,123 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         lower = df["SUPERT_10_3.0"].where(df["SUPERTd_10_3.0"] == 1)
         df["SUPERTl_10_3.0"] = lower.ffill()
 
+
+    # ── Normalise price-level indicators ─────────────────────────────────────
+    # Any indicator whose value is in dollar terms will act as a price-level
+    # proxy: a $2 stock always has lower band values near $1, a $50 stock near
+    # $40, so the model learns "price range" rather than the intended signal.
+    # We already exclude raw OHLCV (t3_close etc.) for the same reason.
+    #
+    # Strategy per category:
+    #   DOLLAR bands/lines  → (value / close - 1) * 100   = % distance from close
+    #   SIGNED dollar diffs → value / close * 100          = % of close
+    #   Volume absolutes    → value / vol_ma20             = ratio (already done
+    #                         for volume_ratio; apply same to MAs and OBV)
+    #
+    # NOTE: atr_14_slope is diff(ATRr_14) where ATRr is already % of close,
+    # so its slope is a change-in-% — no further normalisation needed.
+    # Slopes of dollar MAs (ema_20_slope, sma_20_slope) are normalised below.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    _close = df["close"]
+    _safe_close = _close.replace(0, np.nan)
+
+    # ── Moving averages (SMA / EMA / WMA / HMA / VWMA) → % distance from close ──
+    for _ma_col in [
+        "SMA_5", "SMA_10", "SMA_20", "SMA_50",
+        "EMA_5", "EMA_10", "EMA_12", "EMA_20", "EMA_26", "EMA_50",
+        "WMA_10", "WMA_20",
+        "HMA_9", "HMA_20",
+        "VWMA_20",
+    ]:
+        if _ma_col in df.columns:
+            df[_ma_col] = (df[_ma_col] / _safe_close - 1) * 100
+
+    # ── Bollinger Bands: lower/middle/upper → % distance from close ──────────
+    # BBB (bandwidth) and BBP (%B) are already unitless — leave them alone.
+    for _bb_col in ["BBL_20_2.0", "BBM_20_2.0", "BBU_20_2.0"]:
+        if _bb_col in df.columns:
+            df[_bb_col] = (df[_bb_col] / _safe_close - 1) * 100
+
+    # ── Donchian Channels → % distance from close ────────────────────────────
+    for _dc_col in ["DCL_20_20", "DCM_20_20", "DCU_20_20"]:
+        if _dc_col in df.columns:
+            df[_dc_col] = (df[_dc_col] / _safe_close - 1) * 100
+
+    # ── Keltner Channels → % distance from close ─────────────────────────────
+    for _kc_col in ["KCLe_20_2.0", "KCBe_20_2.0", "KCUe_20_2.0"]:
+        if _kc_col in df.columns:
+            df[_kc_col] = (df[_kc_col] / _safe_close - 1) * 100
+
+    # ── Supertrend bands → % distance from close ─────────────────────────────
+    # SUPERTd (direction ±1) is already unitless.
+    for _st_col in ["SUPERT_10_3.0", "SUPERTs_10_3.0", "SUPERTl_10_3.0"]:
+        if _st_col in df.columns:
+            df[_st_col] = (df[_st_col] / _safe_close - 1) * 100
+
+    # ── VWAP → % distance from close ─────────────────────────────────────────
+    if "VWAP_D" in df.columns:
+        df["VWAP_D"] = (df["VWAP_D"] / _safe_close - 1) * 100
+
+    # ── MACD lines & signal → % of close ─────────────────────────────────────
+    # MACD = EMA_fast - EMA_slow, so it's a dollar difference.
+    # Dividing by close gives a scale-free momentum measure.
+    for _macd_col in [
+        "MACD_12_26_9", "MACDh_12_26_9", "MACDs_12_26_9",
+        "MACD_6_13_5",  "MACDh_6_13_5",  "MACDs_6_13_5",
+    ]:
+        if _macd_col in df.columns:
+            df[_macd_col] = df[_macd_col] / _safe_close * 100
+
+    # ── Momentum (MOM) → % of close ──────────────────────────────────────────
+    # MOM_n = close - close[n], a dollar difference.
+    for _mom_col in ["MOM_10", "MOM_20"]:
+        if _mom_col in df.columns:
+            df[_mom_col] = df[_mom_col] / _safe_close * 100
+
+    # ── Awesome Oscillator → % of close ──────────────────────────────────────
+    # AO = SMA5(midprice) - SMA34(midprice), a dollar difference.
+    if "AO_5_34" in df.columns:
+        df["AO_5_34"] = df["AO_5_34"] / _safe_close * 100
+
+    # ── MA slopes → % of close ───────────────────────────────────────────────
+    # These are computed as .diff(1) of dollar MAs above; re-derive after
+    # the MAs have been normalised so slopes are in %-point-per-bar units.
+    if "EMA_20" in df.columns:
+        df["ema_20_slope"] = df["EMA_20"].diff(1)   # already in % after normalisation
+    if "SMA_20" in df.columns:
+        df["sma_20_slope"] = df["SMA_20"].diff(1)
+
+    # ── EMA / SMA cross-spreads → %-point spread ──────────────────────────────
+    # After normalising each MA to % of close, the diff is a %-point spread.
+    if "EMA_12" in df.columns and "EMA_26" in df.columns:
+        df["ema_12_26_diff"] = df["EMA_12"] - df["EMA_26"]   # both now % of close
+    if "SMA_20" in df.columns and "SMA_50" in df.columns:
+        df["sma_20_50_diff"] = df["SMA_20"] - df["SMA_50"]   # both now % of close
+
+    # ── OBV and its SMA → ratio to vol_ma20 ──────────────────────────────────
+    # Raw OBV is a cumulative volume number that varies wildly across stocks
+    # (a high-float $50 stock vs a thinly-traded $2 stock).  Dividing by
+    # vol_ma20 expresses it as "how many average-day-volumes is the OBV?",
+    # making it comparable across market-cap tiers.
+    _safe_vol_ma20 = df["volume_ma20"].replace(0, np.nan) if "volume_ma20" in df.columns else None
+    if "OBV" in df.columns and _safe_vol_ma20 is not None:
+        df["OBV"] = df["OBV"] / _safe_vol_ma20
+    if "obv_sma20" in df.columns and _safe_vol_ma20 is not None:
+        df["obv_sma20"] = df["obv_sma20"] / _safe_vol_ma20
+
+    # ── Volume MAs → ratio to vol_ma20 ───────────────────────────────────────
+    # These are intermediate values used to compute volume_ratio; keeping them
+    # as raw share counts makes them price-cap proxies (high-float stocks have
+    # larger volume in absolute terms).  Express as ratio to 20-day avg volume.
+    if _safe_vol_ma20 is not None:
+        if "volume_ma5" in df.columns:
+            df["volume_ma5"]  = df["volume_ma5"]  / _safe_vol_ma20
+        if "volume_ma10" in df.columns:
+            df["volume_ma10"] = df["volume_ma10"] / _safe_vol_ma20
+        # vol_ma20 / vol_ma20 = 1.0 always — useful as a sanity-check constant,
+        # but not informative.  Zero it out so it adds no noise.
+        df["volume_ma20"] = 1.0
 
     # ── Extract last row and map column names ───────────────────────────────
     last = df.iloc[-1]
