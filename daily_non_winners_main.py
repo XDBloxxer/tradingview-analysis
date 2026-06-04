@@ -50,8 +50,8 @@ def main():
     parser.add_argument(
         "--top-n",
         type=int,
-        default=15,
-        help="Number of non-winners to track (default: 15)"
+        default=60,
+        help="Number of non-winners to track (default: 60)"
     )
     parser.add_argument(
         "--verbose",
