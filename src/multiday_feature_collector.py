@@ -899,16 +899,22 @@ class MultidayFeatureCollector:
             return 0
 
         # Insert in chunks of 500 to stay under request-size limits.
-        # ignore_duplicates=True silently skips rows that already exist,
-        # so re-runs are safe without needing a unique constraint.
-        # If you add UNIQUE(symbol, detection_date) to the table you can
-        # switch back to upsert(on_conflict="symbol,detection_date").
+        # When allow_append=True, use upsert with ignore_duplicates=True so any
+        # symbols that already exist for this date are silently skipped rather
+        # than hard-erroring on the unique constraint.
         written = 0
         chunk_size = 500
         for i in range(0, len(rows), chunk_size):
             chunk = rows[i : i + chunk_size]
             try:
-                self.client.table(table).insert(chunk).execute()
+                if allow_append:
+                    self.client.table(table).upsert(
+                        chunk,
+                        ignore_duplicates=True,
+                        on_conflict="symbol,detection_date",
+                    ).execute()
+                else:
+                    self.client.table(table).insert(chunk).execute()
                 written += len(chunk)
             except Exception as exc:
                 self.logger.error(
