@@ -62,13 +62,18 @@ GAIN REGRESSOR FIXES (2026 update):
        to combined_df, so they contribute to regressor training.
 
 LABEL FIX (2026):
-  RC3-label. Non-winner actual_high_pct backfill: the RC2 join only matches
-       daily_winners rows, so non_winners_day_prior rows exit RC2 with
-       actual_high_pct = NULL. apply_intraday_high_labels() requires
-       (label==0) & (actual_high_pct >= threshold) and could never fire for the
-       ~476 explosive non-winner rows, leaving them mislabelled as 0. A new block
-       inserted between RC2 and FIX 4 fetches ml_prediction_accuracy.actual_high_pct
-       for all remaining NULL rows and fills them before relabelling runs.
+  RC3-label. Non-winner label correction via ml_prediction_accuracy: the RC2
+       join only matches daily_winners rows, so non_winners_day_prior rows exit
+       RC2 with actual_high_pct = NULL.  The previous implementation backfilled
+       actual_high_pct from ml_prediction_accuracy into combined_df before
+       apply_intraday_high_labels() ran — this was lookahead leakage because
+       actual_high_pct is a same-day post-close outcome that does not exist at
+       prediction time.  The fix separates the two pipelines: ml_prediction_accuracy
+       is fetched to build _accuracy_gain_map (for the gain regressor) and to
+       apply label corrections directly (label=0 → 1 where actual_high_pct >=
+       threshold), but actual_high_pct is NOT written back into the feature
+       matrix (combined_df).  apply_intraday_high_labels() now only operates on
+       actual_high_pct values that originated from prior-day data (RC2/daily_winners).
 
 NOTE ON CLASS BALANCE:
   ml_training_base contains both winners (label=1) and non-winners (label=0) from
@@ -3108,21 +3113,42 @@ def main() -> int:
     except Exception as e:
         logger.warning(f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited")
 
-    # ── RC3 FIX: Backfill actual_high_pct for non-winner rows from ml_prediction_accuracy ──
-    # ISSUE 2 FIX: _accuracy_gain_map is built here and passed to train_gain_regressor so
-    # it can skip its own redundant ml_prediction_accuracy fetch.  Initialise to an empty
-    # dict as a safe default in case the try block below raises before populating it.
-    _accuracy_gain_map: dict = {}
-    # PROBLEM: The RC2 block above only joins daily_winners rows, so non_winners_day_prior
-    # rows always have actual_high_pct = NULL after RC2.  apply_intraday_high_labels()
-    # requires (label==0) & (actual_high_pct >= threshold), which can NEVER fire for
-    # non-winner rows — leaving ~476 explosive non-winner stocks permanently mislabelled
-    # as label=0 and poisoning the negative class.
+    # ── RC3: Fetch ml_prediction_accuracy for label correction and gain regressor ──
     #
-    # FIX: fetch ml_prediction_accuracy.actual_high_pct for all symbols/dates present
-    # in combined_df that still have actual_high_pct = NULL, then fill those values in.
-    # This runs BEFORE apply_intraday_high_labels so the mask can actually trigger.
-    logger.info("RC3: Backfilling actual_high_pct for non-winner rows from ml_prediction_accuracy...")
+    # LEAKAGE FIX (RC3-label): The previous implementation backfilled
+    # actual_high_pct from ml_prediction_accuracy directly into combined_df
+    # BEFORE apply_intraday_high_labels() ran.  This conflated two distinct
+    # pipelines:
+    #
+    #   (A) LABEL-CORRECTION PIPELINE — post-close outcomes written to
+    #       ml_prediction_accuracy by the tracker after market close.
+    #       Legitimate use: upgrading label=0 → label=1 for rows where the
+    #       stock actually hit the intraday threshold.  The outcome is the
+    #       LABEL TARGET, not a feature.
+    #
+    #   (B) FEATURE PIPELINE — values that exist at prediction time (T-1
+    #       close data, prior-day stats, etc.).  actual_high_pct from
+    #       ml_prediction_accuracy is SAME-DAY outcome data; it does NOT
+    #       exist when the model runs pre-market.
+    #
+    # By writing accuracy-table actual_high_pct into combined_df.actual_high_pct
+    # before apply_intraday_high_labels(), the old code smuggled same-day
+    # outcome data into the feature column, then trained the gain regressor on
+    # it.  At inference time that column is absent, producing a silent but severe
+    # train/serve skew.
+    #
+    # FIX: We still fetch ml_prediction_accuracy (needed for the gain regressor
+    # via _accuracy_gain_map and for direct label correction below), but we NO
+    # LONGER write actual_high_pct back into combined_df.actual_high_pct.
+    # Instead, label correction is applied directly: rows whose (symbol, date)
+    # appear in the accuracy table with actual_high_pct >= threshold are
+    # upgraded to label=1 here, keeping the outcome data in the label column
+    # where it belongs and out of the feature matrix.
+    #
+    # ISSUE 2 FIX: _accuracy_gain_map is still built and passed to
+    # train_gain_regressor to eliminate its redundant DB fetch.
+    _accuracy_gain_map: dict = {}
+    logger.info("RC3: Fetching ml_prediction_accuracy for label correction and gain regressor...")
     try:
         _symbol_col = next(
             (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
@@ -3131,19 +3157,11 @@ def main() -> int:
             (c for c in ["detection_date", "event_date"]
              if c in combined_df.columns), None
         )
-        _null_mask = (
-            combined_df.get("actual_high_pct", pd.Series(dtype=float)).isna()
-            if "actual_high_pct" in combined_df.columns
-            else pd.Series(True, index=combined_df.index)
-        )
-        n_null_before = int(_null_mask.sum())
-        logger.info(f"RC3: {n_null_before} rows have actual_high_pct = NULL before backfill")
 
-        if _symbol_col and _date_col and n_null_before > 0:
-            # Derive earliest date in the null rows to bound the query
-            _min_date = pd.to_datetime(
-                combined_df.loc[_null_mask, _date_col], errors="coerce"
-            ).min()
+        if _symbol_col and _date_col:
+            # Bound the query to the date range present in combined_df
+            _all_dates = pd.to_datetime(combined_df[_date_col], errors="coerce")
+            _min_date = _all_dates.min()
             _start_date = (
                 _min_date.date().isoformat() if pd.notna(_min_date) else None
             )
@@ -3156,17 +3174,22 @@ def main() -> int:
                 .execute()
             ) if _start_date else None
 
-            # ISSUE 2 FIX: build accuracy_gain_map here so it can be passed
-            # to train_gain_regressor, eliminating its redundant DB fetch.
-            _accuracy_gain_map: dict = {}
             if _acc_resp and _acc_resp.data:
+                # ── Build accuracy_gain_map for gain regressor (ISSUE 2 FIX) ──
                 for _r in _acc_resp.data:
                     _accuracy_gain_map[(_r["symbol"], _r["prediction_date"])] = {
                         "actual_gain_pct": _r.get("actual_gain_pct"),
                         "actual_high_pct": _r.get("actual_high_pct"),
                     }
+                logger.info(
+                    f"RC3: Built accuracy_gain_map with {len(_accuracy_gain_map)} records "
+                    f"(reused by gain regressor — no redundant DB fetch)"
+                )
 
-            if _acc_resp and _acc_resp.data:
+                # ── Direct label correction (no feature-column contamination) ──
+                # Identify combined_df rows that the accuracy table says hit the
+                # intraday threshold.  Upgrade their label directly without writing
+                # actual_high_pct into the feature matrix.
                 _acc_df = pd.DataFrame(_acc_resp.data)
                 _acc_df["prediction_date"] = pd.to_datetime(
                     _acc_df["prediction_date"], errors="coerce"
@@ -3174,49 +3197,78 @@ def main() -> int:
                 _acc_df["actual_high_pct"] = pd.to_numeric(
                     _acc_df["actual_high_pct"], errors="coerce"
                 )
-                _acc_df = _acc_df.dropna(subset=["actual_high_pct"])
 
-                # Normalise date column for join
-                _combined_dates = pd.to_datetime(
-                    combined_df[_date_col], errors="coerce"
-                ).dt.date.astype(str)
+                # Only rows that genuinely cleared the threshold are label correctors
+                _acc_winners = _acc_df[
+                    _acc_df["actual_high_pct"] >= INTRADAY_WIN_THRESHOLD
+                ].set_index(["symbol", "prediction_date"])
 
-                # Build lookup: (symbol, date) → actual_high_pct
-                _acc_lookup = _acc_df.set_index(["symbol", "prediction_date"])["actual_high_pct"]
+                if not _acc_winners.empty:
+                    _combined_dates = pd.to_datetime(
+                        combined_df[_date_col], errors="coerce"
+                    ).dt.date.astype(str)
 
-                # Vectorised fill: only update rows that are still NULL
-                if "actual_high_pct" not in combined_df.columns:
-                    combined_df["actual_high_pct"] = np.nan
+                    # Build a boolean mask: rows in combined_df whose (symbol, date)
+                    # appear as threshold-clearers in ml_prediction_accuracy.
+                    _keys = list(zip(
+                        combined_df[_symbol_col],
+                        _combined_dates,
+                    ))
+                    _is_acc_winner = pd.array(
+                        [k in _acc_winners.index for k in _keys],
+                        dtype=bool,
+                    )
 
-                _update_idx = combined_df.index[_null_mask]
-                _keys = list(zip(
-                    combined_df.loc[_update_idx, _symbol_col],
-                    _combined_dates.loc[_update_idx],
-                ))
-                _filled_values = pd.array(
-                    [_acc_lookup.get(k, np.nan) for k in _keys],
-                    dtype=float,
-                )
-                combined_df.loc[_update_idx, "actual_high_pct"] = _filled_values
+                    # Only upgrade label=0 rows; never downgrade label=1.
+                    # Exclude base_csv rows (unreliable outcome pipeline).
+                    if "source" in combined_df.columns:
+                        _is_base_csv = combined_df["source"].str.contains(
+                            "base_csv", na=False
+                        ).values
+                    else:
+                        _is_base_csv = np.zeros(len(combined_df), dtype=bool)
 
-                n_filled = int(
-                    pd.to_numeric(combined_df.loc[_update_idx, "actual_high_pct"], errors="coerce")
-                    .notna().sum()
-                )
-                logger.info(
-                    f"RC3: Filled actual_high_pct for {n_filled}/{n_null_before} "
-                    f"previously-NULL rows from ml_prediction_accuracy "
-                    f"({len(_acc_df)} accuracy records available from {_start_date})"
-                )
+                    _upgrade_mask = (
+                        (combined_df["label"].values == 0) &
+                        _is_acc_winner &
+                        ~_is_base_csv
+                    )
+                    n_upgraded = int(_upgrade_mask.sum())
+
+                    if n_upgraded > 0:
+                        combined_df.loc[_upgrade_mask, "label"] = 1
+                        # Bump sample weight — high-signal corrective examples
+                        combined_df.loc[_upgrade_mask, "sample_weight"] = (
+                            combined_df.loc[_upgrade_mask, "sample_weight"] * 1.5
+                        )
+                        logger.info(
+                            f"RC3-label: Upgraded {n_upgraded} non-winner rows to label=1 "
+                            f"via ml_prediction_accuracy (actual_high_pct >= "
+                            f"{INTRADAY_WIN_THRESHOLD}%). "
+                            f"actual_high_pct NOT written to feature matrix (leakage fix)."
+                        )
+                    else:
+                        logger.info(
+                            "RC3-label: No label=0 rows matched accuracy-table threshold "
+                            "clearers — no upgrades applied."
+                        )
+                else:
+                    logger.warning(
+                        f"RC3-label: No accuracy records with actual_high_pct >= "
+                        f"{INTRADAY_WIN_THRESHOLD}% — non-winner relabelling will not fire."
+                    )
             else:
-                logger.warning("RC3: ml_prediction_accuracy returned no rows with actual_high_pct — non-winner relabelling will not fire")
+                logger.warning(
+                    "RC3: ml_prediction_accuracy returned no rows with actual_high_pct — "
+                    "non-winner relabelling and gain regressor map will be empty."
+                )
         else:
-            if not _symbol_col or not _date_col:
-                logger.warning("RC3: Could not identify symbol/date columns — skipping non-winner backfill")
-            else:
-                logger.info("RC3: No NULL actual_high_pct rows to backfill — skipping")
+            logger.warning(
+                "RC3: Could not identify symbol/date columns in combined_df — "
+                "skipping accuracy-table label correction."
+            )
     except Exception as _e:
-        logger.warning(f"RC3: Could not backfill actual_high_pct for non-winner rows: {_e}")
+        logger.warning(f"RC3: Could not process ml_prediction_accuracy: {_e}")
 
     # ── FIX 4: Relabel rows with strong intraday moves as winners ─────────────
     combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
