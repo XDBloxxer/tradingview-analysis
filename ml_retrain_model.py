@@ -2782,6 +2782,7 @@ def save_outputs(
     feature_names: list[str],
     training_stats: dict,
     gain_regressor=None,
+    top10_training_stats: dict | None = None,
 ) -> None:
     """Save model, scaler, gain regressor, feature importance, and metadata."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -2821,6 +2822,8 @@ def save_outputs(
                                   "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
         **training_stats,
     }
+    if top10_training_stats:
+        metadata["top10_feature_distribution"] = top10_training_stats
     with open(METADATA_PATH, "w") as f:
         json.dump(metadata, f, indent=2)
     logger.info(f"Saved metadata → {METADATA_PATH}")
@@ -3637,7 +3640,8 @@ def main() -> int:
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor)
+    save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor,
+                 top10_training_stats=top10_training_stats)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("")
