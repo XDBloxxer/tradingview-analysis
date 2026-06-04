@@ -3111,28 +3111,6 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
         selected_neg = pd.concat(selected_parts) if selected_parts else negatives.iloc[0:0]
 
-    # ── Global 16% positive-rate enforcement ─────────────────────────────────
-    target_pos_rate      = 0.16
-    total_neg_needed     = int((len(winners) / target_pos_rate) - len(winners))
-    shortage_remaining   = total_neg_needed - len(selected_neg)
-
-    if shortage_remaining > 0:
-        already_idx        = selected_neg.index
-        backfill_pool      = negatives[~negatives.index.isin(already_idx)]
-        if len(backfill_pool) >= shortage_remaining:
-            backfill = backfill_pool.sample(n=shortage_remaining, random_state=42)
-        else:
-            if logger:
-                logger.warning(
-                    f"Exhausted background negative pool! "
-                    f"Only {len(backfill_pool)} rows available."
-                )
-            backfill = backfill_pool
-        random_selected_count += len(backfill)
-        selected_neg = pd.concat([selected_neg, backfill])
-    elif shortage_remaining < 0:
-        selected_neg = selected_neg.sample(n=total_neg_needed, random_state=42)
-
     # ── Upweight hard negatives ───────────────────────────────────────────────
     if "sample_weight" in selected_neg.columns:
         selected_neg.loc[:, "sample_weight"] = (
@@ -3142,15 +3120,15 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     result = pd.concat([winners, selected_neg], ignore_index=True)
 
     if logger:
+        actual_pos_rate = len(winners) / max(len(result), 1)
         logger.info("=" * 80)
         logger.info("FILTER-AWARE SELECTION RESULTS")
         logger.info(f"  Hard negatives (filter-passing) : {hard_selected_count:,}")
         logger.info(f"  Easy/backfill negatives         : {random_selected_count:,}")
-        final_pos_rate = len(winners) / max(len(result), 1)
         logger.info(
             f"  winners={len(winners):,}, "
             f"selected_negatives={len(selected_neg):,}, "
-            f"enforced_positive_rate={final_pos_rate:.1%}"
+            f"actual_positive_rate={actual_pos_rate:.1%}"
         )
         logger.info("=" * 80)
 
