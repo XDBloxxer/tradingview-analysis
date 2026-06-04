@@ -172,6 +172,11 @@ non_winners:
   # API calls on low-activity days.
   min_pool_factor: 1.5
 
+  # Retraining: target fraction of negatives per date that should come from the
+  # filtered pool (hard negatives) before loosening stops for that date.
+  # 0.80 = aim for 80% hard negatives; the rest are filled with unfiltered rows.
+  min_hard_neg_ratio: 0.85
+
 # ============================================================================
 # BACKTESTING CONFIGURATION
 # ============================================================================
