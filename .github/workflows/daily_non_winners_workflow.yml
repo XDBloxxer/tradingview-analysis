@@ -14,7 +14,7 @@ on:
       top_n:
         description: 'Number of non-winners to track'
         required: false
-        default: '15'
+        default: '60'
 
 
 
@@ -47,7 +47,7 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
-          ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '15' }}"
+          ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '60' }}"
           
           if [ -n "${{ github.event.inputs.date }}" ]; then
             ARGS="$ARGS --date ${{ github.event.inputs.date }}"
