@@ -341,7 +341,7 @@ SCREENER_POSITIVE_RATE: float | None = None
 # and is imported at the top of this file; call-sites below are unchanged.
 
 XGBOOST_PARAMS = {
-    "n_estimators":       300,
+    "n_estimators":       500,
     "max_depth":          3,       # reduced from 6 → less overfitting
     "learning_rate":      0.05,
     "subsample":          0.8,
