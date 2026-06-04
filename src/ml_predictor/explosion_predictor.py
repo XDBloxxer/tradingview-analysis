@@ -802,6 +802,91 @@ class ExplosionPredictor:
         return signals
 
     # -------------------------------------------------------------------------
+    # PSI drift detection â compares live feature distributions to training
+    # -------------------------------------------------------------------------
+
+    def _check_feature_drift(self, X: pd.DataFrame) -> None:
+        """Compute PSI for top-10 features and warn if any exceed threshold.
+
+        Training distributions (percentile buckets) are stored in
+        model_metadata.json under the key ``top10_feature_distribution`` by
+        ml_retrain_model.py.  If that key is absent (older model), this method
+        is a no-op so callers need not guard against it.
+
+        PSI formula per bucket:
+            psi_i = (actual_pct - expected_pct) * ln(actual_pct / expected_pct)
+        Total PSI = sum over all buckets.  PSI > 0.2 indicates significant
+        distribution shift.
+        """
+        PSI_WARN_THRESHOLD = 0.2
+        PSI_MIN_ROWS = 10  # skip check if live batch is too small to be meaningful
+
+        train_stats: dict = self.metadata.get("top10_feature_distribution", {})
+        if not train_stats:
+            return  # older model without saved distribution â skip silently
+
+        if len(X) < PSI_MIN_ROWS:
+            self.logger.info(
+                f"PSI drift check skipped â only {len(X)} live rows "
+                f"(minimum {PSI_MIN_ROWS} required)."
+            )
+            return
+
+        high_psi_features = []
+        for feat, stats in train_stats.items():
+            if feat not in X.columns:
+                continue
+            live_col = X[feat].dropna()
+            if len(live_col) < PSI_MIN_ROWS:
+                continue
+
+            percentiles = stats["percentiles"]  # 11 values â 10 equal-frequency train buckets
+            n_buckets = len(percentiles) - 1
+
+            # Clip live values to the training range edges so they fall in the
+            # first / last bucket rather than creating out-of-range spill.
+            live_clipped = live_col.clip(percentiles[0], percentiles[-1])
+
+            psi_total = 0.0
+            for i in range(n_buckets):
+                lo, hi = percentiles[i], percentiles[i + 1]
+                if lo == hi:
+                    continue  # degenerate bucket (e.g. all-zero feature)
+
+                # Expected fraction: each bucket holds 1/n_buckets of training data
+                expected_pct = 1.0 / n_buckets
+
+                # Actual fraction of live values falling in this bucket
+                if i < n_buckets - 1:
+                    actual_count = int(((live_clipped >= lo) & (live_clipped < hi)).sum())
+                else:
+                    # Last bucket is inclusive on the right edge
+                    actual_count = int(((live_clipped >= lo) & (live_clipped <= hi)).sum())
+                actual_pct = actual_count / len(live_clipped)
+
+                # Smoothing: avoid log(0) â floor at a small epsilon
+                actual_pct   = max(actual_pct,   1e-6)
+                expected_pct = max(expected_pct, 1e-6)
+
+                psi_total += (actual_pct - expected_pct) * np.log(actual_pct / expected_pct)
+
+            if psi_total > PSI_WARN_THRESHOLD:
+                high_psi_features.append((feat, psi_total))
+
+        if high_psi_features:
+            for feat, psi in sorted(high_psi_features, key=lambda x: -x[1]):
+                self.logger.warning(
+                    f"FEATURE DRIFT DETECTED â PSI={psi:.3f} (threshold {PSI_WARN_THRESHOLD}) "
+                    f"for feature '{feat}'. Live distribution differs significantly from "
+                    f"training distribution. Predictions may be degraded. Consider retraining."
+                )
+        else:
+            self.logger.info(
+                f"PSI drift check passed â all {len(train_stats)} top features "
+                f"within acceptable range (threshold {PSI_WARN_THRESHOLD})."
+            )
+
+    # -------------------------------------------------------------------------
     # Prediction — internal, returns (result_df, features_df, X_scaled)
     # -------------------------------------------------------------------------
 
@@ -810,6 +895,7 @@ class ExplosionPredictor:
     ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         features_df = self.prepare_features(data_df)
         X           = features_df[self.feature_names].copy()
+        self._check_feature_drift(X)  # PSI drift check on raw (pre-scaled) features
         X_scaled    = self._scale_features(X)
 
         scaled_std    = X_scaled.std()
