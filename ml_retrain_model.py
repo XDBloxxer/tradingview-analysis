@@ -1554,14 +1554,16 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 # Scaling
 # ---------------------------------------------------------------------------
 
-def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
+def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, list]:
     """
-    Fit scaler on train-split rows only. Returns scaler + scaled X_train.
+    Fit scaler on train-split rows only. Returns scaler, scaled X_train, and
+    the list of sparse column names determined from training-set coverage.
 
     LEAKAGE FIX: The scaler is now fit exclusively on X_train so that
     validation-set rows never influence the scaler's mean_ / std_ parameters.
-    Call scale_with_fitted_scaler(scaler, X_val) to transform the val set
-    (or any other split) using the same, already-fitted scaler.
+    Call scale_with_fitted_scaler(scaler, X_val, sparse_cols) to transform the
+    val set (or any other split) using the same, already-fitted scaler and the
+    sparse-column list computed here from the training set.
 
     NaN RESTORATION FIX (t1_ features): Sparse columns (coverage < SPARSE_THRESHOLD)
     have NaN restored AFTER scaling so XGBoost can use its native missing-value
@@ -1570,6 +1572,12 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
     feature importance entirely.  StandardScaler still receives NaN-free input
     (required), but XGBoost receives NaN for genuinely absent values, matching the
     inference path in _scale_features() in explosion_predictor.py.
+
+    SPARSE THRESHOLD FIX: sparse_cols is derived exclusively from X_train coverage
+    so that the same set of columns is treated as sparse during both training and
+    validation transforms.  Previously scale_with_fitted_scaler() re-computed
+    coverage from whatever X was passed in, meaning a column that is 60% populated
+    in train but 40% in val could be classified differently between splits.
     """
     SPARSE_THRESHOLD = 0.5   # columns with < 50% coverage get NaN restored post-scale
 
@@ -1602,26 +1610,32 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame]:
             f"Examples: {sparse_cols[:5]}"
         )
 
-    return scaler, X_scaled
+    return scaler, X_scaled, sparse_cols
 
 
 def scale_with_fitted_scaler(
     scaler: StandardScaler,
     X: pd.DataFrame,
+    sparse_threshold_cols: list | None = None,
     sparse_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """
     Transform X using an already-fitted scaler (e.g. to scale the val set or
     to reassemble a full scaled DataFrame for the gain regressor).
 
-    NaN RESTORATION FIX: mirrors build_scaler — sparse columns (those whose
-    scaler mean_ was computed from < sparse_threshold coverage) have NaN restored
+    NaN RESTORATION FIX: mirrors build_scaler — sparse columns have NaN restored
     after scaling so XGBoost receives genuinely missing values rather than 0.0.
-    The threshold is inferred from scaler.n_samples_seen_ and the non-zero
-    count stored in scaler.mean_ (columns that were all-NaN get mean_=0).
-    Simpler: we restore NaN wherever the INPUT X had NaN, for all columns whose
-    overall NaN rate in X exceeds (1 - sparse_threshold).  This is consistent
-    with build_scaler which uses X_train coverage to decide.
+
+    SPARSE THRESHOLD FIX: Pass ``sparse_threshold_cols`` (the third return value
+    of ``build_scaler``) so that sparse-column membership is determined from the
+    training-set coverage rather than re-computed from the coverage of whatever X
+    is passed in here.  A column that is 60% populated in train but 40% in val
+    would otherwise be classified differently between splits, causing NaN
+    restoration to differ between training and inference paths.
+
+    Fallback: if ``sparse_threshold_cols`` is None (e.g. calling legacy code that
+    hasn't been updated yet), coverage is re-computed from X as before and a
+    DeprecationWarning is logged so callers know to pass the list.
     """
     col_means = pd.Series(scaler.mean_, index=X.columns)
     X_filled  = X.fillna(col_means)
@@ -1631,9 +1645,23 @@ def scale_with_fitted_scaler(
     X_scaled      = X_scaled.fillna(0.0)
 
     # ── Restore NaN for sparse columns (mirrors build_scaler logic) ────────────
-    coverage = X.notna().mean()
-    sparse_cols = coverage[coverage < sparse_threshold].index.tolist()
-    sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
+    if sparse_threshold_cols is not None:
+        # Preferred path: use the column list determined from train coverage.
+        sparse_cols = [c for c in sparse_threshold_cols if c in X.columns]
+    else:
+        # Legacy fallback: re-compute from the passed-in X.
+        # This is kept for backward compatibility but produces inconsistent results
+        # when val coverage differs from train coverage.
+        logger.warning(
+            "scale_with_fitted_scaler called without sparse_threshold_cols — "
+            "sparse columns will be inferred from the coverage of the input X, "
+            "which may differ from train coverage. Pass the sparse_cols list "
+            "returned by build_scaler() to ensure consistent NaN restoration."
+        )
+        coverage = X.notna().mean()
+        sparse_cols = coverage[coverage < sparse_threshold].index.tolist()
+        sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
+
     if sparse_cols:
         nan_mask = X[sparse_cols].isna()
         X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask, other=np.nan)
@@ -3347,8 +3375,9 @@ def main() -> int:
     # so the scaler's mean_ / std_ were computed using val-set rows, making AUC
     # metrics slightly optimistic and the scaler non-reproducible on train-only data.
     logger.info("Fitting scaler on train split only (leakage fix)...")
-    scaler, X_train = build_scaler(X_train_raw)                    # fit + transform train
-    X_val           = scale_with_fitted_scaler(scaler, X_val_raw)  # transform val only
+    scaler, X_train, _sparse_cols = build_scaler(X_train_raw)                    # fit + transform train
+    X_val                          = scale_with_fitted_scaler(scaler, X_val_raw,
+                                         sparse_threshold_cols=_sparse_cols)     # transform val only
 
     # Reassemble a full scaled DataFrame (train + val, original row order) kept
     # for any downstream use that genuinely needs all rows.
@@ -3556,6 +3585,35 @@ def main() -> int:
         md_cols = [c for c in t1_df.columns if c.startswith(("t3_", "t5_", "t10_"))]
         if md_cols:
             n_t1_with_multiday = int(t1_df[md_cols].notna().any(axis=1).sum())
+
+    # ── Top-10 feature distribution snapshot (for PSI drift detection) ───────
+    # Store per-feature mean, std, and percentile buckets (deciles) computed on
+    # the raw (unscaled) training split for the top-10 most important features.
+    # explosion_predictor.py loads these at inference time and logs a WARNING if
+    # PSI > 0.2 on any top feature, indicating a distribution shift between the
+    # training and live feature sets.
+    top10_features = fi_df.head(10)["feature"].tolist()
+    top10_training_stats: dict = {}
+    for feat in top10_features:
+        if feat not in X_train_raw.columns:
+            continue
+        col = X_train_raw[feat].dropna()
+        if len(col) < 10:
+            continue
+        # 10 equal-width buckets covering the observed training range, plus one
+        # open-ended bucket on each side (handled at inference time via clipping).
+        percentiles = [float(v) for v in np.percentile(col, np.linspace(0, 100, 11))]
+        top10_training_stats[feat] = {
+            "mean":        float(col.mean()),
+            "std":         float(col.std()),
+            "n":           int(len(col)),
+            "percentiles": percentiles,   # 11 values → 10 equal-frequency buckets
+        }
+    logger.info(
+        f"Stored training distribution stats for {len(top10_training_stats)} "
+        f"top-10 features (used for PSI drift detection at inference)."
+    )
+
     training_stats = {
         "n_total_samples":         len(combined_df),
         "n_base_samples":          len(base_df),
