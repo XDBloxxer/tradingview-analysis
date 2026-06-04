@@ -99,6 +99,12 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import yaml
+    _YAML_AVAILABLE = True
+except ImportError:
+    _YAML_AVAILABLE = False
+
 import joblib
 import numpy as np
 import pandas as pd
@@ -191,6 +197,50 @@ MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 #   • Too large  → less training data, slower to adapt to recent market regimes.
 #   8 weeks (≈ 2 months) is a reasonable starting point.
 VAL_WEEKS = 8
+
+# ---------------------------------------------------------------------------
+# Filter-aware negative sampling — loosening config
+# ---------------------------------------------------------------------------
+# These values are read from config.yaml (non_winners section) at import time
+# so they stay in sync with the same knobs used by the live detector.
+# If config.yaml is absent or unreadable the defaults below are used.
+#
+#   loosening_passes   – how many times to retry with progressively looser
+#                        filters before falling back to fully-unfiltered rows.
+#                        0 = no loosening (original behaviour).
+#   loosening_step_pct – % to relax each min_* / max_* threshold per pass.
+#                        At pass N filters are relaxed by (step * N) %.
+#   min_hard_neg_ratio – stop loosening once hard-negative rows >= this
+#                        fraction of the total negatives needed for that date.
+#                        1.0 = fill everything from filtered pool if possible.
+# ---------------------------------------------------------------------------
+
+def _load_loosening_config() -> dict:
+    """Read loosening knobs from config.yaml -> non_winners section.
+    Returns defaults if the file is absent or the key is missing."""
+    defaults = {
+        "loosening_passes":   3,
+        "loosening_step_pct": 20.0,
+        "min_hard_neg_ratio": 0.80,
+    }
+    try:
+        cfg_path = Path("config.yaml")
+        if cfg_path.exists() and _YAML_AVAILABLE:
+            with open(cfg_path, "r") as f:
+                cfg = yaml.safe_load(f) or {}
+            nw = cfg.get("non_winners", {})
+            for key in defaults:
+                if key in nw:
+                    defaults[key] = type(defaults[key])(nw[key])
+    except Exception:
+        pass   # silently keep defaults — retrain must not fail over config issues
+    return defaults
+
+_LOOSENING_CFG = _load_loosening_config()
+SAMPLING_LOOSENING_PASSES   = _LOOSENING_CFG["loosening_passes"]
+SAMPLING_LOOSENING_STEP_PCT = _LOOSENING_CFG["loosening_step_pct"]
+SAMPLING_MIN_HARD_NEG_RATIO = _LOOSENING_CFG["min_hard_neg_ratio"]
+
 
 def _compute_val_cutoff(df_with_dates: "pd.DataFrame") -> "pd.Timestamp":
     """Return the cutoff Timestamp that keeps the most recent VAL_WEEKS of data
@@ -2835,48 +2885,33 @@ def save_outputs(
 
 
 
-def apply_filter_aware_negative_sampling(df, logger=None):
+def _loosen_filters_for_sampling(base_filters: dict, step_pct: float, pass_number: int) -> dict:
     """
-    Retraining enhancement:
-    - Keep all winners.
-    - Prefer non-winners that pass learned_filters.json.
-    - Backfill with same-date random negatives.
-    - Upweight filter-passing negatives.
-    - Preserve existing mistake-learner weights.
-    - ENFORCED: Automatically preserves the 16% natural background positive rate.
+    Return a copy of base_filters with thresholds relaxed by (step_pct * pass_number) %.
+
+    Mirrors _loosen_filters() in daily_non_winners_detector.py so both systems
+    behave identically when given the same config values.
     """
-    import json
-    from pathlib import Path
+    lf = dict(base_filters)
+    reduction  = (step_pct / 100.0) * pass_number
+    min_factor = max(0.0, 1.0 - reduction)
+    max_factor = 1.0 + reduction
+    for key in list(lf.keys()):
+        if lf[key] is None or str(key).startswith("_"):
+            continue
+        if key.startswith("min_"):
+            lf[key] = lf[key] * min_factor
+        elif key.startswith("max_"):
+            lf[key] = lf[key] * max_factor
+    return lf
+
+
+def _build_filter_mask(negatives: "pd.DataFrame", filters: dict) -> "pd.Series":
+    """
+    Build a boolean Series selecting rows in `negatives` that pass `filters`.
+    Returns an all-True Series (no filtering) when no matching columns exist.
+    """
     import pandas as pd
-
-    if df is None or df.empty or "label" not in df.columns:
-        return df
-
-    filters_path = Path("ml_models/learned_filters.json")
-    if not filters_path.exists():
-        return df
-
-    try:
-        filters = json.loads(filters_path.read_text())
-    except Exception:
-        return df
-
-    if logger:
-        logger.info("=" * 80)
-        logger.info("FILTER-AWARE NEGATIVE SAMPLING ENABLED")
-        logger.info(f"Loaded filters from {filters_path}")
-        for k, v in filters.items():
-            if not str(k).startswith("_"):
-                logger.info(f"FILTER {k}={v}")
-        logger.info("=" * 80)
-
-    winners = df[df["label"] == 1].copy()
-    negatives = df[df["label"] == 0].copy()
-
-    if negatives.empty:
-        return df
-
-    mask = pd.Series(True, index=negatives.index)
 
     filter_map = [
         (
@@ -2905,136 +2940,200 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         ),
     ]
 
-    used_filter = False
+    mask = pd.Series(True, index=negatives.index)
+    used = False
     for candidates, min_key, max_key in filter_map:
         col = next((c for c in candidates if c in negatives.columns), None)
         if col is None:
             continue
-
-        if min_key and min_key in filters:
+        if min_key and min_key in filters and filters[min_key] is not None:
             mask &= negatives[col].fillna(-1e9) >= filters[min_key]
-            used_filter = True
-
-        if max_key and max_key in filters:
+            used = True
+        if max_key and max_key in filters and filters[max_key] is not None:
             mask &= negatives[col].fillna(1e9) <= filters[max_key]
-            used_filter = True
+            used = True
+    return mask, used
 
-    if not used_filter:
-        if logger:
-            logger.warning(
-                "apply_filter_aware_negative_sampling: no filter columns found in DataFrame "
-                f"DataFrame columns: {list(negatives.columns[:20])}..."
-            )
+
+def apply_filter_aware_negative_sampling(df, logger=None):
+    """
+    Retraining enhancement:
+    - Keep all winners.
+    - Prefer non-winners that pass learned_filters.json (hard negatives).
+    - If not enough hard negatives exist for a date, progressively loosen the
+      filters (up to SAMPLING_LOOSENING_PASSES times, relaxing by
+      SAMPLING_LOOSENING_STEP_PCT % per pass) before falling back to
+      fully-unfiltered rows.
+    - Upweight filter-passing negatives.
+    - Preserve existing mistake-learner weights.
+    - ENFORCED: Automatically preserves the 16% natural background positive rate.
+
+    Loosening knobs (all in config.yaml under non_winners:):
+        loosening_passes   – extra passes before unfiltered fallback (default 3)
+        loosening_step_pct – % to relax per pass (default 20)
+        min_hard_neg_ratio – target fraction of negatives from filtered pool
+                             before stopping early (default 0.80)
+    """
+    import json
+    import pandas as pd
+    from pathlib import Path
+
+    if df is None or df.empty or "label" not in df.columns:
         return df
 
-    hard_neg = negatives[mask].copy()
-    easy_neg = negatives[~mask].copy()
+    # ── Load filters fresh from disk ─────────────────────────────────────────
+    # Reading here (not at module import) means any retrain picks up the latest
+    # learned_filters.json without restarting.
+    filters_path = Path("ml_models/learned_filters.json")
+    if not filters_path.exists():
+        return df
+
+    try:
+        base_filters = json.loads(filters_path.read_text())
+    except Exception:
+        return df
 
     if logger:
+        logger.info("=" * 80)
+        logger.info("FILTER-AWARE NEGATIVE SAMPLING — PROGRESSIVE LOOSENING")
+        logger.info(f"Filters loaded from {filters_path}")
         logger.info(
-            f"Negative universe={len(negatives):,}, "
-            f"hard_negatives={len(hard_neg):,} ({len(hard_neg)/max(len(negatives),1):.1%}), "
-            f"easy_negatives={len(easy_neg):,} ({len(easy_neg)/max(len(negatives),1):.1%})"
+            f"  loosening_passes={SAMPLING_LOOSENING_PASSES}, "
+            f"step_pct={SAMPLING_LOOSENING_STEP_PCT}%, "
+            f"min_hard_neg_ratio={SAMPLING_MIN_HARD_NEG_RATIO:.0%}"
         )
+        for k, v in base_filters.items():
+            if not str(k).startswith("_"):
+                logger.info(f"  BASE FILTER {k}={v}")
+        logger.info("=" * 80)
+
+    winners  = df[df["label"] == 1].copy()
+    negatives = df[df["label"] == 0].copy()
+
+    if negatives.empty:
+        return df
 
     date_col = next(
         (c for c in ["detection_date", "event_date", "trade_date", "date"] if c in df.columns),
-        None
+        None,
     )
 
-    hard_selected_count = 0
+    # ── Per-date (or global) negative selection with progressive loosening ────
+    def _select_negatives_for_group(neg_group: "pd.DataFrame", target: int) -> "pd.DataFrame":
+        """
+        For a single date-group of negatives, try to fill `target` hard-negative
+        slots using progressively looser filters.  Returns the selected rows.
+        """
+        preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
+        selected_idx = set()
+
+        for pass_idx in range(SAMPLING_LOOSENING_PASSES + 1):
+            if pass_idx == 0:
+                active_filters = base_filters
+                label = "full filters"
+            else:
+                active_filters = _loosen_filters_for_sampling(
+                    base_filters, SAMPLING_LOOSENING_STEP_PCT, pass_idx
+                )
+                label = f"loosened {SAMPLING_LOOSENING_STEP_PCT * pass_idx:.0f}%"
+
+            mask, used = _build_filter_mask(neg_group, active_filters)
+            if not used:
+                # No filterable columns found — skip all loosening, fall straight through
+                break
+
+            # Rows that pass this pass's filter AND haven't been picked yet
+            passing_idx = set(neg_group[mask].index) - selected_idx
+            needed = preferred - len(selected_idx)
+            if needed <= 0:
+                break
+
+            take = list(passing_idx)[:needed]
+            selected_idx.update(take)
+
+            if logger and pass_idx > 0 and take:
+                logger.info(
+                    f"    pass {pass_idx} ({label}): +{len(take)} hard negatives "
+                    f"(cumulative hard={len(selected_idx)}/{preferred})"
+                )
+
+            if len(selected_idx) >= preferred:
+                break   # have enough hard negatives — stop loosening
+
+        # Fill remaining quota (target - hard) with whatever unselected rows are left
+        remaining_needed = target - len(selected_idx)
+        unselected = neg_group[~neg_group.index.isin(selected_idx)]
+        if remaining_needed > 0 and not unselected.empty:
+            easy_take = unselected.sample(
+                min(len(unselected), remaining_needed), random_state=42
+            )
+            selected_idx.update(easy_take.index)
+
+        return neg_group.loc[list(selected_idx)]
+
+    # ── Run selection ─────────────────────────────────────────────────────────
+    hard_selected_count  = 0
     random_selected_count = 0
 
     if date_col is None:
-        # Adjusted target ratio to match the 16% rate (5.25 negatives per winner)
         target_negatives = max(int(len(winners) * 5.25), 8)
-        preferred_target = int(target_negatives * 0.80)
+        selected_neg = _select_negatives_for_group(negatives, target_negatives)
 
-        chosen_hard = (
-            hard_neg.sample(min(len(hard_neg), preferred_target), random_state=42)
-            if len(hard_neg) else hard_neg
-        )
-        remaining = target_negatives - len(chosen_hard)
-        chosen_easy = (
-            easy_neg.sample(min(len(easy_neg), remaining), random_state=42)
-            if remaining > 0 and len(easy_neg) else easy_neg.iloc[0:0]
-        )
-
-        hard_selected_count = len(chosen_hard)
-        random_selected_count = len(chosen_easy)
-
-        parts = [chosen_hard, chosen_easy]
-        selected_neg = pd.concat(parts) if any(len(p) for p in parts) else hard_neg.iloc[0:0]
+        # Approximate hard vs easy split for logging
+        full_mask, used = _build_filter_mask(selected_neg, base_filters)
+        hard_selected_count  = int(full_mask.sum()) if used else 0
+        random_selected_count = len(selected_neg) - hard_selected_count
     else:
         selected_parts = []
-        winner_dates = set(winners[date_col].dropna().unique())
-        all_neg_dates = set(negatives[date_col].dropna().unique())
-        all_dates = winner_dates | all_neg_dates
+        winner_dates   = set(winners[date_col].dropna().unique())
+        all_neg_dates  = set(negatives[date_col].dropna().unique())
 
-        for dt in sorted(all_dates):
-            winner_group = winners[winners[date_col] == dt]
-            # Baseline target dynamically adjusted to look for a 5.25x ratio per day
-            target_negatives = max(int(len(winner_group) * 5.25), 4) if len(winner_group) > 0 else 4
+        for dt in sorted(winner_dates | all_neg_dates):
+            winner_group  = winners[winners[date_col] == dt]
+            target        = max(int(len(winner_group) * 5.25), 4) if len(winner_group) > 0 else 4
+            neg_dt        = negatives[negatives[date_col] == dt]
 
-            hard_dt = hard_neg[hard_neg[date_col] == dt]
-            easy_dt = easy_neg[easy_neg[date_col] == dt]
+            chosen = _select_negatives_for_group(neg_dt, target)
+            selected_parts.append(chosen)
 
-            preferred_target = int(target_negatives * 0.80)
+            full_mask, used = _build_filter_mask(chosen, base_filters)
+            day_hard  = int(full_mask.sum()) if used else 0
+            day_easy  = len(chosen) - day_hard
+            hard_selected_count  += day_hard
+            random_selected_count += day_easy
 
-            chosen_hard = (
-                hard_dt.sample(min(len(hard_dt), preferred_target), random_state=42)
-                if len(hard_dt) else hard_dt
-            )
-
-            remaining = target_negatives - len(chosen_hard)
-
-            chosen_easy = (
-                easy_dt.sample(min(len(easy_dt), remaining), random_state=42)
-                if remaining > 0 and len(easy_dt) else easy_dt.iloc[0:0]
-            )
-
-            selected_parts.append(chosen_hard)
-            selected_parts.append(chosen_easy)
-
-            hard_selected_count += len(chosen_hard)
-            random_selected_count += len(chosen_easy)
-
-            if logger and len(winner_group) > 0 and len(chosen_hard) < preferred_target:
+            preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
+            if logger and len(winner_group) > 0 and day_hard < preferred:
                 logger.info(
-                    f"[{dt}] hard-negative shortage: "
-                    f"wanted={preferred_target}, available={len(hard_dt)}, "
-                    f"backfilled={len(chosen_easy)}"
+                    f"[{dt}] hard-negative shortage after loosening: "
+                    f"wanted={preferred}, got={day_hard}, backfilled={day_easy}"
                 )
 
-        selected_neg = pd.concat(selected_parts) if selected_parts else hard_neg.iloc[0:0]
+        selected_neg = pd.concat(selected_parts) if selected_parts else negatives.iloc[0:0]
 
-    # =========================================================================
-    # GLOBAL NATURAL RATE ENFORCEMENT LAYER (Guarantees exactly 16% positive rate)
-    # =========================================================================
-    target_pos_rate = 0.16
-    total_negatives_needed = int((len(winners) / target_pos_rate) - len(winners))
-    shortage_remaining = total_negatives_needed - len(selected_neg)
+    # ── Global 16% positive-rate enforcement ─────────────────────────────────
+    target_pos_rate      = 0.16
+    total_neg_needed     = int((len(winners) / target_pos_rate) - len(winners))
+    shortage_remaining   = total_neg_needed - len(selected_neg)
 
     if shortage_remaining > 0:
-        # Find every single background negative that wasn't already picked up
-        # We drop duplicates using unique identifiers/index to prevent data cloning
-        selected_indices = selected_neg.index
-        global_backfill_pool = negatives[~negatives.index.isin(selected_indices)]
-        
-        if len(global_backfill_pool) >= shortage_remaining:
-            global_backfill_samples = global_backfill_pool.sample(n=shortage_remaining, random_state=42)
+        already_idx        = selected_neg.index
+        backfill_pool      = negatives[~negatives.index.isin(already_idx)]
+        if len(backfill_pool) >= shortage_remaining:
+            backfill = backfill_pool.sample(n=shortage_remaining, random_state=42)
         else:
             if logger:
-                logger.warning(f"⚠️ Exhausted entire background negative pool! Only found {len(global_backfill_pool)} additional rows.")
-            global_backfill_samples = global_backfill_pool
-            
-        random_selected_count += len(global_backfill_samples)
-        selected_neg = pd.concat([selected_neg, global_backfill_samples])
+                logger.warning(
+                    f"Exhausted background negative pool! "
+                    f"Only {len(backfill_pool)} rows available."
+                )
+            backfill = backfill_pool
+        random_selected_count += len(backfill)
+        selected_neg = pd.concat([selected_neg, backfill])
     elif shortage_remaining < 0:
-        # If stratified loops over-collected, sample it back down to exactly match 16%
-        selected_neg = selected_neg.sample(n=total_negatives_needed, random_state=42)
-    # =========================================================================
+        selected_neg = selected_neg.sample(n=total_neg_needed, random_state=42)
 
+    # ── Upweight hard negatives ───────────────────────────────────────────────
     if "sample_weight" in selected_neg.columns:
         selected_neg.loc[:, "sample_weight"] = (
             selected_neg["sample_weight"].fillna(1.0) * 1.75
@@ -3045,19 +3144,17 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     if logger:
         logger.info("=" * 80)
         logger.info("FILTER-AWARE SELECTION RESULTS")
-        logger.info(f"Hard selected={hard_selected_count:,}")
-        logger.info(f"Random selected={random_selected_count:,}")
+        logger.info(f"  Hard negatives (filter-passing) : {hard_selected_count:,}")
+        logger.info(f"  Easy/backfill negatives         : {random_selected_count:,}")
         final_pos_rate = len(winners) / max(len(result), 1)
         logger.info(
-            f"Filter-aware retraining active: "
-            f"winners={len(winners)}, "
-            f"selected_negatives={len(selected_neg)}, "
-            f"Enforced Positive Rate={final_pos_rate:.1%}"
+            f"  winners={len(winners):,}, "
+            f"selected_negatives={len(selected_neg):,}, "
+            f"enforced_positive_rate={final_pos_rate:.1%}"
         )
         logger.info("=" * 80)
 
     return result
-
 
 
 def main() -> int:
