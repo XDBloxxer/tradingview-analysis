@@ -124,15 +124,21 @@ except ImportError:
         "Place t1_column_map.py alongside ml_retrain_model.py."
     )
 
-# Mistake learner — high-signal training samples from past prediction errors
-try:
-    from ml_mistake_learner import build_mistake_training_samples, log_mistake_summary
-    MISTAKE_LEARNER_AVAILABLE = True
-except ImportError:
-    MISTAKE_LEARNER_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "ml_mistake_learner.py not found — mistake-learning step will be skipped."
-    )
+# Mistake learner — DISABLED (too few samples; circular feedback risk)
+# With only ~18 mistakes, the 3×/2× weighting creates circular feedback:
+# valid setups that fail due to market noise get trained as "bad patterns",
+# causing the model to suppress them on future retrains.
+# Re-enable once a statistically meaningful mistake corpus is available.
+#
+# try:
+#     from ml_mistake_learner import build_mistake_training_samples, log_mistake_summary
+#     MISTAKE_LEARNER_AVAILABLE = True
+# except ImportError:
+#     MISTAKE_LEARNER_AVAILABLE = False
+#     logging.getLogger(__name__).warning(
+#         "ml_mistake_learner.py not found — mistake-learning step will be skipped."
+#     )
+MISTAKE_LEARNER_AVAILABLE = False  # Placeholder — re-enable when corpus is large enough
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -3280,50 +3286,49 @@ def main() -> int:
     # to appear as both a selected negative and a winner in the same training set.
     combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
 
-    # ── Load mistake samples and append AFTER combine_datasets ───────────────
-    mistake_df = pd.DataFrame()
-    if MISTAKE_LEARNER_AVAILABLE:
-        logger.info("\n" + "=" * 60)
-        logger.info("MISTAKE LEARNING STEP")
-        logger.info("=" * 60)
-
-        proto_features = [
-            c for c in combined_df.columns
-            if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
-        ]
-
-        # Load multiday tables so mistake rows get t3_/t5_/t10_ features,
-        # matching the enrichment applied to all regular T-1 rows in load_t1_data().
-        # Without this, mistake samples land in combined_df with every multiday
-        # feature as NaN while still carrying 3×/2× sample weights — giving the
-        # model a strong but half-blind corrective signal.
-        logger.info("Loading multiday tables for mistake-sample enrichment...")
-        _mistake_winners_md, _mistake_non_winners_md = load_multiday_data(client)
-
-        mistake_df = build_mistake_training_samples(
-            lookback_days=90,
-            use_all_timepoints=True,
-            existing_features=proto_features,
-            winners_multiday=_mistake_winners_md,
-            non_winners_multiday=_mistake_non_winners_md,
-        )
-
-        if not mistake_df.empty:
-            # RC6 FIX: Enrich mistake rows with actual gain data BEFORE appending
-            # so they contribute to gain regressor training
-            mistake_df = enrich_mistakes_with_gains(mistake_df, client)
-
-            log_mistake_summary(mistake_df)
-            combined_df = pd.concat([combined_df, mistake_df],
-                                    ignore_index=True, sort=False)
-            logger.info(
-                f"Dataset after adding mistakes: {len(combined_df)} rows "
-                f"(+{len(mistake_df)} mistake samples)"
-            )
-        else:
-            logger.info("No mistake samples to add this run.")
-    else:
-        logger.warning("ml_mistake_learner not available — skipping mistake-learning step.")
+    # ── Mistake learning step — DISABLED ─────────────────────────────────────
+    # Reason: with only ~18 mistakes in the corpus, the 3x/2x sample weights
+    # create a circular feedback loop. Valid setups that fail due to market
+    # noise are labelled as "bad patterns" and up-weighted, causing the model
+    # to suppress those setups on every subsequent retrain.
+    #
+    # Re-enable (and set MISTAKE_LEARNER_AVAILABLE = True at the top of this
+    # file) once there are enough mistakes for statistically meaningful signal
+    # (suggested threshold: ~200+ unique mistake samples).
+    #
+    # The original implementation is preserved below for reference:
+    #
+    # mistake_df = pd.DataFrame()
+    # if MISTAKE_LEARNER_AVAILABLE:
+    #     logger.info("\n" + "=" * 60)
+    #     logger.info("MISTAKE LEARNING STEP")
+    #     logger.info("=" * 60)
+    #     proto_features = [
+    #         c for c in combined_df.columns
+    #         if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
+    #     ]
+    #     logger.info("Loading multiday tables for mistake-sample enrichment...")
+    #     _mistake_winners_md, _mistake_non_winners_md = load_multiday_data(client)
+    #     mistake_df = build_mistake_training_samples(
+    #         lookback_days=90,
+    #         use_all_timepoints=True,
+    #         existing_features=proto_features,
+    #         winners_multiday=_mistake_winners_md,
+    #         non_winners_multiday=_mistake_non_winners_md,
+    #     )
+    #     if not mistake_df.empty:
+    #         mistake_df = enrich_mistakes_with_gains(mistake_df, client)
+    #         log_mistake_summary(mistake_df)
+    #         combined_df = pd.concat([combined_df, mistake_df],
+    #                                 ignore_index=True, sort=False)
+    #         logger.info(
+    #             f"Dataset after adding mistakes: {len(combined_df)} rows "
+    #             f"(+{len(mistake_df)} mistake samples)"
+    #         )
+    #     else:
+    #         logger.info("No mistake samples to add this run.")
+    logger.info("Mistake learning step skipped (corpus too small — see MISTAKE_LEARNER_AVAILABLE).")
+    mistake_df = pd.DataFrame()  # Placeholder; keeps downstream code compatible
 
     # ── Prepare features ──────────────────────────────────────────────────────
     X, y, w = prepare_features(combined_df)
