@@ -219,7 +219,7 @@ def _load_loosening_config() -> dict:
     """Read loosening knobs from config.yaml -> non_winners section.
     Returns defaults if the file is absent or the key is missing."""
     defaults = {
-        "loosening_passes":   3,
+        "loosening_passes":   5,
         "loosening_step_pct": 20.0,
         "min_hard_neg_ratio": 0.80,
     }
