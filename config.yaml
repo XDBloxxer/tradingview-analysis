@@ -153,6 +153,26 @@ daily_winners:
 
 
 # ============================================================================
+# NON-WINNERS TRACKER CONFIGURATION
+# ============================================================================
+non_winners:
+  # How many times to retry with loosened filters before giving up and falling
+  # back to the random-liquid-stock method.  0 = no loosening, just full filters
+  # then immediate fallback.
+  loosening_passes: 5
+
+  # How much to relax every min_* and max_* filter threshold per pass, as a
+  # percentage.  At pass N the filters are relaxed by (loosening_step_pct * N)%.
+  #   e.g. step=20, pass 1 → -20% on all min_ thresholds, +20% on all max_
+  #        step=20, pass 2 → -40% / +40%, and so on.
+  loosening_step_pct: 20.0
+
+  # Stop loosening early once the candidate pool reaches (top_n * min_pool_factor).
+  # Raise this if you want a more diverse pool before sampling; lower it to save
+  # API calls on low-activity days.
+  min_pool_factor: 1.5
+
+# ============================================================================
 # BACKTESTING CONFIGURATION
 # ============================================================================
 backtesting:
