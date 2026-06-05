@@ -2472,20 +2472,18 @@ def train_gain_regressor(
             )
 
     # ------------------------------------------------------------------
-    # CORE FIX: Non-winner rows without actual_high_pct get gain target = 0.0.
+    # CORE FIX: T-1 non-winner rows without actual_high_pct get gain target = 0.0.
     #
     # Root cause of poor regressor training (confirmed in logs):
-    #   - 10,340 rows in the classifier train split
-    #   - Only 1,001 had a gain target (982 winners + 19 non-winners)
-    #   - The regressor was training on 98% winners with mean gain 79.7%
-    #   - It had no low-end anchor, so predictions collapsed to ~22-119%
-    #
-    # The fix mirrors how the main classifier is trained: use ALL rows.
-    # Non-winner rows (label=0) that have no actual_high_pct genuinely did
-    # not produce a large intraday gain — their correct gain target IS ~0%.
-    # Filling NaN with 0.0 for non-winners is not an imputation; it is the
-    # true label.  This gives the regressor the same 84% non-winner majority
-    # the classifier sees, anchoring the low end of the prediction distribution.
+    #   - Only T-1 non-winner rows (source = non_winners_day_prior) are eligible.
+    #   - Base CSV rows have genuinely UNKNOWN outcomes: event_date is the explosion
+    #     day so we have no intraday data for what the stock did. Assigning 0.0 to
+    #     ~6,649 base rows (all with the same constant target) collapses the gain
+    #     distribution std from ~1.86 to ~0.88 in log-space, causing the regressor
+    #     to converge in ~35 trees predicting near-zero for everything.
+    #   - Only T-1 rows passed through the daily non-winner screener, so we know
+    #     with confidence they were scanned and did NOT produce a large intraday move.
+    #     Their correct gain target IS ~0%.
     #
     # Winner rows with NaN actual_high_pct (no prev_close available) are
     # excluded — we don't know their true gain so we cannot assign 0.0.
@@ -2493,15 +2491,27 @@ def train_gain_regressor(
     non_winner_rows = combined_df["label"] == 0
     winner_rows     = combined_df["label"] == 1
 
-    # Fill missing gain targets for non-winners with 0.0 (true label: no big move)
-    n_nonwinner_filled = int((non_winner_rows & gain_targets.isna()).sum())
+    # Identify T-1 non-winner rows (confirmed daily screener output, gain~=0)
+    # vs base CSV rows (unknown outcome, should remain NaN so they're excluded).
+    if "source" in combined_df.columns:
+        t1_non_winner_rows = (
+            non_winner_rows &
+            combined_df["source"].str.contains("non_winners_day_prior", na=False)
+        )
+    else:
+        # No source column — conservatively treat all non-winners as T-1
+        t1_non_winner_rows = non_winner_rows
+
+    # Fill ONLY T-1 non-winners with 0.0; leave base CSV non-winners as NaN
+    n_nonwinner_filled = int((t1_non_winner_rows & gain_targets.isna()).sum())
     if n_nonwinner_filled > 0:
         gain_targets = gain_targets.copy()
-        gain_targets.loc[non_winner_rows & gain_targets.isna()] = 0.0
+        gain_targets.loc[t1_non_winner_rows & gain_targets.isna()] = 0.0
+        n_base_skipped = int((non_winner_rows & ~t1_non_winner_rows).sum())
         logger.info(
-            f"CORE FIX: Filled {n_nonwinner_filled} non-winner rows with gain=0.0 "
-            f"(their correct gain target — no large intraday move occurred). "
-            f"This aligns regressor training population with the classifier's."
+            f"CORE FIX: Filled {n_nonwinner_filled} T-1 non-winner rows with gain=0.0 "
+            f"(confirmed screener output — no large intraday move). "
+            f"Skipped {n_base_skipped} base CSV rows (unknown outcome — kept as NaN)."
         )
 
     # RC7 FIX: cap (not floor) — reject obvious data errors only
@@ -3305,6 +3315,40 @@ def main() -> int:
     base_df     = load_base_training_data(client)
     t1_df       = load_t1_data(client)
     combined_df = combine_datasets(base_df, t1_df)
+
+    # ── Apply lookback_days filter to combined_df ─────────────────────────────
+    # ml_training_base is fetched in full (can span many months), but only the
+    # most recent lookback_days of base data should participate in training.
+    # Without this, old base-data winners from months ago inflate the winner
+    # count while their corresponding date's non-winners are sparse or absent,
+    # creating a severe class imbalance that the per-date sampler cannot fix.
+    #
+    # T-1 rows (winners_day_prior / non_winners_day_prior) already only span
+    # the accumulation period (~90 days), so this filter mainly trims base CSV rows.
+    # We use the _sampling_date logic: detection_date ?? (event_date - 1 BDay).
+    _lookback_cutoff = (datetime.now().date() - timedelta(days=args.lookback_days)).isoformat()
+    _lb_date_col = next(
+        (c for c in ["detection_date", "event_date"] if c in combined_df.columns), None
+    )
+    if _lb_date_col is not None:
+        _lb_dates = pd.to_datetime(combined_df[_lb_date_col], errors="coerce")
+        if _lb_date_col == "event_date":
+            # event_date is the explosion day (T+1), shift back 1 BDay to align
+            _lb_dates = _lb_dates - pd.tseries.offsets.BDay(1)
+        _lb_mask = (_lb_dates.dt.date.astype(str) >= _lookback_cutoff) | _lb_dates.isna()
+        n_before = len(combined_df)
+        combined_df = combined_df[_lb_mask].copy()
+        n_after = len(combined_df)
+        n_pos_after = int((combined_df["label"] == 1).sum())
+        n_neg_after = int((combined_df["label"] == 0).sum())
+        logger.info(
+            f"Lookback filter ({args.lookback_days}d, cutoff={_lookback_cutoff}): "
+            f"{n_before} → {n_after} rows "
+            f"(pos={n_pos_after}, neg={n_neg_after}, "
+            f"pos_rate={n_pos_after/max(n_after,1):.1%})"
+        )
+    else:
+        logger.warning("Lookback filter: no date column found in combined_df — skipping.")
 
     # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
     # Use prev_close as denominator instead of same-day close
