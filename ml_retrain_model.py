@@ -3029,16 +3029,52 @@ def apply_filter_aware_negative_sampling(df, logger=None):
                 logger.info(f"  BASE FILTER {k}={v}")
         logger.info("=" * 80)
 
-    winners  = df[df["label"] == 1].copy()
+    # ── Build a unified sampling date column (coalesce detection_date ?? event_date) ──
+    # combined_df has TWO date columns:
+    #   T-1 rows      → detection_date populated, event_date NaT
+    #   base CSV rows → event_date populated,     detection_date NaT
+    # Using detection_date alone as the grouping key causes base rows to fall
+    # through (NaT never matches any date group), meaning ~13k base negatives
+    # and ~2.7k base winners are invisible to the per-date loop and only a
+    # fraction of T-1 rows (1270 winners / 2742 negatives) are actually sampled.
+    # That produces the observed 59%+ positive rate: base winners are kept
+    # unconditionally while most base negatives are silently dropped.
+    #
+    # Fix: coalesce into _sampling_date so every row has a usable date key.
+    # base CSV event_date is the explosion day (T+1 relative to detection); we
+    # subtract 1 business day to align it with the T-1 detection timeline.
+    df = df.copy()  # avoid mutating caller's DataFrame
+    _SAMPLING_DATE_COL = "_sampling_date"
+
+    if "detection_date" in df.columns or "event_date" in df.columns:
+        _det = pd.to_datetime(
+            df["detection_date"] if "detection_date" in df.columns else pd.Series(pd.NaT, index=df.index),
+            errors="coerce",
+        )
+        if "event_date" in df.columns:
+            _ev = pd.to_datetime(df["event_date"], errors="coerce")
+            _ev_shifted = _ev - pd.tseries.offsets.BDay(1)
+            _unified = _det.fillna(_ev_shifted)
+        else:
+            _unified = _det
+        df[_SAMPLING_DATE_COL] = _unified.dt.strftime("%Y-%m-%d").where(_unified.notna(), None)
+    else:
+        df[_SAMPLING_DATE_COL] = None
+
+    winners   = df[df["label"] == 1].copy()
     negatives = df[df["label"] == 0].copy()
 
     if negatives.empty:
         return df
 
-    date_col = next(
-        (c for c in ["detection_date", "event_date", "trade_date", "date"] if c in df.columns),
-        None,
-    )
+    # Use the coalesced date for grouping; fall back to raw date cols if needed
+    if df[_SAMPLING_DATE_COL].notna().any():
+        date_col = _SAMPLING_DATE_COL
+    else:
+        date_col = next(
+            (c for c in ["detection_date", "event_date", "trade_date", "date"] if c in df.columns),
+            None,
+        )
 
     # ── Per-date (or global) negative selection with progressive loosening ────
     #
@@ -3207,9 +3243,12 @@ def apply_filter_aware_negative_sampling(df, logger=None):
         selected_neg = selected_neg.copy()
         selected_neg["sample_weight"] = selected_neg["sample_weight"].fillna(1.0) * 1.75
 
-    # Drop the internal tracking column before returning
-    if "_filter_pass" in selected_neg.columns:
-        selected_neg = selected_neg.drop(columns=["_filter_pass"])
+    # Drop internal tracking columns before returning
+    for _internal_col in ["_filter_pass", _SAMPLING_DATE_COL]:
+        if _internal_col in selected_neg.columns:
+            selected_neg = selected_neg.drop(columns=[_internal_col])
+        if _internal_col in winners.columns:
+            winners = winners.drop(columns=[_internal_col])
 
     result = pd.concat([winners, selected_neg], ignore_index=True)
 
