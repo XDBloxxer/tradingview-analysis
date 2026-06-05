@@ -2980,9 +2980,15 @@ def apply_filter_aware_negative_sampling(df, logger=None):
       filters (up to SAMPLING_LOOSENING_PASSES times, relaxing by
       SAMPLING_LOOSENING_STEP_PCT % per pass) before falling back to
       fully-unfiltered rows.
-    - Upweight filter-passing negatives.
-    - Preserve existing mistake-learner weights.
-    - ENFORCED: Automatically preserves the 16% natural background positive rate.
+    - Graduated upweighting: rows selected on pass 0 (strict filters) receive
+      the highest weight (HARD_NEG_WEIGHT_BASE × decay^0 = 2.0x), rows selected
+      on pass k receive HARD_NEG_WEIGHT_BASE × HARD_NEG_WEIGHT_DECAY^k, and
+      unfiltered fallback rows receive no uplift (1.0x).
+    - Preserve existing mistake-learner weights (multiplied by the pass weight).
+    - FIX: No-winner dates now receive a proportional target (up to 40% of
+      available negatives, capped at 3 × global_neg_ratio) instead of a flat
+      floor of 4, so they contribute meaningfully and the overall winner:non-winner
+      ratio reflects the true 90-day distribution.
 
     Loosening knobs (all in config.yaml under non_winners:):
         loosening_passes   – extra passes before unfiltered fallback (default 3)
@@ -3035,13 +3041,36 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     )
 
     # ── Per-date (or global) negative selection with progressive loosening ────
+    #
+    # Graduated filter-pass weights:
+    #   pass 0 (full filters)         → HARD_NEG_WEIGHT_BASE   (highest weight)
+    #   pass k (loosened k*step_pct%) → HARD_NEG_WEIGHT_BASE * decay^k
+    #   unfiltered fallback           → 1.0  (base weight, no uplift)
+    #
+    # This rewards rows that pass strict filters more than rows that only
+    # pass after loosening, and rewards loosened-pass rows more than
+    # unfiltered fallback rows.
+    HARD_NEG_WEIGHT_BASE  = 2.0   # weight multiplier for a full-filter pass
+    HARD_NEG_WEIGHT_DECAY = 0.75  # per-loosening-pass decay factor
+
+    def _pass_weight(pass_idx: int) -> float:
+        """Return the sample-weight multiplier for a row selected on pass `pass_idx`.
+        pass_idx=0 → full filters (highest); pass_idx>0 → progressively lower;
+        pass_idx=-1 → unfiltered fallback (no uplift, returns 1.0)."""
+        if pass_idx < 0:
+            return 1.0
+        return HARD_NEG_WEIGHT_BASE * (HARD_NEG_WEIGHT_DECAY ** pass_idx)
+
     def _select_negatives_for_group(neg_group: "pd.DataFrame", target: int) -> "pd.DataFrame":
         """
         For a single date-group of negatives, try to fill `target` hard-negative
-        slots using progressively looser filters.  Returns the selected rows.
+        slots using progressively looser filters.  Returns the selected rows,
+        with a '_filter_pass' column recording which pass selected each row
+        (0 = full filters, 1..N = loosened, -1 = unfiltered fallback).
         """
         preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
-        selected_idx = set()
+        # Map: index → pass_idx that selected it
+        selected_pass: dict = {}
 
         for pass_idx in range(SAMPLING_LOOSENING_PASSES + 1):
             if pass_idx == 0:
@@ -3059,46 +3088,62 @@ def apply_filter_aware_negative_sampling(df, logger=None):
                 break
 
             # Rows that pass this pass's filter AND haven't been picked yet
-            passing_idx = set(neg_group[mask].index) - selected_idx
-            needed = preferred - len(selected_idx)
+            passing_idx = set(neg_group[mask].index) - set(selected_pass.keys())
+            needed = preferred - len(selected_pass)
             if needed <= 0:
                 break
 
             take = list(passing_idx)[:needed]
-            selected_idx.update(take)
+            for idx in take:
+                selected_pass[idx] = pass_idx
 
             if logger and pass_idx > 0 and take:
                 logger.info(
                     f"    pass {pass_idx} ({label}): +{len(take)} hard negatives "
-                    f"(cumulative hard={len(selected_idx)}/{preferred})"
+                    f"(cumulative hard={len(selected_pass)}/{preferred})"
                 )
 
-            if len(selected_idx) >= preferred:
+            if len(selected_pass) >= preferred:
                 break   # have enough hard negatives — stop loosening
 
         # Fill remaining quota (target - hard) with whatever unselected rows are left
-        remaining_needed = target - len(selected_idx)
-        unselected = neg_group[~neg_group.index.isin(selected_idx)]
+        remaining_needed = target - len(selected_pass)
+        unselected = neg_group[~neg_group.index.isin(set(selected_pass.keys()))]
         if remaining_needed > 0 and not unselected.empty:
             easy_take = unselected.sample(
                 min(len(unselected), remaining_needed), random_state=42
             )
-            selected_idx.update(easy_take.index)
+            for idx in easy_take.index:
+                selected_pass[idx] = -1  # unfiltered fallback
 
-        return neg_group.loc[list(selected_idx)]
+        result = neg_group.loc[list(selected_pass.keys())].copy()
+        result["_filter_pass"] = [selected_pass[i] for i in result.index]
+        return result
 
     # ── Run selection ─────────────────────────────────────────────────────────
     hard_selected_count  = 0
     random_selected_count = 0
 
+    # Global neg:winner ratio — used as the per-date target on no-winner dates
+    # so they contribute proportionally rather than getting a flat floor of 4.
+    # Capped at 10 to avoid flooding training with negatives on winner-sparse dates.
+    _global_neg_ratio = max(
+        5.25,
+        min(10.0, len(negatives) / max(1, len(winners)))
+    )
+
     if date_col is None:
-        target_negatives = max(int(len(winners) * 5.25), 8)
+        target_negatives = max(int(len(winners) * _global_neg_ratio), 8)
         selected_neg = _select_negatives_for_group(negatives, target_negatives)
 
         # Approximate hard vs easy split for logging
-        full_mask, used = _build_filter_mask(selected_neg, base_filters)
-        hard_selected_count  = int(full_mask.sum()) if used else 0
-        random_selected_count = len(selected_neg) - hard_selected_count
+        if "_filter_pass" in selected_neg.columns:
+            hard_selected_count   = int((selected_neg["_filter_pass"] >= 0).sum())
+            random_selected_count = int((selected_neg["_filter_pass"] < 0).sum())
+        else:
+            full_mask, used = _build_filter_mask(selected_neg, base_filters)
+            hard_selected_count  = int(full_mask.sum()) if used else 0
+            random_selected_count = len(selected_neg) - hard_selected_count
     else:
         selected_parts = []
         winner_dates   = set(winners[date_col].dropna().unique())
@@ -3106,20 +3151,39 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
         for dt in sorted(winner_dates | all_neg_dates):
             winner_group  = winners[winners[date_col] == dt]
-            target        = max(int(len(winner_group) * 5.25), 4) if len(winner_group) > 0 else 4
-            neg_dt        = negatives[negatives[date_col] == dt]
+            n_winners_dt  = len(winner_group)
+
+            if n_winners_dt > 0:
+                # Winner date: sample proportionally to winners on this date
+                target = max(int(n_winners_dt * 5.25), 4)
+            else:
+                # No-winner date: use the global ratio applied to the available
+                # negatives so these dates contribute meaningfully instead of
+                # receiving a token floor of 4.  Cap at a reasonable ceiling so
+                # one huge no-winner date doesn't crowd out everything else.
+                neg_dt_count = int((negatives[date_col] == dt).sum())
+                target = min(
+                    max(int(neg_dt_count * 0.40), 4),   # take up to 40% of available
+                    int(_global_neg_ratio * 3),          # hard cap: 3 × global ratio
+                )
+
+            neg_dt = negatives[negatives[date_col] == dt]
 
             chosen = _select_negatives_for_group(neg_dt, target)
             selected_parts.append(chosen)
 
-            full_mask, used = _build_filter_mask(chosen, base_filters)
-            day_hard  = int(full_mask.sum()) if used else 0
-            day_easy  = len(chosen) - day_hard
+            if "_filter_pass" in chosen.columns:
+                day_hard = int((chosen["_filter_pass"] >= 0).sum())
+                day_easy = int((chosen["_filter_pass"] < 0).sum())
+            else:
+                full_mask, used = _build_filter_mask(chosen, base_filters)
+                day_hard  = int(full_mask.sum()) if used else 0
+                day_easy  = len(chosen) - day_hard
             hard_selected_count  += day_hard
             random_selected_count += day_easy
 
             preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
-            if logger and len(winner_group) > 0 and day_hard < preferred:
+            if logger and n_winners_dt > 0 and day_hard < preferred:
                 logger.info(
                     f"[{dt}] hard-negative shortage after loosening: "
                     f"wanted={preferred}, got={day_hard}, backfilled={day_easy}"
@@ -3127,11 +3191,25 @@ def apply_filter_aware_negative_sampling(df, logger=None):
 
         selected_neg = pd.concat(selected_parts) if selected_parts else negatives.iloc[0:0]
 
-    # ── Upweight hard negatives ───────────────────────────────────────────────
-    if "sample_weight" in selected_neg.columns:
-        selected_neg.loc[:, "sample_weight"] = (
-            selected_neg["sample_weight"].fillna(1.0) * 1.75
-        )
+    # ── Graduated upweighting based on which filter pass selected each row ────
+    # Rows that pass full (strict) filters get a higher weight than rows that
+    # only passed after loosening, which in turn outweigh unfiltered fallback rows.
+    # This preserves the corrective signal from hard negatives without flattening
+    # the distinction between "genuinely filter-passing" and "loosened-in" rows.
+    if "sample_weight" in selected_neg.columns and "_filter_pass" in selected_neg.columns:
+        def _apply_graduated_weight(row):
+            base_w = row["sample_weight"] if pd.notna(row["sample_weight"]) else 1.0
+            return base_w * _pass_weight(int(row["_filter_pass"]))
+        selected_neg = selected_neg.copy()
+        selected_neg["sample_weight"] = selected_neg.apply(_apply_graduated_weight, axis=1)
+    elif "sample_weight" in selected_neg.columns:
+        # Fallback: flat upweight (old behaviour) when _filter_pass is absent
+        selected_neg = selected_neg.copy()
+        selected_neg["sample_weight"] = selected_neg["sample_weight"].fillna(1.0) * 1.75
+
+    # Drop the internal tracking column before returning
+    if "_filter_pass" in selected_neg.columns:
+        selected_neg = selected_neg.drop(columns=["_filter_pass"])
 
     result = pd.concat([winners, selected_neg], ignore_index=True)
 
