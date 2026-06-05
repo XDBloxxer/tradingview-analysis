@@ -777,6 +777,370 @@ def _join_multiday(
     return merged
 
 
+def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """
+    Ensure all T-1 feature columns that carry dollar-scale or cumulative-volume
+    values are expressed in the same scale-free units that multiday_feature_collector
+    writes to the DB (and that the model was trained to expect).
+
+    WHY THIS IS NEEDED
+    ------------------
+    The intraday_data_collector was originally storing raw dollar values for
+    MAs, Bollinger Bands, MACD, etc.  A fix to the collector now normalises
+    those values at collection time, but rows already in the DB are raw.
+    This function detects — per column, per batch — whether each feature is
+    already normalised and skips it if so, making the operation idempotent:
+    running it on already-normalised data is a no-op.
+
+    NORMALISATION CATEGORIES (mirror of multiday_feature_collector.py)
+    -------------------------------------------------------------------
+    A. Price lines  → (value / close - 1) * 100   [% distance from close]
+       SMA_5/10/20/50, EMA_5/10/12/20/26/50, BB lower/middle/upper,
+       Keltner lower/middle/upper, Donchian lower/middle/upper, VWAP.
+
+    B. Dollar diffs → value / close * 100          [% of close]
+       MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9, MOM_10, AO.
+
+    C. ATR          → value / close * 100          [% of close]
+       ATR_14.  multiday stores ATRr (already %) but intraday's `ta` library
+       returns dollar ATR, so the same normalisation is required.
+
+    D. Volume       → value / Volume_MA20          [ratio]
+       Volume_MA5, Volume_MA10, OBV.
+       Volume_MA20 / Volume_MA20 = 1.0 always (sentinel value; set to 1.0).
+
+    DERIVED RE-COMPUTATION
+    ----------------------
+    Four derived columns depend on the raw MA values and must be re-derived
+    after normalisation so they are consistent with their inputs:
+       EMA_20_Slope   = diff(EMA_20)            after normalisation
+       SMA_20_Slope   = diff(SMA_20)            after normalisation
+       EMA_12_26_Diff = EMA_12 − EMA_26         after normalisation
+       SMA_20_50_Diff = SMA_20 − SMA_50         after normalisation
+       Price_vs_SMA20 = −SMA_20                 (= 0 − normalised_SMA_20)
+       Price_vs_SMA50 = −SMA_50
+       Price_vs_EMA20 = −EMA_20
+       ATR_14_Slope   = diff(ATR_14)            after normalisation
+
+    DETECTION LOGIC
+    ---------------
+    Detection is per-column on the median of the non-null values in the batch.
+    Using the median (not the mean) makes it robust to a handful of extreme
+    outliers.  The close price column (e.g. t1_close_Close) is used as an
+    anchor for price-relative checks.
+
+    Each group has its own detection rule:
+
+      Price lines: a normalised MA sits within ±50% of close (i.e. in the
+        range −50 to +50).  A raw MA equals the close price itself — so its
+        median absolute value ≈ median(close).  Threshold: if the median
+        absolute value of the column exceeds 50 (which is impossible for a
+        correctly normalised % distance), the column is raw.
+
+      Dollar diffs (MACD/MOM/AO): normalised values are small percentages,
+        typically ±5%.  Raw values are dollar differences whose magnitude
+        scales with close price.  Threshold: if median(|col|) > 20 the column
+        is raw.  (A normalised MACD of 20% of close would be extreme.)
+
+      ATR: normalised ATR is 1–20% for volatile small caps.  Dollar ATR for
+        a $5 stock may be $0.30 (= 6% normalised) — difficult to distinguish
+        just from magnitude.  Use close as anchor: if median(ATR) > 0.5 *
+        median(close) the column must be raw (a 50%+ daily ATR is impossible).
+        Fallback: if median(ATR) > 50 it is certainly raw.
+
+      Volume MAs: after normalisation Volume_MA20 is exactly 1.0 and
+        Volume_MA5/MA10 are ratios near 1.0.  Threshold: if median(col) > 100
+        the column is raw.
+
+      OBV: after normalisation OBV is a ratio to daily average volume,
+        typically in the range −200 to +200.  Raw OBV is millions to billions.
+        Threshold: if median(|OBV|) > 10 000 the column is raw.
+
+    Args:
+        df:     DataFrame as returned by rename_t1_columns — column names
+                already carry the full prefix (e.g. 't1_close_SMA_20').
+        prefix: 't1_close' or 't1_open' — used to locate the close-price
+                anchor column and to build the full column names.
+
+    Returns:
+        df with unnormalised columns normalised in-place (copy returned).
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    close_col = f"{prefix}_Close"
+    vol_ma20_col = f"{prefix}_Volume_MA20"
+
+    # --- close anchor (Series of per-row close prices) ----------------------
+    # Used for price-relative normalisation; may be absent for old DB rows.
+    close_s = (
+        pd.to_numeric(df[close_col], errors="coerce")
+        if close_col in df.columns
+        else None
+    )
+    safe_close = close_s.replace(0, np.nan) if close_s is not None else None
+    median_close = float(close_s.median()) if close_s is not None and close_s.notna().any() else None
+
+    # --- volume anchor -------------------------------------------------------
+    vol_ma20_s = (
+        pd.to_numeric(df[vol_ma20_col], errors="coerce")
+        if vol_ma20_col in df.columns
+        else None
+    )
+    safe_vol_ma20 = vol_ma20_s.replace(0, np.nan) if vol_ma20_s is not None else None
+
+    normalised_count = 0
+    skipped_count    = 0
+
+    def _median_abs(col_name: str) -> float:
+        """Median of the absolute values of a column; NaN if column absent."""
+        if col_name not in df.columns:
+            return float("nan")
+        s = pd.to_numeric(df[col_name], errors="coerce").dropna()
+        return float(s.abs().median()) if len(s) else float("nan")
+
+    def _is_raw_price_line(col_name: str) -> bool:
+        """True if the column looks like a raw dollar price rather than % dist from close."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False   # no data — leave as-is
+        # Normalised % distance from close is almost always in (−50, +50).
+        # Raw dollar price equals the close, so median ≈ median_close >> 50.
+        return med > 50.0
+
+    def _is_raw_dollar_diff(col_name: str) -> bool:
+        """True if MACD/MOM/AO column looks like a raw dollar difference."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # Normalised value is a small %; rarely exceeds ±20%.
+        # A raw MACD of $20+ would require an extraordinarily expensive stock
+        # with an unusually wide MACD.  Safe threshold.
+        return med > 20.0
+
+    def _is_raw_atr(col_name: str) -> bool:
+        """True if ATR column looks like raw dollar ATR rather than % of close."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # Fast path: if median > 50 it is definitely dollar ATR
+        if med > 50.0:
+            return True
+        # Slower path: use close anchor — dollar ATR > 50% of close is impossible
+        if median_close is not None and median_close > 0:
+            return med > median_close * 0.5
+        return False
+
+    def _is_raw_volume_ma(col_name: str) -> bool:
+        """True if a Volume_MA column is still in raw share counts."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # After normalisation Volume_MA5/10 are ratios near 1.0; Volume_MA20 = 1.0.
+        # Raw share counts are always > 100 (even the most thinly traded stocks).
+        return med > 100.0
+
+    def _is_raw_obv(col_name: str) -> bool:
+        """True if OBV is in raw cumulative share counts rather than ÷ vol_ma20."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # Normalised OBV is a ratio to daily avg volume — typically ±200.
+        # Raw OBV for even a thinly traded stock easily hits tens of thousands.
+        return med > 10_000.0
+
+    # ── A. Price lines → (value / close − 1) × 100 ──────────────────────────
+    PRICE_LINE_COLS = [
+        f"{prefix}_SMA_5",   f"{prefix}_SMA_10",  f"{prefix}_SMA_20",  f"{prefix}_SMA_50",
+        f"{prefix}_EMA_5",   f"{prefix}_EMA_10",  f"{prefix}_EMA_12",
+        f"{prefix}_EMA_20",  f"{prefix}_EMA_26",  f"{prefix}_EMA_50",
+        f"{prefix}_BBL_20_2.0_2.0", f"{prefix}_BBM_20_2.0_2.0", f"{prefix}_BBU_20_2.0_2.0",
+        f"{prefix}_KCLe_20_2",      f"{prefix}_KCBe_20_2",      f"{prefix}_KCUe_20_2",
+        f"{prefix}_DCL_20_20",      f"{prefix}_DCM_20_20",      f"{prefix}_DCU_20_20",
+        f"{prefix}_VWAP",
+    ]
+
+    for col in PRICE_LINE_COLS:
+        if col not in df.columns:
+            continue
+        if _is_raw_price_line(col):
+            if safe_close is not None:
+                num = pd.to_numeric(df[col], errors="coerce")
+                df[col] = (num / safe_close - 1) * 100
+                normalised_count += 1
+                logger.debug(f"  normalise_t1: {col} → % dist from close")
+            else:
+                logger.warning(
+                    f"  normalise_t1: {col} appears raw but {close_col} is absent "
+                    "— cannot normalise.  Rows without a close price will have NaN."
+                )
+        else:
+            skipped_count += 1
+
+    # ── B. Dollar diffs → value / close × 100 ────────────────────────────────
+    DOLLAR_DIFF_COLS = [
+        f"{prefix}_MACD_12_26_9",
+        f"{prefix}_MACDh_12_26_9",
+        f"{prefix}_MACDs_12_26_9",
+        f"{prefix}_MOM_10",
+        f"{prefix}_AO",
+    ]
+
+    for col in DOLLAR_DIFF_COLS:
+        if col not in df.columns:
+            continue
+        if _is_raw_dollar_diff(col):
+            if safe_close is not None:
+                num = pd.to_numeric(df[col], errors="coerce")
+                df[col] = num / safe_close * 100
+                normalised_count += 1
+                logger.debug(f"  normalise_t1: {col} → % of close")
+            else:
+                logger.warning(
+                    f"  normalise_t1: {col} appears raw but {close_col} is absent."
+                )
+        else:
+            skipped_count += 1
+
+    # ── C. ATR → value / close × 100 ─────────────────────────────────────────
+    atr_col = f"{prefix}_ATR_14"
+    if atr_col in df.columns:
+        if _is_raw_atr(atr_col):
+            if safe_close is not None:
+                num = pd.to_numeric(df[atr_col], errors="coerce")
+                df[atr_col] = num / safe_close * 100
+                normalised_count += 1
+                logger.debug(f"  normalise_t1: {atr_col} → % of close")
+            else:
+                logger.warning(
+                    f"  normalise_t1: {atr_col} appears raw but {close_col} is absent."
+                )
+        else:
+            skipped_count += 1
+
+    # ── D. Volume → value / Volume_MA20 ──────────────────────────────────────
+    vol_ma5_col  = f"{prefix}_Volume_MA5"
+    vol_ma10_col = f"{prefix}_Volume_MA10"
+    obv_col      = f"{prefix}_OBV"
+
+    # Detect using Volume_MA5 (most reliable signal; MA20 = 1.0 post-norm
+    # so its median would pass the > 100 test even when partially normalised).
+    vol_needs_norm = (
+        _is_raw_volume_ma(vol_ma5_col) or
+        _is_raw_volume_ma(vol_ma10_col)
+    )
+    obv_needs_norm = _is_raw_obv(obv_col)
+
+    if vol_needs_norm:
+        if safe_vol_ma20 is not None:
+            for col in [vol_ma5_col, vol_ma10_col]:
+                if col in df.columns:
+                    num = pd.to_numeric(df[col], errors="coerce")
+                    df[col] = num / safe_vol_ma20
+                    normalised_count += 1
+                    logger.debug(f"  normalise_t1: {col} → ratio to vol_ma20")
+            # Volume_MA20 / itself = 1.0 always (matches multiday behaviour).
+            if vol_ma20_col in df.columns:
+                df[vol_ma20_col] = 1.0
+                normalised_count += 1
+                logger.debug(f"  normalise_t1: {vol_ma20_col} → 1.0 sentinel")
+        else:
+            logger.warning(
+                f"  normalise_t1: Volume MAs appear raw but {vol_ma20_col} is "
+                "absent — cannot normalise volume features."
+            )
+    else:
+        skipped_count += 1   # whole volume group already normalised
+
+    if obv_needs_norm:
+        if safe_vol_ma20 is not None:
+            if obv_col in df.columns:
+                num = pd.to_numeric(df[obv_col], errors="coerce")
+                df[obv_col] = num / safe_vol_ma20
+                normalised_count += 1
+                logger.debug(f"  normalise_t1: {obv_col} → ratio to vol_ma20")
+        else:
+            logger.warning(
+                f"  normalise_t1: {obv_col} appears raw but {vol_ma20_col} is "
+                "absent — cannot normalise OBV."
+            )
+    else:
+        skipped_count += 1
+
+    # ── Derived re-computation ────────────────────────────────────────────────
+    # These were computed before normalisation in the old collector and are
+    # therefore in raw-dollar units.  Re-derive them from the now-normalised
+    # base columns so they are consistent with multiday behaviour.
+    #
+    # We only re-derive when the base columns exist AND are now normalised
+    # (i.e. median absolute value ≤ 50 after the steps above).
+
+    ema20 = f"{prefix}_EMA_20"
+    sma20 = f"{prefix}_SMA_20"
+    ema12 = f"{prefix}_EMA_12"
+    ema26 = f"{prefix}_EMA_26"
+    sma50 = f"{prefix}_SMA_50"
+    atr14 = f"{prefix}_ATR_14"
+
+    # EMA_20_Slope and SMA_20_Slope: diff of normalised MA (%-point per snapshot)
+    ema20_slope_col = f"{prefix}_EMA_20_Slope"
+    if ema20 in df.columns and not _is_raw_price_line(ema20):
+        df[ema20_slope_col] = pd.to_numeric(df[ema20], errors="coerce").diff(1)
+        logger.debug(f"  normalise_t1: re-derived {ema20_slope_col}")
+
+    sma20_slope_col = f"{prefix}_SMA_20_Slope"
+    if sma20 in df.columns and not _is_raw_price_line(sma20):
+        df[sma20_slope_col] = pd.to_numeric(df[sma20], errors="coerce").diff(1)
+        logger.debug(f"  normalise_t1: re-derived {sma20_slope_col}")
+
+    # EMA_12_26_Diff and SMA_20_50_Diff: spread of normalised MAs
+    ema_diff_col = f"{prefix}_EMA_12_26_Diff"
+    if ema12 in df.columns and ema26 in df.columns:
+        if not _is_raw_price_line(ema12) and not _is_raw_price_line(ema26):
+            df[ema_diff_col] = (
+                pd.to_numeric(df[ema12], errors="coerce") -
+                pd.to_numeric(df[ema26], errors="coerce")
+            )
+            logger.debug(f"  normalise_t1: re-derived {ema_diff_col}")
+
+    sma_diff_col = f"{prefix}_SMA_20_50_Diff"
+    if sma20 in df.columns and sma50 in df.columns:
+        if not _is_raw_price_line(sma20) and not _is_raw_price_line(sma50):
+            df[sma_diff_col] = (
+                pd.to_numeric(df[sma20], errors="coerce") -
+                pd.to_numeric(df[sma50], errors="coerce")
+            )
+            logger.debug(f"  normalise_t1: re-derived {sma_diff_col}")
+
+    # Price_vs_MA: price is always 0% from itself after normalisation,
+    # so price_vs_MA = 0 − normalised_MA = −normalised_MA.
+    for ma_col, vs_col in [
+        (sma20, f"{prefix}_Price_vs_SMA20"),
+        (sma50, f"{prefix}_Price_vs_SMA50"),
+        (ema20, f"{prefix}_Price_vs_EMA20"),
+    ]:
+        if ma_col in df.columns and not _is_raw_price_line(ma_col):
+            df[vs_col] = -pd.to_numeric(df[ma_col], errors="coerce")
+            logger.debug(f"  normalise_t1: re-derived {vs_col}")
+
+    # ATR_14_Slope: diff of normalised ATR (matches multiday atr_14_slope)
+    atr_slope_col = f"{prefix}_ATR_14_Slope"
+    if atr14 in df.columns and not _is_raw_atr(atr14):
+        df[atr_slope_col] = pd.to_numeric(df[atr14], errors="coerce").diff(1)
+        logger.debug(f"  normalise_t1: re-derived {atr_slope_col}")
+
+    if normalised_count > 0 or skipped_count > 0:
+        logger.info(
+            f"  normalise_t1 [{prefix}]: "
+            f"{normalised_count} column(s) normalised, "
+            f"{skipped_count} already normalised (skipped)."
+        )
+
+    return df
+
+
 def load_t1_data(client: Client) -> pd.DataFrame:
     """
     Load accumulated T-1 winner and non-winner samples, then join in the
@@ -838,6 +1202,12 @@ def load_t1_data(client: Client) -> pd.DataFrame:
                     f"after rename: {dupes[:10]}"
                 )
                 df = df.loc[:, ~df.columns.duplicated(keep="first")]
+            # Normalise any features that are still in raw dollar / cumulative-
+            # volume scale.  Rows collected after the intraday_data_collector fix
+            # are already normalised and will be detected as such and skipped.
+            # Older rows are normalised here so training always uses scale-free
+            # features regardless of when the row was collected.
+            df = normalise_t1_features(df, prefix=prefix)
         else:
             logger.warning(
                 f"  {table}: column map unavailable — "
