@@ -693,4 +693,114 @@ class IntradayDataCollector:
         except:
             pass
         
+        # ── Normalise raw-scale features to match multiday_feature_collector ──────
+        #
+        # multiday_feature_collector.py normalises every dollar-scale and
+        # cumulative-volume feature before writing to the DB so that the model
+        # receives scale-free inputs.  This block applies the exact same
+        # transformations to the equivalent intraday columns so that t1_ features
+        # are on the same scale as t3_/t5_/t10_ features.
+        #
+        # Three normalisation strategies (matching multiday exactly):
+        #   A. Dollar bands / price lines  → (value / close - 1) * 100  (% distance from close)
+        #   B. Dollar differences          → value / close * 100         (% of close)
+        #   C. Cumulative / absolute volume → value / volume_ma20        (ratio)
+        #
+        # ATR: multiday uses pandas_ta ATRr which returns ATR already as % of
+        # close.  The `ta` library used here returns dollar ATR, so we apply
+        # the same % normalisation (strategy B without the -1) here.
+        #
+        # Derived columns that depend on already-normalised MAs (slopes, diffs,
+        # price-vs-MA ratios) are RE-DERIVED after normalisation so they reflect
+        # the normalised values, not the raw dollar values — mirroring the
+        # multiday re-derivation after its normalisation block.
+
+        _safe_close = result['close'].replace(0, np.nan) if 'close' in result.columns else None
+
+        if _safe_close is not None:
+
+            # ── A. Price lines → % distance from close ───────────────────────
+            for _col in [
+                'sma5', 'sma10', 'sma20', 'sma50',
+                'ema5', 'ema10', 'ema12', 'ema20', 'ema26', 'ema50',
+                'bb.lower', 'bb.middle', 'bb.upper',
+                'keltner_lower', 'keltner_middle', 'keltner_upper',
+                'donchian_lower', 'donchian_middle', 'donchian_upper',
+                'vwap',
+                'kama',
+            ]:
+                if _col in result.columns:
+                    result[_col] = (result[_col] / _safe_close - 1) * 100
+
+            # ── B. Dollar differences → % of close ───────────────────────────
+            # MACD lines and histogram are EMA differences (dollar amounts).
+            for _col in ['macd.macd', 'macd.signal', 'macd_diff']:
+                if _col in result.columns:
+                    result[_col] = result[_col] / _safe_close * 100
+
+            # Momentum = close - close[n], also a dollar difference.
+            for _col in ['mom']:
+                if _col in result.columns:
+                    result[_col] = result[_col] / _safe_close * 100
+
+            # Awesome Oscillator = SMA5(midprice) - SMA34(midprice).
+            if 'ao' in result.columns:
+                result['ao'] = result['ao'] / _safe_close * 100
+
+            # ATR: multiday stores ATRr (already % of close via pandas_ta).
+            # The `ta` library returns dollar ATR, so normalise to match.
+            for _col in ['atr']:
+                if _col in result.columns:
+                    result[_col] = result[_col] / _safe_close * 100
+
+            # ── Re-derive ATR slope after normalisation ───────────────────────
+            # atr_pct was previously (atr / close * 100) — now atr IS already
+            # normalised, so drop the stale atr_pct and recompute the slope
+            # from the normalised atr series (mirrors multiday atr_14_slope).
+            if 'atr' in result.columns:
+                result['atr_pct'] = result['atr'].diff(1)   # slope of normalised ATR
+
+            # ── Re-derive MA-based derived columns after normalisation ────────
+            # These were computed from raw dollar MAs; re-derive so they use
+            # the normalised (%-of-close) values, matching multiday behaviour.
+            if 'ema20' in result.columns:
+                result['ema20_slope'] = result['ema20'].diff(1)
+            if 'sma20' in result.columns:
+                result['sma20_slope'] = result['sma20'].diff(1)
+            if 'ema12' in result.columns and 'ema26' in result.columns:
+                result['ema_12_26_diff'] = result['ema12'] - result['ema26']
+            if 'sma20' in result.columns and 'sma50' in result.columns:
+                result['sma_20_50_diff'] = result['sma20'] - result['sma50']
+
+            # price_vs_* ratios: re-derive from normalised MAs.
+            # normalised MA = (MA/close - 1)*100, so price_vs_MA = -normalised_MA
+            # (price is always 0% from itself; MA distance is the negative).
+            # We negate so positive means price is above the MA (matches multiday).
+            if 'sma20' in result.columns:
+                result['price_vs_sma20'] = -result['sma20']
+            if 'sma50' in result.columns:
+                result['price_vs_sma50'] = -result['sma50']
+            if 'ema20' in result.columns:
+                result['price_vs_ema20'] = -result['ema20']
+
+        # ── C. Volume → ratio to volume_ma20 ─────────────────────────────────
+        # Raw volume MAs are absolute share counts that act as a market-cap
+        # proxy (high-float large-caps have vastly larger numbers).
+        # Dividing by volume_ma20 makes them scale-free across stocks,
+        # matching how multiday normalises volume_ma5/ma10/ma20 and OBV.
+        _safe_vol_ma20 = (
+            result['volume_sma20'].replace(0, np.nan)
+            if 'volume_sma20' in result.columns else None
+        )
+        if _safe_vol_ma20 is not None:
+            if 'obv' in result.columns:
+                result['obv'] = result['obv'] / _safe_vol_ma20
+            if 'volume_sma5' in result.columns:
+                result['volume_sma5'] = result['volume_sma5'] / _safe_vol_ma20
+            if 'volume_sma10' in result.columns:
+                result['volume_sma10'] = result['volume_sma10'] / _safe_vol_ma20
+            # volume_sma20 / volume_sma20 = 1.0 always — zero it out (matches
+            # multiday which sets volume_ma20 = 1.0 as a sanity-check constant).
+            result['volume_sma20'] = 1.0
+
         return result
