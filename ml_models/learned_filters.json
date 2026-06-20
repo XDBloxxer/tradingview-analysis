@@ -9,7 +9,7 @@
   "min_volume_ratio": 1.0,
   "min_relative_volume": 1.0,
   "_derived_from_n_winners": 844,
-  "_derived_at": "2026-06-19T01:20:20.604999",
+  "_derived_at": "2026-06-20T00:37:56.723626",
   "_lookback_days": 90,
   "_comment": "Tightened from defaults. max_price 50 and min_volume 500k target the small-cap explosive universe. min_relative_volume 2.0 requires stocks already showing above-normal activity. Model-driven thresholds (hv10, rsi) will be auto-populated by ml_track_comprehensive_accuracy.py after enough prediction history accumulates."
 }
