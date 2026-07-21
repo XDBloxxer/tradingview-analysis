@@ -4177,9 +4177,21 @@ def main() -> int:
     logger.info("\n" + "=" * 60)
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
     logger.info("=" * 60)
+    # NOTE (supersedes the "EVALUATION INTEGRITY FIX" comment above): restricting
+    # this to X_train / combined_df.loc[train_idx] was found to starve the
+    # regressor entirely. Because the classifier's val split is the most recent
+    # ~VAL_WEEKS window, and virtually all rows with real gain data (T-1 rows
+    # and ml_prediction_accuracy matches) fall in that same recent window,
+    # train_idx structurally contained zero gain-labeled rows — the regressor
+    # always saw "0 rows with gain data" and fell back to the hardcoded
+    # _GAIN_CURVE regardless of how much data existed. train_gain_regressor
+    # performs its own internal time-based train/val split for its reported
+    # metrics, so passing the full dataset here restores real training data
+    # without affecting the classifier's own AUC/val evaluation (computed
+    # separately, above/below, from X_val_xgb).
     gain_regressor = train_gain_regressor(
-        X_scaled=X_train,                           # train rows only — no val-period leakage
-        combined_df=combined_df.loc[train_idx],     # matching train-split rows
+        X_scaled=X_scaled,                          # full dataset — train rows alone had no gain data
+        combined_df=combined_df,                    # full dataset, matching X_scaled row order
         feature_names=feature_names,
         client=client,                              # RC1: fallback fetch if map not supplied
         accuracy_gain_map=_accuracy_gain_map,       # ISSUE 2 FIX: reuse RC3 fetch, no redundant DB query
