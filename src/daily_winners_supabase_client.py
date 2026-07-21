@@ -8,10 +8,12 @@ ENHANCED: Supports day_prior_open table
 
 import logging
 import os
+import re
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
 
 class DailyWinnersSupabaseClient:
@@ -116,6 +118,66 @@ class DailyWinnersSupabaseClient:
         
         return sanitized
     
+    # Matches the PostgREST "schema cache" error PostgREST/Supabase returns
+    # (code PGRST204) when a payload contains a column that doesn't exist in
+    # the target table, e.g.:
+    #   "Could not find the 'ema20_slope' column of 'winners_market_open' in the schema cache"
+    _MISSING_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column")
+
+    def _insert_with_schema_retry(self, table_name: str, rows: List[Dict[str, Any]]):
+        """
+        Insert rows into `table_name`, self-healing against PGRST204
+        "column not found in schema cache" errors.
+
+        The DataFrame that produces these rows can grow new derived
+        columns (e.g. new indicators) that haven't been added to the
+        Supabase table yet. Rather than hard-failing the entire batch
+        (which is what was happening for winners_market_open/close and
+        winners_day_prior_open/close), drop any column PostgREST reports
+        as unknown and retry, so the rest of the (valid) data still gets
+        written. A warning is logged listing everything that was dropped
+        so the schema drift is visible and can be fixed with a migration.
+
+        Returns the Supabase response from the (eventually) successful
+        insert.
+        """
+        rows = [dict(r) for r in rows]  # don't mutate caller's dicts
+        dropped_columns: set = set()
+
+        max_attempts = 25  # generous ceiling; one retry per bad column found
+        for attempt in range(max_attempts):
+            try:
+                response = self.client.table(table_name).insert(rows).execute()
+                if dropped_columns:
+                    self.logger.warning(
+                        f"Inserted into {table_name} after dropping column(s) not "
+                        f"present in the DB schema: {sorted(dropped_columns)}. "
+                        f"Add these columns to the table (or remove them from the "
+                        f"data pipeline) to stop this warning."
+                    )
+                return response
+            except APIError as e:
+                message = e.args[0].get("message", "") if e.args else str(e)
+                code = e.args[0].get("code") if e.args else None
+                match = self._MISSING_COLUMN_RE.search(message)
+                if code == "PGRST204" and match:
+                    bad_col = match.group(1)
+                    dropped_columns.add(bad_col)
+                    for r in rows:
+                        r.pop(bad_col, None)
+                    self.logger.debug(
+                        f"{table_name}: column '{bad_col}' not in DB schema, "
+                        f"dropping and retrying insert."
+                    )
+                    continue
+                # Not a recoverable schema-cache error - re-raise as-is
+                raise
+
+        raise RuntimeError(
+            f"Gave up inserting into {table_name} after {max_attempts} attempts "
+            f"dropping unknown columns: {sorted(dropped_columns)}"
+        )
+
     def _get_existing_symbols(self, table_name: str, detection_date: str) -> set:
         """
         Get set of symbols that already exist for a date in a table
@@ -178,10 +240,10 @@ class DailyWinnersSupabaseClient:
             # Sanitize all data
             sanitized_winners = [self._sanitize_dict(w) for w in new_winners]
             
-            # Insert new data only
-            response = self.client.table(self.tables["winners"]).insert(
-                sanitized_winners
-            ).execute()
+            # Insert new data only (self-heals if a column isn't in the DB schema yet)
+            response = self._insert_with_schema_retry(
+                self.tables["winners"], sanitized_winners
+            )
             
             count = len(response.data) if response.data else 0
             self.logger.info(f"Wrote {count} NEW winners to Supabase")
@@ -249,10 +311,10 @@ class DailyWinnersSupabaseClient:
                     self.logger.info(f"DEBUG {data_type} - exchange: {first_record.get('exchange')}")
                     self.logger.info(f"DEBUG {data_type} - detection_date: {first_record.get('detection_date')}")
                 
-                # Insert new data only
-                response = self.client.table(self.tables[table_key]).insert(
-                    sanitized_data
-                ).execute()
+                # Insert new data only (self-heals if a column isn't in the DB schema yet)
+                response = self._insert_with_schema_retry(
+                    self.tables[table_key], sanitized_data
+                )
                 
                 count = len(response.data) if response.data else 0
                 counts[data_type] = count
