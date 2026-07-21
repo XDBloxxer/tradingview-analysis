@@ -3896,7 +3896,7 @@ def main() -> int:
                         combined_df[_symbol_col],
                         _combined_dates,
                     ))
-                    _is_acc_winner = pd.array(
+                    _is_acc_winner = np.array(
                         [k in _acc_winners.index for k in _keys],
                         dtype=bool,
                     )
