@@ -3744,13 +3744,33 @@ def main() -> int:
                     if "change_pct" in winners_corrected.columns:
                         gain_cols.append("change_pct")
 
+                    # BUG FIX: winners_corrected["detection_date"] is datetime64
+                    # (set in _compute_correct_actual_high_pct), while combined_df's
+                    # date_col is typically a plain string/object column pulled from
+                    # Supabase. Merging on mismatched dtypes raises a ValueError
+                    # ("You are trying to merge on str and datetime64[us] columns"),
+                    # which was being silently swallowed by the except Exception
+                    # below — so actual_high_pct was NEVER populated, starving the
+                    # gain regressor of the >=30 rows it needs and forcing the
+                    # hardcoded _GAIN_CURVE fallback. Normalize both merge keys to
+                    # the same "YYYY-MM-DD" string format before merging.
+                    merge_helper = winners_corrected[gain_cols].copy()
+                    merge_helper["detection_date"] = pd.to_datetime(
+                        merge_helper["detection_date"], errors="coerce"
+                    ).dt.strftime("%Y-%m-%d")
+
+                    _tmp_key_col = "__merge_date_key__"
+                    combined_df[_tmp_key_col] = pd.to_datetime(
+                        combined_df[date_col], errors="coerce"
+                    ).dt.strftime("%Y-%m-%d")
+
                     combined_df = combined_df.merge(
-                        winners_corrected[gain_cols],
-                        left_on=[symbol_col, date_col],
+                        merge_helper,
+                        left_on=[symbol_col, _tmp_key_col],
                         right_on=["symbol", "detection_date"],
                         how="left",
                         suffixes=("", "_winners"),
-                    ).drop(columns=["detection_date_winners"], errors="ignore")
+                    ).drop(columns=["detection_date_winners", _tmp_key_col], errors="ignore")
 
                     # Resolve column conflicts after merge
                     for col in ["actual_high_pct", "change_pct"]:
@@ -3770,7 +3790,10 @@ def main() -> int:
                         f"(prev_close denominator)"
                     )
     except Exception as e:
-        logger.warning(f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited")
+        logger.warning(
+            f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited",
+            exc_info=True,
+        )
 
     # ── RC3: Fetch ml_prediction_accuracy for label correction and gain regressor ──
     #
