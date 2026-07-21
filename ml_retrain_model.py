@@ -1339,6 +1339,28 @@ def enrich_mistakes_with_gains(
 
     Without this, mistake rows have no gain target and are silently excluded
     from the regressor's winner_mask, wasting the corrective signal they carry.
+
+    FIX2 (denominator consistency): ml_prediction_accuracy.actual_high_pct is
+    NOT guaranteed to be computed on the same base as
+    _compute_correct_actual_high_pct's prev_close-based value. The tracker
+    (ml_track_comprehensive_accuracy.py) prefers a prev_close-denominated
+    yfinance figure, but falls back to a same-day-close-denominated figure
+    (high / same-day price - 1) whenever yfinance data is unavailable for a
+    symbol/date. Silently merging that column in — as the previous
+    implementation did — mixes two incompatible scales into a single gain
+    target: same-day-close-based values cluster near 0% (the denominator and
+    numerator are close together intraday), while prev_close-based values
+    span the true intraday range. That is exactly the ~122pp split reported
+    in the FIX2 diagnostic.
+
+    To keep both sources on the same base, we re-derive actual_high_pct
+    directly from daily_winners via _compute_correct_actual_high_pct — the
+    same function RC2 uses for winner rows — for every mistake row we can
+    match. Only when a row has no daily_winners match (so no reliable
+    prev_close is obtainable) do we fall back to the accuracy table's value,
+    and we mark that fallback explicitly so it can be distinguished/excluded
+    downstream instead of being silently blended in as if it were on the
+    same base.
     """
     if mistake_df.empty:
         return mistake_df
@@ -1361,6 +1383,33 @@ def enrich_mistakes_with_gains(
     dates = pairs["detection_date"].unique().tolist()
     symbols = pairs["symbol"].unique().tolist()
 
+    # ── Primary source: daily_winners, run through _compute_correct_actual_high_pct
+    # so the denominator (prev_close) exactly matches RC2's winner rows. ──────────
+    winners_corrected = pd.DataFrame()
+    try:
+        winners_rows = []
+        for i in range(0, len(dates), 20):
+            date_chunk = dates[i:i + 20]
+            try:
+                resp = (
+                    client.table("daily_winners")
+                    .select("symbol, detection_date, price, high, open, close, prev_close_db")
+                    .in_("detection_date", date_chunk)
+                    .in_("symbol", symbols)
+                    .execute()
+                )
+                if resp.data:
+                    winners_rows.extend(resp.data)
+            except Exception as e:
+                logger.debug(f"RC6: daily_winners fetch chunk failed: {e}")
+
+        if winners_rows:
+            winners_raw = pd.DataFrame(winners_rows)
+            winners_corrected = _compute_correct_actual_high_pct(winners_raw)
+    except Exception as e:
+        logger.debug(f"RC6: could not fetch/correct daily_winners for mistake rows: {e}")
+
+    # ── Fallback source: ml_prediction_accuracy (denominator not guaranteed) ────
     accuracy_rows = []
     for i in range(0, len(dates), 20):
         date_chunk = dates[i:i + 20]
@@ -1377,41 +1426,87 @@ def enrich_mistakes_with_gains(
         except Exception as e:
             logger.debug(f"RC6: accuracy fetch chunk failed: {e}")
 
-    if not accuracy_rows:
-        logger.info("RC6: No accuracy data found for mistake symbols — skipping enrichment")
+    if winners_corrected.empty and not accuracy_rows:
+        logger.info("RC6: No accuracy or daily_winners data found for mistake symbols — skipping enrichment")
         return mistake_df
 
-    acc_df = pd.DataFrame(accuracy_rows).rename(columns={"prediction_date": "detection_date"})
-    acc_df = acc_df.dropna(subset=["symbol", "detection_date"])
-
     result = mistake_df.copy()
-    # Merge in actual_gain_pct and actual_high_pct where missing
-    merged = result.merge(
-        acc_df[["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]],
-        on=["symbol", "detection_date"],
-        how="left",
-        suffixes=("", "_acc"),
-    )
+    if "actual_gain_pct" not in result.columns:
+        result["actual_gain_pct"] = np.nan
+    if "actual_high_pct" not in result.columns:
+        result["actual_high_pct"] = np.nan
+    result["_gain_source"] = "none"
 
-    # Fill missing values from the accuracy table
-    if "actual_gain_pct" not in merged.columns:
-        merged["actual_gain_pct"] = np.nan
-    if "actual_high_pct" not in merged.columns:
-        merged["actual_high_pct"] = np.nan
+    # Step 1: fill from daily_winners (prev_close-based — same base as RC2).
+    n_from_winners = 0
+    if not winners_corrected.empty:
+        wc = winners_corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
+        if "change_pct" in winners_corrected.columns:
+            wc["actual_gain_pct"] = winners_corrected["change_pct"]
+        merged = result.merge(
+            wc,
+            on=["symbol", "detection_date"],
+            how="left",
+            suffixes=("", "_rc2"),
+        )
+        for col in ["actual_gain_pct", "actual_high_pct"]:
+            rc2_col = f"{col}_rc2"
+            if rc2_col in merged.columns:
+                fillable = merged[col].isna() & merged[rc2_col].notna()
+                merged.loc[fillable, col] = merged.loc[fillable, rc2_col]
+                if col == "actual_high_pct":
+                    n_from_winners = int(fillable.sum())
+                    merged.loc[fillable, "_gain_source"] = "daily_winners_prev_close"
+                merged = merged.drop(columns=[rc2_col])
+        result = merged
 
-    # Prefer existing values; only fill where NaN
-    for col in ["actual_gain_pct", "actual_high_pct"]:
-        acc_col = f"{col}_acc"
-        if acc_col in merged.columns:
-            was_nan = merged[col].isna()
-            merged.loc[was_nan, col] = merged.loc[was_nan, acc_col]
-            merged = merged.drop(columns=[acc_col])
+    # Step 2: fall back to ml_prediction_accuracy ONLY for rows still missing a
+    # gain target. Tag these explicitly since their denominator may not match
+    # the prev_close base used above (the accuracy tracker can fall back to a
+    # same-day-close denominator when yfinance data is unavailable).
+    n_from_accuracy = 0
+    if accuracy_rows:
+        acc_df = pd.DataFrame(accuracy_rows).rename(columns={"prediction_date": "detection_date"})
+        acc_df = acc_df.dropna(subset=["symbol", "detection_date"])
 
-    enriched_count = merged["actual_high_pct"].notna().sum()
+        merged = result.merge(
+            acc_df[["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]],
+            on=["symbol", "detection_date"],
+            how="left",
+            suffixes=("", "_acc"),
+        )
+        for col in ["actual_gain_pct", "actual_high_pct"]:
+            acc_col = f"{col}_acc"
+            if acc_col in merged.columns:
+                fillable = merged[col].isna() & merged[acc_col].notna()
+                merged.loc[fillable, col] = merged.loc[fillable, acc_col]
+                if col == "actual_high_pct":
+                    n_from_accuracy = int(fillable.sum())
+                    merged.loc[fillable, "_gain_source"] = "accuracy_table_unverified_base"
+                merged = merged.drop(columns=[acc_col])
+        result = merged
+
+    # Clip to non-negative, matching RC2's treatment, so the two sources can't
+    # diverge on sign conventions either.
+    valid = result["actual_high_pct"].notna()
+    result.loc[valid, "actual_high_pct"] = result.loc[valid, "actual_high_pct"].clip(lower=0)
+
+    n_accuracy_base = int((result["_gain_source"] == "accuracy_table_unverified_base").sum())
+    if n_accuracy_base > 0:
+        logger.warning(
+            f"RC6/FIX2: {n_accuracy_base} mistake rows fell back to ml_prediction_accuracy's "
+            f"actual_high_pct with an unverified denominator (no matching daily_winners row "
+            f"to recompute a prev_close-based value). These are tagged '_gain_source' == "
+            f"'accuracy_table_unverified_base' and should be treated with lower confidence."
+        )
+
+    enriched_count = result["actual_high_pct"].notna().sum()
     logger.info(
-        f"RC6: Enriched {enriched_count}/{len(merged)} mistake rows with gain data"
+        f"RC6: Enriched {enriched_count}/{len(result)} mistake rows with gain data "
+        f"(daily_winners/prev_close: {n_from_winners}, accuracy_table fallback: {n_from_accuracy})"
     )
-    return merged
+    result = result.drop(columns=["_gain_source"], errors="ignore")
+    return result
 
 
 # ---------------------------------------------------------------------------
