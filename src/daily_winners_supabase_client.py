@@ -157,8 +157,11 @@ class DailyWinnersSupabaseClient:
                     )
                 return response
             except APIError as e:
-                message = e.args[0].get("message", "") if e.args else str(e)
-                code = e.args[0].get("code") if e.args else None
+                # postgrest.exceptions.APIError stores structured fields as
+                # attributes (.message/.code), NOT as a dict in .args[0] -
+                # .args[0] is just the pre-formatted repr string.
+                message = e.message or ""
+                code = e.code
                 match = self._MISSING_COLUMN_RE.search(message)
                 if code == "PGRST204" and match:
                     bad_col = match.group(1)
