@@ -2968,10 +2968,18 @@ def train_gain_regressor(
         t1_non_winner_rows = non_winner_rows
 
     # Fill ONLY T-1 non-winners with 0.0; leave base CSV non-winners as NaN
-    n_nonwinner_filled = int((t1_non_winner_rows & gain_targets.isna()).sum())
+    #
+    # FIX2: Track exactly which rows receive this explicit 0.0 anchor (as opposed
+    # to a genuine actual_high_pct value backfilled from ml_prediction_accuracy).
+    # Without this, the FIX2 diagnostic below cannot tell the two apart and ends
+    # up comparing real winner gains against a population dominated by this
+    # intentional zero-fill — which will *always* show a huge mean gap that has
+    # nothing to do with a prev_close vs same-day-close denominator mismatch.
+    zero_fill_mask = t1_non_winner_rows & gain_targets.isna()
+    n_nonwinner_filled = int(zero_fill_mask.sum())
     if n_nonwinner_filled > 0:
         gain_targets = gain_targets.copy()
-        gain_targets.loc[t1_non_winner_rows & gain_targets.isna()] = 0.0
+        gain_targets.loc[zero_fill_mask] = 0.0
         n_base_skipped = int((non_winner_rows & ~t1_non_winner_rows).sum())
         logger.info(
             f"CORE FIX: Filled {n_nonwinner_filled} T-1 non-winner rows with gain=0.0 "
@@ -3021,13 +3029,31 @@ def train_gain_regressor(
     # When RC2 and the accuracy table compute actual_high_pct with different
     # denominators (prev_close vs same-day close), the two populations will have
     # visibly different distribution statistics here — a clear signal to investigate.
+    #
+    # FIX2 (corrected): the previous version of this check compared winner-row
+    # gains against the *entire* non_winners_day_prior population, which is
+    # dominated by rows the CORE FIX above deliberately set to gain=0.0 (they
+    # never had an actual_high_pct at all — they're a "no big move" anchor, not
+    # a same-day-close-denominated value). Comparing real winner gains to an
+    # intentional 0.0 constant will always look like a huge divergence and has
+    # nothing to do with denominators. We now exclude those explicit zero-fill
+    # rows so the comparison only includes non-winner rows that carry a genuine
+    # actual_high_pct/actual_gain_pct value pulled from the accuracy table.
     if valid_gain_mask.any() and "source" in combined_df.columns:
         _gt_valid  = gain_targets[valid_gain_mask]
         _src_valid = combined_df.loc[valid_gain_mask, "source"]
         _is_winner = combined_df.loc[valid_gain_mask, "label"] == 1
+        _zero_fill_valid = zero_fill_mask.reindex(valid_gain_mask.index, fill_value=False)[valid_gain_mask]
+
+        _rc2_group = _src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False)
+        _acc_group_all = _src_valid.str.contains("non_winners_day_prior", na=False)
+        _acc_group_genuine = _acc_group_all & ~_zero_fill_valid
+        _acc_group_zero_anchor = _acc_group_all & _zero_fill_valid
+
         for _src_group, _src_label in [
-            (_src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False), "daily_winners (RC2 enriched)"),
-            (_src_valid.str.contains("non_winners_day_prior", na=False), "non_winners (accuracy-table backfill)"),
+            (_rc2_group, "daily_winners (RC2 enriched)"),
+            (_acc_group_genuine, "non_winners (accuracy-table backfill, genuine)"),
+            (_acc_group_zero_anchor, "non_winners (explicit 0.0 anchor, CORE FIX)"),
             (~_src_valid.str.contains("day_prior", na=False), "base_csv / mistake rows"),
         ]:
             _grp_vals = _gt_valid[_src_group]
@@ -3040,19 +3066,28 @@ def train_gain_regressor(
             )
         # Warn when the two primary sources have very different mean gains —
         # a strong signal that they are using incompatible denominators.
-        _rc2_vals  = _gt_valid[_src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False)]
-        _acc_vals  = _gt_valid[_src_valid.str.contains("non_winners_day_prior", na=False)]
+        # Only the *genuine* accuracy-table rows are compared here; the
+        # explicit 0.0 anchor rows are excluded on purpose (see note above).
+        _rc2_vals  = _gt_valid[_rc2_group]
+        _acc_vals  = _gt_valid[_acc_group_genuine]
         if len(_rc2_vals) >= 5 and len(_acc_vals) >= 5:
             _mean_diff = abs(_rc2_vals.mean() - _acc_vals.mean())
             if _mean_diff > 20.0:
                 logger.warning(
                     f"  ⚠️  FIX2: Mean gain differs by {_mean_diff:.1f}pp between RC2-enriched "
-                    f"winners ({_rc2_vals.mean():.1f}%) and accuracy-table non-winners "
+                    f"winners ({_rc2_vals.mean():.1f}%) and genuine accuracy-table non-winners "
                     f"({_acc_vals.mean():.1f}%). This suggests the two sources are computing "
                     f"actual_high_pct with different denominators (prev_close vs same-day close). "
                     f"Investigate _compute_correct_actual_high_pct and enrich_mistakes_with_gains "
                     f"to ensure both use the same base."
                 )
+        elif len(_acc_vals) < 5:
+            logger.info(
+                f"  FIX2: Skipping denominator-divergence check — only {len(_acc_vals)} "
+                f"genuine (non-zero-anchor) accuracy-table non-winner rows available "
+                f"(need ≥5). Most non-winner rows are explicit 0.0 anchors from CORE FIX, "
+                f"which is expected and not a denominator issue."
+            )
 
     if n_valid < 30:
         logger.warning(f"Only {n_valid} rows with gain data — need ≥30. Skipping gain regressor.")
