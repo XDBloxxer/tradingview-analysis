@@ -3070,7 +3070,12 @@ def train_gain_regressor(
         # explicit 0.0 anchor rows are excluded on purpose (see note above).
         _rc2_vals  = _gt_valid[_rc2_group]
         _acc_vals  = _gt_valid[_acc_group_genuine]
-        if len(_rc2_vals) >= 5 and len(_acc_vals) >= 5:
+        # FIX2: require a larger genuine sample before trusting a mean-diff
+        # warning. n<30 is too small/noisy to distinguish a real denominator
+        # bug from ordinary sampling variance (e.g. n=15 with mean=3.6% is not
+        # a reliable estimate of the true non-winner base rate).
+        MIN_GENUINE_ACC_SAMPLE = 30
+        if len(_rc2_vals) >= 5 and len(_acc_vals) >= MIN_GENUINE_ACC_SAMPLE:
             _mean_diff = abs(_rc2_vals.mean() - _acc_vals.mean())
             if _mean_diff > 20.0:
                 logger.warning(
@@ -3081,12 +3086,13 @@ def train_gain_regressor(
                     f"Investigate _compute_correct_actual_high_pct and enrich_mistakes_with_gains "
                     f"to ensure both use the same base."
                 )
-        elif len(_acc_vals) < 5:
+        elif len(_acc_vals) < MIN_GENUINE_ACC_SAMPLE:
             logger.info(
                 f"  FIX2: Skipping denominator-divergence check — only {len(_acc_vals)} "
                 f"genuine (non-zero-anchor) accuracy-table non-winner rows available "
-                f"(need ≥5). Most non-winner rows are explicit 0.0 anchors from CORE FIX, "
-                f"which is expected and not a denominator issue."
+                f"(need ≥{MIN_GENUINE_ACC_SAMPLE}). Most non-winner rows are explicit 0.0 "
+                f"anchors from CORE FIX, which is expected and not a denominator issue; "
+                f"a small genuine sample is also too noisy to draw a conclusion from."
             )
 
     if n_valid < 30:
