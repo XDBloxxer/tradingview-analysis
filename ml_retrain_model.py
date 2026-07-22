@@ -4524,8 +4524,39 @@ def main() -> int:
     # metrics, so passing the full dataset here restores real training data
     # without affecting the classifier's own AUC/val evaluation (computed
     # separately, above/below, from X_val_xgb).
+    # ── REGRESSOR-ONLY log_price FEATURE ──────────────────────────────────────
+    # The classifier must never see raw price level (that's the whole reason
+    # OHLCV columns are in NON_FEATURE_COLS — "expensive stocks explode more"
+    # is not a real signal). But the gain regressor's job is different: given
+    # that a move is happening, cheap/low-float stocks mechanically swing
+    # harder in % terms than expensive ones, so price level is legitimate
+    # signal for magnitude prediction specifically.
+    #
+    # log_price is derived in-memory only, from t1_close_Close (falling back
+    # to t1_open_Close) — both already populated for every row by the existing
+    # T-1 intraday pipeline. No DB schema change, no backfill, no new column
+    # persisted anywhere: this Series exists only for the duration of this
+    # training run and is never written back to combined_df or the DB.
+    # log1p (not raw price) is used to avoid the model memorising exact price
+    # points and to keep the feature on a smoother, split-friendly scale.
+    _price_source = combined_df.get("t1_close_Close")
+    if _price_source is None:
+        _price_source = pd.Series(np.nan, index=combined_df.index)
+    _price_fallback = combined_df.get("t1_open_Close")
+    if _price_fallback is not None:
+        _price_source = _price_source.fillna(_price_fallback)
+    _price_source = pd.to_numeric(_price_source, errors="coerce").clip(lower=0)
+    log_price = np.log1p(_price_source).reindex(X_scaled.index)
+    log_price = log_price.fillna(log_price.mean())  # match X_scaled's "no raw NaN into XGBoost" convention
+
+    X_scaled_gain = X_scaled.assign(log_price=log_price)
+    logger.info(
+        f"Gain regressor feature matrix: {X_scaled_gain.shape[1]} features "
+        f"({X_scaled.shape[1]} shared with classifier + log_price)"
+    )
+
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled,                          # full dataset — train rows alone had no gain data
+        X_scaled=X_scaled_gain,                     # classifier's matrix + regressor-only log_price
         combined_df=combined_df,                    # full dataset, matching X_scaled row order
         feature_names=feature_names,
         client=client,                              # RC1: fallback fetch if map not supplied
