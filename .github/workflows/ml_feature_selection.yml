@@ -1,0 +1,128 @@
+name: ML Feature Selection
+
+# Runs the 4-stage feature reduction pipeline (correlation clustering ->
+# Boruta -> time-aware RFECV -> genetic polish) and commits its output to
+# ml_models/feature_selection/. This is intentionally SEPARATE from the
+# weekly retrain workflow:
+#
+#   - It's expensive (many XGBoost fits across 4 stages).
+#   - It's stochastic (Boruta shuffling + GA search) — running it every week
+#     would make the feature set drift on noise alone, independent of any
+#     real change in the data.
+#
+# The weekly retrain workflow (ml_weekly_retrain.yml) just reads whatever
+# selected_features.json this workflow last committed, via the
+# USE_SELECTED_FEATURES=1 env var — it never re-runs the search itself.
+#
+# Suggested cadence: monthly, or manually after a meaningful data/schema
+# change. Adjust the cron below to taste.
+
+on:
+  schedule:
+    # 1st of each month, 06:00 UTC (runs before the following Sunday's retrain)
+    - cron: '0 6 1 * *'
+
+  workflow_dispatch:
+    inputs:
+      corr_threshold:
+        description: 'Correlation-cluster cut threshold (r)'
+        required: false
+        default: '0.90'
+        type: string
+      boruta_iterations:
+        description: 'Boruta shadow-feature iterations'
+        required: false
+        default: '100'
+        type: string
+      rfecv_min_features:
+        description: 'RFECV floor on feature count'
+        required: false
+        default: '20'
+        type: string
+      skip_genetic:
+        description: 'Skip the GA polish stage (faster, RFECV output only)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  feature-selection:
+    runs-on: ubuntu-latest
+    # 4 stages of repeated XGBoost fits over ~395 features can run long —
+    # give it much more headroom than the weekly retrain job.
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run feature selection pipeline
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+        run: |
+          CORR="${{ github.event.inputs.corr_threshold || '0.90' }}"
+          BORUTA_ITER="${{ github.event.inputs.boruta_iterations || '100' }}"
+          RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '20' }}"
+          SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
+
+          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN"
+          if [ "$SKIP_GA" = "true" ]; then
+            ARGS="$ARGS --skip-genetic"
+          fi
+
+          python -m src.ml_predictor.feature_selection $ARGS
+
+      - name: Commit feature selection artifacts
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action Bot"
+
+          # Plain JSON/CSV — no LFS needed (only ml_models/*.pkl is LFS-tracked).
+          git add ml_models/feature_selection/selected_features.json          || true
+          git add ml_models/feature_selection/stage1_correlation_clusters.csv || true
+          git add ml_models/feature_selection/stage2_boruta_history.csv       || true
+          git add ml_models/feature_selection/stage3_rfecv_curve.csv          || true
+          git add ml_models/feature_selection/stage4_ga_log.csv               || true
+
+          git diff --staged --quiet || git commit -m "🧬 Auto feature-selection: $(date +'%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@master
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ github.ref }}
+
+      - name: Upload feature selection report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-selection-report-${{ github.run_number }}
+          path: ml_models/feature_selection/
+          retention-days: 180
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "::notice::Feature selection completed."
+          if [ -f ml_models/feature_selection/selected_features.json ]; then
+            python .github/workflows/scripts/print_feature_selection_summary.py
+          fi
+          echo "::notice::Next weekly retrain will use these features only if USE_SELECTED_FEATURES=1 is set."
