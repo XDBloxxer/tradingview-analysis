@@ -42,7 +42,7 @@ on:
       skip_genetic:
         description: 'Skip the GA polish stage (faster, RFECV output only)'
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
