@@ -37,7 +37,7 @@ on:
       rfecv_min_features:
         description: 'RFECV floor on feature count'
         required: false
-        default: '20'
+        default: '8'
         type: string
       skip_genetic:
         description: 'Skip the GA polish stage (faster, RFECV output only)'
@@ -80,7 +80,7 @@ jobs:
         run: |
           CORR="${{ github.event.inputs.corr_threshold || '0.90' }}"
           BORUTA_ITER="${{ github.event.inputs.boruta_iterations || '100' }}"
-          RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '20' }}"
+          RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '8' }}"
           SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
 
           ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN"
