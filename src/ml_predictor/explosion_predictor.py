@@ -982,7 +982,30 @@ class ExplosionPredictor:
         # ------------------------------------------------------------------
         if self.regressor is not None:
             try:
-                predicted_gains_raw = self.regressor.predict(X_scaled)
+                # Mirror the regressor-only log_price feature added at training
+                # time (ml_retrain_model.py). Built in-memory from data_df's
+                # t1_close_Close / t1_open_Close — never persisted, no DB change.
+                # Backward-compatible: only appended if the loaded regressor was
+                # actually trained with it (older saved regressors won't have
+                # 'log_price' in feature_names_in_, so they get X_scaled unchanged).
+                regressor_expects_log_price = "log_price" in getattr(
+                    self.regressor, "feature_names_in_", []
+                )
+                if regressor_expects_log_price:
+                    price_source = data_df.get("t1_close_Close")
+                    if price_source is None:
+                        price_source = pd.Series(np.nan, index=data_df.index)
+                    price_fallback = data_df.get("t1_open_Close")
+                    if price_fallback is not None:
+                        price_source = price_source.fillna(price_fallback)
+                    price_source = pd.to_numeric(price_source, errors="coerce").clip(lower=0)
+                    log_price = np.log1p(price_source).reindex(X_scaled.index)
+                    log_price = log_price.fillna(log_price.mean() if log_price.notna().any() else 0.0)
+                    X_scaled_for_regressor = X_scaled.assign(log_price=log_price)
+                else:
+                    X_scaled_for_regressor = X_scaled
+
+                predicted_gains_raw = self.regressor.predict(X_scaled_for_regressor)
 
                 # RC7 FIX: If the regressor was trained on a log1p-transformed
                 # target (flagged by _log_transformed_target=True), invert the
