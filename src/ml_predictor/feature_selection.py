@@ -413,8 +413,18 @@ class GAConfig:
     crossover_rate: float = 0.7
     mutation_rate: float = 0.05
     tournament_size: int = 3
-    n_splits: int = 4
-    min_features: int = 10
+    # FIX: 4 splits on an already-small candidate pool gave a very noisy
+    # fitness signal (mean_fitness swinging ~0.53-0.97 between generations
+    # in practice) — each fold's test AUC was based on too few positives to
+    # be stable. More folds -> more, smaller, but averaged evaluations.
+    n_splits: int = 6
+    # FIX: previously this was implicitly forced to equal rfecv_min_features//2
+    # by run_pipeline() below, so the GA would converge exactly to its own
+    # configured wall and it looked like "10 features is optimal" when it was
+    # really just "10 is the floor I was given." Lowering the default here
+    # (and decoupling it from rfecv_min_features in run_pipeline) lets the GA
+    # actually explore smaller subsets instead of hitting a hidden ceiling.
+    min_features: int = 5
     max_features: Optional[int] = None
     random_state: int = 42
 
@@ -553,7 +563,10 @@ def run_pipeline(
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
     boruta_alpha: float = 0.05,
-    rfecv_min_features: int = 20,
+    # FIX: 20 was too close to typical Boruta output (~24 in practice), so
+    # RFECV took a single elimination step and produced a 2-point "curve"
+    # instead of an actual elbow. Lower default so it walks a real range.
+    rfecv_min_features: int = 8,
     rfecv_step: int = 5,
     run_genetic_polish: bool = True,
     ga_config: Optional[GAConfig] = None,
@@ -591,7 +604,15 @@ def run_pipeline(
     ga_features = None
     if run_genetic_polish:
         logger.info("STAGE 4: genetic-algorithm polish")
-        cfg = ga_config or GAConfig(min_features=max(10, rfecv_min_features // 2))
+        # FIX: previously `min_features=max(10, rfecv_min_features // 2)` meant
+        # the GA's floor was mechanically derived from the RFECV parameter, so
+        # a run that produced ~24 RFECV survivors with rfecv_min_features=20
+        # would force the GA floor to exactly 10 — and the GA would obediently
+        # converge there every time, looking like a discovery when it was
+        # really just the wall it was given. GAConfig's own default (5) is
+        # independent of rfecv_min_features, so the GA can actually explore
+        # down to a genuinely small subset instead of a derived one.
+        cfg = ga_config or GAConfig()
         ga_features, ga_log = genetic_search(X[rfecv_features], y, dates, rfecv_features, w=w, config=cfg)
         ga_log.to_csv(out / "stage4_ga_log.csv", index=False)
 
@@ -647,7 +668,7 @@ def _cli() -> int:
     parser.add_argument("--corr-threshold", type=float, default=0.90)
     parser.add_argument("--boruta-iterations", type=int, default=100)
     parser.add_argument("--boruta-alpha", type=float, default=0.05)
-    parser.add_argument("--rfecv-min-features", type=int, default=20)
+    parser.add_argument("--rfecv-min-features", type=int, default=8)
     parser.add_argument("--rfecv-step", type=int, default=5)
     parser.add_argument("--skip-genetic", action="store_true")
     parser.add_argument("--output-dir", default="ml_models/feature_selection")
