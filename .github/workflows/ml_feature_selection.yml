@@ -27,7 +27,7 @@ on:
       corr_threshold:
         description: 'Correlation-cluster cut threshold (r)'
         required: false
-        default: '0.90'
+        default: '0.85'
         type: string
       boruta_iterations:
         description: 'Boruta shadow-feature iterations'
