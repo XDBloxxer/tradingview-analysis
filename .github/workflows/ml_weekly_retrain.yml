@@ -20,7 +20,7 @@ on:
       use_selected_features:
         description: 'Restrict to ml_models/feature_selection/selected_features.json (produced by the ML Feature Selection workflow) instead of all ~395 features'
         required: false
-        default: false
+        default: true
         type: boolean
 
 # CRITICAL: Grant write permissions to push model updates
