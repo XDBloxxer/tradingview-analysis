@@ -425,6 +425,8 @@ NON_FEATURE_COLS = {
     "actual_high_pct", "_sort_date",
     # Label-leaking columns: present in training tables but unavailable at prediction time
     "gain_pct", "volume_spike",
+    # TRUE GAIN TARGET FIX: the gain-regressor's own label columns — never features
+    "true_gain_pct", "_unified_gain_target",
     # Training metadata: table bookkeeping columns, not predictive signals
     "snapshot_date", "snapshot_type", "snapshot_time",
     "event_date", "days_since_event", "interval",
@@ -1679,6 +1681,186 @@ def _compute_correct_actual_high_pct(
 
 
 # ---------------------------------------------------------------------------
+# TRUE GAIN TARGET FIX: build the gain-regressor training label directly from
+# the market-day OHLC snapshots the pipeline already collects, instead of
+# ml_prediction_accuracy (a separate, yfinance-backed *tracking* table that
+# only has rows for symbols the model has already scored).
+#
+# WHY A NEW COLUMN NAME ("true_gain_pct") INSTEAD OF REUSING actual_high_pct:
+#   'actual_high_pct' is already overloaded with two incompatible meanings
+#   elsewhere in this file:
+#     1. ml_prediction_accuracy's own column — a post-hoc outcome captured by
+#        the accuracy tracker, sometimes prev_close-denominated, sometimes
+#        same-day-close-denominated depending on yfinance availability
+#        (see enrich_mistakes_with_gains's FIX2 notes above).
+#     2. The RC2-corrected version computed above in
+#        _compute_correct_actual_high_pct(), which uses prev_close.
+#   Mixing a third computation into that same column name would make the
+#   denominator-mismatch bugs even harder to diagnose. 'true_gain_pct' is
+#   used only for this pipeline, so it can never silently collide with either
+#   of the above.
+#
+# SOURCE TABLES (already written by intraday_data_collector.py — no yfinance
+# dependency, no dependency on the model having already scored the symbol):
+#   winners_market_close      / non_winners_market_close
+#       -> 'high' column, captured from the last 5-minute bar of the actual
+#          detection-day session (snapshot_time ~15:55-16:00). This is the
+#          closing-bar high, NOT a full-day intraday high — a stock that
+#          spiked mid-day and faded back down by the close will understate
+#          its true peak gain here. Still a real, directly-measured value
+#          with no external dependency, and a strictly better training
+#          signal than leaving the row unlabeled.
+#   winners_day_prior_close   / non_winners_day_prior_close
+#       -> 'close' column, captured from the prior trading day, but written
+#          with detection_date set to the SAME detection_date as the
+#          market_close snapshot (see intraday_data_collector.py's
+#          "Keep original detection date" comments). This is the correct
+#          prev_close denominator.
+# ---------------------------------------------------------------------------
+
+def fetch_market_snapshot_gain_targets(client: Client) -> pd.DataFrame:
+    """
+    Compute true_gain_pct = (market_close.high / day_prior_close.close - 1) * 100
+    for every (symbol, detection_date) pair that has both snapshots, for both
+    winners and non-winners.
+
+    Returns:
+        DataFrame with columns: symbol, detection_date, true_gain_pct, label
+        (label=1 for rows sourced from the winners_* tables, 0 for
+        non_winners_*). Empty DataFrame (same columns, zero rows) if none of
+        the four source tables could be used.
+    """
+    TABLE_PAIRS = [
+        ("winners_market_close",     "winners_day_prior_close",     1),
+        ("non_winners_market_close", "non_winners_day_prior_close", 0),
+    ]
+
+    frames = []
+    for market_table, prior_table, label in TABLE_PAIRS:
+        try:
+            market_df = fetch_table_paginated(client, market_table)
+        except Exception as e:
+            logger.warning(f"true_gain_pct: could not fetch '{market_table}': {e}")
+            continue
+        if market_df.empty:
+            logger.warning(f"true_gain_pct: '{market_table}' is empty — skipping")
+            continue
+        if "high" not in market_df.columns:
+            logger.warning(f"true_gain_pct: '{market_table}' has no 'high' column — skipping")
+            continue
+
+        try:
+            prior_df = fetch_table_paginated(client, prior_table)
+        except Exception as e:
+            logger.warning(f"true_gain_pct: could not fetch '{prior_table}': {e}")
+            continue
+        if prior_df.empty:
+            logger.warning(f"true_gain_pct: '{prior_table}' is empty — skipping")
+            continue
+        close_col = next((c for c in ("close", "Close") if c in prior_df.columns), None)
+        if close_col is None:
+            logger.warning(f"true_gain_pct: '{prior_table}' has no close column — skipping")
+            continue
+
+        m = market_df[["symbol", "detection_date", "high"]].copy()
+        p = prior_df[["symbol", "detection_date", close_col]].rename(columns={close_col: "prev_close"})
+
+        m["detection_date"] = pd.to_datetime(m["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        p["detection_date"] = pd.to_datetime(p["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        m = m.dropna(subset=["symbol", "detection_date"])
+        p = p.dropna(subset=["symbol", "detection_date"])
+        m = m.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+        p = p.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+
+        merged = m.merge(p, on=["symbol", "detection_date"], how="inner")
+        merged["high"]       = pd.to_numeric(merged["high"], errors="coerce")
+        merged["prev_close"] = pd.to_numeric(merged["prev_close"], errors="coerce")
+
+        valid = merged["high"].notna() & merged["prev_close"].notna() & (merged["prev_close"] > 0)
+        merged = merged[valid].copy()
+        if merged.empty:
+            logger.warning(
+                f"true_gain_pct: {market_table} x {prior_table} joined but no rows had "
+                "both a valid high and a valid prev_close — skipping"
+            )
+            continue
+
+        merged["true_gain_pct"] = ((merged["high"] / merged["prev_close"] - 1) * 100).clip(lower=0)
+        merged["label"] = label
+
+        logger.info(
+            f"true_gain_pct: {market_table} x {prior_table} -> {len(merged)} rows "
+            f"(range {merged['true_gain_pct'].min():.1f}%-{merged['true_gain_pct'].max():.1f}%, "
+            f"mean {merged['true_gain_pct'].mean():.1f}%)"
+        )
+        frames.append(merged[["symbol", "detection_date", "true_gain_pct", "label"]])
+
+    if not frames:
+        logger.warning(
+            "true_gain_pct: no market-snapshot gain data available from any source table — "
+            "gain regressor will fall back to ml_training_base.gain_pct / legacy accuracy-table sources."
+        )
+        return pd.DataFrame(columns=["symbol", "detection_date", "true_gain_pct", "label"])
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+    logger.info(f"true_gain_pct: {len(result)} total rows with market-snapshot-derived gain targets")
+    return result
+
+
+def attach_true_gain_targets(combined_df: pd.DataFrame, market_gain_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Merge true_gain_pct (from fetch_market_snapshot_gain_targets) onto
+    combined_df by (symbol, detection_date), and build a single unified gain
+    target column '_unified_gain_target' that the gain regressor reads first:
+
+        1. true_gain_pct           — market-snapshot-derived (T-1 rows; see above)
+        2. gain_pct                — ml_training_base's own pre-computed gain
+                                      column, previously collected but never
+                                      used as a regression target (only
+                                      excluded from the feature matrix to
+                                      avoid classifier leakage). Covers the
+                                      base-CSV rows that true_gain_pct can't
+                                      reach (they have no detection_date).
+
+    Rows with neither source populated are left NaN in '_unified_gain_target'
+    and train_gain_regressor() falls back to its legacy
+    actual_high_pct / actual_gain_pct / accuracy-table logic for them.
+    """
+    combined_df = combined_df.copy()
+
+    symbol_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
+    if symbol_col and "detection_date" in combined_df.columns and not market_gain_df.empty:
+        _key = pd.to_datetime(combined_df["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        _lookup = market_gain_df.set_index(["symbol", "detection_date"])["true_gain_pct"]
+        keys = list(zip(combined_df[symbol_col], _key))
+        combined_df["true_gain_pct"] = [_lookup.get(k, np.nan) for k in keys]
+        n_matched = combined_df["true_gain_pct"].notna().sum()
+        logger.info(f"true_gain_pct: matched onto {n_matched}/{len(combined_df)} combined_df rows")
+    else:
+        combined_df["true_gain_pct"] = np.nan
+        logger.info("true_gain_pct: nothing to merge (no market_gain_df data or no detection_date column)")
+
+    unified = combined_df["true_gain_pct"].copy()
+    if "gain_pct" in combined_df.columns:
+        gain_pct_numeric = pd.to_numeric(combined_df["gain_pct"], errors="coerce")
+        n_filled_from_base = int((unified.isna() & gain_pct_numeric.notna()).sum())
+        unified = unified.fillna(gain_pct_numeric)
+        logger.info(
+            f"true_gain_pct: filled {n_filled_from_base} additional rows from "
+            "ml_training_base.gain_pct (previously unused as a regression target)"
+        )
+
+    combined_df["_unified_gain_target"] = unified
+    n_total_unified = int(combined_df["_unified_gain_target"].notna().sum())
+    logger.info(
+        f"_unified_gain_target populated for {n_total_unified}/{len(combined_df)} rows "
+        "(true_gain_pct + ml_training_base.gain_pct combined)"
+    )
+    return combined_df
+
+
+# ---------------------------------------------------------------------------
 # Data preparation
 # ---------------------------------------------------------------------------
 
@@ -2827,7 +3009,14 @@ def train_gain_regressor(
     # that accuracy-table data can count toward the ≥30 threshold.
     # ------------------------------------------------------------------
     gain_col = None
-    for candidate in ("actual_high_pct", "actual_gain_pct", "change_pct"):
+    # TRUE GAIN TARGET FIX: '_unified_gain_target' (built in attach_true_gain_targets()
+    # from true_gain_pct — the market_close/day_prior_close snapshot join — and
+    # ml_training_base.gain_pct) is checked FIRST. It is a directly-measured,
+    # pipeline-native label with no yfinance/ml_prediction_accuracy dependency,
+    # and it covers both T-1 rows (via true_gain_pct) and base-CSV rows (via
+    # gain_pct, previously discarded entirely). The legacy columns below remain
+    # as a fallback for any deployment that hasn't backfilled the new tables yet.
+    for candidate in ("_unified_gain_target", "actual_high_pct", "actual_gain_pct", "change_pct"):
         if candidate in combined_df.columns:
             col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
             non_null = col_vals.notna().sum()
@@ -4098,6 +4287,15 @@ def main() -> int:
     # to appear as both a selected negative and a winner in the same training set.
     combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
 
+    # ── TRUE GAIN TARGET FIX: build the gain regressor's label from the ──────
+    # market_close/day_prior_close snapshot tables (+ ml_training_base.gain_pct
+    # for base rows) instead of ml_prediction_accuracy. See the docstrings on
+    # fetch_market_snapshot_gain_targets() / attach_true_gain_targets() above
+    # for why this replaces the old actual_high_pct-via-accuracy-table path.
+    logger.info("Fetching market-snapshot gain targets (true_gain_pct)...")
+    market_gain_df = fetch_market_snapshot_gain_targets(client)
+    combined_df = attach_true_gain_targets(combined_df, market_gain_df)
+
     # ── Mistake learning step — DISABLED ─────────────────────────────────────
     # Reason: with only ~18 mistakes in the corpus, the 3x/2x sample weights
     # create a circular feedback loop. Valid setups that fail due to market
@@ -4311,7 +4509,8 @@ def main() -> int:
     # If excluding the most-recent ~VAL_WEEKS compresses the gain distribution too
     # much, lower VAL_WEEKS (e.g. from 8 to 4) rather than reverting this fix.
     logger.info("\n" + "=" * 60)
-    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied)")
+    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied; "
+                "true_gain_pct market-snapshot target takes priority — see attach_true_gain_targets)")
     logger.info("=" * 60)
     # NOTE (supersedes the "EVALUATION INTEGRITY FIX" comment above): restricting
     # this to X_train / combined_df.loc[train_idx] was found to starve the
