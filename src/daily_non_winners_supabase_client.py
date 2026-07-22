@@ -5,10 +5,12 @@ Mirrors the structure of DailyWinnersSupabaseClient but for negative examples
 
 import logging
 import os
+import re
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import numpy as np
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 
 
 class DailyNonWinnersSupabaseClient:
@@ -167,7 +169,79 @@ class DailyNonWinnersSupabaseClient:
         except Exception as e:
             self.logger.debug(f"Could not check existing symbols in {table_name}: {e}")
             return set()
-    
+
+    # Matches the PostgREST "schema cache" error PostgREST/Supabase returns
+    # (code PGRST204) when a payload contains a column that doesn't exist in
+    # the target table, e.g.:
+    #   "Could not find the 'ema20_slope' column of 'non_winners_market_open' in the schema cache"
+    _MISSING_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column")
+
+    def _insert_with_schema_retry(self, table_name: str, rows: List[Dict[str, Any]],
+                                   use_upsert: bool = False):
+        """
+        Insert (or upsert) rows into `table_name`, self-healing against
+        PGRST204 "column not found in schema cache" errors.
+
+        The DataFrame that produces these rows can grow new derived
+        columns (e.g. new indicators like ema20_slope) that haven't been
+        added to the Supabase table yet. Rather than hard-failing the
+        entire batch (which caused non_winners_market_open/close and
+        non_winners_day_prior_open/close to silently write 0 rows), drop
+        any column PostgREST reports as unknown and retry, so the rest of
+        the (valid) data still gets written. A warning is logged listing
+        everything that was dropped so the schema drift is visible.
+
+        Returns the Supabase response from the (eventually) successful
+        insert/upsert.
+        """
+        rows = [dict(r) for r in rows]  # don't mutate caller's dicts
+        dropped_columns: set = set()
+
+        max_attempts = 25  # generous ceiling; one retry per bad column found
+        for attempt in range(max_attempts):
+            try:
+                if use_upsert:
+                    response = self.client.table(table_name).upsert(
+                        rows,
+                        ignore_duplicates=True,
+                        on_conflict="symbol,detection_date",
+                    ).execute()
+                else:
+                    response = self.client.table(table_name).insert(rows).execute()
+
+                if dropped_columns:
+                    self.logger.warning(
+                        f"Inserted into {table_name} after dropping column(s) not "
+                        f"present in the DB schema: {sorted(dropped_columns)}. "
+                        f"Add these columns to the table (or remove them from the "
+                        f"data pipeline) to stop this warning."
+                    )
+                return response
+            except APIError as e:
+                # postgrest.exceptions.APIError stores structured fields as
+                # attributes (.message/.code), NOT as a dict in .args[0] -
+                # .args[0] is just the pre-formatted repr string.
+                message = e.message or ""
+                code = e.code
+                match = self._MISSING_COLUMN_RE.search(message)
+                if code == "PGRST204" and match:
+                    bad_col = match.group(1)
+                    dropped_columns.add(bad_col)
+                    for r in rows:
+                        r.pop(bad_col, None)
+                    self.logger.debug(
+                        f"{table_name}: column '{bad_col}' not in DB schema, "
+                        f"dropping and retrying insert."
+                    )
+                    continue
+                # Not a recoverable schema-cache error - re-raise as-is
+                raise
+
+        raise RuntimeError(
+            f"Gave up inserting into {table_name} after {max_attempts} attempts "
+            f"dropping unknown columns: {sorted(dropped_columns)}"
+        )
+
     def write_non_winners(self, non_winners: List[Dict[str, Any]], allow_append: bool = False) -> int:
         """
         Write daily non-winners to Supabase.
@@ -224,16 +298,11 @@ class DailyNonWinnersSupabaseClient:
             # When appending to an existing date, use upsert with ignore_duplicates=True
             # so any symbols already in the DB are silently skipped rather than hard-erroring.
             # Normal inserts don't need this because the pre-filter above already removed them.
-            if allow_append:
-                response = self.client.table(self.tables["non_winners"]).upsert(
-                    sanitized_non_winners,
-                    ignore_duplicates=True,
-                    on_conflict="symbol,detection_date",
-                ).execute()
-            else:
-                response = self.client.table(self.tables["non_winners"]).insert(
-                    sanitized_non_winners
-                ).execute()
+            # _insert_with_schema_retry also self-heals if the payload has a
+            # column (e.g. ema20_slope) that isn't in this table's DB schema yet.
+            response = self._insert_with_schema_retry(
+                self.tables["non_winners"], sanitized_non_winners, use_upsert=allow_append
+            )
             
             count = len(response.data) if response.data else 0
             self.logger.info(f"Wrote {count} NEW non-winners to Supabase")
@@ -308,16 +377,12 @@ class DailyNonWinnersSupabaseClient:
 
                 # When appending to an existing date, use upsert with ignore_duplicates=True
                 # so any symbols already in the DB are silently skipped rather than hard-erroring.
-                if allow_append:
-                    response = self.client.table(self.tables[table_key]).upsert(
-                        sanitized_data,
-                        ignore_duplicates=True,
-                        on_conflict="symbol,detection_date",
-                    ).execute()
-                else:
-                    response = self.client.table(self.tables[table_key]).insert(
-                        sanitized_data
-                    ).execute()
+                # _insert_with_schema_retry also self-heals if the payload has a
+                # column (e.g. ema20_slope) that isn't in this table's DB schema yet,
+                # instead of letting PostgREST reject the whole batch (PGRST204).
+                response = self._insert_with_schema_retry(
+                    self.tables[table_key], sanitized_data, use_upsert=allow_append
+                )
                 
                 count = len(response.data) if response.data else 0
                 counts[data_type] = count
