@@ -414,7 +414,17 @@ XGBOOST_PARAMS = {
     "use_label_encoder":  False,
     "random_state":       42,
     "n_jobs":             -1,
-    "early_stopping_rounds": 100,  # Raised from 50 — prevents stopping at 34 trees.
+    # Lowered from 100 → 40. At 100 rounds of patience with n_estimators=500,
+    # training was running to best_iteration≈478 — i.e. XGBoost kept adding
+    # trees for as long as loss kept improving on X_val_xgb, which is also the
+    # set the classification report / probability distribution are evaluated
+    # on. That's model selection against the "held-out" set, not a blind
+    # evaluation, and it manifested as a bimodal (hard 0 / hard 1) probability
+    # collapse on X_val_xgb that did NOT appear on the truly untouched
+    # calibration set (X_cal_fit), which stayed well-spread (std≈0.44) the
+    # whole time. 40 rounds of patience still tolerates normal noisy plateaus
+    # but stops the model well before it can memorize X_val_xgb round-by-round.
+    "early_stopping_rounds": 50,
 }
 
 # Columns excluded from the feature matrix X.
@@ -4732,6 +4742,74 @@ def main() -> int:
     logger.info("Val set probability distribution (early-stop holdout):")
     for bucket, count in dist.items():
         logger.info(f"  {str(bucket):<20} {count:>4}")
+
+    # ── Evaluate classifier on the truly blind calibration holdout ───────────
+    # X_val_xgb (above) was used by XGBoost's early_stopping_rounds to decide
+    # how many trees to build, so metrics on it are model-selection-influenced,
+    # not a blind evaluation — that's what produced the bimodal collapse
+    # investigated on 2026-07-22 (X_val_xgb collapsed to hard 0/0.9-1.0 while
+    # X_cal_fit, never touched during tree-building, stayed well-spread).
+    #
+    # X_cal_fit isn't perfectly blind either — it was used to fit the isotonic
+    # calibrator — so its calibrated *probability values* are still slightly
+    # optimistic. But XGBoost's tree structure and early-stopping point were
+    # never chosen using X_cal_fit, so its AUC/ranking behaviour is a much
+    # more honest estimate of generalization than X_val_xgb's, and is the
+    # number to trust if the two disagree.
+    if X_cal_fit is not None and y_cal_fit is not None:
+        cal_proba_report = model.predict_proba(X_cal_fit)[:, 1]
+        cal_pred_report  = (cal_proba_report >= 0.5).astype(int)
+
+        try:
+            cal_auc = roc_auc_score(y_cal_fit, cal_proba_report)
+            logger.info(
+                f"Validation AUC-ROC: {cal_auc:.4f} "
+                f"(evaluated on blind calibration holdout, n={len(y_cal_fit)}) "
+                "— trust this over the early-stop-holdout AUC above if they diverge."
+            )
+        except Exception:
+            cal_auc = float("nan")
+            logger.warning("Calibration-holdout AUC-ROC: nan (only one class in set)")
+
+        logger.info("Classification report (val — blind calibration holdout):")
+        for line in classification_report(y_cal_fit, cal_pred_report).split("\n"):
+            if line.strip():
+                logger.info(f"  {line}")
+
+        cal_proba_report_series = pd.Series(cal_proba_report)
+        cal_dist = pd.cut(cal_proba_report_series, bins=bins).value_counts().sort_index()
+        logger.info("Val set probability distribution (blind calibration holdout):")
+        for bucket, count in cal_dist.items():
+            logger.info(f"  {str(bucket):<20} {count:>4}")
+
+        cal_gap_count = int(((cal_proba_report_series > 0.15) & (cal_proba_report_series < 0.85)).sum())
+        if cal_gap_count < 5:
+            logger.warning(
+                f"  ⚠️  BIMODAL COLLAPSE detected on blind calibration holdout too: "
+                f"only {cal_gap_count} predictions in 0.15–0.85 range. "
+                "This set was never used for early stopping, so a collapse here points "
+                "at the base model / data (e.g. leakage, near-duplicate rows) rather "
+                "than early-stopping overfit."
+            )
+        else:
+            logger.info(
+                f"  ✅ {cal_gap_count} predictions in mid-range (0.15–0.85) on the blind "
+                "calibration holdout — distribution looks healthy."
+            )
+
+        if auc is not None and not (auc != auc) and abs(auc - cal_auc) > 0.03:
+            logger.warning(
+                f"  ⚠️  Early-stop-holdout AUC ({auc:.4f}) and blind calibration-holdout "
+                f"AUC ({cal_auc:.4f}) diverge by more than 0.03. This gap is itself a "
+                "diagnostic: it suggests early stopping is fitting X_val_xgb specifically "
+                "rather than a generalizable stopping point. Consider lowering "
+                "early_stopping_rounds further and/or increasing calibration-set size."
+            )
+    else:
+        logger.info(
+            "No blind calibration holdout available (val set too small to split) — "
+            "only the early-stop-holdout metrics above are available this run."
+        )
 
     gap_count = int(((val_proba_series > 0.15) & (val_proba_series < 0.85)).sum())
     if gap_count < 5:
