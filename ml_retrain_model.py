@@ -2256,6 +2256,39 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
         f"{n_base_rows} base rows (flag=0)"
     )
 
+    # ── OPTIONAL: restrict to a pre-computed feature subset ────────────────
+    # If src/ml_predictor/feature_selection.py has been run (see that module's
+    # docstring), it writes ml_models/feature_selection/selected_features.json.
+    # Setting USE_SELECTED_FEATURES=1 in the environment restricts X to that
+    # subset instead of all ~395 raw columns. Default behaviour (flag unset)
+    # is unchanged — nothing about this file's normal operation depends on
+    # the feature_selection module.
+    if os.environ.get("USE_SELECTED_FEATURES", "").lower() in ("1", "true", "yes"):
+        selected_path = Path("ml_models/feature_selection/selected_features.json")
+        if selected_path.exists():
+            with open(selected_path) as f:
+                selected = json.load(f).get("final_features", [])
+            missing = [c for c in selected if c not in X.columns]
+            if missing:
+                logger.warning(
+                    f"USE_SELECTED_FEATURES: {len(missing)} selected features "
+                    f"not present in current data (schema drift): {missing[:10]}..."
+                )
+            keep = [c for c in selected if c in X.columns]
+            if "has_t1_features" in X.columns and "has_t1_features" not in keep:
+                keep.append("has_t1_features")
+            X = X[keep]
+            logger.info(
+                f"USE_SELECTED_FEATURES active — restricted to {X.shape[1]} features "
+                f"from {selected_path}"
+            )
+        else:
+            logger.warning(
+                f"USE_SELECTED_FEATURES=1 but {selected_path} not found — "
+                "run `python -m src.ml_predictor.feature_selection` first. "
+                "Falling back to the full feature set."
+            )
+
     logger.info(f"Feature matrix: {X.shape[0]} rows × {X.shape[1]} features")
     nan_pct = X.isna().mean().mean() * 100
     logger.info(f"Overall NaN rate: {nan_pct:.1f}% (expected for cross-lag rows)")
