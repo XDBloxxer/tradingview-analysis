@@ -70,7 +70,27 @@ features, report = correlation_cluster_selection(X, y, corr_threshold=0.85)
   merging genuinely distinct signals; 0.85–0.90 is a reasonable range.
 - `--boruta-iterations`: 100 is a solid default; bump to 200+ if the
   confirmed/tentative split near the boundary looks noisy.
-- `--rfecv-min-features` / `--rfecv-step`: smaller step = finer-grained
-  elbow curve but more XGBoost fits (slower).
+- `--rfecv-min-features` (default 8): keep this well below your expected
+  Boruta output count. If it's set close to (or above) how many features
+  Boruta actually confirms, RFECV only gets to take one elimination step
+  and you get a 2-point "curve" instead of a real elbow — check
+  `stage3_rfecv_curve.csv` and confirm it has more than 2-3 rows.
+- `GAConfig.min_features` (default 5) is intentionally independent of
+  `--rfecv-min-features`. Earlier versions derived the GA's floor from the
+  RFECV parameter, so the GA would mechanically converge to that derived
+  wall and it looked like a discovered optimum. Don't reintroduce that
+  coupling — if you want the GA to explore a narrower range, set
+  `GAConfig(min_features=..., max_features=...)` explicitly and treat it
+  as a constraint you chose, not a result.
+- `GAConfig.n_splits` (default 6): the GA's fitness is walk-forward CV AUC
+  on a small candidate pool — too few folds makes `mean_fitness` swing
+  wildly between generations (a real run showed it bouncing ~0.53-0.97).
+  If `stage4_ga_log.csv`'s `mean_fitness` column is still noisy at 6 splits,
+  go higher before trusting the winning subset.
+- Stability check worth doing occasionally: run the whole pipeline 2-3
+  times with different `--boruta-iterations`/seeds and diff
+  `final_features` across runs. Large churn between runs means the GA step
+  is picking up noise rather than signal — lean on the Boruta/RFECV output
+  instead, which is more stable by construction.
 - The genetic step is the most expensive stage per feature — only run it
   once the pool is already down to Boruta/RFECV survivors (roughly 60-150).
