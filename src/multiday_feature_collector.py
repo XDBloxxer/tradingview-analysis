@@ -99,11 +99,17 @@ PANDAS_TA_TO_BASE: Dict[str, str] = {
     # VWAP
     "VWAP_D": "vwap",
     # Manually computed fields (see helpers section below)
-    # NOTE: raw OHLCV (open/high/low/close/volume) are intentionally excluded.
-    # Price-level features are weak out-of-sample (splits, delistings, survivor
-    # bias) and were shown to dominate feature importance (t3_high at 19.2%),
-    # which indicates the model was learning price level rather than signal.
-    # Only derived / normalised indicators are kept.
+    # Raw OHLCV are collected again below (open/high/low/close/volume).
+    # They are NOT excluded here anymore — the classifier still never sees
+    # them because ml_retrain_model.py's NON_FEATURE_COLS strips
+    # t3_open/high/low/close/volume (and t5_/t10_ equivalents) from the
+    # feature matrix regardless of whether they exist in the DB. The gain
+    # regressor also does not use these directly (it gets its own in-memory
+    # log_price feature derived from T-1 data, not from these columns).
+    # Kept here for downstream analysis / backfill / potential future use,
+    # with the overfitting risk (splits, delistings, survivor bias) that
+    # motivated the original exclusion still fully mitigated on the model side.
+    "open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume",
     "gap_pct": "gap_pct",
     "volume_ratio": "volume_ratio",
     "obv_sma20": "obv_sma20",
@@ -132,6 +138,13 @@ TIMEFRAMES = {
 # ---------------------------------------------------------------------------
 DB_COLUMNS: set = {
     "symbol", "detection_date",
+    # ── Raw OHLCV, restored ────────────────────────────────────────────────
+    # Requires these columns to exist in Supabase already (user is backfilling
+    # historical values separately) — added here so _sanitize no longer strips
+    # them before upsert.
+    "t3_open", "t3_high", "t3_low", "t3_close", "t3_volume",
+    "t5_open", "t5_high", "t5_low", "t5_close", "t5_volume",
+    "t10_open", "t10_high", "t10_low", "t10_close", "t10_volume",
     # ── t10 ──────────────────────────────────────────────────────────────────
     "t10_adx_14", "t10_adxr_14_2", "t10_ao", "t10_aroond_25", "t10_aroonosc_25",
     "t10_aroonu_25", "t10_atr_14", "t10_atr_14_slope", "t10_atr_20", "t10_atr_7",
