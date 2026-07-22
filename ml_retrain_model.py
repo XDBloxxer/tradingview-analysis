@@ -2884,12 +2884,22 @@ _HIGH_GAIN_MULTIPLIER = 3.0     # FIX #9: Reduced from 5.0 (was 40x total, now 9
                                  # surface and pushed all predictions toward the high end.
 
 
+
+# Minimum number of gain-labeled rows required in the classifier's TRAIN split
+# before we trust a leak-free regressor fit.  If the train-only pool falls
+# short of this, train_gain_regressor() falls back to training on the full
+# (train+val) pool instead — but it does so loudly, via the return value
+# and a logged warning, rather than silently.  See LEAK-FREE FIX below.
+MIN_TRAIN_ONLY_GAIN_ROWS = 200
+
+
 def train_gain_regressor(
     X_scaled: pd.DataFrame,           # RC3 FIX: receive pre-scaled features
     combined_df: pd.DataFrame,
     feature_names: list[str],
     client: Client,
     accuracy_gain_map: "Optional[dict]" = None,  # ISSUE 2 FIX: pre-fetched from main() to avoid redundant DB query
+    _is_fallback_retry: bool = False,  # internal — set True on the leaky-fallback recursive call
 ) -> "Optional[object]":
     """
     Train a regression model to predict actual % gain for stocks the
@@ -3289,6 +3299,64 @@ def train_gain_regressor(
         return None
 
     # ------------------------------------------------------------------
+    # LEAK-FREE FIX (reinstated): the caller (main()) now passes ONLY the
+    # classifier's train-split rows here by default (X_train / combined_df
+    # .loc[train_idx]), so this function's own internal 80/20 time split is
+    # drawn entirely from data the classifier already trained on — no
+    # overlap with the classifier's held-out val/cal windows.
+    #
+    # This was previously reverted (see the superseded "NOTE" left in main()
+    # below) because, at the time, virtually all gain-labeled rows came from
+    # true_gain_pct (the market-snapshot join), which only exists for recent
+    # T-1 rows — i.e. exactly the rows living in the classifier's val window.
+    # Restricting to train_idx therefore left ~0 labeled rows.
+    #
+    # That is no longer the whole picture: attach_true_gain_targets() also
+    # backfills '_unified_gain_target' from ml_training_base.gain_pct, which
+    # is populated across the FULL historical span of the base CSV, not just
+    # the recent val window. That gives the train split real, broadly-
+    # distributed gain labels even after excluding the most recent VAL_WEEKS.
+    #
+    # We still don't take this on faith: if the train-only pool genuinely
+    # doesn't clear MIN_TRAIN_ONLY_GAIN_ROWS, we fall back to the old
+    # (leaky) full-dataset behaviour rather than training on a starved
+    # sample — but we do it visibly, via a WARNING and a metadata flag,
+    # instead of silently baking leakage into every run.
+    # ------------------------------------------------------------------
+    if not _is_fallback_retry and n_valid < MIN_TRAIN_ONLY_GAIN_ROWS:
+        logger.warning(
+            f"LEAK-FREE FIX: only {n_valid} gain-labeled rows in the train-only "
+            f"pool passed to this function (need ≥{MIN_TRAIN_ONLY_GAIN_ROWS} to "
+            "trust a leak-free split). Falling back to training the gain "
+            "regressor on the FULL (train+val) pool instead. This reintroduces "
+            "train/val overlap for the regressor ONLY (the classifier is "
+            "unaffected) — its reported val MAE/R² should be treated as "
+            "optimistic. This fallback should disappear on its own as more "
+            "gain-labeled history accumulates."
+        )
+        _full_df = getattr(train_gain_regressor, "_full_combined_df", None)
+        _full_X  = getattr(train_gain_regressor, "_full_X_scaled", None)
+        if _full_df is not None and _full_X is not None:
+            fallback_model = train_gain_regressor(
+                X_scaled=_full_X,
+                combined_df=_full_df,
+                feature_names=feature_names,
+                client=client,
+                accuracy_gain_map=accuracy_gain_map,
+                _is_fallback_retry=True,
+            )
+            if fallback_model is not None:
+                fallback_model._trained_leak_free = False  # type: ignore[attr-defined]
+            return fallback_model
+        else:
+            logger.warning(
+                "LEAK-FREE FIX: no full-dataset fallback was registered by the "
+                "caller — proceeding with the train-only pool despite being "
+                f"below the {MIN_TRAIN_ONLY_GAIN_ROWS}-row threshold. Results "
+                "may be noisy."
+            )
+
+    # ------------------------------------------------------------------
     # RC3 FIX: Use X_scaled (already StandardScaler-transformed), not raw
     # ------------------------------------------------------------------
     # BUG 4 FIX: align X_scaled to combined_df by shared index labels rather
@@ -3538,6 +3606,10 @@ def train_gain_regressor(
 
     # Store a flag so explosion_predictor.py knows to apply expm1 at inference
     regressor._log_transformed_target = True  # type: ignore[attr-defined]
+    # LEAK-FREE FIX: mark whether this fit came from the train-only pool
+    # (leak-free) or the full train+val fallback pool (see guard above).
+    # main() reads this to log/record it in model_metadata.json.
+    regressor._trained_leak_free = not _is_fallback_retry  # type: ignore[attr-defined]
 
     return regressor
 
@@ -4512,18 +4584,22 @@ def main() -> int:
     logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied; "
                 "true_gain_pct market-snapshot target takes priority — see attach_true_gain_targets)")
     logger.info("=" * 60)
-    # NOTE (supersedes the "EVALUATION INTEGRITY FIX" comment above): restricting
-    # this to X_train / combined_df.loc[train_idx] was found to starve the
-    # regressor entirely. Because the classifier's val split is the most recent
-    # ~VAL_WEEKS window, and virtually all rows with real gain data (T-1 rows
-    # and ml_prediction_accuracy matches) fall in that same recent window,
-    # train_idx structurally contained zero gain-labeled rows — the regressor
-    # always saw "0 rows with gain data" and fell back to the hardcoded
-    # _GAIN_CURVE regardless of how much data existed. train_gain_regressor
-    # performs its own internal time-based train/val split for its reported
-    # metrics, so passing the full dataset here restores real training data
-    # without affecting the classifier's own AUC/val evaluation (computed
-    # separately, above/below, from X_val_xgb).
+    # LEAK-FREE FIX (re-reinstated, 2026-07): the earlier "NOTE" here reverted
+    # to passing the FULL (train+val) pool because train_idx-only data used
+    # to structurally contain ~0 gain-labeled rows (true_gain_pct only exists
+    # for recent T-1 rows, i.e. exactly the val window). That is no longer
+    # the whole picture: attach_true_gain_targets() now also backfills
+    # '_unified_gain_target' from ml_training_base.gain_pct, which spans the
+    # FULL historical range of the base CSV — so the train split has real,
+    # broadly time-distributed gain labels even after VAL_WEEKS is excluded.
+    #
+    # We pass train-only data by default. train_gain_regressor() itself
+    # checks whether that pool actually clears MIN_TRAIN_ONLY_GAIN_ROWS; if
+    # it doesn't (e.g. a sparse/early-stage deployment), it falls back to the
+    # full pool registered below (right before the call) via
+    # _full_combined_df/_full_X_scaled — but logs a loud warning and tags the
+    # resulting model as not leak-free (regressor._trained_leak_free = False)
+    # rather than silently reverting every run regardless of data volume.
     # ── REGRESSOR-ONLY log_price FEATURE ──────────────────────────────────────
     # The classifier must never see raw price level (that's the whole reason
     # OHLCV columns are in NON_FEATURE_COLS — "expensive stocks explode more"
@@ -4555,13 +4631,41 @@ def main() -> int:
         f"({X_scaled.shape[1]} shared with classifier + log_price)"
     )
 
+    # LEAK-FREE FIX: register the full (train+val) pool as the fallback that
+    # train_gain_regressor() will use ONLY if the train-only pool doesn't
+    # clear MIN_TRAIN_ONLY_GAIN_ROWS. Registered as function attributes so
+    # the internal fallback-retry call (which recurses with the same
+    # function object) can reach it without changing every call signature
+    # up the stack.
+    train_gain_regressor._full_combined_df = combined_df
+    train_gain_regressor._full_X_scaled    = X_scaled_gain
+
+    # Train-only slice: same rows the classifier trained on (train_idx),
+    # matched between combined_df and the scaled feature matrix.
+    combined_df_train_only = combined_df.loc[train_idx]
+    X_scaled_gain_train_only = X_scaled_gain.reindex(train_idx)
+
     gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled_gain,                     # classifier's matrix + regressor-only log_price
-        combined_df=combined_df,                    # full dataset, matching X_scaled row order
+        X_scaled=X_scaled_gain_train_only,          # LEAK-FREE FIX: train rows only (was: full X_scaled_gain)
+        combined_df=combined_df_train_only,         # LEAK-FREE FIX: train rows only (was: full combined_df)
         feature_names=feature_names,
         client=client,                              # RC1: fallback fetch if map not supplied
         accuracy_gain_map=_accuracy_gain_map,       # ISSUE 2 FIX: reuse RC3 fetch, no redundant DB query
     )
+
+    if gain_regressor is not None:
+        _leak_free = getattr(gain_regressor, "_trained_leak_free", None)
+        if _leak_free is True:
+            logger.info(
+                "  ✅ Gain regressor trained leak-free (train-split-only data; "
+                "no overlap with classifier val/cal rows)."
+            )
+        elif _leak_free is False:
+            logger.warning(
+                "  ⚠️  Gain regressor fell back to the full train+val pool "
+                "(train-only data was below MIN_TRAIN_ONLY_GAIN_ROWS). "
+                "Its reported val MAE/R² should be treated as optimistic."
+            )
 
     # ── Evaluate classifier ───────────────────────────────────────────────────
     # AUC is reported on X_val_xgb (the early-stopping half of the val set)
@@ -4658,8 +4762,13 @@ def main() -> int:
             if not t1_df.empty else False
         ),
         "gain_regressor_trained":  gain_regressor is not None,
+        "gain_regressor_leak_free": (
+            getattr(gain_regressor, "_trained_leak_free", None)
+            if gain_regressor is not None else None
+        ),
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
-                                    "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
+                                    "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights",
+                                    "LEAK_FREE_train_split_only_with_fallback"],
     }
 
     # ── Save ──────────────────────────────────────────────────────────────────
