@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""
+feature_selection.py — 4-stage feature reduction pipeline
+===========================================================
+
+Reduces the ~395-feature matrix used by ml_retrain_model.py down to a small,
+statistically-defensible subset, using the same time-aware (walk-forward)
+splitting scheme already used elsewhere in this repo for the train/val split.
+
+Stages (each is independently callable; run_pipeline() chains all four):
+
+  1. correlation_cluster_selection()
+       Hierarchical-clusters features on `1 - |correlation|`, cuts the tree at
+       `corr_threshold`, and keeps one representative per cluster (highest
+       |correlation| with the label, tie-broken by lowest NaN rate). Free,
+       model-agnostic, and typically the single biggest reduction.
+
+  2. boruta_select()
+       Self-contained shadow-feature permutation test (the "real" version of
+       "shuffle a column and see if it still matters"). Each real feature is
+       duplicated as a shuffled shadow copy; an XGBoost model is trained on
+       real+shadow columns; any real feature that beats the best shadow
+       feature's importance is scored a "hit". Repeated for n_iterations, and
+       a two-sided binomial test (same test the reference Boruta R/py package
+       uses) decides Confirmed / Rejected / Tentative at significance `alpha`.
+
+  3. rfecv_time_aware()
+       Recursive Feature Elimination with walk-forward (not random/k-fold) CV,
+       reusing the same "most recent slice held out" philosophy as
+       train_val_split() in ml_retrain_model.py. Produces a score-vs-feature-
+       count curve so you can eyeball or auto-pick the elbow.
+
+  4. genetic_search() [optional polish step]
+       Genetic-algorithm search over subsets of the ~60-150 RFECV survivors.
+       Each candidate subset is scored with *nested* walk-forward CV (mean
+       across folds), not a single static split, to discourage p-hacking a
+       lucky subset. Only worth running once the candidate pool is small
+       (RFECV output), since the search space explodes otherwise.
+
+Nothing in this file talks to Supabase or touches the production model files.
+It operates purely on an (X, y, dates[, w]) triple and writes its artifacts
+(selected_features.json + a few CSV/JSON diagnostics) to an output directory.
+See the `if __name__ == "__main__":` block for a ready-to-run CLI that pulls
+the same training data ml_retrain_model.py uses.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import fcluster, linkage
+from scipy.spatial.distance import squareform
+from scipy.stats import binomtest
+from sklearn.metrics import roc_auc_score
+
+logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+# Shared: time-aware (walk-forward) CV splitter
+# ===========================================================================
+
+def time_aware_splits(
+    dates: pd.Series,
+    n_splits: int = 5,
+    min_train_frac: float = 0.4,
+    gap: int = 0,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """
+    Walk-forward CV splits ordered by `dates` (ties broken by index order).
+
+    Unlike sklearn.model_selection.TimeSeriesSplit (which needs the frame
+    pre-sorted and gives you positional folds), this works directly off a
+    date column so it matches the "sort by detection/event date, hold out
+    the most recent slice" logic already used in train_val_split().
+
+    Rows with NaT dates are always placed in the train portion of every fold
+    (mirrors FIX 2 in ml_retrain_model.train_val_split — mistake/undated rows
+    must never leak into a validation slice).
+
+    Returns a list of (train_idx, test_idx) pairs of *positional* indices
+    into `dates.reset_index(drop=True)`. Each successive fold's test window
+    is a later, non-overlapping slice of the timeline — this is the walk-
+    forward scheme the caller should reuse instead of random/K-fold CV.
+    """
+    d = pd.to_datetime(dates, errors="coerce").reset_index(drop=True)
+    n = len(d)
+    nat_mask = d.isna()
+
+    dated_pos = np.where(~nat_mask)[0]
+    order = dated_pos[np.argsort(d.iloc[dated_pos].values)]  # positions sorted by date
+
+    n_dated = len(order)
+    start = int(n_dated * min_train_frac)
+    if n_dated - start < n_splits:
+        raise ValueError(
+            f"Not enough dated rows ({n_dated}) for {n_splits} walk-forward "
+            f"folds with min_train_frac={min_train_frac}. Reduce n_splits."
+        )
+
+    fold_edges = np.linspace(start, n_dated, n_splits + 1, dtype=int)
+    nat_positions = np.where(nat_mask)[0]
+
+    splits = []
+    for i in range(n_splits):
+        train_end = fold_edges[i]
+        test_end = fold_edges[i + 1]
+        train_pos = order[: max(train_end - gap, 0)]
+        test_pos = order[train_end:test_end]
+        train_pos = np.concatenate([train_pos, nat_positions])
+        splits.append((train_pos, test_pos))
+    return splits
+
+
+def _prep_xy(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, np.ndarray]:
+    Xc = X.copy()
+    for c in Xc.columns:
+        Xc[c] = pd.to_numeric(Xc[c], errors="coerce")
+    Xc = Xc.replace([np.inf, -np.inf], np.nan)
+    return Xc, y.astype(int).values
+
+
+# ===========================================================================
+# Stage 1 — Correlation clustering
+# ===========================================================================
+
+def correlation_cluster_selection(
+    X: pd.DataFrame,
+    y: pd.Series,
+    corr_threshold: float = 0.90,
+    method: str = "average",
+    min_periods: int = 30,
+) -> tuple[list[str], pd.DataFrame]:
+    """
+    Hierarchical-cluster features on `1 - |pairwise correlation|`, cut the
+    dendrogram at `corr_threshold`, keep one representative per cluster.
+
+    Representative choice, in priority order:
+      1. Highest |correlation| with the label y
+      2. Lowest NaN rate (best coverage)
+
+    Returns (selected_feature_names, cluster_report_df). The report has one
+    row per *original* feature with its cluster id and whether it was kept,
+    so you can audit what got dropped and why.
+    """
+    Xc, yv = _prep_xy(X, y)
+    cols = list(Xc.columns)
+
+    corr = Xc.corr(min_periods=min_periods).fillna(0.0)
+    corr = corr.reindex(index=cols, columns=cols).fillna(0.0)
+    dist = 1.0 - corr.abs().values
+    np.fill_diagonal(dist, 0.0)
+    dist = (dist + dist.T) / 2.0  # enforce exact symmetry against fp noise
+    dist[dist < 0] = 0.0
+
+    condensed = squareform(dist, checks=False)
+    Z = linkage(condensed, method=method)
+    cluster_ids = fcluster(Z, t=1.0 - corr_threshold, criterion="distance")
+
+    nan_rate = Xc.isna().mean()
+    label_corr = Xc.apply(lambda s: s.corr(pd.Series(yv, index=Xc.index)))
+    label_corr = label_corr.abs().fillna(0.0)
+
+    report_rows = []
+    selected = []
+    for cid in sorted(set(cluster_ids)):
+        members = [c for c, k in zip(cols, cluster_ids) if k == cid]
+        ranked = sorted(
+            members,
+            key=lambda c: (-label_corr.get(c, 0.0), nan_rate.get(c, 1.0)),
+        )
+        rep = ranked[0]
+        selected.append(rep)
+        for c in members:
+            report_rows.append({
+                "feature": c,
+                "cluster_id": int(cid),
+                "cluster_size": len(members),
+                "label_corr_abs": round(float(label_corr.get(c, 0.0)), 4),
+                "nan_rate": round(float(nan_rate.get(c, 1.0)), 4),
+                "kept_as_representative": c == rep,
+            })
+
+    report = pd.DataFrame(report_rows).sort_values(
+        ["cluster_size", "cluster_id"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    logger.info(
+        f"[corr-cluster] {len(cols)} -> {len(selected)} features "
+        f"({len(set(cluster_ids))} clusters at r={corr_threshold})"
+    )
+    return selected, report
+
+
+# ===========================================================================
+# Stage 2 — Boruta (shadow-feature permutation test)
+# ===========================================================================
+
+@dataclass
+class BorutaResult:
+    confirmed: list[str]
+    tentative: list[str]
+    rejected: list[str]
+    history: pd.DataFrame  # per-feature hit counts / p-values
+
+
+def boruta_select(
+    X: pd.DataFrame,
+    y: pd.Series,
+    w: Optional[pd.Series] = None,
+    n_iterations: int = 100,
+    alpha: float = 0.05,
+    max_depth: int = 6,
+    n_estimators: int = 100,
+    random_state: int = 42,
+    keep_tentative: bool = False,
+) -> BorutaResult:
+    """
+    Self-contained Boruta implementation (no external `boruta` package, so
+    there's no dependency on its now-unmaintained sklearn/numpy API surface).
+
+    Algorithm, repeated `n_iterations` times:
+      1. Build a shadow copy of every real feature by independently
+         shuffling its values (destroys any real relationship with y while
+         preserving the marginal distribution).
+      2. Fit an XGBoost classifier on [real | shadow] columns.
+      3. `shadow_max` = highest shadow-feature importance this round.
+      4. Any real feature whose importance beats shadow_max scores a "hit".
+
+    After all iterations, each feature's hit count is compared against a
+    Binomial(n_iterations, 0.5) null (the same null the reference Boruta
+    package uses — "a useless feature beats the max shadow ~50% of the time
+    by chance") via a two-sided binomial test. Confirmed = p < alpha and
+    hit-rate > 0.5; Rejected = p < alpha and hit-rate < 0.5; everything else
+    is Tentative.
+    """
+    import xgboost as xgb
+
+    Xc, yv = _prep_xy(X, y)
+    Xc = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
+    cols = list(Xc.columns)
+    n_pos = int((yv == 1).sum())
+    n_neg = int((yv == 0).sum())
+    spw = n_neg / max(n_pos, 1)
+    sample_weight = w.values if w is not None else None
+
+    rng = np.random.RandomState(random_state)
+    hits = pd.Series(0, index=cols)
+
+    for it in range(n_iterations):
+        shadow = Xc.apply(lambda s: rng.permutation(s.values))
+        shadow.columns = [f"shadow__{c}" for c in cols]
+        Xit = pd.concat([Xc, shadow], axis=1)
+
+        model = xgb.XGBClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            scale_pos_weight=spw,
+            random_state=random_state + it,
+            n_jobs=-1,
+            eval_metric="logloss",
+        )
+        model.fit(Xit, yv, sample_weight=sample_weight)
+        importances = pd.Series(model.feature_importances_, index=Xit.columns)
+
+        shadow_max = importances.filter(like="shadow__").max()
+        real_imp = importances.loc[cols]
+        hits[real_imp > shadow_max] += 1
+
+        if (it + 1) % max(1, n_iterations // 5) == 0:
+            logger.info(f"[boruta] iteration {it + 1}/{n_iterations}")
+
+    rows = []
+    confirmed, tentative, rejected = [], [], []
+    for c in cols:
+        k = int(hits[c])
+        p = binomtest(k, n_iterations, 0.5, alternative="two-sided").pvalue
+        hit_rate = k / n_iterations
+        if p < alpha and hit_rate > 0.5:
+            status = "confirmed"
+            confirmed.append(c)
+        elif p < alpha and hit_rate < 0.5:
+            status = "rejected"
+            rejected.append(c)
+        else:
+            status = "tentative"
+            tentative.append(c)
+        rows.append({
+            "feature": c, "hits": k, "hit_rate": round(hit_rate, 3),
+            "p_value": round(float(p), 5), "status": status,
+        })
+
+    history = pd.DataFrame(rows).sort_values("hit_rate", ascending=False).reset_index(drop=True)
+    logger.info(
+        f"[boruta] confirmed={len(confirmed)} tentative={len(tentative)} "
+        f"rejected={len(rejected)} (of {len(cols)}, {n_iterations} iterations)"
+    )
+    result = BorutaResult(confirmed=confirmed, tentative=tentative, rejected=rejected, history=history)
+    if keep_tentative:
+        result.confirmed = confirmed + tentative
+    return result
+
+
+# ===========================================================================
+# Stage 3 — RFECV with time-aware CV
+# ===========================================================================
+
+def rfecv_time_aware(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    w: Optional[pd.Series] = None,
+    min_features: int = 20,
+    step: int = 5,
+    n_splits: int = 5,
+    max_depth: int = 5,
+    n_estimators: int = 200,
+    random_state: int = 42,
+) -> tuple[list[str], pd.DataFrame]:
+    """
+    Manual RFECV loop (not sklearn.feature_selection.RFECV, which only
+    accepts a single scalar `cv` and would force either k-fold or a plain
+    generator without our walk-forward semantics baked in). At each step:
+
+      1. Score every remaining feature by mean CV-fold gain importance.
+      2. Drop the `step` weakest features.
+      3. Re-fit and re-evaluate with time_aware_splits().
+
+    Returns (features_at_best_score, curve_df) where curve_df has one row
+    per elimination round (n_features, mean_auc, std_auc) — plot this to
+    find the elbow ("AUC barely moves after 60 features, then degrades").
+    """
+    import xgboost as xgb
+
+    Xc, yv = _prep_xy(X, y)
+    Xc = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
+    remaining = list(Xc.columns)
+    splits = time_aware_splits(dates, n_splits=n_splits)
+    sample_weight = w.values if w is not None else np.ones(len(yv))
+
+    curve_rows = []
+    round_feature_sets = []
+
+    while True:
+        fold_aucs = []
+        importances_accum = pd.Series(0.0, index=remaining)
+
+        for train_pos, test_pos in splits:
+            if len(np.unique(yv[test_pos])) < 2 or len(np.unique(yv[train_pos])) < 2:
+                continue
+            model = xgb.XGBClassifier(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                scale_pos_weight=(yv[train_pos] == 0).sum() / max((yv[train_pos] == 1).sum(), 1),
+                random_state=random_state,
+                n_jobs=-1,
+                eval_metric="logloss",
+            )
+            model.fit(
+                Xc.iloc[train_pos][remaining], yv[train_pos],
+                sample_weight=sample_weight[train_pos],
+            )
+            proba = model.predict_proba(Xc.iloc[test_pos][remaining])[:, 1]
+            fold_aucs.append(roc_auc_score(yv[test_pos], proba))
+            importances_accum += pd.Series(model.feature_importances_, index=remaining)
+
+        mean_auc = float(np.mean(fold_aucs)) if fold_aucs else float("nan")
+        std_auc = float(np.std(fold_aucs)) if fold_aucs else float("nan")
+        curve_rows.append({"n_features": len(remaining), "mean_auc": mean_auc, "std_auc": std_auc})
+        round_feature_sets.append(list(remaining))
+        logger.info(f"[rfecv] n_features={len(remaining):4d}  mean_auc={mean_auc:.4f} +/- {std_auc:.4f}")
+
+        if len(remaining) <= min_features:
+            break
+
+        importances_accum /= max(len(fold_aucs), 1)
+        ranked = importances_accum.sort_values(ascending=True)
+        n_drop = min(step, len(remaining) - min_features)
+        to_drop = set(ranked.index[:n_drop])
+        remaining = [c for c in remaining if c not in to_drop]
+
+    curve = pd.DataFrame(curve_rows)
+    best_round = curve["mean_auc"].idxmax()
+    best_features = round_feature_sets[best_round]
+    logger.info(
+        f"[rfecv] best round: {curve.loc[best_round, 'n_features']} features, "
+        f"mean_auc={curve.loc[best_round, 'mean_auc']:.4f}"
+    )
+    return best_features, curve
+
+
+# ===========================================================================
+# Stage 4 — Genetic-algorithm subset search (optional polish)
+# ===========================================================================
+
+@dataclass
+class GAConfig:
+    population_size: int = 40
+    n_generations: int = 25
+    crossover_rate: float = 0.7
+    mutation_rate: float = 0.05
+    tournament_size: int = 3
+    n_splits: int = 4
+    min_features: int = 10
+    max_features: Optional[int] = None
+    random_state: int = 42
+
+
+def genetic_search(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    candidate_features: list[str],
+    w: Optional[pd.Series] = None,
+    config: Optional[GAConfig] = None,
+) -> tuple[list[str], pd.DataFrame]:
+    """
+    Genetic-algorithm search over subsets of `candidate_features`
+    (intended to be the ~60-150 survivors of rfecv_time_aware — the search
+    space is only tractable once it's been cut down that far).
+
+    Each individual is a bitmask over candidate_features. Fitness = mean
+    walk-forward CV AUC (via time_aware_splits, re-evaluated fresh for every
+    candidate — never reused from a cached static split) minus a small
+    penalty per feature, so the search doesn't just converge to "keep
+    everything".
+
+    Returns (best_feature_subset, generation_log_df).
+    """
+    import xgboost as xgb
+
+    config = config or GAConfig()
+    rng = random.Random(config.random_state)
+
+    Xc, yv = _prep_xy(X, y)
+    Xc = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
+    splits = time_aware_splits(dates, n_splits=config.n_splits)
+    sample_weight = w.values if w is not None else np.ones(len(yv))
+    n_feat = len(candidate_features)
+    max_features = config.max_features or n_feat
+    min_features = min(config.min_features, n_feat)
+
+    def random_individual() -> list[bool]:
+        k = rng.randint(min_features, max_features)
+        idx = set(rng.sample(range(n_feat), k))
+        return [i in idx for i in range(n_feat)]
+
+    def fitness(mask: list[bool]) -> float:
+        feats = [f for f, keep in zip(candidate_features, mask) if keep]
+        if len(feats) < min_features:
+            return -1.0
+        aucs = []
+        for train_pos, test_pos in splits:
+            if len(np.unique(yv[test_pos])) < 2 or len(np.unique(yv[train_pos])) < 2:
+                continue
+            model = xgb.XGBClassifier(
+                n_estimators=150, max_depth=4, learning_rate=0.08,
+                subsample=0.8, colsample_bytree=0.8,
+                scale_pos_weight=(yv[train_pos] == 0).sum() / max((yv[train_pos] == 1).sum(), 1),
+                random_state=config.random_state, n_jobs=-1, eval_metric="logloss",
+            )
+            model.fit(Xc.iloc[train_pos][feats], yv[train_pos], sample_weight=sample_weight[train_pos])
+            proba = model.predict_proba(Xc.iloc[test_pos][feats])[:, 1]
+            aucs.append(roc_auc_score(yv[test_pos], proba))
+        if not aucs:
+            return -1.0
+        return float(np.mean(aucs)) - 0.0005 * len(feats)  # tiny parsimony penalty
+
+    def tournament(pop: list, fits: list) -> list[bool]:
+        idxs = rng.sample(range(len(pop)), config.tournament_size)
+        best = max(idxs, key=lambda i: fits[i])
+        return pop[best]
+
+    def crossover(a: list[bool], b: list[bool]) -> tuple[list[bool], list[bool]]:
+        point = rng.randint(1, n_feat - 1)
+        return a[:point] + b[point:], b[:point] + a[point:]
+
+    def mutate(mask: list[bool]) -> list[bool]:
+        return [not bit if rng.random() < config.mutation_rate else bit for bit in mask]
+
+    population = [random_individual() for _ in range(config.population_size)]
+    log_rows = []
+    best_mask, best_fit = population[0], -1.0
+
+    for gen in range(config.n_generations):
+        fits = [fitness(ind) for ind in population]
+        gen_best_i = int(np.argmax(fits))
+        if fits[gen_best_i] > best_fit:
+            best_fit, best_mask = fits[gen_best_i], population[gen_best_i]
+        log_rows.append({
+            "generation": gen,
+            "best_fitness": float(np.max(fits)),
+            "mean_fitness": float(np.mean(fits)),
+            "best_n_features": int(sum(population[gen_best_i])),
+        })
+        logger.info(
+            f"[GA] gen {gen:3d}  best={np.max(fits):.4f}  mean={np.mean(fits):.4f}  "
+            f"n_features(best)={sum(population[gen_best_i])}"
+        )
+
+        new_pop = [population[gen_best_i]]  # elitism
+        while len(new_pop) < config.population_size:
+            p1, p2 = tournament(population, fits), tournament(population, fits)
+            if rng.random() < config.crossover_rate:
+                c1, c2 = crossover(p1, p2)
+            else:
+                c1, c2 = p1[:], p2[:]
+            new_pop.append(mutate(c1))
+            if len(new_pop) < config.population_size:
+                new_pop.append(mutate(c2))
+        population = new_pop
+
+    best_features = [f for f, keep in zip(candidate_features, best_mask) if keep]
+    log_df = pd.DataFrame(log_rows)
+    logger.info(f"[GA] final: {len(best_features)} features, fitness={best_fit:.4f}")
+    return best_features, log_df
+
+
+# ===========================================================================
+# Orchestrator
+# ===========================================================================
+
+@dataclass
+class PipelineResult:
+    stage0_features: list[str]
+    stage1_corr_features: list[str]
+    stage2_boruta_features: list[str]
+    stage3_rfecv_features: list[str]
+    stage4_ga_features: Optional[list[str]]
+    final_features: list[str]
+    artifacts_dir: Path
+
+
+def run_pipeline(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    w: Optional[pd.Series] = None,
+    output_dir: str | Path = "ml_models/feature_selection",
+    corr_threshold: float = 0.90,
+    boruta_iterations: int = 100,
+    boruta_alpha: float = 0.05,
+    rfecv_min_features: int = 20,
+    rfecv_step: int = 5,
+    run_genetic_polish: bool = True,
+    ga_config: Optional[GAConfig] = None,
+) -> PipelineResult:
+    """Run all four stages in sequence and persist artifacts to `output_dir`."""
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    logger.info("=" * 70)
+    logger.info(f"STAGE 0: starting from {X.shape[1]} features")
+    logger.info("=" * 70)
+
+    logger.info("STAGE 1: correlation clustering")
+    corr_features, corr_report = correlation_cluster_selection(X, y, corr_threshold=corr_threshold)
+    corr_report.to_csv(out / "stage1_correlation_clusters.csv", index=False)
+
+    logger.info("STAGE 2: Boruta shadow-feature test")
+    boruta_result = boruta_select(X[corr_features], y, w=w, n_iterations=boruta_iterations, alpha=boruta_alpha)
+    boruta_result.history.to_csv(out / "stage2_boruta_history.csv", index=False)
+    boruta_features = boruta_result.confirmed
+    if len(boruta_features) < rfecv_min_features:
+        logger.warning(
+            f"[boruta] only {len(boruta_features)} confirmed features (< "
+            f"rfecv_min_features={rfecv_min_features}) — including tentative features too."
+        )
+        boruta_features = boruta_result.confirmed + boruta_result.tentative
+
+    logger.info("STAGE 3: RFECV (time-aware walk-forward CV)")
+    rfecv_features, rfecv_curve = rfecv_time_aware(
+        X[boruta_features], y, dates, w=w,
+        min_features=rfecv_min_features, step=rfecv_step,
+    )
+    rfecv_curve.to_csv(out / "stage3_rfecv_curve.csv", index=False)
+
+    ga_features = None
+    if run_genetic_polish:
+        logger.info("STAGE 4: genetic-algorithm polish")
+        cfg = ga_config or GAConfig(min_features=max(10, rfecv_min_features // 2))
+        ga_features, ga_log = genetic_search(X[rfecv_features], y, dates, rfecv_features, w=w, config=cfg)
+        ga_log.to_csv(out / "stage4_ga_log.csv", index=False)
+
+    final_features = ga_features if ga_features is not None else rfecv_features
+
+    result = PipelineResult(
+        stage0_features=list(X.columns),
+        stage1_corr_features=corr_features,
+        stage2_boruta_features=boruta_features,
+        stage3_rfecv_features=rfecv_features,
+        stage4_ga_features=ga_features,
+        final_features=final_features,
+        artifacts_dir=out,
+    )
+
+    summary = {
+        "stage0_count": len(result.stage0_features),
+        "stage1_corr_count": len(result.stage1_corr_features),
+        "stage2_boruta_count": len(result.stage2_boruta_features),
+        "stage3_rfecv_count": len(result.stage3_rfecv_features),
+        "stage4_ga_count": len(ga_features) if ga_features is not None else None,
+        "final_count": len(final_features),
+        "final_features": final_features,
+        "corr_threshold": corr_threshold,
+        "boruta_iterations": boruta_iterations,
+        "boruta_alpha": boruta_alpha,
+        "rfecv_min_features": rfecv_min_features,
+    }
+    with open(out / "selected_features.json", "w") as f:
+        json.dump(summary, f, indent=2)
+
+    logger.info("=" * 70)
+    logger.info(
+        f"PIPELINE COMPLETE: {summary['stage0_count']} -> {summary['stage1_corr_count']} "
+        f"(corr) -> {summary['stage2_boruta_count']} (boruta) -> {summary['stage3_rfecv_count']} "
+        f"(rfecv)" + (f" -> {summary['stage4_ga_count']} (GA)" if ga_features is not None else "")
+    )
+    logger.info(f"Artifacts written to: {out}/")
+    logger.info("=" * 70)
+    return result
+
+
+# ===========================================================================
+# CLI — pulls the same training data ml_retrain_model.py uses
+# ===========================================================================
+
+def _cli() -> int:
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--corr-threshold", type=float, default=0.90)
+    parser.add_argument("--boruta-iterations", type=int, default=100)
+    parser.add_argument("--boruta-alpha", type=float, default=0.05)
+    parser.add_argument("--rfecv-min-features", type=int, default=20)
+    parser.add_argument("--rfecv-step", type=int, default=5)
+    parser.add_argument("--skip-genetic", action="store_true")
+    parser.add_argument("--output-dir", default="ml_models/feature_selection")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    # Reuse the exact same data-loading / feature-prep code path as the
+    # production retrain script, so the feature set this pipeline evaluates
+    # is identical to what train_model() actually sees.
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    import ml_retrain_model as rt  # noqa: E402
+
+    client = rt.get_supabase_client()
+    base_df = rt.load_base_training_data(client)
+    t1_df = rt.load_t1_data(client)
+    combined_df = rt.combine_datasets(base_df, t1_df)
+    X, y, w = rt.prepare_features(combined_df)
+
+    date_col = "detection_date" if "detection_date" in combined_df.columns else "event_date"
+    dates = combined_df[date_col] if date_col in combined_df.columns else pd.Series(pd.NaT, index=combined_df.index)
+
+    run_pipeline(
+        X, y, dates, w=w,
+        output_dir=args.output_dir,
+        corr_threshold=args.corr_threshold,
+        boruta_iterations=args.boruta_iterations,
+        boruta_alpha=args.boruta_alpha,
+        rfecv_min_features=args.rfecv_min_features,
+        rfecv_step=args.rfecv_step,
+        run_genetic_polish=not args.skip_genetic,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli())
