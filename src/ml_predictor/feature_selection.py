@@ -127,6 +127,45 @@ def _prep_xy(X: pd.DataFrame, y: pd.Series) -> tuple[pd.DataFrame, np.ndarray]:
     return Xc, y.astype(int).values
 
 
+def _quick_model_importance(
+    Xc: pd.DataFrame,
+    yv: np.ndarray,
+    random_state: int = 42,
+) -> pd.Series:
+    """
+    Single-fit XGBoost gain importance over the *full* feature matrix.
+
+    Used by correlation_cluster_selection() to pick cluster representatives
+    on the same kind of signal (nonlinear, interaction-aware model
+    importance) that every downstream stage (Boruta/RFECV/GA) actually
+    optimizes for — instead of raw Pearson correlation with y, which can
+    disagree with model importance and silently drop the real signal
+    carrier of a cluster before it ever reaches Boruta/RFECV/GA.
+
+    This is one extra cheap fit (not walk-forward, not CV) — good enough
+    for a representative-selection tiebreak, not meant to replace the
+    proper time-aware evaluation done in later stages.
+    """
+    import xgboost as xgb
+
+    Xf = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
+    n_pos = int((yv == 1).sum())
+    n_neg = int((yv == 0).sum())
+    model = xgb.XGBClassifier(
+        n_estimators=150,
+        max_depth=4,
+        learning_rate=0.08,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=n_neg / max(n_pos, 1),
+        random_state=random_state,
+        n_jobs=-1,
+        eval_metric="logloss",
+    )
+    model.fit(Xf, yv)
+    return pd.Series(model.feature_importances_, index=Xc.columns)
+
+
 # ===========================================================================
 # Stage 1 — Correlation clustering
 # ===========================================================================
@@ -143,8 +182,18 @@ def correlation_cluster_selection(
     dendrogram at `corr_threshold`, keep one representative per cluster.
 
     Representative choice, in priority order:
-      1. Highest |correlation| with the label y
-      2. Lowest NaN rate (best coverage)
+      1. Highest XGBoost gain importance from a single full-matrix fit
+         (see _quick_model_importance) — chosen instead of raw Pearson
+         label-correlation because downstream stages (Boruta/RFECV/GA) all
+         score features with model importance, not linear correlation.
+         Ranking cluster reps on a different signal than everything
+         downstream uses is exactly the kind of mismatch that can bury the
+         real signal carrier of a cluster (e.g. a nonlinear volatility
+         feature) behind a weaker but more linearly-correlated cluster-mate
+         before it ever reaches Boruta/RFECV/GA — producing run-to-run
+         "churn" that looks like noise but is actually a selection-metric
+         bug.
+      2. Lowest NaN rate (best coverage), as a tiebreak.
 
     Returns (selected_feature_names, cluster_report_df). The report has one
     row per *original* feature with its cluster id and whether it was kept,
@@ -165,6 +214,8 @@ def correlation_cluster_selection(
     cluster_ids = fcluster(Z, t=1.0 - corr_threshold, criterion="distance")
 
     nan_rate = Xc.isna().mean()
+    model_imp = _quick_model_importance(Xc, yv)
+    # Kept only for diagnostics in the report (no longer used to rank reps).
     label_corr = Xc.apply(lambda s: s.corr(pd.Series(yv, index=Xc.index)))
     label_corr = label_corr.abs().fillna(0.0)
 
@@ -174,7 +225,7 @@ def correlation_cluster_selection(
         members = [c for c, k in zip(cols, cluster_ids) if k == cid]
         ranked = sorted(
             members,
-            key=lambda c: (-label_corr.get(c, 0.0), nan_rate.get(c, 1.0)),
+            key=lambda c: (-model_imp.get(c, 0.0), nan_rate.get(c, 1.0)),
         )
         rep = ranked[0]
         selected.append(rep)
@@ -183,6 +234,7 @@ def correlation_cluster_selection(
                 "feature": c,
                 "cluster_id": int(cid),
                 "cluster_size": len(members),
+                "model_importance": round(float(model_imp.get(c, 0.0)), 5),
                 "label_corr_abs": round(float(label_corr.get(c, 0.0)), 4),
                 "nan_rate": round(float(nan_rate.get(c, 1.0)), 4),
                 "kept_as_representative": c == rep,
@@ -540,6 +592,140 @@ def genetic_search(
 
 
 # ===========================================================================
+# Stability wrapper — re-run Stages 1-3 across resamples, report frequency
+# ===========================================================================
+
+@dataclass
+class StabilityResult:
+    frequency: pd.DataFrame  # one row per feature: times_selected, frequency, mean_importance
+    stable_features: list[str]  # features selected in >= min_frequency of runs
+    per_run_features: list[list[str]]  # raw per-run RFECV output, for auditing
+
+
+def stability_select(
+    X: pd.DataFrame,
+    y: pd.Series,
+    dates: pd.Series,
+    w: Optional[pd.Series] = None,
+    n_runs: int = 8,
+    min_frequency: float = 0.75,
+    block_frac: float = 0.85,
+    corr_threshold: float = 0.90,
+    boruta_iterations: int = 100,
+    boruta_alpha: float = 0.05,
+    rfecv_min_features: int = 8,
+    rfecv_step: int = 5,
+    random_state: int = 42,
+) -> StabilityResult:
+    """
+    Answer "which features should I actually run" directly, instead of
+    eyeballing tallies across separately-launched pipeline runs by hand.
+
+    Re-runs Stages 1-3 (correlation clustering -> Boruta -> RFECV) `n_runs`
+    times, each time on a different contiguous block bootstrap of the
+    training window (resample rows in blocks, not i.i.d., to avoid
+    shuffling apart the time-series structure the walk-forward CV logic
+    elsewhere in this file relies on). The GA stage (4) is intentionally
+    excluded here — it's the noisiest stage and the one this function
+    exists to route around; run genetic_search() separately afterward on
+    `stable_features` if you still want a GA polish pass on a pre-vetted,
+    stable pool.
+
+    A feature's `frequency` is the fraction of the `n_runs` in which it
+    survived all the way to that run's RFECV output. `mean_importance` is
+    its average _quick_model_importance() score across the runs it
+    appeared in (NaN if it never appeared) — use this to break ties among
+    equally-stable features, the same way the retrained feature_importance
+    ranking was used earlier to prioritize among the old GA "stable 4".
+
+    Returns features with frequency >= min_frequency as `stable_features`,
+    but the full `frequency` table is the more useful artifact: it lets you
+    manually pick a cutoff instead of trusting a single hard-coded one.
+    """
+    rng = np.random.RandomState(random_state)
+    Xc, yv_full = _prep_xy(X, y)
+    n = len(Xc)
+    block_size = max(int(n * block_frac), 1)
+
+    counts: dict[str, int] = {}
+    importance_sums: dict[str, float] = {}
+    importance_counts: dict[str, int] = {}
+    per_run_features: list[list[str]] = []
+
+    for run_i in range(n_runs):
+        # Contiguous block resample: pick a random start, take a
+        # contiguous slice, wrapping around if needed. Preserves local
+        # time-ordering (required by time_aware_splits downstream) while
+        # still perturbing which rows/period the run sees, so cluster
+        # membership and Boruta/RFECV outcomes can actually vary run to
+        # run — that variation is the whole point of this function.
+        start = rng.randint(0, n)
+        idx = (np.arange(block_size) + start) % n
+        idx = np.sort(idx)
+
+        X_run = X.iloc[idx].reset_index(drop=True)
+        y_run = y.iloc[idx].reset_index(drop=True)
+        dates_run = dates.iloc[idx].reset_index(drop=True)
+        w_run = w.iloc[idx].reset_index(drop=True) if w is not None else None
+
+        logger.info(f"[stability] run {run_i + 1}/{n_runs} (n={len(X_run)})")
+
+        corr_features, _ = correlation_cluster_selection(
+            X_run, y_run, corr_threshold=corr_threshold,
+        )
+        boruta_result = boruta_select(
+            X_run[corr_features], y_run, w=w_run,
+            n_iterations=boruta_iterations, alpha=boruta_alpha,
+            random_state=random_state + run_i,
+        )
+        boruta_features = boruta_result.confirmed
+        if len(boruta_features) < rfecv_min_features:
+            boruta_features = boruta_result.confirmed + boruta_result.tentative
+
+        rfecv_features, _ = rfecv_time_aware(
+            X_run[boruta_features], y_run, dates_run, w=w_run,
+            min_features=rfecv_min_features, step=rfecv_step,
+            random_state=random_state + run_i,
+        )
+        per_run_features.append(rfecv_features)
+
+        Xc_run, yv_run = _prep_xy(X_run[rfecv_features], y_run)
+        run_importance = _quick_model_importance(Xc_run, yv_run, random_state=random_state + run_i)
+
+        for feat in rfecv_features:
+            counts[feat] = counts.get(feat, 0) + 1
+            importance_sums[feat] = importance_sums.get(feat, 0.0) + float(run_importance.get(feat, 0.0))
+            importance_counts[feat] = importance_counts.get(feat, 0) + 1
+
+    rows = []
+    for feat, k in counts.items():
+        mean_imp = importance_sums[feat] / importance_counts[feat]
+        rows.append({
+            "feature": feat,
+            "times_selected": k,
+            "frequency": round(k / n_runs, 3),
+            "mean_importance": round(mean_imp, 5),
+        })
+    frequency = pd.DataFrame(rows).sort_values(
+        ["frequency", "mean_importance"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    stable_features = frequency.loc[
+        frequency["frequency"] >= min_frequency, "feature"
+    ].tolist()
+
+    logger.info(
+        f"[stability] {len(stable_features)}/{len(frequency)} features "
+        f"selected in >= {min_frequency:.0%} of {n_runs} runs"
+    )
+    return StabilityResult(
+        frequency=frequency,
+        stable_features=stable_features,
+        per_run_features=per_run_features,
+    )
+
+
+# ===========================================================================
 # Orchestrator
 # ===========================================================================
 
@@ -570,10 +756,43 @@ def run_pipeline(
     rfecv_step: int = 5,
     run_genetic_polish: bool = True,
     ga_config: Optional[GAConfig] = None,
+    run_stability_check: bool = True,
+    stability_n_runs: int = 8,
+    stability_min_frequency: float = 0.75,
 ) -> PipelineResult:
-    """Run all four stages in sequence and persist artifacts to `output_dir`."""
+    """
+    Run the pipeline and persist artifacts to `output_dir`.
+
+    `run_stability_check` defaults to True: Stages 1-3 are first repeated
+    `stability_n_runs` times over block-bootstrapped resamples (see
+    stability_select()) and the per-feature selection frequency +
+    mean importance is written to `stability_frequency.csv`. This does not
+    change what feeds the rest of the pipeline (Boruta/RFECV/GA below still
+    run once on the full data, as before) — it's a diagnostic to check
+    whether that single run's output is actually stable, so you don't have
+    to eyeball tallies across separately-launched runs by hand.
+    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    if run_stability_check:
+        logger.info("STAGE 0.5: stability check (bootstrapped Stages 1-3)")
+        stability = stability_select(
+            X, y, dates, w=w,
+            n_runs=stability_n_runs,
+            min_frequency=stability_min_frequency,
+            corr_threshold=corr_threshold,
+            boruta_iterations=boruta_iterations,
+            boruta_alpha=boruta_alpha,
+            rfecv_min_features=rfecv_min_features,
+            rfecv_step=rfecv_step,
+        )
+        stability.frequency.to_csv(out / "stability_frequency.csv", index=False)
+        logger.info(
+            f"[stability] wrote {out / 'stability_frequency.csv'} — "
+            f"{len(stability.stable_features)} features stable at "
+            f">= {stability_min_frequency:.0%} frequency"
+        )
 
     logger.info("=" * 70)
     logger.info(f"STAGE 0: starting from {X.shape[1]} features")
@@ -671,6 +890,15 @@ def _cli() -> int:
     parser.add_argument("--rfecv-min-features", type=int, default=8)
     parser.add_argument("--rfecv-step", type=int, default=5)
     parser.add_argument("--skip-genetic", action="store_true")
+    parser.add_argument(
+        "--no-stability-check", action="store_true",
+        help="Skip the stability check (on by default): repeating Stages 1-3 "
+             "over block-bootstrapped resamples first and writing "
+             "stability_frequency.csv (per-feature selection frequency + "
+             "mean importance) before running the normal single-pass pipeline.",
+    )
+    parser.add_argument("--stability-n-runs", type=int, default=8)
+    parser.add_argument("--stability-min-frequency", type=float, default=0.75)
     parser.add_argument("--output-dir", default="ml_models/feature_selection")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -704,6 +932,9 @@ def _cli() -> int:
         rfecv_min_features=args.rfecv_min_features,
         rfecv_step=args.rfecv_step,
         run_genetic_polish=not args.skip_genetic,
+        run_stability_check=not args.no_stability_check,
+        stability_n_runs=args.stability_n_runs,
+        stability_min_frequency=args.stability_min_frequency,
     )
     return 0
 
