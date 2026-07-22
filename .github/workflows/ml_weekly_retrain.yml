@@ -17,6 +17,11 @@ on:
         required: false
         default: true
         type: boolean
+      use_selected_features:
+        description: 'Restrict to ml_models/feature_selection/selected_features.json (produced by the ML Feature Selection workflow) instead of all ~395 features'
+        required: false
+        default: false
+        type: boolean
 
 # CRITICAL: Grant write permissions to push model updates
 permissions:
@@ -50,6 +55,13 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TZ: 'America/New_York'
+          # Defaults to 'true' on the scheduled run so weekly retrains
+          # automatically pick up whatever the ML Feature Selection workflow
+          # last committed. Explicit workflow_dispatch input overrides this.
+          # prepare_features() falls back to the full feature set with a
+          # warning if selected_features.json doesn't exist yet, so this is
+          # safe even before feature selection has ever been run.
+          USE_SELECTED_FEATURES: ${{ github.event.inputs.use_selected_features || 'true' }}
         run: |
           LOOKBACK="${{ github.event.inputs.lookback_days }}"
           USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
