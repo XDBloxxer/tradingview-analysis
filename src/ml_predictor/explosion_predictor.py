@@ -905,6 +905,23 @@ class ExplosionPredictor:
             f"zero-var cols: {zero_var_cols} | "
             f"mean_std: {scaled_std.mean():.4f}"
         )
+        if zero_var_cols > 0:
+            zero_var_names = scaled_std[scaled_std < 1e-9].index.tolist()
+            self.logger.warning(f"ZERO-VAR COLUMN NAMES: {zero_var_names}")
+            for zv_name in zero_var_names:
+                if zv_name in X.columns:
+                    raw_vals = X[zv_name]
+                    self.logger.warning(
+                        f"  {zv_name}: raw live values -> "
+                        f"min={raw_vals.min()}, max={raw_vals.max()}, "
+                        f"unique={raw_vals.nunique()}, sample={raw_vals.head(5).tolist()}"
+                    )
+        # Flag the columns with the LARGEST post-scaling std too — these are
+        # most likely driving an inflated mean_std (e.g. a 689016-style figure),
+        # since one wildly out-of-distribution column dominates the average
+        # far more than several merely "drifted" ones do.
+        top_std = scaled_std.sort_values(ascending=False).head(5)
+        self.logger.warning(f"TOP 5 HIGHEST post-scaling std columns: {top_std.to_dict()}")
         if zero_var_cols > len(self.feature_names) * 0.5:
             self.logger.warning(
                 "MORE THAN HALF of features are zero-variance after scaling. "
