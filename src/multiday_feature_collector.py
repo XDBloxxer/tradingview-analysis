@@ -501,10 +501,26 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
         df["macd_roc"] = df["MACD_12_26_9"].pct_change(1) * 100
 
     # ── Historical Volatility ─────────────────────────────────────────────────
-    log_ret = np.log(close / close.shift(1))
-    df["hv_10"] = log_ret.rolling(10).std() * np.sqrt(252) * 100
-    df["hv_20"] = log_ret.rolling(20).std() * np.sqrt(252) * 100
-    df["hv_30"] = log_ret.rolling(30).std() * np.sqrt(252) * 100
+    # MATCHED TO backfill_multiday_features.py (2026-07-24 fix):
+    # The historical t3_/t5_/t10_ hv_10/20/30 columns that the model was
+    # trained on were built by backfill_multiday_features.py using SIMPLE
+    # (pct_change) returns, not log returns:
+    #     df["HV_30"] = close.pct_change().rolling(window=30).std() * sqrt(252) * 100
+    # This collector previously used np.log(close/close.shift(1)) instead,
+    # which is a materially different number for volatile/explosive stocks
+    # (large daily moves make simple and log returns diverge). That train/serve
+    # formula mismatch showed up as severe PSI feature drift (t5_hv_30,
+    # t10_hv_30, t10_hv_10, etc. all >2.0, some >5.0) in live scoring.
+    # backfill_multiday_features.py is not invoked anywhere in the live
+    # pipeline (confirmed: no imports, no workflow calls it) — it only ran
+    # once to seed historical data — so we match ITS formula here rather than
+    # touching it, since re-deriving thousands of historical rows isn't
+    # practical and the live side is the one that's wrong relative to what
+    # the model actually learned from.
+    pct_ret = close.pct_change()
+    df["hv_10"] = pct_ret.rolling(10).std() * np.sqrt(252) * 100
+    df["hv_20"] = pct_ret.rolling(20).std() * np.sqrt(252) * 100
+    df["hv_30"] = pct_ret.rolling(30).std() * np.sqrt(252) * 100
 
     # ── ADXR (pandas_ta does not output ADXR; compute as 2-period SMA of ADX) ──────
     if "ADX_14" in df.columns:
