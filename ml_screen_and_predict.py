@@ -904,6 +904,22 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         else:                          obv_vals.append(obv_vals[-1])
     ind["obv"] = float(obv_vals[-1])
 
+    # ── Volume → ratio to volume_sma20 ───────────────────────────────────────
+    # FIX (2026-07-24): this local _compute_indicators duplicate had diverged
+    # from src/intraday_data_collector.py's _normalize(), which divides
+    # volume_sma5/volume_sma10/obv by volume_sma20 so they're scale-free
+    # ratios (matching how the model was trained) instead of raw share
+    # counts. That missing step was producing t1_close_Volume_MA5,
+    # t1_open_Volume_MA5, and t1_open_Volume_MA10 values in the hundreds of
+    # thousands to millions live, versus a ~0.5-3.0 ratio in training —
+    # a multi-million-x scale mismatch after StandardScaler transform.
+    _safe_vm20 = vm20.replace(0, np.nan)
+    _last_vm20 = float(vm20.iloc[-1]) if len(vm20) else 0.0
+    ind["volume_sma5"]  = safe(vm5 / _safe_vm20, 1.0)
+    ind["volume_sma10"] = safe(vm10 / _safe_vm20, 1.0)
+    ind["obv"]          = (ind["obv"] / _last_vm20) if _last_vm20 else 0.0
+    ind["volume_sma20"] = 1.0
+
     # ── CMF ────────────────────────────────────────────────────────────────
     # With <20 bars v.rolling(20).sum() is all-NaN, causing safe() to return
     # 0.0 (instead of a real Chaikin Money Flow value).  Use the full
