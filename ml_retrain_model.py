@@ -2905,26 +2905,30 @@ def compute_feature_importance(
 # the distortion from outliers far more than a hard cap.
 _GAIN_WINSOR_PCT = 99.5   # winsorize above this percentile
 
-# Weight multiplier applied to winner rows in regressor training.
-# The training set is overwhelmingly non-winners (label=0, gain≈0-5%).
-# Without boosting winner weights the regressor learns "predict ~5%" for
-# everything and never reaches 50%+ territory.
-_WINNER_WEIGHT_MULTIPLIER = 3.0    # FIX #9: Reduced from 8.0.
-                                    # With ~15% positive rate, 8× was equivalent to
-                                    # training on a ~59% winner dataset (8×15% / (8×15%+85%)),
-                                    # causing the regressor to underfit non-winner rows.
-                                    # This explains the suspiciously high gain floor (~22%)
-                                    # seen in prediction logs — even the worst-ranked stock
-                                    # received a high predicted gain because non-winner rows
-                                    # were barely seen during training.
-                                    # 3× gives ~35% effective winner rate, a more balanced
-                                    # training signal while still teaching the regressor that
-                                    # high-gain regimes exist.
+# RC8 FIX: Winner up-weighting is now DATA-DRIVEN, mirroring exactly how
+# train_model() derives the classifier's scale_pos_weight (n_neg/n_pos,
+# clamped to [SPW_MIN, SPW_MAX]) instead of a fixed number picked by hand.
+# The old approach (_WINNER_WEIGHT_MULTIPLIER = 3.0, tuned down from 8.0,
+# tuned down from who-knows-what before that) was a guess that had to be
+# re-guessed every time the winner/non-winner ratio in the training data
+# shifted. Computing it from n_non_winners/n_winners on THIS run's actual
+# training pool (see train_gain_regressor below) means the weight adapts
+# automatically as more winner data accumulates, exactly like the
+# classifier's scale_pos_weight does. The constants below are only the
+# clamp bounds (and the legacy fallback values used only if the training
+# pool is degenerate — e.g. zero winners).
+REG_WINNER_WEIGHT_MIN = 2.0     # never weight winners less than 2x
+REG_WINNER_WEIGHT_MAX = 8.0     # never let the data-driven ratio run away
+                                # unboundedly on a very winner-scarce run
+_WINNER_WEIGHT_MULTIPLIER = 3.0    # legacy fallback if n_winners or
+                                    # n_non_winners is 0 (ratio undefined)
 
 _HIGH_GAIN_THRESHOLD  = 30.0    # Lowered from 50% — more winners qualify for the boost
-_HIGH_GAIN_MULTIPLIER = 3.0     # FIX #9: Reduced from 5.0 (was 40x total, now 9x total).
-                                 # 40× weight made high-gain outliers dominate the loss
-                                 # surface and pushed all predictions toward the high end.
+REG_HIGH_GAIN_WEIGHT_MIN = 1.5   # additional multiplier on top of the winner
+REG_HIGH_GAIN_WEIGHT_MAX = 5.0   # weight above, also computed from the actual
+                                  # high-gain / other-winner ratio in this run's data
+_HIGH_GAIN_MULTIPLIER = 3.0     # legacy fallback if n_high_gain or
+                                 # n_other_winners is 0
 
 
 
@@ -3441,26 +3445,63 @@ def train_gain_regressor(
     )
 
     # ------------------------------------------------------------------
-    # RC7 FIX: Heavily up-weight winner rows, especially large-gain ones.
-    # The training set has far more non-winner rows (gain ≈ 0–5%) than
-    # winner rows (gain can be 50–5000%).  A 2× winner bonus is lost in
-    # the noise — we need a much stronger signal for the regressor to
-    # learn that high-gain stocks are a distinct regime.
+    # RC8 FIX: Up-weight winner rows (and high-gain winners within them)
+    # using the SAME data-driven approach train_model() uses for the
+    # classifier's scale_pos_weight: compute the actual class-imbalance
+    # ratio in this run's training pool, then clamp it to sane bounds.
+    # This replaces the old fixed multipliers (_WINNER_WEIGHT_MULTIPLIER /
+    # _HIGH_GAIN_MULTIPLIER), which had to be hand-re-tuned (8.0→3.0,
+    # 5.0→3.0) every time the winner ratio in the data shifted, and were
+    # the direct cause of the "regressor predictions clustered near
+    # 0–5%" issue once the ratio drifted from when those constants were
+    # last hand-tuned.
     # ------------------------------------------------------------------
     winner_mask_valid = (combined_df["label"] == 1) & valid_gain_mask
     high_gain_mask = winner_mask_valid & (gain_targets >= _HIGH_GAIN_THRESHOLD)
 
+    n_winners     = int(winner_mask_valid.sum())
+    n_non_winners = int((~winner_mask_valid).sum())
+    if n_winners > 0 and n_non_winners > 0:
+        raw_winner_w = n_non_winners / n_winners
+        winner_weight = max(REG_WINNER_WEIGHT_MIN, min(REG_WINNER_WEIGHT_MAX, raw_winner_w))
+    else:
+        raw_winner_w = None
+        winner_weight = _WINNER_WEIGHT_MULTIPLIER  # degenerate case fallback
+
+    n_high_gain     = int(high_gain_mask.sum())
+    n_other_winners = n_winners - n_high_gain
+    if n_high_gain > 0 and n_other_winners > 0:
+        raw_high_gain_w = n_other_winners / n_high_gain
+        high_gain_weight = max(REG_HIGH_GAIN_WEIGHT_MIN, min(REG_HIGH_GAIN_WEIGHT_MAX, raw_high_gain_w))
+    else:
+        raw_high_gain_w = None
+        high_gain_weight = _HIGH_GAIN_MULTIPLIER  # degenerate case fallback
+
     if winner_mask_valid.any():
         w_reg = w_reg.copy()
-        w_reg[winner_mask_valid] *= _WINNER_WEIGHT_MULTIPLIER
+        w_reg[winner_mask_valid] *= winner_weight
         if high_gain_mask.any():
-            w_reg[high_gain_mask] *= _HIGH_GAIN_MULTIPLIER
+            w_reg[high_gain_mask] *= high_gain_weight
             logger.info(
-                f"  RC7: up-weighted {winner_mask_valid.sum()} winner rows ×{_WINNER_WEIGHT_MULTIPLIER}, "
-                f"{high_gain_mask.sum()} high-gain (≥{_HIGH_GAIN_THRESHOLD}%) rows ×{_WINNER_WEIGHT_MULTIPLIER * _HIGH_GAIN_MULTIPLIER:.0f} total"
+                f"  RC8: winner weight={winner_weight:.2f} "
+                f"(raw neg/pos={n_non_winners}/{n_winners}"
+                f"{f'={raw_winner_w:.2f}' if raw_winner_w is not None else ''}, "
+                f"clamped to [{REG_WINNER_WEIGHT_MIN}, {REG_WINNER_WEIGHT_MAX}]) "
+                f"applied to {n_winners} winner rows; "
+                f"high-gain weight={high_gain_weight:.2f} "
+                f"(raw other/high={n_other_winners}/{n_high_gain}"
+                f"{f'={raw_high_gain_w:.2f}' if raw_high_gain_w is not None else ''}, "
+                f"clamped to [{REG_HIGH_GAIN_WEIGHT_MIN}, {REG_HIGH_GAIN_WEIGHT_MAX}]) "
+                f"applied to {n_high_gain} rows (×{winner_weight * high_gain_weight:.1f} total)"
             )
         else:
-            logger.info(f"  RC7: up-weighted {winner_mask_valid.sum()} winner rows ×{_WINNER_WEIGHT_MULTIPLIER}")
+            logger.info(
+                f"  RC8: winner weight={winner_weight:.2f} "
+                f"(raw neg/pos={n_non_winners}/{n_winners}"
+                f"{f'={raw_winner_w:.2f}' if raw_winner_w is not None else ''}, "
+                f"clamped to [{REG_WINNER_WEIGHT_MIN}, {REG_WINNER_WEIGHT_MAX}]) "
+                f"applied to {n_winners} winner rows"
+            )
 
     X_reg_valid = X_reg[valid_gain_mask]
     y_reg_valid = y_reg[valid_gain_mask]
@@ -4879,6 +4920,7 @@ def main() -> int:
         ),
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
                                     "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights",
+                                    "RC8_data_driven_winner_weighting",
                                     "LEAK_FREE_train_split_only_with_fallback"],
     }
 
