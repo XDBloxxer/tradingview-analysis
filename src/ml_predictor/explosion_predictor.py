@@ -896,6 +896,23 @@ class ExplosionPredictor:
         features_df = self.prepare_features(data_df)
         X           = features_df[self.feature_names].copy()
         self._check_feature_drift(X)  # PSI drift check on raw (pre-scaled) features
+
+        # TEMP DEBUG (2026-07-24) — print raw live values for the
+        # persistently-drifted features next to their training percentile
+        # range, to see actual numbers instead of just the PSI score.
+        _debug_feats = ["t5_hv_30", "t10_hv_30", "t10_hv_10", "t5_kcle_20_2"]
+        _train_dist = self.metadata.get("top10_feature_distribution", {})
+        for _df_name in _debug_feats:
+            if _df_name in X.columns:
+                _vals = X[_df_name].dropna()
+                _tp = _train_dist.get(_df_name, {}).get("percentiles", [])
+                self.logger.warning(
+                    f"RAW LIVE {_df_name}: min={_vals.min():.2f} "
+                    f"p25={_vals.quantile(0.25):.2f} median={_vals.median():.2f} "
+                    f"p75={_vals.quantile(0.75):.2f} max={_vals.max():.2f} | "
+                    f"TRAIN p10-p90=[{_tp[1] if len(_tp)>1 else 'NA'}, {_tp[9] if len(_tp)>9 else 'NA'}]"
+                )
+
         X_scaled    = self._scale_features(X)
 
         scaled_std    = X_scaled.std()
