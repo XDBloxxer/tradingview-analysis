@@ -4715,6 +4715,45 @@ def main() -> int:
         f"({X_scaled.shape[1]} shared with classifier + log_price)"
     )
 
+    # ── REGRESSOR-ONLY clf_probability FEATURE (RC9 FIX) ──────────────────────
+    # Root cause of "STRONG BUY / BUY gain estimates aren't higher than HOLD":
+    # the gain regressor was trained purely on price/volume/technical features
+    # and never saw the classifier's own confidence score. It had no way to
+    # learn "the classifier is very sure this one is a winner → predict a
+    # bigger gain" because that information simply wasn't in its feature
+    # matrix. RC8's data-driven winner weighting fixed the OVERALL scale of
+    # gain predictions, but couldn't fix this — weighting affects how hard
+    # the loss penalises winner rows, not what information the model has
+    # available to tell winners apart from each other.
+    #
+    # Fix: expose the classifier's predicted probability as an explicit
+    # regressor feature (clf_probability). This lets XGBoost learn a direct
+    # probability→gain relationship on top of the raw technical features,
+    # so a STRONG BUY (prob≈0.95) and a BUY (prob≈0.75) are no longer forced
+    # to share a prediction just because their underlying indicators look
+    # similar — the confidence gap itself becomes a splittable feature.
+    #
+    # Note: probabilities here come from the classifier's predict_proba on
+    # X_scaled for the SAME rows used to train the classifier, so on the
+    # training set this feature is mildly optimistic (not an out-of-fold
+    # estimate). We accept that: the point isn't to squeeze out extra
+    # predictive accuracy, it's to give the regressor the confidence signal
+    # at all. At inference time explosion_predictor.py computes fresh
+    # predict_proba() output on genuinely unseen data, so no leakage reaches
+    # actual predictions.
+    try:
+        clf_probability = pd.Series(
+            model.predict_proba(X_scaled)[:, 1], index=X_scaled.index
+        )
+    except Exception as e:
+        logger.warning(f"RC9: Could not compute clf_probability feature ({e}) — skipping")
+        clf_probability = pd.Series(np.nan, index=X_scaled.index)
+    X_scaled_gain = X_scaled_gain.assign(clf_probability=clf_probability)
+    logger.info(
+        f"RC9: Added clf_probability feature to gain regressor "
+        f"(mean={clf_probability.mean():.3f}, std={clf_probability.std():.3f})"
+    )
+
     # LEAK-FREE FIX: register the full (train+val) pool as the fallback that
     # train_gain_regressor() will use ONLY if the train-only pool doesn't
     # clear MIN_TRAIN_ONLY_GAIN_ROWS. Registered as function attributes so
