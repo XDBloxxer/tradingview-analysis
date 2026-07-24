@@ -517,6 +517,9 @@ def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
     # touching it, since re-deriving thousands of historical rows isn't
     # practical and the live side is the one that's wrong relative to what
     # the model actually learned from.
+  # TEMP DEBUG — remove after confirming deploy
+    import sys
+    print("HV_FORMULA_VERSION: pct_change_2026-07-24", file=sys.stderr)
     pct_ret = close.pct_change()
     df["hv_10"] = pct_ret.rolling(10).std() * np.sqrt(252) * 100
     df["hv_20"] = pct_ret.rolling(20).std() * np.sqrt(252) * 100
