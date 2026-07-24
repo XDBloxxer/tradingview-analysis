@@ -2930,6 +2930,15 @@ REG_HIGH_GAIN_WEIGHT_MAX = 5.0   # weight above, also computed from the actual
 _HIGH_GAIN_MULTIPLIER = 3.0     # legacy fallback if n_high_gain or
                                  # n_other_winners is 0
 
+# RC9: Additional multiplier applied to winner rows, scaled by classifier
+# confidence (clf_proba), on top of the RC8 winner/high-gain weights above.
+# A 50%-confidence winner gets ~REG_CONFIDENCE_WEIGHT_MIN (near-neutral);
+# a near-100%-confidence winner (strong-buy territory) gets pulled toward
+# REG_CONFIDENCE_WEIGHT_MAX, so the regressor is penalised more heavily for
+# under-predicting gain on exactly the rows the classifier is most sure about.
+REG_CONFIDENCE_WEIGHT_MIN = 1.0
+REG_CONFIDENCE_WEIGHT_MAX = 2.5
+
 
 
 # Minimum number of gain-labeled rows required in the classifier's TRAIN split
@@ -3502,6 +3511,43 @@ def train_gain_regressor(
                 f"clamped to [{REG_WINNER_WEIGHT_MIN}, {REG_WINNER_WEIGHT_MAX}]) "
                 f"applied to {n_winners} winner rows"
             )
+
+    # ------------------------------------------------------------------
+    # RC9 FIX: Further up-weight winner rows by classifier confidence.
+    # RC8 already up-weights all winners uniformly, but a 51%-confidence
+    # winner and a 99%-confidence (strong-buy) winner get the same weight —
+    # so the regressor has no extra incentive to get the high-confidence
+    # rows' magnitude right, and those are exactly the rows where the
+    # reported gain kept coming out too low. Since clf_proba is now a
+    # feature in X_scaled (see the "REGRESSOR-ONLY clf_proba FEATURE" block
+    # in main()), we can also use it here, at training time, to scale the
+    # winner-row weight itself: within the winner rows, higher classifier
+    # confidence -> proportionally more weight, on top of (not replacing)
+    # the RC8 winner/high-gain multipliers above.
+    # ------------------------------------------------------------------
+    if winner_mask_valid.any() and "clf_proba" in X_reg.columns:
+        conf = X_reg.loc[winner_mask_valid, "clf_proba"].reindex(w_reg.index).fillna(0.5)
+        # Map confidence in [0, 1] onto a [REG_CONFIDENCE_WEIGHT_MIN, MAX]
+        # multiplier so a 50%-confidence winner keeps roughly its RC8 weight
+        # (multiplier ~1x) while a near-100%-confidence winner gets boosted.
+        confidence_multiplier = (
+            REG_CONFIDENCE_WEIGHT_MIN
+            + (REG_CONFIDENCE_WEIGHT_MAX - REG_CONFIDENCE_WEIGHT_MIN)
+            * conf.clip(0.0, 1.0)
+        )
+        w_reg = w_reg.copy()
+        w_reg.loc[winner_mask_valid] *= confidence_multiplier
+        logger.info(
+            f"  RC9: classifier-confidence weight boost applied to "
+            f"{int(winner_mask_valid.sum())} winner rows "
+            f"(multiplier range [{REG_CONFIDENCE_WEIGHT_MIN}, {REG_CONFIDENCE_WEIGHT_MAX}] "
+            f"scaled by clf_proba; mean confidence={conf.mean():.3f})"
+        )
+    elif winner_mask_valid.any():
+        logger.info(
+            "  RC9: skipped — clf_proba not present in this run's feature "
+            "matrix (older training path); winner rows keep RC8 weighting only."
+        )
 
     X_reg_valid = X_reg[valid_gain_mask]
     y_reg_valid = y_reg[valid_gain_mask]
@@ -4709,49 +4755,28 @@ def main() -> int:
     log_price = np.log1p(_price_source).reindex(X_scaled.index)
     log_price = log_price.fillna(log_price.mean())  # match X_scaled's "no raw NaN into XGBoost" convention
 
-    X_scaled_gain = X_scaled.assign(log_price=log_price)
-    logger.info(
-        f"Gain regressor feature matrix: {X_scaled_gain.shape[1]} features "
-        f"({X_scaled.shape[1]} shared with classifier + log_price)"
+    # ── REGRESSOR-ONLY clf_proba FEATURE ──────────────────────────────────────
+    # Tie gain-magnitude predictions to how confident the classifier is that
+    # a move is happening at all. The classifier's calibrated probability is
+    # already a strong summary of "how explosive does this setup look" —
+    # feeding it to the regressor lets high-confidence strong-buy/buy rows
+    # pull toward higher predicted gains instead of the regressor treating a
+    # 51%-confidence row and a 99%-confidence row as equally likely to have
+    # any given magnitude of gain.
+    #
+    # `model` here is the fully trained + calibrated classifier from
+    # train_model() above, so this is the same probability the classifier
+    # itself reports for these rows — not a leaky re-derivation.
+    clf_proba = pd.Series(
+        model.predict_proba(X_scaled)[:, 1],
+        index=X_scaled.index,
+        name="clf_proba",
     )
 
-    # ── REGRESSOR-ONLY clf_probability FEATURE (RC9 FIX) ──────────────────────
-    # Root cause of "STRONG BUY / BUY gain estimates aren't higher than HOLD":
-    # the gain regressor was trained purely on price/volume/technical features
-    # and never saw the classifier's own confidence score. It had no way to
-    # learn "the classifier is very sure this one is a winner → predict a
-    # bigger gain" because that information simply wasn't in its feature
-    # matrix. RC8's data-driven winner weighting fixed the OVERALL scale of
-    # gain predictions, but couldn't fix this — weighting affects how hard
-    # the loss penalises winner rows, not what information the model has
-    # available to tell winners apart from each other.
-    #
-    # Fix: expose the classifier's predicted probability as an explicit
-    # regressor feature (clf_probability). This lets XGBoost learn a direct
-    # probability→gain relationship on top of the raw technical features,
-    # so a STRONG BUY (prob≈0.95) and a BUY (prob≈0.75) are no longer forced
-    # to share a prediction just because their underlying indicators look
-    # similar — the confidence gap itself becomes a splittable feature.
-    #
-    # Note: probabilities here come from the classifier's predict_proba on
-    # X_scaled for the SAME rows used to train the classifier, so on the
-    # training set this feature is mildly optimistic (not an out-of-fold
-    # estimate). We accept that: the point isn't to squeeze out extra
-    # predictive accuracy, it's to give the regressor the confidence signal
-    # at all. At inference time explosion_predictor.py computes fresh
-    # predict_proba() output on genuinely unseen data, so no leakage reaches
-    # actual predictions.
-    try:
-        clf_probability = pd.Series(
-            model.predict_proba(X_scaled)[:, 1], index=X_scaled.index
-        )
-    except Exception as e:
-        logger.warning(f"RC9: Could not compute clf_probability feature ({e}) — skipping")
-        clf_probability = pd.Series(np.nan, index=X_scaled.index)
-    X_scaled_gain = X_scaled_gain.assign(clf_probability=clf_probability)
+    X_scaled_gain = X_scaled.assign(log_price=log_price, clf_proba=clf_proba)
     logger.info(
-        f"RC9: Added clf_probability feature to gain regressor "
-        f"(mean={clf_probability.mean():.3f}, std={clf_probability.std():.3f})"
+        f"Gain regressor feature matrix: {X_scaled_gain.shape[1]} features "
+        f"({X_scaled.shape[1]} shared with classifier + log_price + clf_proba)"
     )
 
     # LEAK-FREE FIX: register the full (train+val) pool as the fallback that
