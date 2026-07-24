@@ -409,13 +409,35 @@ class ExplosionPredictor:
             f"regressor expects {self._regressor_n_features} features"
         )
 
+        # FEATURE-COUNT CHECK FIX: ml_retrain_model.py deliberately trains the
+        # gain regressor on one extra feature — 'log_price' — that the
+        # classifier/scaler never sees (see the "REGRESSOR-ONLY log_price
+        # FEATURE" block in ml_retrain_model.py). predict_with_targets() below
+        # already knows how to append log_price before calling
+        # self.regressor.predict(), so a regressor with exactly
+        # classifier_n + 1 features (and 'log_price' in its
+        # feature_names_in_) is EXPECTED, not a mismatch. Only disable the
+        # regressor when the count differs in a way that isn't explained by
+        # that known, intentional offset.
+        regressor_feature_names = list(getattr(self.regressor, "feature_names_in_", []) or [])
+        regressor_has_log_price = "log_price" in regressor_feature_names
+        expected_regressor_n = classifier_n + 1 if regressor_has_log_price else classifier_n
+
         if (self._regressor_n_features is not None
-                and self._regressor_n_features != classifier_n):
+                and self._regressor_n_features != expected_regressor_n):
             self.logger.warning(
                 f"Regressor feature count ({self._regressor_n_features}) != "
-                f"classifier ({classifier_n}). Regressor DISABLED — retrain both together."
+                f"expected ({expected_regressor_n}, classifier={classifier_n} "
+                f"{'+ log_price' if regressor_has_log_price else ''}). "
+                f"Regressor DISABLED — retrain both together."
             )
             self.regressor = None
+        elif regressor_has_log_price:
+            self.logger.info(
+                f"Regressor expects {self._regressor_n_features} features "
+                f"({classifier_n} shared with classifier + log_price) — this is "
+                f"the expected, intentional offset. Regressor ENABLED."
+            )
 
         has_t1   = any("t1_open" in f or "t1_close" in f for f in self.feature_names)
         has_flat = any(
