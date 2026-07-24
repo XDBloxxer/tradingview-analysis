@@ -419,7 +419,10 @@ class ExplosionPredictor:
         # feature_names_in_) is EXPECTED, not a mismatch. Only disable the
         # regressor when the count differs in a way that isn't explained by
         # that known, intentional offset.
-        regressor_feature_names = list(getattr(self.regressor, "feature_names_in_", []) or [])
+        regressor_feature_names_raw = getattr(self.regressor, "feature_names_in_", None)
+        regressor_feature_names = (
+            list(regressor_feature_names_raw) if regressor_feature_names_raw is not None else []
+        )
         regressor_has_log_price = "log_price" in regressor_feature_names
         expected_regressor_n = classifier_n + 1 if regressor_has_log_price else classifier_n
 
