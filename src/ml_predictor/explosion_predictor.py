@@ -410,35 +410,45 @@ class ExplosionPredictor:
         )
 
         # FEATURE-COUNT CHECK FIX: ml_retrain_model.py deliberately trains the
-        # gain regressor on one extra feature — 'log_price' — that the
-        # classifier/scaler never sees (see the "REGRESSOR-ONLY log_price
-        # FEATURE" block in ml_retrain_model.py). predict_with_targets() below
-        # already knows how to append log_price before calling
-        # self.regressor.predict(), so a regressor with exactly
-        # classifier_n + 1 features (and 'log_price' in its
-        # feature_names_in_) is EXPECTED, not a mismatch. Only disable the
-        # regressor when the count differs in a way that isn't explained by
-        # that known, intentional offset.
+        # gain regressor on extra features — 'log_price' and 'clf_proba' —
+        # that the classifier/scaler never sees (see the "REGRESSOR-ONLY
+        # log_price FEATURE" and "REGRESSOR-ONLY clf_proba FEATURE" blocks in
+        # ml_retrain_model.py). predict_with_targets() below already knows how
+        # to append both before calling self.regressor.predict(), so a
+        # regressor with classifier_n + {1 or 2} features (with 'log_price'
+        # and/or 'clf_proba' in its feature_names_in_) is EXPECTED, not a
+        # mismatch. Only disable the regressor when the count differs in a
+        # way that isn't explained by these known, intentional offsets.
         regressor_feature_names_raw = getattr(self.regressor, "feature_names_in_", None)
         regressor_feature_names = (
             list(regressor_feature_names_raw) if regressor_feature_names_raw is not None else []
         )
         regressor_has_log_price = "log_price" in regressor_feature_names
-        expected_regressor_n = classifier_n + 1 if regressor_has_log_price else classifier_n
+        regressor_has_clf_proba = "clf_proba" in regressor_feature_names
+        expected_regressor_n = (
+            classifier_n
+            + (1 if regressor_has_log_price else 0)
+            + (1 if regressor_has_clf_proba else 0)
+        )
+        _extra_desc = " + ".join(
+            n for n, present in
+            (("log_price", regressor_has_log_price), ("clf_proba", regressor_has_clf_proba))
+            if present
+        )
 
         if (self._regressor_n_features is not None
                 and self._regressor_n_features != expected_regressor_n):
             self.logger.warning(
                 f"Regressor feature count ({self._regressor_n_features}) != "
                 f"expected ({expected_regressor_n}, classifier={classifier_n} "
-                f"{'+ log_price' if regressor_has_log_price else ''}). "
+                f"{('+ ' + _extra_desc) if _extra_desc else ''}). "
                 f"Regressor DISABLED — retrain both together."
             )
             self.regressor = None
-        elif regressor_has_log_price:
+        elif _extra_desc:
             self.logger.info(
                 f"Regressor expects {self._regressor_n_features} features "
-                f"({classifier_n} shared with classifier + log_price) — this is "
+                f"({classifier_n} shared with classifier + {_extra_desc}) — this is "
                 f"the expected, intentional offset. Regressor ENABLED."
             )
 
@@ -1050,6 +1060,21 @@ class ExplosionPredictor:
                 regressor_expects_log_price = "log_price" in getattr(
                     self.regressor, "feature_names_in_", []
                 )
+                # Mirror the regressor-only clf_proba feature added at training
+                # time (ml_retrain_model.py). This is the SAME calibrated
+                # classifier probability already computed above in
+                # _predict_internal() (the "explosion_probability" column in
+                # `predictions`, which is row-aligned with X_scaled since both
+                # were sorted/reset together) — not a leaky re-derivation, and
+                # not an extra classifier call. Backward-compatible: only
+                # appended if the loaded regressor was actually trained with
+                # it (older saved regressors won't have 'clf_proba' in
+                # feature_names_in_, so they get X_scaled unchanged).
+                regressor_expects_clf_proba = "clf_proba" in getattr(
+                    self.regressor, "feature_names_in_", []
+                )
+
+                extra_feats = {}
                 if regressor_expects_log_price:
                     price_source = data_df.get("t1_close_Close")
                     if price_source is None:
@@ -1060,9 +1085,17 @@ class ExplosionPredictor:
                     price_source = pd.to_numeric(price_source, errors="coerce").clip(lower=0)
                     log_price = np.log1p(price_source).reindex(X_scaled.index)
                     log_price = log_price.fillna(log_price.mean() if log_price.notna().any() else 0.0)
-                    X_scaled_for_regressor = X_scaled.assign(log_price=log_price)
-                else:
-                    X_scaled_for_regressor = X_scaled
+                    extra_feats["log_price"] = log_price
+                if regressor_expects_clf_proba:
+                    clf_proba = pd.Series(
+                        predictions["explosion_probability"].values,
+                        index=X_scaled.index,
+                    )
+                    extra_feats["clf_proba"] = clf_proba
+
+                X_scaled_for_regressor = (
+                    X_scaled.assign(**extra_feats) if extra_feats else X_scaled
+                )
 
                 predicted_gains_raw = self.regressor.predict(X_scaled_for_regressor)
 
