@@ -82,7 +82,7 @@ class DailyWinnersDetector:
             return []
         
         # ── Backfill OHLC for any candidate missing it (TradingView path) ──
-        candidates = self._backfill_ohlc(candidates)
+        candidates = self._backfill_ohlc(candidates, target_date)
         
         self.logger.info(f"Total candidates before validation: {len(candidates)}")
         
@@ -119,7 +119,7 @@ class DailyWinnersDetector:
             )
             
             if additional_candidates:
-                additional_candidates = self._backfill_ohlc(additional_candidates)
+                additional_candidates = self._backfill_ohlc(additional_candidates, target_date)
                 self.logger.info(f"Fetched {len(additional_candidates)} additional candidates")
                 
                 if not skip_validation:
@@ -161,14 +161,35 @@ class DailyWinnersDetector:
     # Uses a single yf.download() batch call for efficiency.
     # ─────────────────────────────────────────────────────────────────────
 
-    def _backfill_ohlc(self, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _backfill_ohlc(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_date: datetime,
+    ) -> List[Dict[str, Any]]:
         """
         For any candidate missing high/low/open/close, fetch from yfinance
-        daily bars (1d interval) and fill them in.
+        daily bars (1d interval) and fill them in — for `target_date`
+        specifically.
 
         TradingView MarketMovers only returns close + change + volume.
         yfinance Screener returns regularMarketPrice but not the full OHLC bar.
         This method patches both.
+
+        FIX: This previously called yf.download(period='2d') and always took
+        the LAST row (iloc[-1]) regardless of what date was being backfilled.
+        When this ran as part of a bulk catch-up job across many historical
+        detection_dates, every candidate — no matter which historical date it
+        belonged to — got patched with whatever the most-recent trading bar
+        happened to be at the moment the script ran. That silently wrote the
+        same OHLC snapshot into the table under dozens of different
+        detection_date rows (confirmed via duplicate symbol+OHLC combinations
+        spanning ~38 distinct dates with identical values).
+
+        The fix fetches an explicit [target_date, target_date + 1 day) window
+        and selects the row matching target_date, rather than "whatever's
+        last." If the market was closed that day (weekend/holiday) or data
+        isn't available for that exact date, we skip the backfill for that
+        candidate rather than silently substituting a different day's bar.
         """
         missing = [c for c in candidates
                    if any(c.get(f) is None for f in ('high', 'low', 'open', 'close'))]
@@ -177,12 +198,22 @@ class DailyWinnersDetector:
             return candidates
 
         symbols = list({c['symbol'] for c in missing})
-        self.logger.info(f"Backfilling OHLC for {len(symbols)} candidates via yfinance daily bars...")
+        target_date_only = target_date.date()
+        # yfinance's `end` is exclusive, so request a small window and filter
+        # down to the exact date rather than relying on "last row returned."
+        start = target_date_only
+        end = target_date_only + timedelta(days=1)
+
+        self.logger.info(
+            f"Backfilling OHLC for {len(symbols)} candidates via yfinance "
+            f"daily bars for {target_date_only.isoformat()}..."
+        )
 
         try:
             data = yf.download(
                 symbols,
-                period='2d',
+                start=start.isoformat(),
+                end=end.isoformat(),
                 interval='1d',
                 group_by='ticker',
                 progress=False,
@@ -191,16 +222,31 @@ class DailyWinnersDetector:
             )
 
             if data.empty:
-                self.logger.warning("yfinance returned no OHLC data for backfill")
+                self.logger.warning(
+                    f"yfinance returned no OHLC data for {target_date_only.isoformat()} "
+                    "(likely a non-trading day, or data not yet available) — "
+                    "skipping backfill rather than substituting another day's bar."
+                )
                 return candidates
 
-            # Build a quick lookup: symbol → latest OHLC bar
+            # Build a quick lookup: symbol → OHLC bar for target_date_only.
             ohlc_lookup: Dict[str, Dict[str, float]] = {}
+
+            def _row_for_target_date(frame: pd.DataFrame):
+                """Return the row whose index date matches target_date_only,
+                or None if that exact date isn't present in the response."""
+                if frame.empty:
+                    return None
+                idx_dates = frame.index.date
+                matches = frame.loc[idx_dates == target_date_only]
+                if matches.empty:
+                    return None
+                return matches.iloc[0]
 
             if len(symbols) == 1:
                 # Single-symbol download: columns are Open/High/Low/Close/Volume (no ticker level)
-                if not data.empty:
-                    row = data.iloc[-1]
+                row = _row_for_target_date(data)
+                if row is not None:
                     ohlc_lookup[symbols[0]] = {
                         'open':  float(row.get('Open',  row.get('open',  0))),
                         'high':  float(row.get('High',  row.get('high',  0))),
@@ -214,9 +260,9 @@ class DailyWinnersDetector:
                         if sym not in data.columns.get_level_values(0):
                             continue
                         sym_data = data[sym].dropna(how='all')
-                        if sym_data.empty:
+                        row = _row_for_target_date(sym_data)
+                        if row is None:
                             continue
-                        row = sym_data.iloc[-1]
                         ohlc_lookup[sym] = {
                             'open':  float(row.get('Open',  row.get('open',  0))),
                             'high':  float(row.get('High',  row.get('high',  0))),
@@ -232,6 +278,7 @@ class DailyWinnersDetector:
 
         # Patch candidates in-place
         patched = 0
+        skipped_no_match = 0
         for c in candidates:
             sym = c.get('symbol')
             if sym in ohlc_lookup:
@@ -243,8 +290,15 @@ class DailyWinnersDetector:
                 if not c.get('price') and bar['close']:
                     c['price'] = bar['close']
                 patched += 1
+            elif sym in {m['symbol'] for m in missing}:
+                skipped_no_match += 1
 
-        self.logger.info(f"✓ OHLC backfilled for {patched}/{len(missing)} candidates")
+        self.logger.info(
+            f"✓ OHLC backfilled for {patched}/{len(missing)} candidates "
+            f"for {target_date_only.isoformat()}"
+            + (f" ({skipped_no_match} skipped — no bar for that exact date, "
+               "left unpatched rather than guessing)" if skipped_no_match else "")
+        )
         return candidates
 
     # ─────────────────────────────────────────────────────────────────────
