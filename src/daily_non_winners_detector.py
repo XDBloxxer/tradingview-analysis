@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
+import numpy as np
 import pandas as pd
 import yfinance as yf
 import time
@@ -85,6 +86,68 @@ class DailyNonWinnersDetector:
             f"loosening_passes={self.loosening_passes}, "
             f"loosening_step_pct={self.loosening_step_pct}%"
         )
+
+    def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, float]]:
+        """
+        Fetch the daily OHLCV bar for `symbol` on `target_date` specifically,
+        plus the prior trading day's close (for change_pct).
+
+        FIX: The three call sites that used to inline
+            ticker.history(period='2d', interval='1d') ... hist.iloc[-1]
+        always returned whatever the MOST RECENT trading bar was at the
+        moment the code ran — completely ignoring target_date. When this
+        detector was run as part of a historical backfill (looping over many
+        past detection_dates), every single one of those dates got patched
+        with the same "latest" bar, silently duplicating one real snapshot
+        across dozens of rows (confirmed via identical OHLCV values recurring
+        under many different detection_date rows in the DB).
+
+        This fetches an explicit window around target_date and returns None
+        if that exact date isn't present (e.g. weekend/holiday/no data),
+        rather than substituting a different day's bar.
+        """
+        target_date_only = target_date.date()
+        # Need a couple of trading days of lookback to compute change_pct
+        # (prev close), and yfinance's `end` is exclusive.
+        start = target_date_only - timedelta(days=7)
+        end = target_date_only + timedelta(days=1)
+
+        try:
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(start=start.isoformat(), end=end.isoformat(), interval='1d')
+        except Exception:
+            return None
+
+        if hist.empty:
+            return None
+
+        idx_dates = hist.index.date
+        target_mask = idx_dates == target_date_only
+        if not target_mask.any():
+            return None
+
+        target_pos = int(np.where(target_mask)[0][0])
+        if target_pos == 0:
+            # No prior bar available in the lookback window to compute change_pct from.
+            return None
+
+        latest = hist.iloc[target_pos]
+        previous = hist.iloc[target_pos - 1]
+
+        close = float(latest['Close'])
+        prev_close = float(previous['Close'])
+        if prev_close == 0:
+            return None
+
+        return {
+            'close':      close,
+            'prev_close': prev_close,
+            'change_pct': ((close - prev_close) / prev_close) * 100,
+            'volume':     float(latest['Volume']),
+            'high':       float(latest['High']),
+            'low':        float(latest['Low']),
+            'open':       float(latest['Open']),
+        }
 
     def _load_learned_filters(self) -> dict:
         """Load learned filters from ml_models/learned_filters.json.
@@ -223,7 +286,7 @@ class DailyNonWinnersDetector:
                 f"min_rvol={_fmt(active_filters.get('min_relative_volume'), '.2f')}]..."
             )
 
-            new_candidates = self._get_filtered_candidates(winners_symbols, active_filters)
+            new_candidates = self._get_filtered_candidates(winners_symbols, active_filters, target_date)
 
             added = 0
             for c in new_candidates:
@@ -361,6 +424,7 @@ class DailyNonWinnersDetector:
         self,
         exclude_symbols: set,
         filters: dict = None,
+        target_date: datetime = None,
     ) -> List[Dict[str, Any]]:
         """
         Fetch a pool of stocks that pass the given filters but did NOT gain ≥20 % intraday.
@@ -372,7 +436,12 @@ class DailyNonWinnersDetector:
         Args:
             exclude_symbols: Symbols to exclude (winners + already-selected)
             filters: Filter dict to apply.  Defaults to self.learned_filters.
+            target_date: Date the candidates are being collected for. Required
+                for the yfinance fallback path to fetch the correct historical
+                bar instead of "whatever is most recent."
         """
+        if target_date is None:
+            target_date = datetime.now()
         lf = filters if filters is not None else self.learned_filters
 
         # Map from learned_filters keys → (tv_column, operation)
@@ -482,20 +551,13 @@ class DailyNonWinnersDetector:
 
         for symbol in liquid_stocks:
             try:
-                ticker = yf.Ticker(symbol)
-                hist   = ticker.history(period="2d", interval="1d")
-
-                if hist.empty or len(hist) < 2:
+                bar = self._fetch_yf_bar_for_date(symbol, target_date)
+                if bar is None:
                     continue
 
-                latest   = hist.iloc[-1]
-                previous = hist.iloc[-2]
-
-                close      = latest["Close"]
-                prev_close = previous["Close"]
-                volume     = latest["Volume"]
-
-                change_pct = ((close - prev_close) / prev_close) * 100
+                change_pct = bar["change_pct"]
+                close      = bar["close"]
+                volume     = bar["volume"]
 
                 if change_pct >= 20.0:
                     continue
@@ -512,9 +574,9 @@ class DailyNonWinnersDetector:
                     "price":      float(close),
                     "change_pct": float(change_pct),
                     "volume":     int(volume),
-                    "high":       float(latest["High"]),
-                    "low":        float(latest["Low"]),
-                    "open":       float(latest["Open"]),
+                    "high":       float(bar["high"]),
+                    "low":        float(bar["low"]),
+                    "open":       float(bar["open"]),
                     "close":      float(close),
                 })
             except Exception:
@@ -672,21 +734,14 @@ class DailyNonWinnersDetector:
                 break
             
             try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period='2d', interval='1d')
-                
-                if hist.empty or len(hist) < 2:
+                bar = self._fetch_yf_bar_for_date(symbol, target_date)
+                if bar is None:
                     continue
-                
-                latest = hist.iloc[-1]
-                previous = hist.iloc[-2]
-                
-                close = latest['Close']
-                prev_close = previous['Close']
-                volume = latest['Volume']
-                
-                change_pct = ((close - prev_close) / prev_close) * 100
-                
+
+                change_pct = bar['change_pct']
+                close      = bar['close']
+                volume     = bar['volume']
+
                 if min_change <= change_pct <= max_change:
                     if close >= self.min_price and volume >= self.min_volume:
                         candidates.append({
@@ -695,9 +750,9 @@ class DailyNonWinnersDetector:
                             'price': float(close),
                             'change_pct': float(change_pct),
                             'volume': int(volume),
-                            'high': float(latest['High']),
-                            'low': float(latest['Low']),
-                            'open': float(latest['Open']),
+                            'high': float(bar['high']),
+                            'low': float(bar['low']),
+                            'open': float(bar['open']),
                             'close': float(close)
                         })
                 
@@ -729,21 +784,14 @@ class DailyNonWinnersDetector:
                 break
             
             try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period='2d', interval='1d')
-                
-                if hist.empty or len(hist) < 2:
+                bar = self._fetch_yf_bar_for_date(symbol, target_date)
+                if bar is None:
                     continue
-                
-                latest = hist.iloc[-1]
-                previous = hist.iloc[-2]
-                
-                close = latest['Close']
-                prev_close = previous['Close']
-                volume = latest['Volume']
-                
-                change_pct = ((close - prev_close) / prev_close) * 100
-                
+
+                change_pct = bar['change_pct']
+                close      = bar['close']
+                volume     = bar['volume']
+
                 # Exclude big gainers (>20%)
                 if change_pct > 20:
                     continue
@@ -755,9 +803,9 @@ class DailyNonWinnersDetector:
                         'price': float(close),
                         'change_pct': float(change_pct),
                         'volume': int(volume),
-                        'high': float(latest['High']),
-                        'low': float(latest['Low']),
-                        'open': float(latest['Open']),
+                        'high': float(bar['high']),
+                        'low': float(bar['low']),
+                        'open': float(bar['open']),
                         'close': float(close)
                     })
                 
