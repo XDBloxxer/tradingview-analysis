@@ -9,7 +9,15 @@ on:
   workflow_dispatch:
     inputs:
       date:
-        description: 'Target date (YYYY-MM-DD, leave empty for today)'
+        description: 'Target date (YYYY-MM-DD, leave empty for today). Ignored if start_date is set.'
+        required: false
+        default: ''
+      start_date:
+        description: 'Backfill: range start date (YYYY-MM-DD). Requires end_date. Runs every trading day in [start_date, end_date].'
+        required: false
+        default: ''
+      end_date:
+        description: 'Backfill: range end date (YYYY-MM-DD). Requires start_date.'
         required: false
         default: ''
       top_n:
@@ -47,11 +55,13 @@ jobs:
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '15' }}"
-          
-          if [ -n "${{ github.event.inputs.date }}" ]; then
+
+          if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
+            ARGS="$ARGS --start-date ${{ github.event.inputs.start_date }} --end-date ${{ github.event.inputs.end_date }}"
+          elif [ -n "${{ github.event.inputs.date }}" ]; then
             ARGS="$ARGS --date ${{ github.event.inputs.date }}"
           fi
-          
+
           echo "Running with args: $ARGS"
           python daily_winners_main.py $ARGS
       
