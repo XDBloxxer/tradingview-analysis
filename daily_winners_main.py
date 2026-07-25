@@ -9,7 +9,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
@@ -28,53 +28,25 @@ def is_trading_day(d) -> bool:
     return len(holidays) == 0
 
 
-def main():
-    """Main execution function for daily winners tracker"""
-    parser = argparse.ArgumentParser(
-        description="Daily Winners Tracker - Track top performers with intraday indicators"
-    )
-    parser.add_argument(
-        "--config",
-        default="config.yaml",
-        help="Path to configuration file"
-    )
-    parser.add_argument(
-        "--date",
-        type=str,
-        help="Target date (YYYY-MM-DD). Defaults to today."
-    )
-    parser.add_argument(
-        "--top-n",
-        type=int,
-        default=10,
-        help="Number of top winners to track (default: 10)"
-    )
-    parser.add_argument(
-        "--verbose",
-        "-v",
-        action="store_true",
-        help="Enable verbose logging"
-    )
+def trading_days_between(start_date, end_date):
+    """Yield each NYSE trading day from start_date to end_date, inclusive."""
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    d = start_date
+    one_day = timedelta(days=1)
+    while d <= end_date:
+        if is_trading_day(d):
+            yield d
+        d += one_day
 
-    args = parser.parse_args()
 
-    # Load configuration
-    config = load_config(args.config)
-
-    # Setup logging
-    log_level = "DEBUG" if args.verbose else config.get("logging", {}).get("level", "INFO")
-    logger = setup_logging(log_level, config.get("logging", {}))
-
-    # Parse target date
-    if args.date:
-        try:
-            target_date = datetime.strptime(args.date, "%Y-%m-%d")
-        except ValueError:
-            logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD")
-            return 1
-    else:
-        target_date = datetime.now()
-
+def run_for_date(target_date: datetime, args, config, logger) -> int:
+    """
+    Runs the full winners-detection pipeline for a single target_date.
+    Identical to the previous single-date main() body — used for both
+    normal (single-day) runs and each day inside a --start-date/--end-date
+    backfill range.
+    """
     target_date_str = target_date.date().isoformat()
 
     # ── Market holiday / weekend guard ──────────────────────────────────────
@@ -189,8 +161,105 @@ def main():
         return 0
 
     except Exception as e:
-        logger.error(f"✗ Daily winners tracker failed: {str(e)}", exc_info=True)
+        logger.error(f"✗ Daily winners tracker failed for {target_date_str}: {str(e)}", exc_info=True)
         return 1
+
+
+def main():
+    """Main execution function for daily winners tracker"""
+    parser = argparse.ArgumentParser(
+        description="Daily Winners Tracker - Track top performers with intraday indicators"
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to configuration file"
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="Target date (YYYY-MM-DD). Defaults to today. Ignored if --start-date is given."
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Backfill: first date (YYYY-MM-DD) of a range to process, inclusive. Requires --end-date."
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="Backfill: last date (YYYY-MM-DD) of a range to process, inclusive. Requires --start-date."
+    )
+    parser.add_argument(
+        "--top-n",
+        type=int,
+        default=10,
+        help="Number of top winners to track (default: 10)"
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        help="Enable verbose logging"
+    )
+
+    args = parser.parse_args()
+
+    if bool(args.start_date) != bool(args.end_date):
+        print("Error: --start-date and --end-date must be provided together.", file=sys.stderr)
+        return 1
+
+    # Load configuration
+    config = load_config(args.config)
+
+    # Setup logging
+    log_level = "DEBUG" if args.verbose else config.get("logging", {}).get("level", "INFO")
+    logger = setup_logging(log_level, config.get("logging", {}))
+
+    # ── Range backfill mode ──────────────────────────────────────────────
+    if args.start_date and args.end_date:
+        try:
+            start_date = datetime.strptime(args.start_date, "%Y-%m-%d").date()
+            end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date()
+        except ValueError as e:
+            logger.error(f"Invalid --start-date/--end-date: {e}. Use YYYY-MM-DD")
+            return 1
+
+        dates = list(trading_days_between(start_date, end_date))
+        logger.info("=" * 60)
+        logger.info("DAILY WINNERS TRACKER — BACKFILL RANGE")
+        logger.info(f"  {start_date.isoformat()} → {end_date.isoformat()} "
+                    f"({len(dates)} trading days, weekends/holidays skipped)")
+        logger.info("=" * 60)
+
+        results = {}
+        for d in dates:
+            target_date = datetime.combine(d, datetime.min.time())
+            results[d.isoformat()] = run_for_date(target_date, args, config, logger)
+
+        failed = [d for d, rc in results.items() if rc != 0]
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("BACKFILL RANGE SUMMARY")
+        logger.info(f"  Processed: {len(results)} trading days")
+        logger.info(f"  Succeeded: {len(results) - len(failed)}")
+        if failed:
+            logger.info(f"  Failed:    {len(failed)} → {', '.join(failed)}")
+        logger.info("=" * 60)
+
+        return 1 if failed else 0
+
+    # ── Single-date mode (normal GitHub Actions runs, or one-off backfill) ──
+    if args.date:
+        try:
+            target_date = datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD")
+            return 1
+    else:
+        target_date = datetime.now()
+
+    return run_for_date(target_date, args, config, logger)
 
 
 if __name__ == "__main__":
