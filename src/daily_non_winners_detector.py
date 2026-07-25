@@ -87,10 +87,29 @@ class DailyNonWinnersDetector:
             f"loosening_step_pct={self.loosening_step_pct}%"
         )
 
+    def _is_live(self, target_date: datetime) -> bool:
+        """
+        True if `target_date` is today (a live run), False if it's a
+        historical backfill date.
+
+        The TradingView screener/scanner endpoints only ever return *current*
+        market data — they have no historical-date parameter. Using them for
+        a backfill silently returns today's data mislabeled as the backfill
+        date (the same class of bug fixed in _fetch_yf_bar_for_date below).
+        Call sites use this to route backfill runs through the date-aware
+        yfinance path exclusively.
+        """
+        if target_date is None:
+            return True
+        target = target_date.date() if isinstance(target_date, datetime) else target_date
+        return target >= datetime.now().date()
+
     def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, float]]:
         """
         Fetch the daily OHLCV bar for `symbol` on `target_date` specifically,
-        plus the prior trading day's close (for change_pct).
+        plus derived metrics (change_pct, hv10, hv20, relative_volume_10d,
+        atr14) computed from the trading days immediately preceding
+        target_date — never from "whatever's most recent."
 
         FIX: The three call sites that used to inline
             ticker.history(period='2d', interval='1d') ... hist.iloc[-1]
@@ -102,14 +121,17 @@ class DailyNonWinnersDetector:
         across dozens of rows (confirmed via identical OHLCV values recurring
         under many different detection_date rows in the DB).
 
-        This fetches an explicit window around target_date and returns None
-        if that exact date isn't present (e.g. weekend/holiday/no data),
-        rather than substituting a different day's bar.
+        This fetches an explicit window ending at target_date and returns
+        None if that exact date isn't present (e.g. weekend/holiday/no data),
+        rather than substituting a different day's bar. The window is wide
+        enough (45 calendar days) to compute HV10/HV20/ATR14 — the same
+        metrics the TradingView screener filters on — so backfill runs can
+        apply the full learned-filter set instead of only price/volume.
         """
-        target_date_only = target_date.date()
-        # Need a couple of trading days of lookback to compute change_pct
-        # (prev close), and yfinance's `end` is exclusive.
-        start = target_date_only - timedelta(days=7)
+        target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+        # Need ~25 trading days of lookback for hv20/atr14; yfinance's
+        # `end` is exclusive.
+        start = target_date_only - timedelta(days=45)
         end = target_date_only + timedelta(days=1)
 
         try:
@@ -131,15 +153,16 @@ class DailyNonWinnersDetector:
             # No prior bar available in the lookback window to compute change_pct from.
             return None
 
-        latest = hist.iloc[target_pos]
-        previous = hist.iloc[target_pos - 1]
+        window = hist.iloc[:target_pos + 1]  # everything up to and including target_date
+        latest = window.iloc[-1]
+        previous = window.iloc[-2]
 
         close = float(latest['Close'])
         prev_close = float(previous['Close'])
         if prev_close == 0:
             return None
 
-        return {
+        result: Dict[str, float] = {
             'close':      close,
             'prev_close': prev_close,
             'change_pct': ((close - prev_close) / prev_close) * 100,
@@ -148,6 +171,32 @@ class DailyNonWinnersDetector:
             'low':        float(latest['Low']),
             'open':       float(latest['Open']),
         }
+
+        # Historical volatility: annualized std of daily log returns.
+        closes = window['Close']
+        log_returns = np.log(closes / closes.shift(1)).dropna()
+        for n, key in ((10, 'hv10'), (20, 'hv20')):
+            if len(log_returns) >= n:
+                result[key] = float(log_returns.tail(n).std() * np.sqrt(252) * 100)
+
+        # Relative volume: target day's volume vs. average of the prior 10 days.
+        volumes = window['Volume']
+        if len(volumes) > 10:
+            avg_vol = float(volumes.iloc[-11:-1].mean())
+            if avg_vol > 0:
+                result['relative_volume_10d'] = float(result['volume'] / avg_vol)
+
+        # ATR(14): average true range over the last 14 days.
+        if len(window) >= 15:
+            highs, lows, closes_prev = window['High'], window['Low'], window['Close'].shift(1)
+            tr = pd.concat([
+                highs - lows,
+                (highs - closes_prev).abs(),
+                (lows - closes_prev).abs(),
+            ], axis=1).max(axis=1)
+            result['atr14'] = float(tr.tail(14).mean())
+
+        return result
 
     def _load_learned_filters(self) -> dict:
         """Load learned filters from ml_models/learned_filters.json.
@@ -457,7 +506,11 @@ class DailyNonWinnersDetector:
             "min_volume_ratio":    ("relative_volume_10d_calc", "greater"),
         }
 
-        if SCREENER_AVAILABLE and self.screener:
+        # FIX: TradingView's screener has no historical-date parameter — it
+        # only ever reflects the current market. Using it during a backfill
+        # would silently label today's screen results as the backfill date.
+        # Route backfill runs straight to the (now date-aware) yfinance path.
+        if SCREENER_AVAILABLE and self.screener and self._is_live(target_date):
             # Build TradingView filter list from learned values
             tv_col_bounds: Dict[str, Dict] = {}
             for filter_key, (tv_col, operation) in TV_FILTER_MAP.items():
@@ -568,6 +621,34 @@ class DailyNonWinnersDetector:
                 if volume < min_volume_filter:
                     continue
 
+                # FIX: These filters used to be TradingView-screener-only —
+                # a backfill run that skipped the screener silently dropped
+                # them. Apply the same bounds here using the metrics computed
+                # by _fetch_yf_bar_for_date, so filter behavior matches
+                # between live and backfill runs.
+                hv10 = bar.get("hv10")
+                if lf.get("min_hv10") is not None and (hv10 is None or hv10 < lf["min_hv10"]):
+                    continue
+                if lf.get("max_hv10") is not None and (hv10 is None or hv10 > lf["max_hv10"]):
+                    continue
+
+                hv20 = bar.get("hv20")
+                if lf.get("min_hv20") is not None and (hv20 is None or hv20 < lf["min_hv20"]):
+                    continue
+                if lf.get("max_hv20") is not None and (hv20 is None or hv20 > lf["max_hv20"]):
+                    continue
+
+                rel_vol = bar.get("relative_volume_10d")
+                min_rel_vol = lf.get("min_relative_volume")
+                if min_rel_vol is None:
+                    min_rel_vol = lf.get("min_volume_ratio")
+                if min_rel_vol is not None and (rel_vol is None or rel_vol < min_rel_vol):
+                    continue
+
+                atr14 = bar.get("atr14")
+                if lf.get("min_atr14") is not None and (atr14 is None or atr14 < lf["min_atr14"]):
+                    continue
+
                 candidates.append({
                     "symbol":     symbol,
                     "exchange":   "NASDAQ",
@@ -629,7 +710,7 @@ class DailyNonWinnersDetector:
             List of stock dictionaries
         """
         try:
-            if SCREENER_AVAILABLE and self.screener:
+            if SCREENER_AVAILABLE and self.screener and self._is_live(target_date):
                 return self._screen_by_change_range(
                     min_change, max_change, limit, exclude_symbols
                 )
