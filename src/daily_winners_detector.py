@@ -52,6 +52,80 @@ class DailyWinnersDetector:
             f"Daily Winners detector initialized (DEBUG MODE): "
             f"min_price={self.min_price}, min_volume={self.min_volume}"
         )
+
+    def _is_live(self, target_date: datetime) -> bool:
+        """
+        True if `target_date` is today (a live run), False if it's a
+        historical backfill. Only live runs may fall back to "most recent
+        bar" style fetches (period='2d'/'5d' + iloc[-1]); backfills must use
+        a fetch pinned to the exact target_date, or that date's row can get
+        silently overwritten with today's bar (the same class of bug fixed
+        in _backfill_ohlc / _fetch_yf_bar_for_date below).
+        """
+        if target_date is None:
+            return True
+        target = target_date.date() if isinstance(target_date, datetime) else target_date
+        return target == datetime.now().date()
+
+    def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the daily OHLCV bar for `symbol` on `target_date` specifically
+        (not "whatever's most recent"). Returns None if that exact date isn't
+        present (non-trading day, delisted, no data yet) rather than
+        substituting a different day's bar.
+        """
+        target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+        start = target_date_only - timedelta(days=10)
+        end = target_date_only + timedelta(days=1)
+
+        try:
+            hist = yf.download(
+                symbol,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                interval='1d',
+                progress=False,
+                auto_adjust=True,
+            )
+        except Exception as e:
+            self.logger.debug(f"{symbol}: yfinance fetch failed: {e}")
+            return None
+
+        if hist is None or hist.empty:
+            return None
+
+        idx_dates = hist.index.date
+        target_mask = idx_dates == target_date_only
+        if not target_mask.any():
+            return None
+
+        target_pos = int(target_mask.nonzero()[0][-1])
+        if target_pos == 0:
+            return None
+
+        window = hist.iloc[:target_pos + 1]
+        latest = window.iloc[-1]
+        previous = window.iloc[-2]
+
+        try:
+            close = float(latest['Close'])
+            prev_close = float(previous['Close'])
+            volume = int(latest['Volume'])
+        except (TypeError, ValueError):
+            return None
+
+        if prev_close == 0:
+            return None
+
+        return {
+            'close': close,
+            'prev_close': prev_close,
+            'change_pct': ((close - prev_close) / prev_close) * 100,
+            'volume': volume,
+            'high': float(latest['High']),
+            'low': float(latest['Low']),
+            'open': float(latest['Open']),
+        }
     
     def detect_top_winners(self, top_n: int = 15, target_date: datetime = None) -> List[Dict[str, Any]]:
         if target_date is None:
@@ -495,6 +569,9 @@ class DailyWinnersDetector:
         limit: int,
         exclude_symbols: Set[str]
     ) -> List[Dict[str, Any]]:
+        if not self._is_live(target_date):
+            return self._fetch_from_liquid_stocks_for_date(target_date, limit, exclude_symbols)
+
         try:
             self.logger.info("Scanning liquid stocks...")
             
@@ -583,6 +660,60 @@ class DailyWinnersDetector:
         except Exception as e:
             self.logger.error(f"Error in liquid stocks: {e}", exc_info=True)
             return []
+
+    def _fetch_from_liquid_stocks_for_date(
+        self,
+        target_date: datetime,
+        limit: int,
+        exclude_symbols: Set[str]
+    ) -> List[Dict[str, Any]]:
+        """
+        Backfill-safe counterpart to _fetch_from_liquid_stocks. Uses
+        _fetch_yf_bar_for_date so every candidate's OHLC is pinned to
+        target_date instead of "whatever yfinance's last row is right now."
+        """
+        self.logger.info(f"Scanning liquid stocks for {target_date.date().isoformat()}...")
+
+        candidates = []
+        liquid_stocks = self._get_liquid_stocks_list()
+        liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
+
+        for symbol in liquid_stocks:
+            try:
+                bar = self._fetch_yf_bar_for_date(symbol, target_date)
+                if bar is None:
+                    continue
+
+                close, volume, change_pct = bar['close'], bar['volume'], bar['change_pct']
+                if close < self.min_price or volume < self.min_volume or change_pct <= 0:
+                    continue
+                if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                    continue
+
+                candidates.append({
+                    'symbol':     symbol.upper(),
+                    'exchange':   'NASDAQ',
+                    'price':      close,
+                    'change_pct': float(change_pct),
+                    'volume':     volume,
+                    'high':       bar['high'],
+                    'low':        bar['low'],
+                    'open':       bar['open'],
+                    'close':      close,
+                    'source':     'yfinance_liquid_backfill',
+                })
+            except Exception:
+                continue
+
+            if len(candidates) >= limit * 3:
+                # Gather a bit more than `limit` before sorting, same spirit
+                # as the live path's early-exit, but per-symbol so no single
+                # batch failure loses the whole page.
+                break
+
+        candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
+        self.logger.info(f"✅ Found {len(candidates)} from liquid stocks (backfill, date-pinned)")
+        return candidates
     
     def _batch_verify_freshness(
         self, 
@@ -596,7 +727,16 @@ class DailyWinnersDetector:
         
         valid_candidates = []
         target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
-        
+
+        if not self._is_live(target_date):
+            # period='5d' below fetches the 5 days most recent to *right now*,
+            # not the 5 days around target_date. For a historical backfill
+            # that makes days_diff go negative (always <= 5), so it silently
+            # passed and stamped today's OHLC onto old candidates — the same
+            # class of bug fixed in _backfill_ohlc. Route backfills through
+            # the date-pinned helper instead.
+            return self._verify_freshness_for_date(candidates, target_date)
+
         symbols = [c['symbol'] for c in candidates]
         
         self.logger.info("=" * 80)
@@ -694,7 +834,44 @@ class DailyWinnersDetector:
         self.logger.info("=" * 80 + "\n")
         
         return valid_candidates
-    
+
+    def _verify_freshness_for_date(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_date: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        Backfill-safe counterpart to _batch_verify_freshness. Validates and
+        fills OHLC using _fetch_yf_bar_for_date so nothing gets compared
+        against, or overwritten with, "whatever's most recent right now."
+        """
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        valid_candidates = []
+
+        for candidate in candidates:
+            symbol = candidate['symbol']
+            bar = self._fetch_yf_bar_for_date(symbol, target_date)
+            if bar is None:
+                self.logger.warning(f"  ❌ {symbol}: no bar for {target_date_obj} — rejected")
+                continue
+            if bar['volume'] < self.min_volume:
+                self.logger.warning(f"  ❌ {symbol}: volume {bar['volume']:,} < {self.min_volume:,}")
+                continue
+
+            for field, key in (('high', 'high'), ('low', 'low'),
+                                ('open', 'open'), ('close', 'close')):
+                if candidate.get(field) is None:
+                    candidate[field] = bar[key]
+
+            valid_candidates.append(candidate)
+
+        self.logger.info(
+            f"📊 VALIDATION SUMMARY (backfill, date-pinned): "
+            f"total={len(candidates)}, passed={len(valid_candidates)}, "
+            f"rejected={len(candidates)-len(valid_candidates)}"
+        )
+        return valid_candidates
+
     def _get_liquid_stocks_list(self) -> List[str]:
         return [
             'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK.B', 'UNH', 'JNJ',
