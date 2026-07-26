@@ -22,6 +22,11 @@ on:
         required: false
         default: true
         type: boolean
+      use_learned_filters:
+        description: 'Use ml_models/learned_filters.json for filter-aware hard-negative sampling during retraining'
+        required: false
+        default: false
+        type: boolean
 
 # CRITICAL: Grant write permissions to push model updates
 permissions:
@@ -62,6 +67,9 @@ jobs:
           # warning if selected_features.json doesn't exist yet, so this is
           # safe even before feature selection has ever been run.
           USE_SELECTED_FEATURES: ${{ github.event.inputs.use_selected_features || 'true' }}
+          # Filter-aware hard-negative sampling using ml_models/learned_filters.json.
+          # Disabled by default on the scheduled run; opt in via workflow_dispatch.
+          USE_LEARNED_FILTERS: ${{ github.event.inputs.use_learned_filters || 'false' }}
         run: |
           LOOKBACK="${{ github.event.inputs.lookback_days }}"
           USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
