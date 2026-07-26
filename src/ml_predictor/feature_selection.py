@@ -763,6 +763,18 @@ def run_pipeline(
     """
     Run the pipeline and persist artifacts to `output_dir`.
 
+    CALLER CONTRACT — X/y/dates must already be train-only: this function
+    (and every stage it calls) fits directly on whatever rows it's given.
+    Stages 1 (correlation-cluster representative pick) and 2 (Boruta) have
+    no internal time split of their own, so if X/y/dates here still include
+    rows from the classifier's val / blind-calibration window, this pipeline
+    will pick features using label information from that "held out" period
+    before the classifier ever sees it — inflating its val AUC and
+    blind_cal_auc regardless of how clean ml_retrain_model.py's own split is.
+    The `_cli()` entry point below carves out a train-only slice (mirroring
+    ml_retrain_model.py's _compute_val_cutoff()/VAL_WEEKS) before calling
+    this function; any other caller must do the same.
+
     `run_stability_check` defaults to True: Stages 1-3 are first repeated
     `stability_n_runs` times over block-bootstrapped resamples (see
     stability_select()) and the per-feature selection frequency +
@@ -922,6 +934,35 @@ def _cli() -> int:
 
     date_col = "detection_date" if "detection_date" in combined_df.columns else "event_date"
     dates = combined_df[date_col] if date_col in combined_df.columns else pd.Series(pd.NaT, index=combined_df.index)
+
+    # ── LEAK FIX: restrict feature selection to train-only rows ─────────────
+    # Stages 1 (correlation-cluster representative pick) and 2 (Boruta) each
+    # fit directly on whatever X/y they're given, with no internal time split
+    # of their own — unlike Stage 3 (RFECV) and Stage 4 (GA), which already do
+    # walk-forward CV internally. If X/y here include the same rows that
+    # ml_retrain_model.py later holds out as val / blind-calibration data,
+    # those stages pick features using label information from the "held out"
+    # period before ml_retrain_model.py ever sees it — so its val AUC and
+    # blind_cal_auc both come out inflated regardless of how clean the
+    # downstream split is. This mirrors ml_retrain_model.py's own
+    # _compute_val_cutoff()/VAL_WEEKS logic so feature selection is blind to
+    # exactly the same window the classifier is evaluated on.
+    cutoff = rt._compute_val_cutoff(combined_df)
+    parsed_dates = pd.to_datetime(dates, errors="coerce")
+    # Rows with unparseable dates (e.g. mistake samples) are kept in the
+    # train-only pool, matching ml_retrain_model.py's FIX 2 (NaT -> train).
+    fs_train_mask = parsed_dates.isna() | (parsed_dates < cutoff)
+    n_excluded = int((~fs_train_mask).sum())
+    logging.getLogger(__name__).info(
+        f"Feature-selection train-only cutoff: {cutoff.date()} — "
+        f"excluding {n_excluded} row(s) at/after cutoff from feature selection "
+        f"({int(fs_train_mask.sum())} rows remain for Stages 1-4)."
+    )
+    X = X.loc[fs_train_mask]
+    y = y.loc[fs_train_mask]
+    if w is not None:
+        w = w.loc[fs_train_mask]
+    dates = dates.loc[fs_train_mask]
 
     run_pipeline(
         X, y, dates, w=w,
