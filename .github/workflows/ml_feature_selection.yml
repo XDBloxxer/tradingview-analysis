@@ -44,6 +44,11 @@ on:
         required: false
         default: true
         type: boolean
+      use_excluded_features:
+        description: 'Apply ml_models/feature_selection/excluded_features.json as a permanent feature blocklist'
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: write
@@ -82,10 +87,14 @@ jobs:
           BORUTA_ITER="${{ github.event.inputs.boruta_iterations || '100' }}"
           RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '8' }}"
           SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
+          USE_EXCLUDED="${{ github.event.inputs.use_excluded_features || 'true' }}"
 
           ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN"
           if [ "$SKIP_GA" = "true" ]; then
             ARGS="$ARGS --skip-genetic"
+          fi
+          if [ "$USE_EXCLUDED" = "false" ]; then
+            ARGS="$ARGS --no-exclude-features"
           fi
 
           python -m src.ml_predictor.feature_selection $ARGS
@@ -101,6 +110,7 @@ jobs:
           git add ml_models/feature_selection/stage2_boruta_history.csv       || true
           git add ml_models/feature_selection/stage3_rfecv_curve.csv          || true
           git add ml_models/feature_selection/stage4_ga_log.csv               || true
+          git add ml_models/feature_selection/excluded_features.json         || true
 
           git diff --staged --quiet || git commit -m "🧬 Auto feature-selection: $(date +'%Y-%m-%d %H:%M:%S UTC')"
 
