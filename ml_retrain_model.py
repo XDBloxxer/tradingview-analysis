@@ -645,10 +645,13 @@ def audit_base_data(base_df: pd.DataFrame) -> None:
             logger.info(f"    {src}: {p:.1%} positive ({len(grp)} rows)")
     
     # Check intraday relabelling impact
+    # NOTE: previously hardcoded to 15.0, which had drifted out of sync with
+    # INTRADAY_WIN_THRESHOLD (20.0) used by apply_intraday_high_labels() — this
+    # diagnostic was overstating how many rows would actually get upgraded.
     if 'actual_high_pct' in base_df.columns:
         would_upgrade = (
             (base_df['label'] == 0) & 
-            (pd.to_numeric(base_df['actual_high_pct'], errors='coerce') >= 15.0)
+            (pd.to_numeric(base_df['actual_high_pct'], errors='coerce') >= INTRADAY_WIN_THRESHOLD)
         ).sum()
         logger.info(f"  Rows intraday_high_labels would upgrade: {would_upgrade}")
 
