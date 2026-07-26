@@ -38,6 +38,35 @@ Artifacts land in `ml_models/feature_selection/`:
 - `stage3_rfecv_curve.csv` — score vs. feature-count curve (find the elbow)
 - `stage4_ga_log.csv` — best/mean fitness per GA generation
 
+## Blocking specific features
+
+By default the pipeline loads `ml_models/feature_selection/excluded_features.json`
+and drops any column named there **before Stage 0** — so a blocklisted
+feature is invisible to the stability check, correlation clustering,
+Boruta, RFECV, and the GA alike, and can never come back through any stage.
+
+The file is either a plain JSON list of column names:
+
+```json
+["some_leaky_feature", "another_feature_to_never_use"]
+```
+
+or a dict with an `excluded_features` key (so you can leave yourself a note):
+
+```json
+{"excluded_features": ["some_leaky_feature"], "note": "why"}
+```
+
+A missing file is treated as an empty blocklist (no error). Flags:
+
+- `--exclude-features-file PATH` — point at a different blocklist (default
+  `ml_models/feature_selection/excluded_features.json`)
+- `--no-exclude-features` — disable the blocklist entirely for this run,
+  even if the file exists
+
+In the `ML Feature Selection` GitHub Actions workflow this is the
+`use_excluded_features` input, on by default.
+
 ## Use the result in training
 
 The selected subset is opt-in and does not change default behaviour:
