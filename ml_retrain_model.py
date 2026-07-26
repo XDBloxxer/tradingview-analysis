@@ -3913,6 +3913,20 @@ def apply_filter_aware_negative_sampling(df, logger=None):
     if df is None or df.empty or "label" not in df.columns:
         return df
 
+    # ── Opt-in gate ────────────────────────────────────────────────────────
+    # Filter-aware hard-negative sampling is OFF by default. Set
+    # USE_LEARNED_FILTERS=1/true/yes in the environment (or pass
+    # --use-learned-filters on the CLI, which sets this same env var) to
+    # enable it for a retrain run. This mirrors the USE_SELECTED_FEATURES
+    # opt-in flag used elsewhere in this file.
+    if os.environ.get("USE_LEARNED_FILTERS", "").lower() not in ("1", "true", "yes"):
+        if logger:
+            logger.info(
+                "Filter-aware negative sampling DISABLED (USE_LEARNED_FILTERS not set) "
+                "— using unfiltered negative sampling."
+            )
+        return df
+
     # ── Load filters fresh from disk ─────────────────────────────────────────
     # Reading here (not at module import) means any retrain picks up the latest
     # learned_filters.json without restarting.
@@ -4195,17 +4209,29 @@ def main() -> int:
         "--use-all-timepoints", action="store_true", default=True,
         help="Use both day_prior_close and day_prior_open T-1 tables (default: True).",
     )
+    parser.add_argument(
+        "--use-learned-filters", action="store_true", default=False,
+        help=(
+            "Enable filter-aware hard-negative sampling using "
+            "ml_models/learned_filters.json during retraining (default: False). "
+            "Equivalent to setting USE_LEARNED_FILTERS=1 in the environment."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
         _configure_logging(logging.DEBUG)
         logger.debug("Verbose logging enabled.")
 
+    if args.use_learned_filters:
+        os.environ["USE_LEARNED_FILTERS"] = "true"
+
     logger.info("=" * 60)
     logger.info("ML RETRAIN — FULL RETRAIN FROM SCRATCH")
-    logger.info(f"  lookback_days      : {args.lookback_days}")
-    logger.info(f"  use_all_timepoints : {args.use_all_timepoints}")
-    logger.info(f"  verbose            : {args.verbose}")
+    logger.info(f"  lookback_days       : {args.lookback_days}")
+    logger.info(f"  use_all_timepoints  : {args.use_all_timepoints}")
+    logger.info(f"  use_learned_filters : {os.environ.get('USE_LEARNED_FILTERS', '').lower() in ('1', 'true', 'yes')}")
+    logger.info(f"  verbose             : {args.verbose}")
     logger.info("=" * 60)
 
     # ── Connect ──────────────────────────────────────────────────────────────
