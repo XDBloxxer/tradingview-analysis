@@ -4861,6 +4861,7 @@ def main() -> int:
     # never chosen using X_cal_fit, so its AUC/ranking behaviour is a much
     # more honest estimate of generalization than X_val_xgb's, and is the
     # number to trust if the two disagree.
+    cal_auc = None  # persisted to metadata below; None when no blind holdout was available
     if X_cal_fit is not None and y_cal_fit is not None:
         cal_proba_report = model.predict_proba(X_cal_fit)[:, 1]
         cal_pred_report  = (cal_proba_report >= 0.5).astype(int)
@@ -4970,6 +4971,15 @@ def main() -> int:
         "n_negative":              int((y == 0).sum()),
         "positive_rate":           float((y == 1).mean()),
         "val_auc_roc":             float(auc),
+        # NOTE: val_auc_roc / best_val_auc above are measured on X_val_xgb, the
+        # same set XGBoost's early_stopping_rounds used to choose best_iteration —
+        # that makes them a model-selection score, not a blind evaluation, and
+        # they run optimistic (can approach ~1.0 even when the model doesn't
+        # generalize). blind_cal_auc below is measured on X_cal_fit, a holdout
+        # that was never used for tree-building, and is the number to trust.
+        "blind_cal_auc": (
+            float(cal_auc) if cal_auc is not None and cal_auc == cal_auc else None
+        ),
         "base_sample_weight":      BASE_CSV_WEIGHT,
         "t1_sample_weight":        T1_WEIGHT,
         "intraday_win_threshold":  INTRADAY_WIN_THRESHOLD,
@@ -5031,7 +5041,12 @@ def main() -> int:
             "This model may be over-fitted to recent market conditions. Investigate "
             "before deploying — see dedup diagnostics logged earlier in this run."
         )
-    logger.info(f"  Validation AUC      : {auc:.4f}")
+    logger.info(f"  Validation AUC      : {auc:.4f}  (early-stop holdout — optimistic, see below)")
+    _blind_cal_auc = training_stats.get("blind_cal_auc")
+    if _blind_cal_auc is not None:
+        logger.info(f"  Blind cal-holdout AUC: {_blind_cal_auc:.4f}  (trust this number)")
+    else:
+        logger.info("  Blind cal-holdout AUC: n/a (val set too small to carve a holdout this run)")
     _best_iter = (model.calibrated_classifiers_[0].estimator.best_iteration
                   if hasattr(model, "calibrated_classifiers_") else model.best_iteration)
     logger.info(f"  Best iteration      : {_best_iter}")
