@@ -64,6 +64,71 @@ logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
+# Shared: excluded-features blocklist
+# ===========================================================================
+
+DEFAULT_EXCLUDED_FEATURES_PATH = "ml_models/feature_selection/excluded_features.json"
+
+
+def load_excluded_features(path: str | Path) -> list[str]:
+    """
+    Load a manual feature blocklist for the selection pipeline.
+
+    Expected JSON shape is a simple list of column names:
+
+        ["some_leaky_feature", "another_feature_to_never_use"]
+
+    A dict with an "excluded_features" key (list[str]) is also accepted, so
+    the file can carry comments/metadata alongside the list if you want:
+
+        {"excluded_features": ["some_leaky_feature"], "note": "why"}
+
+    Missing file -> returns [] (nothing excluded) rather than raising, so
+    this is safe to point at a path that doesn't exist yet.
+    """
+    p = Path(path)
+    if not p.exists():
+        logger.info(f"[exclude] no blocklist file at {p} — nothing excluded")
+        return []
+
+    with open(p) as f:
+        data = json.load(f)
+
+    if isinstance(data, list):
+        excluded = data
+    elif isinstance(data, dict):
+        excluded = data.get("excluded_features", [])
+    else:
+        raise ValueError(
+            f"{p}: expected a JSON list or a dict with an 'excluded_features' "
+            f"key, got {type(data).__name__}"
+        )
+
+    excluded = [str(c) for c in excluded]
+    logger.info(f"[exclude] loaded {len(excluded)} feature(s) to exclude from {p}")
+    return excluded
+
+
+def apply_feature_exclusions(X: pd.DataFrame, excluded_features: list[str]) -> pd.DataFrame:
+    """
+    Drop `excluded_features` from X before any selection stage sees them.
+
+    Names in the blocklist that aren't actually present in X are logged and
+    ignored (not an error) — the pipeline's feature set changes over time,
+    so a stale entry shouldn't break the run.
+    """
+    if not excluded_features:
+        return X
+    present = [c for c in excluded_features if c in X.columns]
+    missing = [c for c in excluded_features if c not in X.columns]
+    if missing:
+        logger.info(f"[exclude] {len(missing)} blocklisted name(s) not present in X (ignored): {missing}")
+    if present:
+        logger.info(f"[exclude] dropping {len(present)} blocklisted feature(s): {present}")
+    return X.drop(columns=present)
+
+
+# ===========================================================================
 # Shared: time-aware (walk-forward) CV splitter
 # ===========================================================================
 
@@ -759,6 +824,7 @@ def run_pipeline(
     run_stability_check: bool = True,
     stability_n_runs: int = 8,
     stability_min_frequency: float = 0.75,
+    exclude_features: Optional[list[str]] = None,
 ) -> PipelineResult:
     """
     Run the pipeline and persist artifacts to `output_dir`.
@@ -786,6 +852,9 @@ def run_pipeline(
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+
+    if exclude_features:
+        X = apply_feature_exclusions(X, exclude_features)
 
     if run_stability_check:
         logger.info("STAGE 0.5: stability check (bootstrapped Stages 1-3)")
@@ -871,6 +940,7 @@ def run_pipeline(
         "boruta_iterations": boruta_iterations,
         "boruta_alpha": boruta_alpha,
         "rfecv_min_features": rfecv_min_features,
+        "excluded_features": list(exclude_features) if exclude_features else [],
     }
     with open(out / "selected_features.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -911,6 +981,19 @@ def _cli() -> int:
     )
     parser.add_argument("--stability-n-runs", type=int, default=8)
     parser.add_argument("--stability-min-frequency", type=float, default=0.75)
+    parser.add_argument(
+        "--exclude-features-file",
+        default=DEFAULT_EXCLUDED_FEATURES_PATH,
+        help="JSON file listing feature names to exclude from selection entirely "
+             f"(default: {DEFAULT_EXCLUDED_FEATURES_PATH}). Either a plain JSON "
+             "list of names, or a dict with an 'excluded_features' key. Missing "
+             "file is treated as an empty list (no error).",
+    )
+    parser.add_argument(
+        "--no-exclude-features", action="store_true",
+        help="Disable the feature blocklist entirely, even if --exclude-features-file exists "
+             "(the blocklist is applied by default).",
+    )
     parser.add_argument("--output-dir", default="ml_models/feature_selection")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -964,6 +1047,14 @@ def _cli() -> int:
         w = w.loc[fs_train_mask]
     dates = dates.loc[fs_train_mask]
 
+    exclude_features: list[str] = []
+    if not args.no_exclude_features:
+        exclude_features = load_excluded_features(args.exclude_features_file)
+    else:
+        logging.getLogger(__name__).info(
+            "[exclude] --no-exclude-features set — ignoring any blocklist file"
+        )
+
     run_pipeline(
         X, y, dates, w=w,
         output_dir=args.output_dir,
@@ -976,6 +1067,7 @@ def _cli() -> int:
         run_stability_check=not args.no_stability_check,
         stability_n_runs=args.stability_n_runs,
         stability_min_frequency=args.stability_min_frequency,
+        exclude_features=exclude_features,
     )
     return 0
 
