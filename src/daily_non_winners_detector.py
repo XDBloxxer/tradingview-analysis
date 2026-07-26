@@ -51,6 +51,16 @@ class DailyNonWinnersDetector:
         "min_relative_volume": None,
         "min_volume_ratio": None,
     }
+
+    # Keys from learned_filters.json that this detector is allowed to apply.
+    # learned_filters.json also carries model-driven thresholds (min_hv10,
+    # max_hv10, min_hv20, max_hv20, min_atr14, min_relative_volume,
+    # min_volume_ratio) that are derived from the ML model's winner
+    # distribution — those are intentionally excluded here so the
+    # non-winners pool stays purely price/volume filtered and doesn't
+    # inherit model-driven selection bias. Only simple price/volume
+    # thresholds are pulled from the learned file.
+    LEARNED_FILTER_ALLOWED_KEYS = {"min_price", "max_price", "min_volume"}
     
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
@@ -200,7 +210,14 @@ class DailyNonWinnersDetector:
 
     def _load_learned_filters(self) -> dict:
         """Load learned filters from ml_models/learned_filters.json.
-        
+
+        Only price/volume keys (min_price, max_price, min_volume) are taken
+        from the learned file — the model-driven thresholds it also carries
+        (hv10/hv20/atr14/relative_volume/volume_ratio, derived from the ML
+        model's winner distribution) are deliberately ignored here so the
+        non-winners pool isn't shaped by the same model it's meant to
+        provide independent negative examples for.
+
         Falls back to DEFAULT_FILTERS if the file is missing or unreadable.
         """
         defaults = dict(self.DEFAULT_FILTERS)
@@ -211,18 +228,27 @@ class DailyNonWinnersDetector:
                     learned = json.load(f)
 
                 applied = []
+                skipped_model_driven = []
                 for key, value in learned.items():
                     if key.startswith("_"):   # skip metadata keys
                         continue
                     if value is None:
                         continue
+                    if key not in self.LEARNED_FILTER_ALLOWED_KEYS:
+                        skipped_model_driven.append(f"{key}={value}")
+                        continue
                     defaults[key] = value
                     applied.append(f"{key}={value}")
 
                 if applied:
-                    self.logger.info(f"Loaded learned filters for non-winners: {', '.join(applied)}")
+                    self.logger.info(f"Loaded learned price/volume filters for non-winners: {', '.join(applied)}")
                 else:
-                    self.logger.info("learned_filters.json found but contained no usable keys — using defaults")
+                    self.logger.info("learned_filters.json found but contained no usable price/volume keys — using defaults")
+                if skipped_model_driven:
+                    self.logger.info(
+                        f"Ignored model-driven learned filters (not applied to non-winners): "
+                        f"{', '.join(skipped_model_driven)}"
+                    )
             else:
                 self.logger.info("No learned_filters.json found — using permissive defaults for non-winners")
         except Exception as e:
