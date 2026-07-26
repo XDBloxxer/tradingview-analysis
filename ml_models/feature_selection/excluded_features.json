@@ -1,0 +1,4 @@
+{
+  "excluded_features": [],
+  "note": "List feature column names here (as they appear in X) to permanently block them from every stage of the feature-selection pipeline (stability check, correlation clustering, Boruta, RFECV, GA). Applied by default; disable with --no-exclude-features or a different --exclude-features-file."
+}
