@@ -3150,14 +3150,18 @@ def train_gain_regressor(
         accuracy_gain_map = {}
         try:
             logger.info("RC1: Fetching gain data from ml_prediction_accuracy (no pre-fetched data supplied)...")
-            date_col = next(
-                (c for c in ("detection_date", "explosion_date", "prediction_date", "date")
-                 if c in combined_df.columns),
-                None,
-            )
-            if date_col is not None:
+            date_col_candidates = [c for c in ("detection_date", "explosion_date", "prediction_date", "date") if c in combined_df.columns]
+            if date_col_candidates:
                 try:
-                    start_date = pd.to_datetime(combined_df[date_col], errors="coerce").min()
+                    # BUG FIX: previously picked only the first matching column
+                    # for the whole frame (same issue fixed elsewhere in this
+                    # file) — rows lacking that particular column read as NaT
+                    # and were silently excluded from the min-date calculation.
+                    # Combine all candidate date columns per-row instead.
+                    _fallback_dates = pd.Series(pd.NaT, index=combined_df.index)
+                    for _c in date_col_candidates:
+                        _fallback_dates = _fallback_dates.fillna(pd.to_datetime(combined_df[_c], errors="coerce"))
+                    start_date = _fallback_dates.min()
                     start_date = start_date.date().isoformat() if pd.notna(start_date) else None
                 except Exception:
                     start_date = None
@@ -4427,15 +4431,13 @@ def main() -> int:
                 # RC2: Apply the corrected computation using prev_close
                 winners_corrected = _compute_correct_actual_high_pct(winners_response)
 
+                _has_detection_rc2 = "detection_date" in combined_df.columns
+                _has_event_rc2     = "event_date" in combined_df.columns
                 symbol_col = next(
                     (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
                 )
-                date_col = next(
-                    (c for c in ["detection_date", "event_date"]
-                     if c in combined_df.columns), None
-                )
 
-                if symbol_col and date_col:
+                if symbol_col and (_has_detection_rc2 or _has_event_rc2):
                     gain_cols = ["symbol", "detection_date", "actual_high_pct"]
                     if "change_pct" in winners_corrected.columns:
                         gain_cols.append("change_pct")
@@ -4455,10 +4457,22 @@ def main() -> int:
                         merge_helper["detection_date"], errors="coerce"
                     ).dt.strftime("%Y-%m-%d")
 
+                    # BUG FIX: previously picked ONE column (detection_date, if
+                    # present) for the entire frame, so base rows (no
+                    # detection_date) got NaT keys and silently never matched
+                    # winners_corrected — only T-1 rows ever received the RC2
+                    # corrected actual_high_pct. Build the key per-row instead,
+                    # falling back to event_date - 1 BDay (same alignment
+                    # convention used by the lookback filter / train_val_split).
+                    _merge_dates = pd.Series(pd.NaT, index=combined_df.index)
+                    if _has_detection_rc2:
+                        _merge_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+                    if _has_event_rc2:
+                        _merge_event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
+                        _merge_dates = _merge_dates.fillna(_merge_event_dates)
+
                     _tmp_key_col = "__merge_date_key__"
-                    combined_df[_tmp_key_col] = pd.to_datetime(
-                        combined_df[date_col], errors="coerce"
-                    ).dt.strftime("%Y-%m-%d")
+                    combined_df[_tmp_key_col] = _merge_dates.dt.strftime("%Y-%m-%d")
 
                     combined_df = combined_df.merge(
                         merge_helper,
@@ -4467,6 +4481,7 @@ def main() -> int:
                         how="left",
                         suffixes=("", "_winners"),
                     ).drop(columns=["detection_date_winners", _tmp_key_col], errors="ignore")
+
 
                     # Resolve column conflicts after merge
                     for col in ["actual_high_pct", "change_pct"]:
@@ -4531,14 +4546,21 @@ def main() -> int:
         _symbol_col = next(
             (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
         )
-        _date_col = next(
-            (c for c in ["detection_date", "event_date"]
-             if c in combined_df.columns), None
-        )
+        _has_detection_rc3 = "detection_date" in combined_df.columns
+        _has_event_rc3     = "event_date" in combined_df.columns
 
-        if _symbol_col and _date_col:
-            # Bound the query to the date range present in combined_df
-            _all_dates = pd.to_datetime(combined_df[_date_col], errors="coerce")
+        if _symbol_col and (_has_detection_rc3 or _has_event_rc3):
+            # BUG FIX: previously picked ONE column (detection_date, if present)
+            # for the whole frame, so _min_date reflected only T-1 rows' dates
+            # (a ~90-day window) and silently ignored the much older event_date
+            # rows — narrowing the accuracy-table query and starving label
+            # correction / the gain map for base rows. Build per-row instead.
+            _all_dates = pd.Series(pd.NaT, index=combined_df.index)
+            if _has_detection_rc3:
+                _all_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+            if _has_event_rc3:
+                _all_event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
+                _all_dates = _all_dates.fillna(_all_event_dates)
             _min_date = _all_dates.min()
             _start_date = (
                 _min_date.date().isoformat() if pd.notna(_min_date) else None
@@ -4582,9 +4604,7 @@ def main() -> int:
                 ].set_index(["symbol", "prediction_date"])
 
                 if not _acc_winners.empty:
-                    _combined_dates = pd.to_datetime(
-                        combined_df[_date_col], errors="coerce"
-                    ).dt.date.astype(str)
+                    _combined_dates = _all_dates.dt.date.astype(str)
 
                     # Build a boolean mask: rows in combined_df whose (symbol, date)
                     # appear as threshold-clearers in ml_prediction_accuracy.
