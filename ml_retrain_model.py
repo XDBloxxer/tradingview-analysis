@@ -95,6 +95,7 @@ OUTPUTS (same paths as before, drop-in compatible with ml_weekly_retrain.yml):
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
