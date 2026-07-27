@@ -199,6 +199,28 @@ MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 VAL_WEEKS = 8
 
 # ---------------------------------------------------------------------------
+# Purge / embargo gap at the train/val boundary
+# ---------------------------------------------------------------------------
+# The train/val split below is a hard date cutoff. Several of the most
+# important features (t3_hv_30, t3_hv_20, t5_hv_10, ...) are rolling windows
+# up to EMBARGO_DAYS deep. Without a gap, a train row dated just before the
+# cutoff and a val row dated just after it (especially for the same symbol)
+# have rolling-window feature vectors that overlap heavily in the underlying
+# days they're computed from — nothing is "from the future," but the two
+# rows are highly autocorrelated purely because they sit next to each other
+# in time. This inflates val AUC relative to what the model will see on a
+# genuinely fresh period, in exactly the way purged/embargoed CV (de Prado)
+# is designed to prevent.
+#
+# EMBARGO_DAYS removes a buffer of rows immediately before the cutoff from
+# the TRAIN set entirely (they are dropped, not moved into val) so that no
+# train row's rolling window is adjacent to a val row's rolling window.
+# Set to the deepest rolling-window length in use (30 days, hv_30) so the
+# gap is at least as wide as any single feature's lookback.
+EMBARGO_DAYS = 30
+
+
+# ---------------------------------------------------------------------------
 # Filter-aware negative sampling — loosening config
 # ---------------------------------------------------------------------------
 # These values are read from config.yaml (non_winners section) at import time
@@ -2689,6 +2711,15 @@ def train_val_split(
       val, training aborts with a clear message rather than producing a junk model
       (previously the code only warned and then continued).
 
+    FIX 4 — Purge/embargo gap at the cutoff (EMBARGO_DAYS).
+      Rows dated within EMBARGO_DAYS immediately before the cutoff are dropped
+      from train entirely (not moved to val). Several top features are rolling
+      windows up to 30 days deep, so a hard cutoff with no gap put train rows
+      and val rows right next to each other in time with highly overlapping
+      (autocorrelated) rolling-window feature vectors — inflating val AUC via
+      boundary adjacency rather than genuine generalisation. The embargo
+      removes that adjacency.
+
     To change the val window size, adjust VAL_WEEKS in the configuration block.
     """
     df_work = df_with_dates.copy()
@@ -2730,9 +2761,29 @@ def train_val_split(
         VAL_CUTOFF_DATE = cutoff.date()  # stored for metadata/logging
         dates  = pd.to_datetime(df_work[date_col], errors="coerce")
 
+        # ── Purge/embargo gap ────────────────────────────────────────────
+        # Drop rows whose date falls in [cutoff - EMBARGO_DAYS, cutoff) from
+        # TRAIN entirely (they are not moved to val either — they're simply
+        # excluded) so that no train row's rolling-window features are
+        # adjacent in time to a val row's rolling-window features. This
+        # mirrors purged/embargoed CV: it removes the boundary-adjacency
+        # effect that would otherwise inflate val AUC via autocorrelated
+        # feature vectors rather than genuine generalisation.
+        embargo_start = cutoff - pd.Timedelta(days=EMBARGO_DAYS)
+
         # FIX 2 applied here: NaT → train regardless of cutoff
-        train_mask = nat_mask | (dates < cutoff)
-        val_mask   = (~nat_mask) & (dates >= cutoff)
+        train_mask   = nat_mask | (dates < embargo_start)
+        embargo_mask = (~nat_mask) & (dates >= embargo_start) & (dates < cutoff)
+        val_mask     = (~nat_mask) & (dates >= cutoff)
+
+        n_embargoed = int(embargo_mask.sum())
+        if n_embargoed > 0:
+            logger.info(
+                f"Purge/embargo: dropping {n_embargoed} rows dated "
+                f"[{embargo_start.date()} \u2192 {cutoff.date()}) \u2014 within "
+                f"{EMBARGO_DAYS}d of the val cutoff \u2014 from train so "
+                "rolling-window features don't straddle the boundary."
+            )
 
         train_idx = df_work.index[train_mask]
         val_idx   = df_work.index[val_mask]
@@ -2745,7 +2796,8 @@ def train_val_split(
             f"train {train_dates.min().date() if not train_dates.empty else '?'} "
             f"→ {train_dates.max().date() if not train_dates.empty else '?'}, "
             f"val {val_dates.min().date() if not val_dates.empty else '?'} "
-            f"→ {val_dates.max().date() if not val_dates.empty else '?'}"
+            f"→ {val_dates.max().date() if not val_dates.empty else '?'}, "
+            f"embargoed={n_embargoed}"
         )
     else:
         # No date column at all — fall back to sequential split (last resort)
