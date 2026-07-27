@@ -222,6 +222,14 @@ VAL_WEEKS = 8
 EMBARGO_DAYS_FLOOR = 5
 EMBARGO_DAYS_CAP   = 90
 
+# Minimum number of days of pre-embargo data train_val_split will insist on
+# keeping for TRAIN, even if that means shrinking the inferred embargo below
+# what the deepest rolling-window feature would otherwise call for. Purely a
+# safety floor against the embargo silently consuming the entire train
+# window (see the guard in train_val_split) -- it does not replace choosing
+# a sane --lookback-days for the actual dataset.
+MIN_TRAIN_WINDOW_DAYS = 14
+
 # Matches the deepest rolling-window length actually present in a set of
 # feature column names, so the embargo automatically widens if someone adds
 # a feature with a longer lookback (e.g. hv_45) without anyone remembering
@@ -2962,6 +2970,39 @@ def train_val_split(
         # feature vectors rather than genuine generalisation.
         embargo_start = cutoff - pd.Timedelta(days=EMBARGO_DAYS)
 
+        # ── Guard: don't let the embargo eat the entire train window ────────
+        # EMBARGO_DAYS is inferred from feature names and can be as large as
+        # EMBARGO_DAYS_CAP (90d), independent of how much pre-cutoff data
+        # lookback_days actually left us. If embargo_start falls at or before
+        # the earliest dated row, EVERY dated row is a candidate for the
+        # embargo band and none reach train (NaT rows are the only rows that
+        # would survive) -- silently producing a train split with 0 or 1
+        # classes rather than an error. Shrink the embargo instead, down to
+        # a floor, and log loudly so the mismatch between lookback_days and
+        # the inferred embargo is visible rather than surfacing later as a
+        # confusing XGBoost "invalid classes" crash.
+        earliest_dated = dates[~nat_mask].min() if (~nat_mask).any() else pd.NaT
+        if pd.notna(earliest_dated):
+            available_pre_cutoff_days = (cutoff - earliest_dated).days
+            min_required = MIN_TRAIN_WINDOW_DAYS + EMBARGO_DAYS_FLOOR
+            if available_pre_cutoff_days < min_required:
+                logger.warning(
+                    f"Only {available_pre_cutoff_days}d of data exist before the "
+                    f"val cutoff ({cutoff.date()}), but the inferred embargo "
+                    f"({EMBARGO_DAYS}d) plus a {MIN_TRAIN_WINDOW_DAYS}d minimum "
+                    f"train window need {min_required}d. This usually means "
+                    "lookback_days is too small for the deepest rolling-window "
+                    "feature in use (or a data source — e.g. ml_training_base — "
+                    "aged out and stopped padding the window). "
+                    "Shrinking the embargo instead of letting it consume the "
+                    "whole train window; consider raising --lookback-days."
+                )
+                EMBARGO_DAYS = max(
+                    EMBARGO_DAYS_FLOOR,
+                    min(EMBARGO_DAYS, available_pre_cutoff_days - MIN_TRAIN_WINDOW_DAYS),
+                )
+                embargo_start = cutoff - pd.Timedelta(days=EMBARGO_DAYS)
+
         # FIX 2 applied here: NaT → train regardless of cutoff
         train_mask   = nat_mask | (dates < embargo_start)
         embargo_mask = (~nat_mask) & (dates >= embargo_start) & (dates < cutoff)
@@ -3109,6 +3150,29 @@ def train_val_split(
         )
     else:
         logger.info(f"  ✅ Val set has {val_pos} positives — early stopping signal is stable.")
+
+    # ── Hard minimum: train must contain BOTH classes ─────────────────────────
+    # A single-class train set (usually train_pos=0 after the purge/embargo
+    # step ate every dated row, or a VAL REBALANCE that only moved positives
+    # over) fails deep inside XGBoost.fit() with a cryptic "Invalid classes
+    # inferred" error. Catch it here instead, with a message that actually
+    # points at the fix.
+    train_pos = int((y_train == 1).sum())
+    train_neg = int((y_train == 0).sum())
+    if train_pos == 0 or train_neg == 0:
+        logger.error(
+            f"ABORTING: train split has pos={train_pos}, neg={train_neg} — "
+            "missing a class entirely, XGBoost cannot fit on this. "
+            "This almost always means the purge/embargo window consumed the "
+            "whole pre-cutoff train range (EMBARGO_DAYS close to or larger "
+            "than the data available before the val cutoff). "
+            "Options: (1) increase --lookback-days so more pre-cutoff data "
+            "exists, (2) check whether a data source that used to pad the "
+            "training window (e.g. ml_training_base) has gone stale/empty, "
+            "(3) lower VAL_WEEKS so the val cutoff sits later, leaving more "
+            "room before it for train."
+        )
+        sys.exit(1)
 
     return X_train, X_val, y_train, y_val, w_train, w_val, train_idx
 
@@ -4476,7 +4540,7 @@ def main() -> int:
         help="Set log level to DEBUG (default: INFO).",
     )
     parser.add_argument(
-        "--lookback-days", type=int, default=90, metavar="N",
+        "--lookback-days", type=int, default=180, metavar="N",
         help="How many days of T-1 data to use for training (default: 90).",
     )
     parser.add_argument(
@@ -4507,6 +4571,28 @@ def main() -> int:
     logger.info(f"  use_learned_filters : {os.environ.get('USE_LEARNED_FILTERS', '').lower() in ('1', 'true', 'yes')}")
     logger.info(f"  verbose             : {args.verbose}")
     logger.info("=" * 60)
+
+    # ── Sanity check: is lookback_days wide enough for the embargo? ───────────
+    # Worst case, the inferred embargo hits EMBARGO_DAYS_CAP (driven by
+    # whatever rolling-window feature happens to be selected that month).
+    # For train to have any real pre-embargo window left, lookback_days needs
+    # to cover: the val window (VAL_WEEKS) + the embargo (up to the cap) +
+    # a minimum train slice (MIN_TRAIN_WINDOW_DAYS). Computed from the same
+    # constants train_val_split's own cap uses, so this can't drift out of
+    # sync with the actual guard.
+    _recommended_min_lookback = (VAL_WEEKS * 7) + EMBARGO_DAYS_CAP + MIN_TRAIN_WINDOW_DAYS
+    if args.lookback_days < _recommended_min_lookback:
+        logger.warning(
+            f"lookback_days={args.lookback_days} is below the recommended "
+            f"minimum of {_recommended_min_lookback}d "
+            f"(= {VAL_WEEKS*7}d val window + {EMBARGO_DAYS_CAP}d worst-case "
+            f"embargo + {MIN_TRAIN_WINDOW_DAYS}d minimum train slice). "
+            "If the deepest rolling-window feature in this run's selected "
+            "features pushes the inferred embargo close to the cap, train "
+            "may end up starved -- train_val_split will auto-shrink the "
+            "embargo to compensate, but that trades away purge protection "
+            "you probably want. Consider raising --lookback-days instead."
+        )
 
     # ── Connect ──────────────────────────────────────────────────────────────
     client = get_supabase_client()
