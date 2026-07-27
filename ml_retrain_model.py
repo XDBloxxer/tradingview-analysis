@@ -203,21 +203,64 @@ VAL_WEEKS = 8
 # ---------------------------------------------------------------------------
 # The train/val split below is a hard date cutoff. Several of the most
 # important features (t3_hv_30, t3_hv_20, t5_hv_10, ...) are rolling windows
-# up to EMBARGO_DAYS deep. Without a gap, a train row dated just before the
-# cutoff and a val row dated just after it (especially for the same symbol)
-# have rolling-window feature vectors that overlap heavily in the underlying
-# days they're computed from — nothing is "from the future," but the two
-# rows are highly autocorrelated purely because they sit next to each other
-# in time. This inflates val AUC relative to what the model will see on a
-# genuinely fresh period, in exactly the way purged/embargoed CV (de Prado)
-# is designed to prevent.
+# up to N days deep. Without a gap, a train row dated just before the cutoff
+# and a val row dated just after it (especially for the same symbol) have
+# rolling-window feature vectors that overlap heavily in the underlying days
+# they're computed from — nothing is "from the future," but the two rows are
+# highly autocorrelated purely because they sit next to each other in time.
+# This inflates val AUC relative to what the model will see on a genuinely
+# fresh period, in exactly the way purged/embargoed CV (de Prado) is
+# designed to prevent.
 #
-# EMBARGO_DAYS removes a buffer of rows immediately before the cutoff from
-# the TRAIN set entirely (they are dropped, not moved into val) so that no
-# train row's rolling window is adjacent to a val row's rolling window.
-# Set to the deepest rolling-window length in use (30 days, hv_30) so the
-# gap is at least as wide as any single feature's lookback.
-EMBARGO_DAYS = 30
+# EMBARGO_DAYS_FLOOR / EMBARGO_DAYS_CAP bound the *inferred* gap (below).
+# The floor guards against a feature-name scan that happens to find nothing
+# and would otherwise embargo 0 days; the cap guards against a stray large
+# number in an unrelated column name (e.g. a year) blowing the gap out to
+# something absurd and starving train of data.
+EMBARGO_DAYS_FLOOR = 5
+EMBARGO_DAYS_CAP   = 90
+
+# Matches the deepest rolling-window length actually present in a set of
+# feature column names, so the embargo automatically widens if someone adds
+# a feature with a longer lookback (e.g. hv_45) without anyone remembering
+# to bump a hardcoded constant. Column names encode window length as a
+# trailing/embedded integer — SMA_50, EMA_26, hv_30, Volume_MA20, HV_10,
+# BBL_20_2.0_2.0, MACD_12_26_9, etc. — so every integer run in the name is a
+# candidate window length; we take the max across all feature columns,
+# clamped to a sane [floor, cap] range.
+_WINDOW_NUMBER_RE = re.compile(r"\d+")
+
+
+def _infer_embargo_days(
+    feature_cols,
+    floor: int = EMBARGO_DAYS_FLOOR,
+    cap: int = EMBARGO_DAYS_CAP,
+) -> int:
+    """Infer the purge/embargo gap (in days) from the deepest rolling-window
+    length encoded in the given feature column names.
+
+    Falls back to `floor` if no plausible window length is found (e.g. an
+    empty feature list), and clamps the result to `cap` so a stray large
+    number in an unrelated column name can't blow the train set apart.
+    """
+    max_window = 0
+    for col in feature_cols:
+        for match in _WINDOW_NUMBER_RE.findall(col):
+            try:
+                n = int(match)
+            except ValueError:
+                continue
+            # Decimal fragments like "2.0" in BBL_20_2.0_2.0 surface as "2"
+            # and "0" — harmless, they're just smaller than the real window
+            # numbers and won't win the max(). Ignore implausibly large
+            # numbers (e.g. a stray year or id) outright rather than let
+            # them dominate the max before clamping.
+            if n > cap:
+                continue
+            max_window = max(max_window, n)
+
+    inferred = max_window if max_window > 0 else floor
+    return int(max(floor, min(cap, inferred)))
 
 
 # ---------------------------------------------------------------------------
