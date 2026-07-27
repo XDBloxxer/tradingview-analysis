@@ -99,6 +99,7 @@ import re
 import sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional
 
 try:
     import yaml
@@ -596,23 +597,70 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 
-def fetch_table_paginated(client: Client, table: str, page_size: int = 1000) -> pd.DataFrame:
-    """Fetch all rows from a Supabase table using pagination."""
-    rows   = []
-    offset = 0
-    while True:
-        resp = (
-            client.table(table)
-            .select("*")
-            .range(offset, offset + page_size - 1)
-            .execute()
-        )
-        batch = resp.data or []
-        rows.extend(batch)
-        logger.info(f"  {table}: fetched {len(rows)} rows so far...")
-        if len(batch) < page_size:
-            break
-        offset += page_size
+FETCH_BUFFER_DAYS = 10  # see full rationale in docstring below
+
+
+def fetch_table_paginated(
+    client: Client,
+    table: str,
+    page_size: int = 1000,
+    date_columns: Optional[list] = None,
+    cutoff_date: Optional[str] = None,
+) -> pd.DataFrame:
+    """Fetch rows from a Supabase table using pagination.
+
+    If ``date_columns`` and ``cutoff_date`` are given, apply a server-side
+    ``col >= cutoff_date`` filter (OR'd across every column in
+    ``date_columns``, plus rows where all of them are NULL, so mistake /
+    legacy rows without a date are never silently dropped). This cuts
+    egress on tables that hold long history but where only a recent window
+    is ever used for training. The exact, row-accurate lookback filter
+    still runs afterwards in Python (see FETCH_BUFFER_DAYS), so results are
+    identical to fetching the whole table -- only the transferred byte
+    count changes.
+    """
+    query = client.table(table).select("*")
+
+    if date_columns and cutoff_date:
+        # PostgREST or_() syntax: "col1.gte.DATE,col2.gte.DATE,col1.is.null"
+        # A row passes if ANY clause matches: keep it if it's recent by any
+        # available date column, or if it has no date at all (better to
+        # over-fetch a few stray rows than to silently lose ones the old
+        # full-fetch would have kept).
+        clauses = [f"{col}.gte.{cutoff_date}" for col in date_columns]
+        clauses += [f"{col}.is.null" for col in date_columns]
+        query = query.or_(",".join(clauses))
+
+    def _run(q):
+        rows_, offset_ = [], 0
+        while True:
+            resp = q.range(offset_, offset_ + page_size - 1).execute()
+            batch = resp.data or []
+            rows_.extend(batch)
+            logger.info(f"  {table}: fetched {len(rows_)} rows so far...")
+            if len(batch) < page_size:
+                break
+            offset_ += page_size
+        return rows_
+
+    try:
+        rows = _run(query)
+    except Exception as e:
+        if date_columns and cutoff_date:
+            # Most likely cause: one of date_columns doesn't exist on this
+            # table's schema, which PostgREST rejects outright. Don't let a
+            # bandwidth optimization take down the whole retrain -- fall
+            # back to the old unfiltered fetch and flag it loudly so the
+            # date_columns list can be fixed.
+            logger.warning(
+                f"  {table}: date-filtered fetch failed ({e}); "
+                "falling back to a full unfiltered fetch. Check that "
+                f"{date_columns} actually exist on '{table}'."
+            )
+            rows = _run(client.table(table).select("*"))
+        else:
+            raise
+
     df = pd.DataFrame(rows)
     logger.info(f"  {table}: total {len(df)} rows, {len(df.columns)} columns")
     return df
@@ -622,10 +670,32 @@ def fetch_table_paginated(client: Client, table: str, page_size: int = 1000) -> 
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_base_training_data(client: Client) -> pd.DataFrame:
+def _fetch_cutoff(lookback_days: Optional[int]) -> Optional[str]:
+    """Server-side fetch cutoff = lookback_days + FETCH_BUFFER_DAYS ago.
+
+    Looser than the exact client-side lookback filter on purpose (see
+    FETCH_BUFFER_DAYS) -- this only trims what crosses the wire, the exact
+    cutoff is still enforced in Python afterwards.
+    """
+    if not lookback_days:
+        return None
+    return (
+        datetime.now().date() - timedelta(days=lookback_days + FETCH_BUFFER_DAYS)
+    ).isoformat()
+
+
+def load_base_training_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
     """Load original CSV data from ml_training_base."""
     logger.info(f"Loading base training data from '{TABLE_BASE}'...")
-    df = fetch_table_paginated(client, TABLE_BASE)
+    # ml_training_base only has event_date (no detection_date) -- see
+    # combine_datasets(). Filtering on a column that doesn't exist on this
+    # table would make PostgREST reject the whole query, so we deliberately
+    # do NOT include detection_date here.
+    df = fetch_table_paginated(
+        client, TABLE_BASE,
+        date_columns=["event_date"],
+        cutoff_date=_fetch_cutoff(lookback_days),
+    )
     if df.empty:
         logger.error(
             f"Table '{TABLE_BASE}' is empty! "
@@ -724,7 +794,7 @@ def audit_base_data(base_df: pd.DataFrame) -> None:
         logger.info(f"  Rows intraday_high_labels would upgrade: {would_upgrade}")
 
 
-def load_multiday_data(client: Client) -> tuple[pd.DataFrame, pd.DataFrame]:
+def load_multiday_data(client: Client, lookback_days: Optional[int] = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load the backfilled / daily-generated T-3/T-5/T-10 feature tables.
 
@@ -741,7 +811,11 @@ def load_multiday_data(client: Client) -> tuple[pd.DataFrame, pd.DataFrame]:
         (TABLE_NON_WINNERS_MULTIDAY, "non_winners"),
     ]:
         try:
-            df = fetch_table_paginated(client, table)
+            df = fetch_table_paginated(
+                client, table,
+                date_columns=["detection_date"],
+                cutoff_date=_fetch_cutoff(lookback_days),
+            )
             if df.empty:
                 logger.warning(f"  {table}: table is empty or does not exist")
                 result[key] = pd.DataFrame()
@@ -1242,7 +1316,7 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     return df
 
 
-def load_t1_data(client: Client) -> pd.DataFrame:
+def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
     """
     Load accumulated T-1 winner and non-winner samples, then join in the
     corresponding T-3/T-5/T-10 multiday features so every row has the full
@@ -1264,7 +1338,7 @@ def load_t1_data(client: Client) -> pd.DataFrame:
 
     # Load multiday tables once — reused for both open and close variants
     logger.info("Loading multiday feature tables for T-1 enrichment...")
-    winners_multiday, non_winners_multiday = load_multiday_data(client)
+    winners_multiday, non_winners_multiday = load_multiday_data(client, lookback_days=lookback_days)
 
     # Each label (winner=1, non-winner=0) has a close table and an open table.
     # We load them as paired groups and merge close+open features into a single
@@ -1283,7 +1357,11 @@ def load_t1_data(client: Client) -> pd.DataFrame:
 
     def _load_and_rename(table: str, prefix: str) -> pd.DataFrame:
         """Fetch one table and rename its intraday feature columns."""
-        df = fetch_table_paginated(client, table)
+        df = fetch_table_paginated(
+            client, table,
+            date_columns=["detection_date"],
+            cutoff_date=_fetch_cutoff(lookback_days),
+        )
         if df.empty:
             return df
         df["label"]  = -1          # placeholder; caller sets the real value
@@ -4371,8 +4449,8 @@ def main() -> int:
     client = get_supabase_client()
 
     # ── Load standard training data ───────────────────────────────────────────
-    base_df     = load_base_training_data(client)
-    t1_df       = load_t1_data(client)
+    base_df     = load_base_training_data(client, lookback_days=args.lookback_days)
+    t1_df       = load_t1_data(client, lookback_days=args.lookback_days)
     combined_df = combine_datasets(base_df, t1_df)
 
     # ── Apply lookback_days filter to combined_df ─────────────────────────────
