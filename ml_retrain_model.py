@@ -462,10 +462,12 @@ XGBOOST_PARAMS = {
     "learning_rate":      0.05,
     "subsample":          0.8,
     "colsample_bytree":   0.8,
-    "min_child_weight":   10,      # raised from 3 → requires more samples per leaf
-    "gamma":              2.0,     # raised from 0.1 → higher minimum gain to split
-    "reg_alpha":          0.5,     # raised from 0.1 → more L1 regularisation
-    "reg_lambda":         2.0,     # raised from 1.0 → more L2 regularisation
+    "min_child_weight":   4,       # loosened from 10 → was over-constraining the smaller,
+                                    # denser 22-feature/lookback-fixed training set (early
+                                    # stopping was firing after only 3 trees)
+    "gamma":              0.3,     # loosened from 2.0 → lower minimum gain needed to split
+    "reg_alpha":          0.2,     # loosened from 0.5 → less L1 regularisation
+    "reg_lambda":         1.5,     # loosened from 2.0 → less L2 regularisation
     "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
     "objective":          "binary:logistic",
     # eval_metric changed from "logloss" to "auc":
@@ -3711,14 +3713,23 @@ def train_gain_regressor(
     # training, making val R² optimistic.
     if len(X_reg_fill) >= 20:
         # Re-use the date information from combined_df to sort rows
-        _date_col = next(
-            (c for c in ["detection_date", "event_date"] if c in combined_df.columns),
-            None,
-        )
+        _has_detection_reg = "detection_date" in combined_df.columns
+        _has_event_reg     = "event_date" in combined_df.columns
+        _date_col = "detection_date" if _has_detection_reg else ("event_date" if _has_event_reg else None)
         if _date_col is not None:
-            _dates = pd.to_datetime(
-                combined_df.loc[valid_gain_mask, _date_col], errors="coerce"
-            )
+            # BUG FIX (same root cause as the lookback filter above): don't pick
+            # one column for the whole frame. detection_date is NaT for every
+            # base-CSV row, which previously made _dates all-NaT whenever a
+            # split happened to contain mostly/only base rows — collapsing the
+            # val set to 0 rows and crashing mean_absolute_error downstream.
+            # Fall back to event_date (shifted 1 BDay) per-row instead.
+            _dates = pd.Series(pd.NaT, index=combined_df.index)
+            if _has_detection_reg:
+                _dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+            if _has_event_reg:
+                _event_dates_reg = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
+                _dates = _dates.fillna(_event_dates_reg)
+            _dates = _dates.loc[valid_gain_mask]
             # FIX 1: Mirror train_val_split's FIX 2 — NaT rows are mistake samples
             # (they have no detection_date/event_date).  sort_values(na_position="last")
             # previously pushed them to the END of the sorted index, meaning they landed
@@ -3809,10 +3820,10 @@ def train_gain_regressor(
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        min_child_weight=10,
-        gamma=1.0,
-        reg_alpha=0.5,
-        reg_lambda=2.0,
+        min_child_weight=4,   # loosened from 10, matching classifier fix
+        gamma=0.3,             # loosened from 1.0
+        reg_alpha=0.2,         # loosened from 0.5
+        reg_lambda=1.5,        # loosened from 2.0
         objective="reg:squarederror",
         eval_metric="rmse",
         random_state=42,
@@ -4371,14 +4382,25 @@ def main() -> int:
     # the accumulation period (~90 days), so this filter mainly trims base CSV rows.
     # We use the _sampling_date logic: detection_date ?? (event_date - 1 BDay).
     _lookback_cutoff = (datetime.now().date() - timedelta(days=args.lookback_days)).isoformat()
-    _lb_date_col = next(
-        (c for c in ["detection_date", "event_date"] if c in combined_df.columns), None
-    )
+    _has_detection = "detection_date" in combined_df.columns
+    _has_event     = "event_date" in combined_df.columns
+    _lb_date_col = "detection_date" if _has_detection else ("event_date" if _has_event else None)
     if _lb_date_col is not None:
-        _lb_dates = pd.to_datetime(combined_df[_lb_date_col], errors="coerce")
-        if _lb_date_col == "event_date":
-            # event_date is the explosion day (T+1), shift back 1 BDay to align
-            _lb_dates = _lb_dates - pd.tseries.offsets.BDay(1)
+        # BUG FIX: previously this picked ONE column for the entire dataframe.
+        # Since detection_date exists (populated only on T-1 rows), it was
+        # selected for every row — base-CSV rows (event_date only) showed up
+        # as NaT in detection_date and bypassed the filter entirely via the
+        # `.isna()` passthrough below, letting years of old base data into
+        # train regardless of lookback_days. Fix: build sort dates per-row,
+        # preferring detection_date and falling back to event_date (shifted
+        # back 1 BDay, since event_date is the explosion day T+1) wherever
+        # detection_date is missing — mirroring train_val_split's sort_date.
+        _lb_dates = pd.Series(pd.NaT, index=combined_df.index)
+        if _has_detection:
+            _lb_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+        if _has_event:
+            _event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
+            _lb_dates = _lb_dates.fillna(_event_dates)
         _lb_mask = (_lb_dates.dt.date.astype(str) >= _lookback_cutoff) | _lb_dates.isna()
         n_before = len(combined_df)
         combined_df = combined_df[_lb_mask].copy()
