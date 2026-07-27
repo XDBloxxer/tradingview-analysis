@@ -2768,6 +2768,10 @@ def train_val_split(
     """
     df_work = df_with_dates.copy()
 
+    # Infer the purge/embargo gap from the deepest rolling-window length
+    # encoded in the feature column names (clamped to [floor, cap]).
+    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
+
     # ── Build a unified sort_date from whichever date column(s) exist ────────
     has_detection = "detection_date" in df_work.columns
     has_event     = "event_date"     in df_work.columns
