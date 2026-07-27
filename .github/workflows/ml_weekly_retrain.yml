@@ -10,7 +10,7 @@ on:
       lookback_days:
         description: 'Days of training data to use'
         required: false
-        default: '90'
+        default: '180'
         type: string
       use_all_timepoints:
         description: 'Use all timepoints (day_prior_close + day_prior_open)'
@@ -75,7 +75,7 @@ jobs:
           USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
           
           if [ -z "$LOOKBACK" ]; then
-            LOOKBACK=90
+            LOOKBACK=180
           fi
           
           if [ "$USE_ALL" = "true" ]; then
