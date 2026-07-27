@@ -684,9 +684,53 @@ def _fetch_cutoff(lookback_days: Optional[int]) -> Optional[str]:
     ).isoformat()
 
 
+def _table_max_date(client: Client, table: str, date_column: str) -> Optional[str]:
+    """Cheap 1-row query for the newest value of date_column in a table.
+
+    Used to decide whether a full fetch is even worth doing, instead of
+    paginating the whole table and finding out afterward it's stale.
+    Returns None if the table is empty, the column doesn't exist, or the
+    query fails for any reason (caller should fall back to a real fetch).
+    """
+    try:
+        resp = (
+            client.table(table)
+            .select(date_column)
+            .order(date_column, desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        return rows[0].get(date_column) if rows else None
+    except Exception as e:
+        logger.debug(f"  {table}: max-date pre-check failed ({e}); will fall back to a full fetch")
+        return None
+
+
 def load_base_training_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
     """Load original CSV data from ml_training_base."""
     logger.info(f"Loading base training data from '{TABLE_BASE}'...")
+
+    cutoff = _fetch_cutoff(lookback_days)
+
+    # ml_training_base is a mostly-static historical seed table (uploaded once
+    # via upload_base_training_data.py, not continuously appended to like the
+    # T-1 tables). Once its newest event_date falls outside the lookback
+    # window, EVERY retrain from here on would fetch and then immediately
+    # discard the whole table. A single tiny query up front tells us that
+    # cheaply, instead of paginating potentially the entire table only to end
+    # up with 0 usable rows.
+    if cutoff is not None:
+        max_date = _table_max_date(client, TABLE_BASE, "event_date")
+        if max_date is not None and max_date < cutoff:
+            logger.info(
+                f"  {TABLE_BASE}: newest event_date is {max_date}, older than the "
+                f"{cutoff} fetch cutoff — table is stale relative to the "
+                f"{lookback_days}-day lookback window. Skipping the fetch "
+                "entirely (T-1 data covers the training window instead)."
+            )
+            return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
+
     # ml_training_base only has event_date (no detection_date) -- see
     # combine_datasets(). Filtering on a column that doesn't exist on this
     # table would make PostgREST reject the whole query, so we deliberately
@@ -694,9 +738,24 @@ def load_base_training_data(client: Client, lookback_days: Optional[int] = None)
     df = fetch_table_paginated(
         client, TABLE_BASE,
         date_columns=["event_date"],
-        cutoff_date=_fetch_cutoff(lookback_days),
+        cutoff_date=cutoff,
     )
     if df.empty:
+        if cutoff is not None:
+            # Distinguish "table is genuinely missing/misconfigured" (fatal,
+            # same as before) from "table has rows, just none inside the
+            # lookback window" (expected once the seed CSV ages out — not an
+            # error, just means base contributes nothing to this retrain).
+            unfiltered_probe = fetch_table_paginated(client, TABLE_BASE, page_size=1)
+            if not unfiltered_probe.empty:
+                logger.info(
+                    f"  {TABLE_BASE}: no rows within the lookback window "
+                    f"(cutoff={cutoff}), but the table itself is not empty — "
+                    "base data is just older than lookback_days. Continuing "
+                    "with T-1 data only."
+                )
+                return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
+
         logger.error(
             f"Table '{TABLE_BASE}' is empty! "
             "Run upload_base_training_data.py first."
@@ -2153,6 +2212,10 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     NOTE: mistake samples should be added AFTER this function returns,
     so their custom sample_weights (3.0 / 2.0) are not overwritten here.
     """
+    if base_df.empty:
+        logger.info("Combining: T-1 data only (base data empty or outside lookback window)")
+        return t1_df.copy()
+
     if t1_df.empty:
         logger.info("Combining: base data only (no T-1 data yet)")
         return base_df.copy()
