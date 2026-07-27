@@ -4710,9 +4710,16 @@ def main() -> int:
     X_val                          = scale_with_fitted_scaler(scaler, X_val_raw,
                                          sparse_threshold_cols=_sparse_cols)     # transform val only
 
-    # Reassemble a full scaled DataFrame (train + val, original row order) kept
-    # for any downstream use that genuinely needs all rows.
-    X_scaled = pd.concat([X_train, X_val]).loc[X.index]  # restore original row order
+    # Reassemble a scaled DataFrame (train + val, original row order) kept for
+    # any downstream use that needs the surviving rows in order. Note: rows
+    # dropped by the purge/embargo gap in train_val_split are neither in
+    # X_train nor X_val, so X.index (the full original index) is a superset
+    # of the combined train+val index — reindexing to X.index directly would
+    # KeyError on the embargoed rows. Restore order using only the index
+    # values that actually survived the split instead.
+    X_combined      = pd.concat([X_train, X_val])
+    _surviving_index = [idx for idx in X.index if idx in X_combined.index]
+    X_scaled = X_combined.loc[_surviving_index]
 
     # ── Train-set size guard ──────────────────────────────────────────────────
     # The MIN_VAL_POSITIVES check (inside train_val_split) only guards the val
