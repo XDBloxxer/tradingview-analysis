@@ -863,13 +863,17 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         median(close) the column must be raw (a 50%+ daily ATR is impossible).
         Fallback: if median(ATR) > 50 it is certainly raw.
 
-      Volume MAs: after normalisation Volume_MA20 is exactly 1.0 and
-        Volume_MA5/MA10 are ratios near 1.0.  Threshold: if median(col) > 100
-        the column is raw.
-
-      OBV: after normalisation OBV is a ratio to daily average volume,
-        typically in the range −200 to +200.  Raw OBV is millions to billions.
-        Threshold: if median(|OBV|) > 10 000 the column is raw.
+      Volume MAs / OBV: after normalisation Volume_MA20 is exactly 1.0 and
+        Volume_MA5/MA10/OBV are ratios near 1.0. Unlike every other group
+        above, this detection is done PER ROW rather than on the column
+        median: a row is raw iff its own Volume_MA20 value is > 100 (raw
+        share counts are always > 100; normalised Volume_MA20 is always
+        exactly 1.0). This matters because a single DataFrame can contain
+        rows from multiple ingestion batches — some already normalised,
+        some not — and a column-median threshold would normalise-or-skip
+        the *entire* column based on whichever state is in the majority,
+        silently leaving the minority batch's rows on a raw share-count
+        scale in the same column as rows pinned at the 1.0 sentinel.
 
     Args:
         df:     DataFrame as returned by rename_t1_columns — column names
@@ -904,7 +908,6 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         if vol_ma20_col in df.columns
         else None
     )
-    safe_vol_ma20 = vol_ma20_s.replace(0, np.nan) if vol_ma20_s is not None else None
 
     normalised_count = 0
     skipped_count    = 0
@@ -1036,53 +1039,68 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             skipped_count += 1
 
     # ── D. Volume → value / Volume_MA20 ──────────────────────────────────────
+    #
+    # IMPORTANT: detection here MUST be done PER-ROW, not per-column-median.
+    # A DataFrame passed to this function can contain a mix of rows from
+    # different ingestion batches — some already normalised (post-fix
+    # collector), some still raw (pre-fix collector / old DB rows). A
+    # column-level median check decides "raw vs normalised" for the WHOLE
+    # column at once, so whichever state is in the majority wins and the
+    # minority rows are left untouched. In particular, if most rows are
+    # already normalised, `vol_needs_norm` comes back False and the ~10%
+    # still-raw rows keep their raw share-count values (hundreds of
+    # thousands to millions) sitting in the same column as rows pinned at
+    # the 1.0 sentinel — a mixed-scale column that leaks ingestion-batch
+    # identity into the model instead of carrying real signal. Detecting
+    # and normalising per row (using each row's own Volume_MA20 value as
+    # the raw/normalised signal, since raw Volume_MA20 is always > 100 and
+    # normalised Volume_MA20 is always exactly 1.0) fixes this regardless
+    # of how the batches are mixed.
     vol_ma5_col  = f"{prefix}_Volume_MA5"
     vol_ma10_col = f"{prefix}_Volume_MA10"
     obv_col      = f"{prefix}_OBV"
 
-    # Detect using Volume_MA5 (most reliable signal; MA20 = 1.0 post-norm
-    # so its median would pass the > 100 test even when partially normalised).
-    vol_needs_norm = (
-        _is_raw_volume_ma(vol_ma5_col) or
-        _is_raw_volume_ma(vol_ma10_col)
-    )
-    obv_needs_norm = _is_raw_obv(obv_col)
+    if vol_ma20_s is not None:
+        # Per-row raw mask: a row is "raw" iff its OWN Volume_MA20 value is
+        # still a raw share count (> 100). Post-normalisation Volume_MA20
+        # is always exactly 1.0, so this check is self-consistent and
+        # idempotent — already-normalised rows are correctly left alone.
+        raw_row_mask = vol_ma20_s > 100.0
+        n_raw = int(raw_row_mask.sum())
 
-    if vol_needs_norm:
-        if safe_vol_ma20 is not None:
-            for col in [vol_ma5_col, vol_ma10_col]:
+        if n_raw > 0:
+            # Use each raw row's own (pre-overwrite) Volume_MA20 as the
+            # denominator for that row.
+            denom = vol_ma20_s.where(raw_row_mask).replace(0, np.nan)
+
+            for col in [vol_ma5_col, vol_ma10_col, obv_col]:
                 if col in df.columns:
                     num = pd.to_numeric(df[col], errors="coerce")
-                    df[col] = num / safe_vol_ma20
+                    df.loc[raw_row_mask, col] = (
+                        num.loc[raw_row_mask] / denom.loc[raw_row_mask]
+                    )
                     normalised_count += 1
-                    logger.debug(f"  normalise_t1: {col} → ratio to vol_ma20")
-            # Volume_MA20 / itself = 1.0 always (matches multiday behaviour).
-            if vol_ma20_col in df.columns:
-                df[vol_ma20_col] = 1.0
-                normalised_count += 1
-                logger.debug(f"  normalise_t1: {vol_ma20_col} → 1.0 sentinel")
-        else:
-            logger.warning(
-                f"  normalise_t1: Volume MAs appear raw but {vol_ma20_col} is "
-                "absent — cannot normalise volume features."
-            )
-    else:
-        skipped_count += 1   # whole volume group already normalised
+                    logger.debug(
+                        f"  normalise_t1: {col} → ratio to vol_ma20 "
+                        f"({n_raw} raw rows)"
+                    )
 
-    if obv_needs_norm:
-        if safe_vol_ma20 is not None:
-            if obv_col in df.columns:
-                num = pd.to_numeric(df[obv_col], errors="coerce")
-                df[obv_col] = num / safe_vol_ma20
-                normalised_count += 1
-                logger.debug(f"  normalise_t1: {obv_col} → ratio to vol_ma20")
-        else:
-            logger.warning(
-                f"  normalise_t1: {obv_col} appears raw but {vol_ma20_col} is "
-                "absent — cannot normalise OBV."
+            # Volume_MA20 / itself = 1.0 always (matches multiday behaviour).
+            # Only overwrite the rows that were actually raw — already
+            # normalised rows are already 1.0 and are left untouched.
+            df.loc[raw_row_mask, vol_ma20_col] = 1.0
+            normalised_count += 1
+            logger.debug(
+                f"  normalise_t1: {vol_ma20_col} → 1.0 sentinel "
+                f"({n_raw} raw rows)"
             )
+        else:
+            skipped_count += 1   # every row already normalised
     else:
-        skipped_count += 1
+        logger.warning(
+            f"  normalise_t1: Volume MAs/OBV appear raw but {vol_ma20_col} is "
+            "absent — cannot normalise volume features."
+        )
 
     # ── Derived re-computation ────────────────────────────────────────────────
     # These were computed before normalisation in the old collector and are
