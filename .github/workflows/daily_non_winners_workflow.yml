@@ -86,7 +86,7 @@ jobs:
             fi
 
             echo "Push attempt $i failed (likely a race with another enqueue), retrying..."
-            git reset --soft HEAD~1
+            git reset --hard HEAD~1
             sleep $((RANDOM % 5 + 2))
           done
 
