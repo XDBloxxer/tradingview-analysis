@@ -103,7 +103,24 @@ class IntradayDataCollector:
             # Fetch extended intraday data (5-min bars for past 60 days)
             # This gives us enough bars to calculate 200-period indicators on 5-min data
             intraday_df_extended = self._fetch_intraday_extended(symbol, target_date)
-            five_min_ok = intraday_df_extended is not None and len(intraday_df_extended) >= 200
+
+            # FIX: yfinance's 5-min history is always "the trailing 60 days from
+            # right now," not from target_date — it has no historical/point-in-time
+            # mode. For any backfill date, len(intraday_df_extended) >= 200 was
+            # being treated as proof the pull "worked," but that data can be
+            # entirely from a different calendar window than target_date (e.g.
+            # backfilling 2026-02-04 today pulls May-July 2026 bars — plenty of
+            # rows, none of them anywhere near the target date). That silently
+            # produced market_open=None, empty market_close stub rows, and
+            # day_prior_open/close=None instead of routing to the daily-bar T-1
+            # fallback below, which is the path actually designed to handle
+            # dates yfinance's 5-min window doesn't cover. Require the fetched
+            # data to actually contain a bar on target_date before trusting it.
+            five_min_ok = (
+                intraday_df_extended is not None
+                and len(intraday_df_extended) >= 200
+                and target_date.date() in set(intraday_df_extended.index.date)
+            )
 
             if not five_min_ok:
                 # ── T-1 DAILY-BAR FALLBACK ──────────────────────────────────
@@ -267,7 +284,22 @@ class IntradayDataCollector:
         cache_key = f"{symbol}:intraday_extended"
         if cache_key in self.cache:
             return self.cache[cache_key]
-        
+
+        # yfinance's 5-min bars only ever cover the trailing ~60 days from today,
+        # regardless of what target_date is. A backfill date older than that can
+        # never be found in this pull no matter how many rows come back, so skip
+        # the (rate-limited, per-symbol) network call entirely and go straight to
+        # the daily-bar T-1 fallback in _process_winner. Small buffer under 60 to
+        # be conservative about yfinance's exact cutoff.
+        target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+        if (datetime.now().date() - target_date_only).days > 58:
+            self.logger.debug(
+                f"{symbol}: {target_date_only.isoformat()} is outside yfinance's 5-min "
+                f"window (>58 days old) — skipping 5-min fetch, will use daily fallback."
+            )
+            self.cache[cache_key] = None
+            return None
+
         try:
             ticker = yf.Ticker(symbol)
             
