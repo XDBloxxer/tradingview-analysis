@@ -5410,21 +5410,16 @@ def main() -> int:
             if line.strip():
                 logger.info(f"  {line}")
 # ── DIAGNOSTIC: split blind-holdout AUC by train/val symbol overlap ──
-        overlap_df = pd.read_csv("ml_models/feature_selection/diagnostics/train_val_symbol_overlap.csv")
-        overlap_df["detection_date"] = pd.to_datetime(overlap_df["detection_date"]).dt.date
+        # No external file needed — derive the overlap directly from data
+        # already loaded in this run (train_idx / combined_df).
+        train_symbols = set(combined_df.loc[train_idx, "symbol"])
 
-        # X_cal_fit shares its index with combined_df, so pull symbol/date straight from there
         diag = combined_df.loc[X_cal_fit.index, ["symbol", "detection_date"]].copy()
-        diag["detection_date"] = pd.to_datetime(diag["detection_date"], errors="coerce").dt.date
         diag["label"] = y_cal_fit.values
         diag["proba"] = cal_proba_report
-
-        diag = diag.merge(
-            overlap_df[["symbol", "detection_date", "train_overlap"]],
-            on=["symbol", "detection_date"],
-            how="left",
+        diag["train_overlap"] = diag["symbol"].apply(
+            lambda s: "seen_in_train" if s in train_symbols else "unseen"
         )
-        diag["train_overlap"] = diag["train_overlap"].fillna("unseen")
 
         logger.info("── Symbol-overlap AUC breakdown (blind calibration holdout) ──")
         for group_name, group in diag.groupby("train_overlap"):
@@ -5434,6 +5429,9 @@ def main() -> int:
             g_auc = roc_auc_score(group["label"], group["proba"])
             logger.info(f"  {group_name}: n={len(group)}  pos_rate={group['label'].mean():.1%}  AUC={g_auc:.4f}")
 
+
+
+      
         cal_proba_report_series = pd.Series(cal_proba_report)
         cal_dist = pd.cut(cal_proba_report_series, bins=bins).value_counts().sort_index()
         logger.info("Val set probability distribution (blind calibration holdout):")
