@@ -67,6 +67,15 @@ jobs:
           ITER=0
 
           while true; do
+            # Defensive: same reasoning as in the enqueue workflows -- clear
+            # any pre-existing diff in the working tree (e.g. a line-ending
+            # quirk in a tracked selection-counts file) before pulling, so
+            # "pull --rebase" never refuses to start with "You have
+            # unstaged changes". Safe here because each iteration only
+            # reaches this point after the previous iteration's own commit
+            # was already pushed.
+            git reset --hard HEAD
+            git clean -fd
             git pull --rebase origin "${{ github.ref_name }}"
 
             if ! ITEM_JSON=$(python src/queue_worker.py peek); then
