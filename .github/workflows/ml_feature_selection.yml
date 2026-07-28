@@ -49,6 +49,11 @@ on:
         required: false
         default: true
         type: boolean
+      lookback_days:
+        description: 'Days of T-1/base history to fetch (0 = unbounded). Deliberately wider than the weekly retrain window for regime diversity.'
+        required: false
+        default: '365'
+        type: string
 
 permissions:
   contents: write
@@ -88,8 +93,9 @@ jobs:
           RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '8' }}"
           SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
           USE_EXCLUDED="${{ github.event.inputs.use_excluded_features || 'true' }}"
+          LOOKBACK="${{ github.event.inputs.lookback_days || '365' }}"
 
-          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN"
+          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN --lookback-days $LOOKBACK"
           if [ "$SKIP_GA" = "true" ]; then
             ARGS="$ARGS --skip-genetic"
           fi
