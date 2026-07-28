@@ -2628,8 +2628,15 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
                     f"not present in current data (schema drift): {missing[:10]}..."
                 )
             keep = [c for c in selected if c in X.columns]
-            if "has_t1_features" in X.columns and "has_t1_features" not in keep:
-                keep.append("has_t1_features")
+            # NOTE (2026-07-28): has_t1_features used to be force-appended here
+            # even if absent from selected_features.json, on the assumption it's
+            # a harmless structural flag. Temporarily disabled while testing
+            # whether it's a source-provenance leak (base_csv vs T-1 pos_rate
+            # gap) rather than genuine signal -- see symbol-overlap AUC
+            # diagnostic upstream. Re-enable (uncomment) once that's resolved
+            # if has_t1_features is cleared as safe.
+            # if "has_t1_features" in X.columns and "has_t1_features" not in keep:
+            #     keep.append("has_t1_features")
             X = X[keep]
             logger.info(
                 f"USE_SELECTED_FEATURES active — restricted to {X.shape[1]} features "
@@ -5409,29 +5416,7 @@ def main() -> int:
         for line in classification_report(y_cal_fit, cal_pred_report).split("\n"):
             if line.strip():
                 logger.info(f"  {line}")
-# ── DIAGNOSTIC: split blind-holdout AUC by train/val symbol overlap ──
-        # No external file needed — derive the overlap directly from data
-        # already loaded in this run (train_idx / combined_df).
-        train_symbols = set(combined_df.loc[train_idx, "symbol"])
 
-        diag = combined_df.loc[X_cal_fit.index, ["symbol", "detection_date"]].copy()
-        diag["label"] = y_cal_fit.values
-        diag["proba"] = cal_proba_report
-        diag["train_overlap"] = diag["symbol"].apply(
-            lambda s: "seen_in_train" if s in train_symbols else "unseen"
-        )
-
-        logger.info("── Symbol-overlap AUC breakdown (blind calibration holdout) ──")
-        for group_name, group in diag.groupby("train_overlap"):
-            if group["label"].nunique() < 2:
-                logger.info(f"  {group_name}: n={len(group)} — only one class present, AUC undefined")
-                continue
-            g_auc = roc_auc_score(group["label"], group["proba"])
-            logger.info(f"  {group_name}: n={len(group)}  pos_rate={group['label'].mean():.1%}  AUC={g_auc:.4f}")
-
-
-
-      
         cal_proba_report_series = pd.Series(cal_proba_report)
         cal_dist = pd.cut(cal_proba_report_series, bins=bins).value_counts().sort_index()
         logger.info("Val set probability distribution (blind calibration holdout):")
