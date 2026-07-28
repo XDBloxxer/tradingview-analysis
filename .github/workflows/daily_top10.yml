@@ -24,10 +24,29 @@ on:
         description: 'Number of top winners to track'
         required: false
         default: '15'
+      allow_append:
+        description: 'Allow appending to dates that already have data (use when re-running a backfill after a partial failure)'
+        required: false
+        default: 'false'
+        type: boolean
+
+# Shared across BOTH this workflow and the non-winners workflow (same group
+# name in both files). Chunked backfill runs read the OTHER run's committed
+# selection-counts file at checkout, so two runs (even one winners + one
+# non-winners) executing at the same time would both check out the same
+# stale counts and both push conflicting commits at the end -- silently
+# undoing the anti-repeat persistence fix. This makes every run (scheduled
+# or manually queued) wait in line and execute strictly one-at-a-time, in
+# the order triggered, regardless of how fast you queue them up.
+concurrency:
+  group: tv-analysis-backfill
+  cancel-in-progress: false
 
 jobs:
   track-winners:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
@@ -56,6 +75,10 @@ jobs:
         run: |
           ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '15' }}"
 
+          if [ "${{ github.event.inputs.allow_append }}" = "true" ]; then
+            ARGS="$ARGS --allow-append"
+          fi
+
           if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
             ARGS="$ARGS --start-date ${{ github.event.inputs.start_date }} --end-date ${{ github.event.inputs.end_date }}"
           elif [ -n "${{ github.event.inputs.date }}" ]; then
@@ -64,6 +87,30 @@ jobs:
 
           echo "Running with args: $ARGS"
           python daily_winners_main.py $ARGS
+
+      - name: Persist selection counts
+        # Commits data/winner_selection_counts.json (the MAX_USES_PER_SYMBOL
+        # anti-repeat tracker) back to the repo. Without this, every workflow
+        # run starts from a fresh checkout with an empty counts file, which
+        # defeats the cap across a multi-run chunked backfill (each chunk
+        # would think every symbol has 0 uses). `if: always()` so partial
+        # runs still save whatever progress was made before a failure.
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/winner_selection_counts.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No change to selection counts, nothing to commit."
+          else
+            git commit -m "chore: update winner selection counts [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && \
+              git push origin "HEAD:${{ github.ref_name }}" && break
+              echo "Push attempt $i failed, retrying..."
+              sleep 5
+            done
+          fi
       
       - name: Upload logs
         if: always()
