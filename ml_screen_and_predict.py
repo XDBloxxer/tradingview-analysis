@@ -636,6 +636,60 @@ class SmartScreener:
 
 
 # ---------------------------------------------------------------------------
+# FIX 12: Accurate entry price from the last available 1-minute candle
+# ---------------------------------------------------------------------------
+
+def fetch_accurate_entry_price(symbol: str, logger=None) -> float | None:
+    """
+    Fetch the true current/entry price for `symbol` from the most recent
+    available 1-minute candle.
+
+    The TradingView screener's `close` field is used to seed `current_price`
+    in build_features_from_tv_data(), but it does not reliably reflect the
+    actual last trade around pre-market/after-hours — which matters because
+    predictions are generated and locked in before the regular session opens.
+
+    Preference order:
+      1. The last 1-minute bar of the current session, including pre-market
+         and after-hours (prepost=True) — e.g. the after-hours closing bar
+         if the market has already closed for the day.
+      2. If today has no 1m bars yet (e.g. this runs very early before
+         yfinance has backfilled anything for the new session), widen the
+         window and fall back to the most recent 1m bar available at all.
+
+    Returns None if no price data can be fetched, so callers can fall back
+    to the TradingView screener close instead of dropping the stock.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        hist = ticker.history(period="1d", interval="1m", prepost=True)
+        if hist.empty:
+            # Nothing for today yet — widen the window and just take
+            # whatever the last available 1-minute bar is.
+            hist = ticker.history(period="5d", interval="1m", prepost=True)
+
+        if hist.empty or "Close" not in hist.columns:
+            return None
+
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            return None
+
+        return float(closes.iloc[-1])
+
+    except Exception as e:
+        if logger:
+            logger.debug(f"fetch_accurate_entry_price({symbol}) failed: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # FIX 6: Feature building — fills ALL relevant prefix groups
 # ---------------------------------------------------------------------------
 
@@ -1706,6 +1760,51 @@ def main():
     if not enriched_stocks:
         logger.error("Failed to build features for any stocks")
         return 1
+
+    # ── STEP 2.5: ACCURATE ENTRY PRICE REFRESH (FIX 12) ──────────────────────
+    # The TradingView screener `close` field can be stale around pre-market —
+    # it doesn't reliably reflect the actual last after-hours trade, which
+    # matters because predictions are generated and locked in before the
+    # regular session opens. Replace it with the last available 1-minute
+    # candle close from yfinance (after-hours bar if present, otherwise the
+    # most recent bar that exists at all). Falls back to the TV close on any
+    # per-symbol fetch failure so a flaky request never drops a stock.
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 2.5: ACCURATE ENTRY PRICE REFRESH")
+    logger.info("=" * 80)
+
+    from concurrent.futures import ThreadPoolExecutor as _PriceTPE, as_completed as _price_as_completed
+
+    price_workers = max(1, min(args.t1_workers, len(enriched_stocks)))
+    price_map     = {}
+
+    with _PriceTPE(max_workers=price_workers) as executor:
+        futures = {
+            executor.submit(fetch_accurate_entry_price, s["symbol"], logger): s["symbol"]
+            for s in enriched_stocks
+        }
+        for future in _price_as_completed(futures):
+            sym = futures[future]
+            try:
+                price_map[sym] = future.result()
+            except Exception as e:
+                logger.debug(f"Entry price fetch failed for {sym}: {e}")
+                price_map[sym] = None
+
+    refreshed = 0
+    for stock in enriched_stocks:
+        new_price = price_map.get(stock["symbol"])
+        if new_price:
+            stock["current_price"] = new_price
+            refreshed += 1
+        # else: keep the TV screener close already written by
+        # build_features_from_tv_data() as a fallback.
+
+    logger.info(
+        f"✓ Refreshed entry price for {refreshed}/{len(enriched_stocks)} stocks "
+        f"from live 1-minute bars ({len(enriched_stocks) - refreshed} kept the "
+        f"TV screener close as fallback)"
+    )
 
     # ── STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT ────────────────────────────
     if not args.no_t1:
