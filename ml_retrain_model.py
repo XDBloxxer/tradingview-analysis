@@ -3225,6 +3225,51 @@ def train_val_split(
             f"→ {val_dates.max().date() if not val_dates.empty else '?'}, "
             f"embargoed={n_embargoed}"
         )
+
+        # ── FIX 5: Symbol-level purge ──────────────────────────────────────
+        # The date embargo above only guarantees train/val rows aren't
+        # temporally adjacent. It does NOT stop the same symbol appearing on
+        # both sides of the split. Several top features (hv_20/30, atr_14,
+        # cci, dcm, ema-slope, etc.) are rolling-window indicators that stay
+        # close to a stock's own baseline level for weeks/months. If ticker
+        # X shows up in train in June and again in val in September, the
+        # embargo (a date rule) is satisfied, but the model can still
+        # partially re-identify ticker X from residual level/scale
+        # information in those features rather than learning a genuinely
+        # predictive pattern — inflating val AUC via symbol memorization,
+        # not generalisation. See synthetic_leak_test.py, which reproduces
+        # this exact effect with pure-noise labels and a symbol-autocorrelated
+        # feature under a clean time-only split.
+        #
+        # Fix: any symbol present in val is purged entirely from train
+        # (not moved to val — just dropped), the same way the date embargo
+        # drops rows rather than reassigning them.
+        if "symbol" in df_work.columns:
+            val_symbols = set(df_work.loc[val_idx, "symbol"].dropna().unique())
+            if val_symbols:
+                train_symbols = df_work.loc[train_idx, "symbol"]
+                symbol_overlap_mask = train_symbols.isin(val_symbols)
+                n_overlap = int(symbol_overlap_mask.sum())
+                if n_overlap > 0:
+                    overlap_frac = n_overlap / max(1, len(train_idx))
+                    logger.warning(
+                        f"FIX 5 — Symbol purge: {n_overlap} train rows "
+                        f"({overlap_frac:.1%} of train) share a symbol with "
+                        f"a val row ({len(val_symbols)} distinct val symbols). "
+                        "Dropping these from train to prevent symbol-level "
+                        "leakage (see synthetic_leak_test.py)."
+                    )
+                    train_idx = train_symbols.index[~symbol_overlap_mask]
+                else:
+                    logger.info(
+                        "FIX 5 — Symbol purge: no train/val symbol overlap found."
+                    )
+        else:
+            logger.warning(
+                "FIX 5 — Symbol purge skipped: no 'symbol' column in "
+                "combined_df. Train/val may still share tickers; symbol-level "
+                "leakage cannot be ruled out."
+            )
     else:
         # No date column at all — fall back to sequential split (last resort)
         logger.warning(
