@@ -43,6 +43,8 @@ class DailyNonWinnersDetector:
         "min_price": 0.25,
         "max_price": None,
         "min_volume": 10000,
+        "min_market_cap": None,
+        "max_market_cap": None,
         "min_hv10": None,
         "max_hv10": None,
         "min_hv20": None,
@@ -57,10 +59,12 @@ class DailyNonWinnersDetector:
     # max_hv10, min_hv20, max_hv20, min_atr14, min_relative_volume,
     # min_volume_ratio) that are derived from the ML model's winner
     # distribution — those are intentionally excluded here so the
-    # non-winners pool stays purely price/volume filtered and doesn't
-    # inherit model-driven selection bias. Only simple price/volume
-    # thresholds are pulled from the learned file.
-    LEARNED_FILTER_ALLOWED_KEYS = {"min_price", "max_price", "min_volume"}
+    # non-winners pool stays purely price/volume/market-cap filtered and
+    # doesn't inherit model-driven selection bias. Only simple universe
+    # thresholds (price, volume, market cap) are pulled from the learned file.
+    LEARNED_FILTER_ALLOWED_KEYS = {
+        "min_price", "max_price", "min_volume", "min_market_cap", "max_market_cap",
+    }
     
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
@@ -205,6 +209,18 @@ class DailyNonWinnersDetector:
                 (lows - closes_prev).abs(),
             ], axis=1).max(axis=1)
             result['atr14'] = float(tr.tail(14).mean())
+
+        # Market cap: yfinance has no historical market-cap series, so this is
+        # always the CURRENT market cap, not the market cap as-of target_date.
+        # That's an acceptable approximation for filtering purposes (shares
+        # outstanding rarely changes enough to flip a stock across a cap
+        # bucket), but it means backfill runs filter on today's cap.
+        try:
+            market_cap = ticker.fast_info["market_cap"]
+            if market_cap:
+                result['market_cap'] = float(market_cap)
+        except Exception:
+            pass
 
         return result
 
@@ -454,6 +470,8 @@ class DailyNonWinnersDetector:
                     per_cat_needed * 2,
                     winners_symbols | already_syms | filtered_syms,
                     max_price_filter=base_filters.get("max_price"),
+                    min_market_cap_filter=base_filters.get("min_market_cap"),
+                    max_market_cap_filter=base_filters.get("max_market_cap"),
                 )
                 for stock in batch:
                     if stock["symbol"] not in already_syms and stock["symbol"] not in filtered_syms:
@@ -470,6 +488,8 @@ class DailyNonWinnersDetector:
                     winners_symbols,
                     already_syms | filtered_syms,
                     max_price_filter=base_filters.get("max_price"),
+                    min_market_cap_filter=base_filters.get("min_market_cap"),
+                    max_market_cap_filter=base_filters.get("max_market_cap"),
                 )
                 fallback.extend(random_stocks[:remaining])
 
@@ -526,6 +546,8 @@ class DailyNonWinnersDetector:
             "min_price":           ("close",                    "greater"),
             "max_price":           ("close",                    "less"),
             "min_volume":          ("volume",                   "greater"),
+            "min_market_cap":      ("market_cap_basic",         "greater"),
+            "max_market_cap":      ("market_cap_basic",         "less"),
             "min_hv10":            ("historical_volatility_10", "greater"),
             "max_hv10":            ("historical_volatility_10", "less"),
             "min_hv20":            ("historical_volatility_20", "greater"),
@@ -597,11 +619,34 @@ class DailyNonWinnersDetector:
                         price      = float(item.get("close",  0))
                         change_pct = float(item.get("change", 0))
                         volume     = int(item.get("volume",   0))
+                        market_cap = item.get("market_cap_basic")
 
                         if price < self.min_price or volume < self.min_volume:
                             continue
                         if change_pct >= 20.0:
                             continue
+
+                        # FIX: the screener's own "close < max_price" constraint
+                        # (built into tv_filters above) was being trusted blindly.
+                        # In practice the TradingView screener has returned rows
+                        # that violate the requested bound, so re-check every
+                        # bound explicitly here — the same way min_price/min_volume
+                        # already are — instead of assuming the upstream filter
+                        # worked.
+                        max_price = lf.get("max_price")
+                        if max_price is not None and price > max_price:
+                            continue
+
+                        min_mcap = lf.get("min_market_cap")
+                        max_mcap = lf.get("max_market_cap")
+                        if min_mcap is not None or max_mcap is not None:
+                            if market_cap is None:
+                                continue
+                            market_cap = float(market_cap)
+                            if min_mcap is not None and market_cap < min_mcap:
+                                continue
+                            if max_mcap is not None and market_cap > max_mcap:
+                                continue
 
                         candidates.append({
                             "symbol":     symbol.strip().upper(),
@@ -609,6 +654,7 @@ class DailyNonWinnersDetector:
                             "price":      float(price),
                             "change_pct": float(change_pct),
                             "volume":     int(volume),
+                            "market_cap": float(market_cap) if market_cap is not None else None,
                             "high":       float(item.get("high", price)),
                             "low":        float(item.get("low",  price)),
                             "open":       float(item.get("open", price)),
@@ -626,6 +672,8 @@ class DailyNonWinnersDetector:
         min_price_filter  = lf.get("min_price",  self.min_price)
         max_price_filter  = lf.get("max_price",  None)
         min_volume_filter = lf.get("min_volume", self.min_volume)
+        min_mcap_filter    = lf.get("min_market_cap")
+        max_mcap_filter    = lf.get("max_market_cap")
 
         liquid_stocks = [s for s in self._get_liquid_stocks_list() if s not in exclude_symbols]
         candidates = []
@@ -677,12 +725,22 @@ class DailyNonWinnersDetector:
                 if lf.get("min_atr14") is not None and (atr14 is None or atr14 < lf["min_atr14"]):
                     continue
 
+                market_cap = bar.get("market_cap")
+                if min_mcap_filter is not None or max_mcap_filter is not None:
+                    if market_cap is None:
+                        continue
+                    if min_mcap_filter is not None and market_cap < min_mcap_filter:
+                        continue
+                    if max_mcap_filter is not None and market_cap > max_mcap_filter:
+                        continue
+
                 candidates.append({
                     "symbol":     symbol,
                     "exchange":   "NASDAQ",
                     "price":      float(close),
                     "change_pct": float(change_pct),
                     "volume":     int(volume),
+                    "market_cap": float(market_cap) if market_cap is not None else None,
                     "high":       float(bar["high"]),
                     "low":        float(bar["low"]),
                     "open":       float(bar["open"]),
@@ -723,7 +781,9 @@ class DailyNonWinnersDetector:
         max_change: float,
         limit: int,
         exclude_symbols: set,
-        max_price_filter: Optional[float] = None
+        max_price_filter: Optional[float] = None,
+        min_market_cap_filter: Optional[float] = None,
+        max_market_cap_filter: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """
         Get stocks within a specific change percentage range
@@ -738,6 +798,8 @@ class DailyNonWinnersDetector:
                                Applied here so Phase 2 fallback candidates stay
                                within the same price range as Phase 1 instead of
                                pulling from the uncapped liquid-stocks list.
+            min_market_cap_filter: Optional market-cap floor from learned_filters.json.
+            max_market_cap_filter: Optional market-cap ceiling from learned_filters.json.
             
         Returns:
             List of stock dictionaries
@@ -747,11 +809,15 @@ class DailyNonWinnersDetector:
                 return self._screen_by_change_range(
                     min_change, max_change, limit, exclude_symbols,
                     max_price_filter=max_price_filter,
+                    min_market_cap_filter=min_market_cap_filter,
+                    max_market_cap_filter=max_market_cap_filter,
                 )
             else:
                 return self._get_from_liquid_stocks(
                     target_date, min_change, max_change, limit, exclude_symbols,
                     max_price_filter=max_price_filter,
+                    min_market_cap_filter=min_market_cap_filter,
+                    max_market_cap_filter=max_market_cap_filter,
                 )
         except Exception as e:
             self.logger.error(f"Error getting stocks in range {min_change}% to {max_change}%: {e}")
@@ -763,7 +829,9 @@ class DailyNonWinnersDetector:
         max_change: float,
         limit: int,
         exclude_symbols: set,
-        max_price_filter: Optional[float] = None
+        max_price_filter: Optional[float] = None,
+        min_market_cap_filter: Optional[float] = None,
+        max_market_cap_filter: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Use TradingView screener to find stocks in change range"""
         try:
@@ -775,6 +843,10 @@ class DailyNonWinnersDetector:
             ]
             if max_price_filter is not None:
                 filters.append({'left': 'close', 'operation': 'less', 'right': max_price_filter})
+            if min_market_cap_filter is not None:
+                filters.append({'left': 'market_cap_basic', 'operation': 'greater', 'right': min_market_cap_filter})
+            if max_market_cap_filter is not None:
+                filters.append({'left': 'market_cap_basic', 'operation': 'less', 'right': max_market_cap_filter})
             
             result = self.screener.screen(
                 market='america',
@@ -806,11 +878,20 @@ class DailyNonWinnersDetector:
                     price = float(item.get('close', 0))
                     change_pct = float(item.get('change', 0))
                     volume = int(item.get('volume', 0))
+                    market_cap = item.get('market_cap_basic')
                     
                     if price < self.min_price or volume < self.min_volume:
                         continue
                     if max_price_filter is not None and price > max_price_filter:
                         continue
+                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
+                        if market_cap is None:
+                            continue
+                        market_cap = float(market_cap)
+                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                            continue
+                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                            continue
                     
                     candidates.append({
                         'symbol': symbol.strip().upper(),
@@ -818,6 +899,7 @@ class DailyNonWinnersDetector:
                         'price': float(price),
                         'change_pct': float(change_pct),
                         'volume': int(volume),
+                        'market_cap': float(market_cap) if market_cap is not None else None,
                         'high': float(item.get('high', price)),
                         'low': float(item.get('low', price)),
                         'open': float(item.get('open', price)),
@@ -843,7 +925,9 @@ class DailyNonWinnersDetector:
         max_change: float,
         limit: int,
         exclude_symbols: set,
-        max_price_filter: Optional[float] = None
+        max_price_filter: Optional[float] = None,
+        min_market_cap_filter: Optional[float] = None,
+        max_market_cap_filter: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Get stocks from liquid stock list using yfinance"""
         liquid_stocks = self._get_liquid_stocks_list()
@@ -867,6 +951,15 @@ class DailyNonWinnersDetector:
                 if max_price_filter is not None and close > max_price_filter:
                     continue
 
+                market_cap = bar.get('market_cap')
+                if min_market_cap_filter is not None or max_market_cap_filter is not None:
+                    if market_cap is None:
+                        continue
+                    if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                        continue
+                    if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                        continue
+
                 if min_change <= change_pct <= max_change:
                     if close >= self.min_price and volume >= self.min_volume:
                         candidates.append({
@@ -875,6 +968,7 @@ class DailyNonWinnersDetector:
                             'price': float(close),
                             'change_pct': float(change_pct),
                             'volume': int(volume),
+                            'market_cap': float(market_cap) if market_cap is not None else None,
                             'high': float(bar['high']),
                             'low': float(bar['low']),
                             'open': float(bar['open']),
@@ -894,7 +988,9 @@ class DailyNonWinnersDetector:
         limit: int,
         exclude_winners: set,
         exclude_existing: set,
-        max_price_filter: Optional[float] = None
+        max_price_filter: Optional[float] = None,
+        min_market_cap_filter: Optional[float] = None,
+        max_market_cap_filter: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Get random stocks from liquid list as fallback"""
         liquid_stocks = self._get_liquid_stocks_list()
@@ -924,6 +1020,15 @@ class DailyNonWinnersDetector:
 
                 if max_price_filter is not None and close > max_price_filter:
                     continue
+
+                market_cap = bar.get('market_cap')
+                if min_market_cap_filter is not None or max_market_cap_filter is not None:
+                    if market_cap is None:
+                        continue
+                    if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                        continue
+                    if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                        continue
                 
                 if close >= self.min_price and volume >= self.min_volume:
                     candidates.append({
@@ -932,6 +1037,7 @@ class DailyNonWinnersDetector:
                         'price': float(close),
                         'change_pct': float(change_pct),
                         'volume': int(volume),
+                        'market_cap': float(market_cap) if market_cap is not None else None,
                         'high': float(bar['high']),
                         'low': float(bar['low']),
                         'open': float(bar['open']),
