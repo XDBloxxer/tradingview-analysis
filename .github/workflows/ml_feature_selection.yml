@@ -69,7 +69,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
+          lfs: true
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Ensure git-lfs is set up and repo is clean
+        run: |
+          git lfs install --local
+          # Drop any stray file that was accidentally tracked despite
+          # being covered by .gitignore (e.g. ml_models/archive/*) — this
+          # is what causes "should have been a pointer, but wasn't" on
+          # rebase/checkout, since those files were never real LFS blobs.
+          git ls-files ml_models/archive/ | while read -r f; do
+            echo "Untracking stray archive file: $f"
+            git rm --cached "$f" >/dev/null 2>&1 || true
+          done
+          git diff --staged --quiet || git commit -m "chore: untrack stray ml_models/archive files"
 
       - name: Set up Python
         uses: actions/setup-python@v4
@@ -121,12 +135,16 @@ jobs:
 
           git diff --staged --quiet || git commit -m "🧬 Auto feature-selection: $(date +'%Y-%m-%d %H:%M:%S UTC')"
 
-          # Rebase onto whatever landed on main while this job was running.
-          # Added --autostash to safely handle any leftover unstaged changes.
+          # Merge in whatever landed on main while this job was running.
+          # A merge (rather than rebase --autostash) avoids replaying our
+          # commit against a working tree that may still have leftover
+          # generated/unstaged files, which is what previously triggered
+          # "should have been a pointer, but wasn't" during the autostash
+          # re-apply.
           git fetch origin "${GITHUB_REF#refs/heads/}"
-          git rebase --autostash "origin/${GITHUB_REF#refs/heads/}" || {
-            echo "Rebase failed — resolve manually.";
-            git rebase --abort;
+          git merge --no-edit "origin/${GITHUB_REF#refs/heads/}" || {
+            echo "Merge failed — resolve manually.";
+            git merge --abort;
             exit 1;
           }
 
