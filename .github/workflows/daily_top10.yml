@@ -4,7 +4,7 @@ on:
   # Run daily at 4:30 PM EST (after market close at 4pm)
   schedule:
     - cron: '50 20 * * 1-5'  # 21:30 UTC = 4:30 PM EST (Mon-Fri only)
-  
+
   # Allow manual triggering
   workflow_dispatch:
     inputs:
@@ -20,6 +20,10 @@ on:
         description: 'Backfill: range end date (YYYY-MM-DD). Requires start_date.'
         required: false
         default: ''
+      chunk_days:
+        description: 'Backfill only: split start_date..end_date into separate queued runs of this many calendar days each (e.g. 7). Leave empty/0 to run the whole range as a single job.'
+        required: false
+        default: ''
       top_n:
         description: 'Number of top winners to track'
         required: false
@@ -30,98 +34,66 @@ on:
         default: 'false'
         type: boolean
 
-# Shared across BOTH this workflow and the non-winners workflow (same group
-# name in both files). Chunked backfill runs read the OTHER run's committed
-# selection-counts file at checkout, so two runs (even one winners + one
-# non-winners) executing at the same time would both check out the same
-# stale counts and both push conflicting commits at the end -- silently
-# undoing the anti-repeat persistence fix. This makes every run (scheduled
-# or manually queued) wait in line and execute strictly one-at-a-time, in
-# the order triggered, regardless of how fast you queue them up.
-concurrency:
-  group: tv-analysis-backfill
-  cancel-in-progress: false
+# This job does NOT actually run the tracker anymore -- it just appends one
+# or more job descriptions to data/run_queue.jsonl (one per chunk, if
+# chunk_days was given for a backfill) and wakes up queue_runner.yml, which
+# is the only workflow that does real work and holds the shared
+# "tv-analysis-backfill" concurrency group. Deliberately no concurrency block
+# here: this job is a few seconds of git work, so any number of these can be
+# queued back-to-back (schedule, manual, winners, non-winners, all mixed)
+# without GitHub silently dropping earlier ones. See queue_runner.yml and
+# src/queue_worker.py for why this exists and how draining/chunking works.
+permissions:
+  contents: write
+  actions: write
 
 jobs:
-  track-winners:
+  enqueue-winners:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
-          cache: 'pip'
-      
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Create directories
-        run: |
-          mkdir -p data/cache
-          mkdir -p logs
-      
-      - name: Run daily winners tracker
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-        run: |
-          ARGS="--verbose --top-n ${{ github.event.inputs.top_n || '15' }}"
 
-          if [ "${{ github.event.inputs.allow_append }}" = "true" ]; then
-            ARGS="$ARGS --allow-append"
-          fi
-
-          if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
-            ARGS="$ARGS --start-date ${{ github.event.inputs.start_date }} --end-date ${{ github.event.inputs.end_date }}"
-          elif [ -n "${{ github.event.inputs.date }}" ]; then
-            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
-          fi
-
-          echo "Running with args: $ARGS"
-          python daily_winners_main.py $ARGS
-
-      - name: Persist selection counts
-        # Commits data/winner_selection_counts.json (the MAX_USES_PER_SYMBOL
-        # anti-repeat tracker) back to the repo. Without this, every workflow
-        # run starts from a fresh checkout with an empty counts file, which
-        # defeats the cap across a multi-run chunked backfill (each chunk
-        # would think every symbol has 0 uses). `if: always()` so partial
-        # runs still save whatever progress was made before a failure.
-        if: always()
+      - name: Append job(s) to shared run queue
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f data/winner_selection_counts.json 2>/dev/null || true
-          if git diff --cached --quiet; then
-            echo "No change to selection counts, nothing to commit."
-          else
-            git commit -m "chore: update winner selection counts [skip ci]"
-            for i in 1 2 3; do
-              git pull --rebase origin "${{ github.ref_name }}" && \
-              git push origin "HEAD:${{ github.ref_name }}" && break
-              echo "Push attempt $i failed, retrying..."
-              sleep 5
-            done
-          fi
-      
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: daily-winners-logs
-          path: logs/
-          retention-days: 30
-      
-      - name: Notify on failure
-        if: failure()
+
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin "${{ github.ref_name }}"
+
+            JOB_IDS=$(python src/queue_worker.py enqueue-range \
+              --job-type winners \
+              --date "${{ github.event.inputs.date }}" \
+              --start-date "${{ github.event.inputs.start_date }}" \
+              --end-date "${{ github.event.inputs.end_date }}" \
+              --chunk-days "${{ github.event.inputs.chunk_days }}" \
+              --top-n "${{ github.event.inputs.top_n || '15' }}" \
+              --allow-append "${{ github.event.inputs.allow_append || 'false' }}" \
+              --queued-by "winners:${{ github.run_id }}")
+
+            git add -f data/run_queue.jsonl
+            NUM_JOBS=$(echo "$JOB_IDS" | grep -c .)
+            git commit -m "chore: enqueue $NUM_JOBS winners job(s) [skip ci]"
+
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "Enqueued:"
+              echo "$JOB_IDS"
+              break
+            fi
+
+            echo "Push attempt $i failed (likely a race with another enqueue), retrying..."
+            git reset --soft HEAD~1
+            sleep $((RANDOM % 5 + 2))
+          done
+
+      - name: Wake up the queue runner
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Daily winners tracker failed. Check logs for details."
-          echo "Data is in Supabase even if workflow fails - check Supabase dashboard"
+          gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
