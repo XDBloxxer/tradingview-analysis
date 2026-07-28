@@ -98,7 +98,7 @@ SCREENER_FEATURE_MAP = {
 # FIX 3: Hard caps prevent any single filter from excluding the bulk of the market.
 HARD_CAPS = {
     "min_price":           0.50,
-    "max_price":           500.0,
+    "max_price":           50.0,
     "min_volume":          100_000,
     "min_relative_volume": 1.0,
     "max_min_hv10":        30.0,
