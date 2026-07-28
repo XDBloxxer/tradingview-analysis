@@ -1,6 +1,6 @@
 {
   "min_price": 0.8,
-  "max_price": 243.28,
+  "max_price": 50.0,
   "min_volume": 100000,
   "min_hv10": 30.0,
   "max_hv10": 490.6525,
