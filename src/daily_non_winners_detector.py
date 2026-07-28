@@ -5,6 +5,7 @@ Finds stocks that did NOT explode - critical negative examples for ML training
 
 import json
 import logging
+import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -37,6 +38,29 @@ class DailyNonWinnersDetector:
     
     # Pattern exclusions (same as winners detector)
     EXCLUDED_PATTERNS = ['OTC', '.PK', '.OB', '-']
+
+    # ── POINT-IN-TIME UNIVERSE FIX ──────────────────────────────────────────
+    # _get_liquid_stocks_list() used to be a hardcoded ~120-symbol megacap
+    # list (AAPL, MSFT, ... WYNN, LVS). Every backfill date (anything where
+    # _is_live() is False) routes through this fallback, so every historical
+    # non-winner run was sampling from the same ~120 names over and over, and
+    # those names are structurally nothing like the small/micro-cap explosive
+    # universe winners are drawn from -- trivially separable on price/market
+    # cap/volatility alone, independent of any real signal.
+    #
+    # UNIVERSE_PATH must point at a broad symbol list (thousands of tickers,
+    # not ~120) -- e.g. a saved copy of the NASDAQ Trader symbol directory
+    # (nasdaqlisted.txt + otherlisted.txt). This class refuses to silently
+    # fall back to a small list if it's missing; see _get_liquid_stocks_list.
+    UNIVERSE_PATH = Path("data/universe_symbols.csv")
+    SELECTION_COUNTS_PATH = Path("data/non_winner_selection_counts.json")
+    # Sized for the 6-month / 100-per-day backfill: ~126 trading days x 100
+    # = ~12,600 slots needed. With a universe of a few thousand symbols and
+    # per-date filter attrition, MAX_USES_PER_SYMBOL=10 gives comfortable
+    # headroom without collapsing back onto a small repeated subset. Raise
+    # this only if the universe file turns out to be too small to hit 100/day
+    # without it (a bigger universe is the better fix, not a higher cap).
+    MAX_USES_PER_SYMBOL = 10
 
     # Default filters used when learned_filters.json is absent or a key is missing
     DEFAULT_FILTERS = {
@@ -74,6 +98,13 @@ class DailyNonWinnersDetector:
         
         self.min_price = detection_config.get("min_price", 0.25)
         self.min_volume = detection_config.get("min_volume", 10000)
+
+        # Point-in-time universe + anti-repetition state (see UNIVERSE_PATH
+        # comment above). Loaded once per detector instance so a full
+        # multi-month backfill run shares one consistent view of what's
+        # already been used, instead of re-reading/re-shuffling per date.
+        self._universe_cache: Optional[List[str]] = None
+        self._selection_counts: Dict[str, int] = self._load_selection_counts()
         
         self.rate_limiter = RateLimiter(config)
         
@@ -980,6 +1011,7 @@ class DailyNonWinnersDetector:
             
             time.sleep(0.1)
         
+        self._record_selections([c['symbol'] for c in candidates])
         return candidates
     
     def _get_random_liquid_stocks(
@@ -1049,6 +1081,7 @@ class DailyNonWinnersDetector:
             
             time.sleep(0.1)
         
+        self._record_selections([c['symbol'] for c in candidates])
         return candidates
     
     def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
@@ -1066,19 +1099,64 @@ class DailyNonWinnersDetector:
         
         return False
     
+    def _load_selection_counts(self) -> Dict[str, int]:
+        if self.SELECTION_COUNTS_PATH.exists():
+            try:
+                with open(self.SELECTION_COUNTS_PATH) as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.warning(f"Could not load selection counts, starting fresh: {e}")
+        return {}
+
+    def _save_selection_counts(self) -> None:
+        self.SELECTION_COUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.SELECTION_COUNTS_PATH, "w") as f:
+            json.dump(self._selection_counts, f, indent=2)
+
+    def _record_selections(self, symbols: List[str]) -> None:
+        """Bump usage counts for symbols actually selected this call, and
+        persist immediately so a crash mid-backfill doesn't lose the count
+        (which would let over-used symbols get picked again)."""
+        if not symbols:
+            return
+        for s in symbols:
+            self._selection_counts[s] = self._selection_counts.get(s, 0) + 1
+        self._save_selection_counts()
+
     def _get_liquid_stocks_list(self) -> List[str]:
-        """Get list of liquid stocks for sampling"""
-        return [
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK.B', 'UNH', 'JNJ',
-            'V', 'PG', 'JPM', 'MA', 'HD', 'CVX', 'MRK', 'ABBV', 'PEP', 'COST',
-            'AVGO', 'KO', 'LLY', 'ADBE', 'WMT', 'MCD', 'CSCO', 'ACN', 'TMO', 'DIS',
-            'ABT', 'DHR', 'VZ', 'NKE', 'NFLX', 'CRM', 'CMCSA', 'TXN', 'INTC', 'ORCL',
-            'AMD', 'QCOM', 'HON', 'UNP', 'PM', 'NEE', 'RTX', 'UPS', 'LOW', 'INTU',
-            'IBM', 'BA', 'AMGN', 'SPGI', 'GS', 'BLK', 'CAT', 'ELV', 'SBUX', 'DE',
-            'AXP', 'ISRG', 'BKNG', 'GILD', 'ADI', 'TJX', 'MMC', 'MDLZ', 'VRTX', 'ADP',
-            'CI', 'SYK', 'REGN', 'ZTS', 'PLD', 'AMT', 'DUK', 'SO', 'PGR', 'BDX',
-            'MO', 'TGT', 'CL', 'USB', 'BMY', 'SCHW', 'CVS', 'CB', 'BSX', 'LRCX',
-            'SLB', 'EOG', 'ITW', 'NOC', 'EQIX', 'MMM', 'C', 'PNC', 'EMR', 'AMAT',
-            'F', 'GM', 'T', 'BAC', 'WFC', 'MS', 'AIG', 'GE', 'XOM', 'CHTR',
-            'DAL', 'AAL', 'UAL', 'CCL', 'NCLH', 'MAR', 'HLT', 'MGM', 'WYNN', 'LVS'
+        """
+        Broad, shuffled, non-overused symbol pool for backfill sampling.
+
+        Replaces the old hardcoded ~120-megacap list. That list caused every
+        backfill date to sample from the same tiny pool of blue-chip names —
+        trivially separable from winners on price/market-cap/volatility
+        alone, and heavily duplicated across dates since there was nowhere
+        else to draw from.
+
+        This loads UNIVERSE_PATH (thousands of tickers expected, not ~120),
+        excludes any symbol that has already hit MAX_USES_PER_SYMBOL across
+        this backfill run, and shuffles on every call so scan order (and
+        therefore which symbols fill a date's quota first) varies date to
+        date instead of always favoring the same alphabetically-first names.
+        """
+        if self._universe_cache is None:
+            if not self.UNIVERSE_PATH.exists():
+                raise FileNotFoundError(
+                    f"Universe file not found at {self.UNIVERSE_PATH}. Refusing to "
+                    f"fall back to a small hardcoded list — that's the exact repetition "
+                    f"bug this replaces. Populate a broad symbol list (e.g. NASDAQ "
+                    f"Trader nasdaqlisted.txt + otherlisted.txt) at that path first."
+                )
+            df = pd.read_csv(self.UNIVERSE_PATH)
+            self._universe_cache = sorted(set(df["symbol"].astype(str).str.upper().tolist()))
+            self.logger.info(
+                f"Loaded point-in-time universe of {len(self._universe_cache)} symbols "
+                f"from {self.UNIVERSE_PATH}"
+            )
+
+        available = [
+            s for s in self._universe_cache
+            if self._selection_counts.get(s, 0) < self.MAX_USES_PER_SYMBOL
         ]
+        random.shuffle(available)
+        return available
