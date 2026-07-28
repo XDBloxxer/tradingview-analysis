@@ -2533,9 +2533,29 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         if "detection_date" in combined.columns:
             unified_key = pd.to_datetime(combined["detection_date"], errors="coerce")
         if "event_date" in combined.columns:
-            # Base rows are keyed by event_date directly. Only fill in where
-            # detection_date was missing so we never overwrite a real T-1 key.
-            event_parsed = pd.to_datetime(combined["event_date"], errors="coerce")
+            # BUG FIX (cross-source dedup date alignment): detection_date (T-1
+            # rows) is the day BEFORE the explosion, while event_date (base
+            # rows) is the explosion day itself -- the two columns are offset
+            # by 1 business day for the SAME real-world event. Every other
+            # place in this file that reconciles these two date columns
+            # (train_gain_regressor, the lookback filter, the RC2/RC3 merges --
+            # see the other `- pd.tseries.offsets.BDay(1)` usages in this
+            # module) shifts event_date back 1 business day before comparing
+            # it to detection_date. This dedup pass previously compared them
+            # raw, so a base row and a T-1 row describing the exact same
+            # symbol+event never collided on the same key (their dates
+            # differed by 1 day) and BOTH survived as near-duplicate feature
+            # snapshots of the same event -- one could land in train and the
+            # other in val, independent of the (already-correct) per-source
+            # dedup keys above. Shifting event_date -1 BDay here makes the
+            # unified key agree with detection_date for the same event, so
+            # true cross-source duplicates are finally caught.
+            event_parsed = (
+                pd.to_datetime(combined["event_date"], errors="coerce")
+                - pd.tseries.offsets.BDay(1)
+            )
+            # Only fill in where detection_date was missing so we never
+            # overwrite a real T-1 key.
             unified_key = unified_key.fillna(event_parsed)
 
         combined["_cross_dedup_key"] = unified_key
