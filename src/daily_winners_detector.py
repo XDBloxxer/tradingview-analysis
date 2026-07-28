@@ -47,7 +47,29 @@ class DailyWinnersDetector:
     UNIVERSE_PATH = Path("data/universe_symbols.csv")
     SELECTION_COUNTS_PATH = Path("data/winner_selection_counts.json")
     MAX_USES_PER_SYMBOL = 10
-    
+
+    # ── WINNER PROFILE FIX ───────────────────────────────────────────────
+    # Every candidate path (TradingView, yfinance screener, liquid-stocks
+    # live, liquid-stocks backfill) was only checking price > min_price,
+    # volume > min_volume, and change_pct > 0 — i.e. "any stock that went up
+    # at all, at any price." That's not what "winner" means anywhere else in
+    # this pipeline:
+    #   - learned_filters.json (derived from 1311 real historical winners)
+    #     caps max_price at 50.0 — winners are the small-cap explosive
+    #     universe, not megacaps that drifted up 0.3%.
+    #   - the non-winners screener hard-excludes change >= 20% specifically
+    #     because that's the boundary that separates "explosive winner" from
+    #     "ordinary mover" (see _screen_by_change_range's `change < 20.0`
+    #     filter in daily_non_winners_detector.py).
+    # Without both of those enforced here, "winners" backfilled from a broad
+    # point-in-time universe (which, unlike the old 120-megacap list, now
+    # legitimately contains high-priced blue chips) can end up being the
+    # least-bad stock in a small random sample rather than an actual
+    # explosive mover — which is exactly the "under 20% gain, priced over
+    # $50" symptom being fixed here.
+    DEFAULT_MAX_PRICE = 50.0
+    DEFAULT_MIN_CHANGE_PCT = 20.0
+
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
         self.config = config
@@ -56,6 +78,19 @@ class DailyWinnersDetector:
         
         self.min_price = detection_config.get("min_price", 0.25)
         self.min_volume = detection_config.get("min_volume", 10000)
+
+        winners_config = config.get("daily_winners", {})
+        learned = self._load_learned_filters()
+        # learned_filters.json wins if present; config.yaml is next; hardcoded
+        # default is last resort. min_change_pct isn't part of learned_filters.json
+        # (it only carries price/volume/market-cap/volatility bounds), so it comes
+        # from config.yaml's daily_winners section or the class default.
+        self.max_price = learned.get("max_price") or winners_config.get(
+            "max_price", self.DEFAULT_MAX_PRICE
+        )
+        self.min_change_pct = float(
+            winners_config.get("min_change_pct", self.DEFAULT_MIN_CHANGE_PCT)
+        )
 
         self._universe_cache: Optional[List[str]] = None
         self._selection_counts: Dict[str, int] = self._load_selection_counts()
@@ -66,8 +101,31 @@ class DailyWinnersDetector:
         
         self.logger.info(
             f"Daily Winners detector initialized (DEBUG MODE): "
-            f"min_price={self.min_price}, min_volume={self.min_volume}"
+            f"min_price={self.min_price}, min_volume={self.min_volume}, "
+            f"max_price={self.max_price}, min_change_pct={self.min_change_pct}"
         )
+
+    def _load_learned_filters(self) -> dict:
+        """Load max_price (and nothing else, for now) from
+        ml_models/learned_filters.json if present. Mirrors
+        DailyNonWinnersDetector._load_learned_filters so both sides of the
+        pipeline agree on what a 'winner-shaped' stock looks like — same
+        file, same max_price, so the winners table and the non-winners
+        exclusion boundary stay consistent with each other."""
+        try:
+            filter_path = Path("ml_models/learned_filters.json")
+            if not filter_path.exists():
+                self.logger.info(
+                    "No learned_filters.json found — using default max_price="
+                    f"{self.DEFAULT_MAX_PRICE} for winners."
+                )
+                return {}
+            with open(filter_path) as f:
+                data = json.load(f)
+            return {"max_price": data.get("max_price")}
+        except Exception as e:
+            self.logger.warning(f"Could not load learned_filters.json: {e} — using defaults")
+            return {}
 
     def _is_live(self, target_date: datetime) -> bool:
         """
@@ -444,6 +502,7 @@ class DailyWinnersDetector:
             filtered_counts = {
                 'excluded_pattern': 0,
                 'low_price': 0,
+                'high_price': 0,
                 'low_volume': 0,
                 'no_change': 0,
                 'parse_error': 0
@@ -483,12 +542,17 @@ class DailyWinnersDetector:
                         self.logger.debug(f"🚫 Filtered (price): {symbol} ${price:.2f}")
                         continue
                     
+                    if price > self.max_price:
+                        filtered_counts['high_price'] += 1
+                        self.logger.debug(f"🚫 Filtered (price > max): {symbol} ${price:.2f}")
+                        continue
+                    
                     if volume < self.min_volume:
                         filtered_counts['low_volume'] += 1
                         self.logger.debug(f"🚫 Filtered (volume): {symbol} {volume:,}")
                         continue
                     
-                    if change_pct <= 0:
+                    if change_pct < self.min_change_pct:
                         filtered_counts['no_change'] += 1
                         continue
                     
@@ -517,6 +581,7 @@ class DailyWinnersDetector:
                 f"TradingView filtering: total={len(data)}, "
                 f"excluded={filtered_counts['excluded_pattern']}, "
                 f"low_price={filtered_counts['low_price']}, "
+                f"high_price={filtered_counts['high_price']}, "
                 f"low_volume={filtered_counts['low_volume']}, "
                 f"no_change={filtered_counts['no_change']}, "
                 f"passed={len(all_candidates)}"
@@ -572,10 +637,9 @@ class DailyWinnersDetector:
                     change_pct = quote.get('regularMarketChangePercent', 0)
                     volume     = quote.get('regularMarketVolume', 0)
                     
-                    if price < self.min_price or volume < self.min_volume or change_pct <= 0:
+                    if (price < self.min_price or price > self.max_price
+                            or volume < self.min_volume or change_pct < self.min_change_pct):
                         continue
-                    
-                    # yfinance Screener provides regularMarketDayHigh/Low/Open
                     candidates.append({
                         'symbol':     symbol.upper(),
                         'exchange':   quote.get('exchange', 'NASDAQ'),
@@ -660,7 +724,8 @@ class DailyWinnersDetector:
                             volume     = int(latest['Volume'])
                             change_pct = ((close - prev_close) / prev_close) * 100
                             
-                            if close < self.min_price or volume < self.min_volume or change_pct <= 0:
+                            if (close < self.min_price or close > self.max_price
+                                    or volume < self.min_volume or change_pct < self.min_change_pct):
                                 continue
                             if self._is_excluded_symbol(symbol, 'NASDAQ'):
                                 continue
@@ -725,7 +790,8 @@ class DailyWinnersDetector:
                     continue
 
                 close, volume, change_pct = bar['close'], bar['volume'], bar['change_pct']
-                if close < self.min_price or volume < self.min_volume or change_pct <= 0:
+                if (close < self.min_price or close > self.max_price
+                        or volume < self.min_volume or change_pct < self.min_change_pct):
                     continue
                 if self._is_excluded_symbol(symbol, 'NASDAQ'):
                     continue
