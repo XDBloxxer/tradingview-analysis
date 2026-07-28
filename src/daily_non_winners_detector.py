@@ -453,6 +453,7 @@ class DailyNonWinnersDetector:
                     target_date, min_chg, max_chg,
                     per_cat_needed * 2,
                     winners_symbols | already_syms | filtered_syms,
+                    max_price_filter=base_filters.get("max_price"),
                 )
                 for stock in batch:
                     if stock["symbol"] not in already_syms and stock["symbol"] not in filtered_syms:
@@ -468,6 +469,7 @@ class DailyNonWinnersDetector:
                     target_date, remaining * 2,
                     winners_symbols,
                     already_syms | filtered_syms,
+                    max_price_filter=base_filters.get("max_price"),
                 )
                 fallback.extend(random_stocks[:remaining])
 
@@ -720,7 +722,8 @@ class DailyNonWinnersDetector:
         min_change: float,
         max_change: float,
         limit: int,
-        exclude_symbols: set
+        exclude_symbols: set,
+        max_price_filter: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """
         Get stocks within a specific change percentage range
@@ -731,6 +734,10 @@ class DailyNonWinnersDetector:
             max_change: Maximum change %
             limit: Number of stocks to get
             exclude_symbols: Symbols to exclude (winners)
+            max_price_filter: Optional price ceiling from learned_filters.json.
+                               Applied here so Phase 2 fallback candidates stay
+                               within the same price range as Phase 1 instead of
+                               pulling from the uncapped liquid-stocks list.
             
         Returns:
             List of stock dictionaries
@@ -738,11 +745,13 @@ class DailyNonWinnersDetector:
         try:
             if SCREENER_AVAILABLE and self.screener and self._is_live(target_date):
                 return self._screen_by_change_range(
-                    min_change, max_change, limit, exclude_symbols
+                    min_change, max_change, limit, exclude_symbols,
+                    max_price_filter=max_price_filter,
                 )
             else:
                 return self._get_from_liquid_stocks(
-                    target_date, min_change, max_change, limit, exclude_symbols
+                    target_date, min_change, max_change, limit, exclude_symbols,
+                    max_price_filter=max_price_filter,
                 )
         except Exception as e:
             self.logger.error(f"Error getting stocks in range {min_change}% to {max_change}%: {e}")
@@ -753,7 +762,8 @@ class DailyNonWinnersDetector:
         min_change: float,
         max_change: float,
         limit: int,
-        exclude_symbols: set
+        exclude_symbols: set,
+        max_price_filter: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """Use TradingView screener to find stocks in change range"""
         try:
@@ -763,6 +773,8 @@ class DailyNonWinnersDetector:
                 {'left': 'change', 'operation': 'greater', 'right': min_change},
                 {'left': 'change', 'operation': 'less', 'right': max_change}
             ]
+            if max_price_filter is not None:
+                filters.append({'left': 'close', 'operation': 'less', 'right': max_price_filter})
             
             result = self.screener.screen(
                 market='america',
@@ -797,6 +809,8 @@ class DailyNonWinnersDetector:
                     
                     if price < self.min_price or volume < self.min_volume:
                         continue
+                    if max_price_filter is not None and price > max_price_filter:
+                        continue
                     
                     candidates.append({
                         'symbol': symbol.strip().upper(),
@@ -828,7 +842,8 @@ class DailyNonWinnersDetector:
         min_change: float,
         max_change: float,
         limit: int,
-        exclude_symbols: set
+        exclude_symbols: set,
+        max_price_filter: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """Get stocks from liquid stock list using yfinance"""
         liquid_stocks = self._get_liquid_stocks_list()
@@ -848,6 +863,9 @@ class DailyNonWinnersDetector:
                 change_pct = bar['change_pct']
                 close      = bar['close']
                 volume     = bar['volume']
+
+                if max_price_filter is not None and close > max_price_filter:
+                    continue
 
                 if min_change <= change_pct <= max_change:
                     if close >= self.min_price and volume >= self.min_volume:
@@ -875,7 +893,8 @@ class DailyNonWinnersDetector:
         target_date: datetime,
         limit: int,
         exclude_winners: set,
-        exclude_existing: set
+        exclude_existing: set,
+        max_price_filter: Optional[float] = None
     ) -> List[Dict[str, Any]]:
         """Get random stocks from liquid list as fallback"""
         liquid_stocks = self._get_liquid_stocks_list()
@@ -901,6 +920,9 @@ class DailyNonWinnersDetector:
 
                 # Exclude big gainers (>20%)
                 if change_pct > 20:
+                    continue
+
+                if max_price_filter is not None and close > max_price_filter:
                     continue
                 
                 if close >= self.min_price and volume >= self.min_volume:
