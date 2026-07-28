@@ -22,7 +22,7 @@ on:
       top_n:
         description: 'Number of non-winners to track'
         required: false
-        default: '60'
+        default: '100'
       allow_append:
         description: 'Allow appending stocks to dates that already exist in the database (manual runs only)'
         required: false
