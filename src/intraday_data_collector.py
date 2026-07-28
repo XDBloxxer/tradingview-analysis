@@ -370,7 +370,7 @@ class IntradayDataCollector:
             if df.index.tz is not None:
                 df.index = df.index.tz_localize(None)
 
-            indicators_df = self._calculate_enhanced_indicators(df)
+            indicators_df = self._calculate_enhanced_indicators(df, bars_per_day=1)
             self.cache[cache_key] = indicators_df
             return indicators_df
 
@@ -584,7 +584,7 @@ class IntradayDataCollector:
             return float(v)
         return v
     
-    def _calculate_enhanced_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _calculate_enhanced_indicators(self, df: pd.DataFrame, bars_per_day: int = 78) -> pd.DataFrame:
         """
         Calculate comprehensive indicators on intraday bars
         NOTE: This is now called on 5-minute bars, so periods have different meanings:
@@ -841,14 +841,18 @@ class IntradayDataCollector:
             except:
                 pass
                 # === ROLLING VOLATILITY ===
-        # Calculated on 5-min bars: 1 trading day ≈ 78 bars
-        # Annualisation factor: sqrt(252 * 78)
+        # bars_per_day distinguishes 5-min bars (~78/day) from daily bars (1/day)
+        # so the window actually spans `d` TRADING DAYS regardless of granularity.
+        # Previously hardcoded to 78 unconditionally, which meant the daily-bar
+        # fallback path (1 row = 1 day) needed a 780-row rolling window to
+        # produce volatility_10d at all — far more history than the ~280
+        # trading-day rows the fallback fetches, so these columns came back
+        # NaN for every row, every symbol, on every backfilled date.
         try:
             log_returns = np.log(df['Close'] / df['Close'].shift(1))
-            BARS_PER_DAY = 78
-            ANNUALISE = np.sqrt(252 * BARS_PER_DAY)
+            ANNUALISE = np.sqrt(252 * bars_per_day)
             for d in [10, 20, 30]:
-                bars = d * BARS_PER_DAY
+                bars = d * bars_per_day
                 result[f'volatility_{d}d'] = (
                     log_returns
                     .rolling(window=bars, min_periods=bars // 2)
