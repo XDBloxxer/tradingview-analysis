@@ -17,7 +17,7 @@
     "t1_open_HV_20",
     "t5_dmn_14",
     "t10_dmn_14",
-    "t5_rsi_14_slope",
+    "t5_rsi_14_slope"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
