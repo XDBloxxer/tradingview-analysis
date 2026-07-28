@@ -226,6 +226,17 @@ VAL_WEEKS = 8
 EMBARGO_DAYS_FLOOR = 5
 EMBARGO_DAYS_CAP   = 90
 
+# Rolling-window feature lengths (SMA_50, hv_30, t10_*, ...) are counted in
+# TRADING days, but the embargo gap itself is subtracted from a CALENDAR-day
+# cutoff (pd.Timedelta(days=EMBARGO_DAYS)). A straight day-for-day mapping
+# therefore undercounts the true gap by ~2 non-trading days per 5 trading
+# days (weekends; more around holidays). E.g. a genuine 50-*trading*-day SMA
+# window spans ~70 calendar days, not 50 — so an embargo of exactly 50
+# calendar days still leaves ~20 days of real autocorrelation across the
+# train/val boundary. TRADING_TO_CALENDAR_RATIO converts the inferred
+# trading-day window into an equivalent calendar-day gap before clamping.
+TRADING_TO_CALENDAR_RATIO = 7.0 / 5.0  # 7 calendar days per 5 trading days
+
 # Minimum number of days of pre-embargo data train_val_split will insist on
 # keeping for TRAIN, even if that means shrinking the inferred embargo below
 # what the deepest rolling-window feature would otherwise call for. Purely a
@@ -250,8 +261,13 @@ def _infer_embargo_days(
     floor: int = EMBARGO_DAYS_FLOOR,
     cap: int = EMBARGO_DAYS_CAP,
 ) -> int:
-    """Infer the purge/embargo gap (in days) from the deepest rolling-window
-    length encoded in the given feature column names.
+    """Infer the purge/embargo gap (in CALENDAR days) from the deepest
+    rolling-window length encoded in the given feature column names.
+
+    The raw max window found in column names is a count of TRADING days
+    (that's how every technical indicator here is computed). We convert it
+    to calendar days via TRADING_TO_CALENDAR_RATIO before clamping, since
+    the embargo is ultimately applied against calendar-day timestamps.
 
     Falls back to `floor` if no plausible window length is found (e.g. an
     empty feature list), and clamps the result to `cap` so a stray large
@@ -273,8 +289,9 @@ def _infer_embargo_days(
                 continue
             max_window = max(max_window, n)
 
-    inferred = max_window if max_window > 0 else floor
-    return int(max(floor, min(cap, inferred)))
+    trading_days = max_window if max_window > 0 else floor
+    calendar_days = math.ceil(trading_days * TRADING_TO_CALENDAR_RATIO)
+    return int(max(floor, min(cap, calendar_days)))
 
 
 # ---------------------------------------------------------------------------
@@ -2493,26 +2510,53 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
     # ── Step 3: Cross-source dedup — T-1 beats base for the same event ────────
-    # A stock may appear in both T-1 (detection_date) and base (event_date) for
-    # the same real-world day.  We prefer the T-1 row (richer features).
-    # We only do this cross-source dedup when detection_date is populated, using
-    # it as the unified date key.  Base rows that have only event_date (no
-    # detection_date) are never incorrectly dropped here.
+    # A stock may appear in both T-1 (identified by detection_date) and base
+    # (identified by event_date) for the same real-world day. The two source
+    # frames use DIFFERENT date columns for the same underlying event, so the
+    # previous version — which only matched on detection_date — could never
+    # actually catch a base-vs-T-1 duplicate: base rows generally don't
+    # populate detection_date, so `has_det` excluded them from the dedup pass
+    # entirely (hence 0 rows ever dropped here in practice, even when a base
+    # row and a T-1 row referred to the exact same symbol+day).
+    #
+    # Fix: build a single unified key per row — detection_date if present,
+    # else event_date — so a base row and a T-1 row for the same symbol+day
+    # collide on the same key regardless of which date column each happened
+    # to populate. T-1 is concatenated first (line above), so keep="first"
+    # still prefers the richer T-1 row.
     cross_sym = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    if cross_sym and "detection_date" in combined.columns:
+    has_any_date_col = ("detection_date" in combined.columns) or ("event_date" in combined.columns)
+    if cross_sym and has_any_date_col:
         n_before_cross = len(combined)
-        # Only dedup rows that actually have a detection_date (T-1 rows and any
-        # base rows that happen to have detection_date populated).
-        has_det = combined["detection_date"].notna()
-        cross_deduped = combined[has_det].drop_duplicates(
-            subset=[cross_sym, "detection_date"], keep="first"
+
+        unified_key = pd.Series(pd.NaT, index=combined.index, dtype="datetime64[ns]")
+        if "detection_date" in combined.columns:
+            unified_key = pd.to_datetime(combined["detection_date"], errors="coerce")
+        if "event_date" in combined.columns:
+            # Base rows are keyed by event_date directly. Only fill in where
+            # detection_date was missing so we never overwrite a real T-1 key.
+            event_parsed = pd.to_datetime(combined["event_date"], errors="coerce")
+            unified_key = unified_key.fillna(event_parsed)
+
+        combined["_cross_dedup_key"] = unified_key
+        has_key = unified_key.notna()
+
+        cross_deduped = combined[has_key].drop_duplicates(
+            subset=[cross_sym, "_cross_dedup_key"], keep="first"
         )
-        combined = pd.concat([cross_deduped, combined[~has_det]], ignore_index=True, sort=False)
+        combined = pd.concat([cross_deduped, combined[~has_key]], ignore_index=True, sort=False)
+        combined = combined.drop(columns=["_cross_dedup_key"])
         n_cross_dropped = n_before_cross - len(combined)
         if n_cross_dropped > 0:
             logger.info(
                 f"Cross-source dedup: removed {n_cross_dropped} rows where T-1 and base "
-                f"shared the same (symbol, detection_date) ({n_before_cross} → {len(combined)})"
+                f"shared the same (symbol, unified-date) ({n_before_cross} → {len(combined)}), "
+                "using detection_date ?? event_date as the unified key."
+            )
+        else:
+            logger.info(
+                "Cross-source dedup: 0 rows removed — no symbol+date overlap found "
+                "between base and T-1 sources for this run."
             )
 
     logger.info(f"Combined dataset: {len(combined)} rows")
