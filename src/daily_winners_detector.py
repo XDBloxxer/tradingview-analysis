@@ -154,13 +154,15 @@ class DailyWinnersDetector:
         end = target_date_only + timedelta(days=1)
 
         try:
-            hist = yf.download(
+            hist = self.rate_limiter.call_with_backoff(
+                yf.download,
                 symbol,
                 start=start.isoformat(),
                 end=end.isoformat(),
                 interval='1d',
                 progress=False,
                 auto_adjust=True,
+                label=f"{symbol} OHLC bar",
             )
         except Exception as e:
             self.logger.debug(f"{symbol}: yfinance fetch failed: {e}")
@@ -359,7 +361,8 @@ class DailyWinnersDetector:
         )
 
         try:
-            data = yf.download(
+            data = self.rate_limiter.call_with_backoff(
+                yf.download,
                 symbols,
                 start=start.isoformat(),
                 end=end.isoformat(),
@@ -368,6 +371,7 @@ class DailyWinnersDetector:
                 progress=False,
                 threads=True,
                 auto_adjust=True,
+                label=f"bulk OHLC backfill ({len(symbols)} symbols) {target_date_only.isoformat()}",
             )
 
             if data.empty:
@@ -689,7 +693,8 @@ class DailyWinnersDetector:
                 batch = liquid_stocks[i:i + batch_size]
                 
                 try:
-                    data = yf.download(
+                    data = self.rate_limiter.call_with_backoff(
+                        yf.download,
                         batch,
                         period='2d',
                         interval='1d',
@@ -697,6 +702,7 @@ class DailyWinnersDetector:
                         progress=False,
                         threads=True,
                         auto_adjust=True,
+                        label=f"live liquid batch ({len(batch)} symbols)",
                     )
                     
                     if data.empty:
@@ -887,7 +893,8 @@ class DailyWinnersDetector:
             self.logger.info(f"📦 Batch {i//batch_size + 1}: Checking {len(batch_symbols)} symbols")
             
             try:
-                data = yf.download(
+                data = self.rate_limiter.call_with_backoff(
+                    yf.download,
                     batch_symbols,
                     period='5d',
                     interval='1d',
@@ -895,6 +902,7 @@ class DailyWinnersDetector:
                     progress=False,
                     threads=True,
                     auto_adjust=True,
+                    label=f"freshness batch {i//batch_size + 1}",
                 )
                 
                 if data.empty:
