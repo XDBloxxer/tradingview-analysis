@@ -6,7 +6,10 @@ FIX: All three fetch paths now populate high, low, open, close so the
      daily_winners table is fully populated after the schema migration.
 """
 
+import json
 import logging
+import random
+from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
 import pandas as pd
@@ -34,6 +37,16 @@ class DailyWinnersDetector:
         '.OB',  # OTC Bulletin Board
         '-',    # Often delisted stocks
     ]
+
+    # ── POINT-IN-TIME UNIVERSE FIX (mirrors daily_non_winners_detector.py) ──
+    # Same hardcoded ~100-megacap fallback bug, same fix: a broad universe
+    # file with anti-repetition tracking, kept in a SEPARATE counts file from
+    # the non-winners side since winners/non-winners are different quotas —
+    # a symbol legitimately can and should appear as a candidate check on
+    # both sides across a backfill without either quota starving the other.
+    UNIVERSE_PATH = Path("data/universe_symbols.csv")
+    SELECTION_COUNTS_PATH = Path("data/winner_selection_counts.json")
+    MAX_USES_PER_SYMBOL = 10
     
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
@@ -43,6 +56,9 @@ class DailyWinnersDetector:
         
         self.min_price = detection_config.get("min_price", 0.25)
         self.min_volume = detection_config.get("min_volume", 10000)
+
+        self._universe_cache: Optional[List[str]] = None
+        self._selection_counts: Dict[str, int] = self._load_selection_counts()
         
         self.rate_limiter = RateLimiter(config)
         self.market_movers = MarketMovers(export_result=False)
@@ -712,6 +728,7 @@ class DailyWinnersDetector:
                 break
 
         candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
+        self._record_selections([c['symbol'] for c in candidates])
         self.logger.info(f"✅ Found {len(candidates)} from liquid stocks (backfill, date-pinned)")
         return candidates
     
@@ -872,16 +889,48 @@ class DailyWinnersDetector:
         )
         return valid_candidates
 
+    def _load_selection_counts(self) -> Dict[str, int]:
+        if self.SELECTION_COUNTS_PATH.exists():
+            try:
+                with open(self.SELECTION_COUNTS_PATH) as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.warning(f"Could not load selection counts, starting fresh: {e}")
+        return {}
+
+    def _save_selection_counts(self) -> None:
+        self.SELECTION_COUNTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.SELECTION_COUNTS_PATH, "w") as f:
+            json.dump(self._selection_counts, f, indent=2)
+
+    def _record_selections(self, symbols: List[str]) -> None:
+        if not symbols:
+            return
+        for s in symbols:
+            self._selection_counts[s] = self._selection_counts.get(s, 0) + 1
+        self._save_selection_counts()
+
     def _get_liquid_stocks_list(self) -> List[str]:
-        return [
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'BRK.B', 'UNH', 'JNJ',
-            'V', 'PG', 'JPM', 'MA', 'HD', 'CVX', 'MRK', 'ABBV', 'PEP', 'COST',
-            'AVGO', 'KO', 'LLY', 'ADBE', 'WMT', 'MCD', 'CSCO', 'ACN', 'TMO', 'DIS',
-            'ABT', 'DHR', 'VZ', 'NKE', 'NFLX', 'CRM', 'CMCSA', 'TXN', 'INTC', 'ORCL',
-            'AMD', 'QCOM', 'HON', 'UNP', 'PM', 'NEE', 'RTX', 'UPS', 'LOW', 'INTU',
-            'IBM', 'BA', 'AMGN', 'SPGI', 'GS', 'BLK', 'CAT', 'ELV', 'SBUX', 'DE',
-            'AXP', 'ISRG', 'BKNG', 'GILD', 'ADI', 'TJX', 'MMC', 'MDLZ', 'VRTX', 'ADP',
-            'CI', 'SYK', 'REGN', 'ZTS', 'PLD', 'AMT', 'DUK', 'SO', 'PGR', 'BDX',
-            'MO', 'TGT', 'CL', 'USB', 'BMY', 'SCHW', 'CVS', 'CB', 'BSX', 'LRCX',
-            'SLB', 'EOG', 'ITW', 'NOC', 'EQIX', 'MMM', 'C', 'PNC', 'EMR', 'AMAT',
+        """Broad, shuffled, non-overused symbol pool for backfill sampling.
+        See daily_non_winners_detector.py's version of this method for the
+        full rationale — same fix, same reasoning, applied here too."""
+        if self._universe_cache is None:
+            if not self.UNIVERSE_PATH.exists():
+                raise FileNotFoundError(
+                    f"Universe file not found at {self.UNIVERSE_PATH}. Refusing to "
+                    f"fall back to a small hardcoded list. Populate a broad symbol "
+                    f"list at that path first (see build_universe.py)."
+                )
+            df = pd.read_csv(self.UNIVERSE_PATH)
+            self._universe_cache = sorted(set(df["symbol"].astype(str).str.upper().tolist()))
+            self.logger.info(
+                f"Loaded point-in-time universe of {len(self._universe_cache)} symbols "
+                f"from {self.UNIVERSE_PATH}"
+            )
+
+        available = [
+            s for s in self._universe_cache
+            if self._selection_counts.get(s, 0) < self.MAX_USES_PER_SYMBOL
         ]
+        random.shuffle(available)
+        return available
