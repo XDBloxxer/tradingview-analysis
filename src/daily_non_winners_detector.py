@@ -186,7 +186,10 @@ class DailyNonWinnersDetector:
 
         try:
             ticker = yf.Ticker(symbol)
-            hist = ticker.history(start=start.isoformat(), end=end.isoformat(), interval='1d')
+            hist = self.rate_limiter.call_with_backoff(
+                ticker.history, start=start.isoformat(), end=end.isoformat(),
+                interval='1d', label=f"{symbol} date-pinned OHLC"
+            )
         except Exception:
             return None
 
