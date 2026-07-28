@@ -6,7 +6,6 @@
   "stage4_ga_count": null,
   "final_count": 40,
   "final_features": [
-    "has_t1_features",
     "t1_close_DMN_14",
     "t3_cci_14",
     "t10_cci_20",
