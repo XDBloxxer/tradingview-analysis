@@ -7,6 +7,7 @@
   "final_count": 40,
   "final_features": [
     "t10_volume_ma5",
+    "has_t1_features",
     "t1_close_Volume_MA5",
     "t1_close_Volume_MA10",
     "t5_obv_sma20",
