@@ -544,8 +544,22 @@ NON_FEATURE_COLS = {
     # are internally price-normalised are retained — they capture the signal
     # without exposing the absolute price level.
     # Both the close-snapshot and open-snapshot variants are excluded.
-    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open",
-    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",
+    #
+    # FIX: t1_close_Volume / t1_open_Volume were missing from this set even
+    # though they are raw (unnormalised) share counts with exactly the same
+    # generalisation problem as raw OHLC — worse, in fact: base_csv rows and
+    # T-1-collected rows populate this column from two different sources
+    # (TradingView screener vs yfinance intraday) at two different scales,
+    # so raw Volume was effectively acting as a proxy for "which pipeline
+    # produced this row" rather than a real momentum signal. That proxy is
+    # trivially separable, which is almost certainly why best_iteration was
+    # collapsing to single digits: XGBoost saturated its achievable AUC in a
+    # handful of rounds because it didn't have to do any real work. The
+    # normalised counterparts (Volume_Ratio, Volume_MA5/10/20, OBV — see
+    # normalise_t1()) are retained; they capture the same signal without
+    # exposing the raw, source-dependent scale.
+    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open", "t1_close_Volume",
+    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",  "t1_open_Volume",
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
