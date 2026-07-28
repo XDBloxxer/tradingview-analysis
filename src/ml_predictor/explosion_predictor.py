@@ -882,17 +882,45 @@ class ExplosionPredictor:
             # first / last bucket rather than creating out-of-range spill.
             live_clipped = live_col.clip(percentiles[0], percentiles[-1])
 
-            psi_total = 0.0
-            for i in range(n_buckets):
+            # BUGFIX: degenerate buckets (lo == hi, e.g. all-zero / heavily
+            # tied features) used to be silently skipped, which dropped their
+            # share of expected_pct (1/n_buckets) from the running total while
+            # the live mass sitting exactly on that shared edge still landed in
+            # the neighboring bucket's actual_pct (because of the clip above).
+            # That desynced expected (< 1.0 total) from actual (~1.0 total),
+            # producing large spurious PSI even when the live batch is drawn
+            # from the same distribution as training.
+            #
+            # Fix: merge consecutive degenerate buckets into their neighbor so
+            # each merged bucket's expected_pct reflects its combined weight
+            # (merged_count / n_buckets), keeping expected and actual on a
+            # consistent 0..1 scale.
+            merged_buckets = []  # list of (lo, hi, weight)
+            i = 0
+            while i < n_buckets:
                 lo, hi = percentiles[i], percentiles[i + 1]
-                if lo == hi:
-                    continue  # degenerate bucket (e.g. all-zero feature)
+                weight = 1
+                while lo == hi and i + 1 < n_buckets:
+                    i += 1
+                    hi = percentiles[i + 1]
+                    weight += 1
+                merged_buckets.append((lo, hi, weight))
+                i += 1
 
-                # Expected fraction: each bucket holds 1/n_buckets of training data
-                expected_pct = 1.0 / n_buckets
+            psi_total = 0.0
+            n_merged = len(merged_buckets)
+            for idx, (lo, hi, weight) in enumerate(merged_buckets):
+                if lo == hi:
+                    # Entire feature is a single constant value in training
+                    # (all buckets collapsed) — no meaningful PSI possible.
+                    continue
+
+                # Expected fraction: this bucket's share of training data,
+                # preserving the mass of any buckets merged into it.
+                expected_pct = weight / n_buckets
 
                 # Actual fraction of live values falling in this bucket
-                if i < n_buckets - 1:
+                if idx < n_merged - 1:
                     actual_count = int(((live_clipped >= lo) & (live_clipped < hi)).sum())
                 else:
                     # Last bucket is inclusive on the right edge
