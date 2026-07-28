@@ -27,6 +27,17 @@ concurrency:
   group: tv-analysis-backfill
   cancel-in-progress: false
 
+# Our git steps (reset/pull/commit/push) never touch anything under
+# ml_models/ -- the only Git LFS-tracked path in this repo -- so skip LFS
+# smudging entirely. Without this, git-lfs's smudge filter runs on every
+# checkout/reset/pull regardless of the "lfs:" flag on actions/checkout, and
+# a pre-existing broken LFS pointer elsewhere in the repo
+# (ml_models/archive/*.pkl committed as a raw binary instead of a pointer)
+# makes "git reset --hard" leave the tree in a state "git pull --rebase"
+# then refuses to touch.
+env:
+  GIT_LFS_SKIP_SMUDGE: '1'
+
 jobs:
   drain-queue:
     runs-on: ubuntu-latest
