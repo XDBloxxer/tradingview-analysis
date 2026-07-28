@@ -65,6 +65,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           for i in 1 2 3 4 5; do
+            # Defensive: force the working tree to exactly match whatever is
+            # currently checked out before pulling. Without this, any
+            # pre-existing diff in a tracked file (e.g. a line-ending quirk
+            # in one of the selection-counts JSON files) makes git refuse to
+            # even start "pull --rebase" with "You have unstaged changes",
+            # before this script has touched anything itself.
+            git reset --hard HEAD
+            git clean -fd
             git pull --rebase origin "${{ github.ref_name }}"
 
             JOB_IDS=$(python src/queue_worker.py enqueue-range \
