@@ -2658,11 +2658,6 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
     X = X.replace([np.inf, -np.inf], np.nan)
-  # temporary experiment: drop every feature that isn't already price/volume-normalized
-    RAW_SCALE_COLS = [c for c in feature_cols if any(
-        tag in c for tag in ("obv", "atr", "macd", "dcm", "dcl", "dcu", "sma", "ema", "wma", "hma", "vwma")
-    ) and not any(norm in c for norm in ("_pct", "_slope", "vs_ema", "_diff", "hv_"))]
-    X_test = X.drop(columns=RAW_SCALE_COLS)
 
     # ── FIX: has_t1_features binary flag ────────────────────────────────────
     # T-1 rows (from winners_day_prior_close / non_winners_day_prior_close)
