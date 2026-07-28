@@ -1,9 +1,10 @@
-name: Daily Non-Winners Tracker
+name: Daily Winners Tracker
 
 on:
-  # Run daily at 5:00 PM EST (after daily winners at 4:30 PM)
+  # Run daily at 4:30 PM EST (after market close at 4pm)
   schedule:
-    - cron: '20 21 * * 1-5'  # 21:20 UTC = 4:20 PM EST -- 30 min after daily_top10.yml's 20:50 UTC winners run, so _get_winners_symbols() always sees that day's winners already written (Mon-Fri only)
+    - cron: '50 20 * * 1-5'  # 21:30 UTC = 4:30 PM EST (Mon-Fri only)
+
   # Allow manual triggering
   workflow_dispatch:
     inputs:
@@ -24,23 +25,24 @@ on:
         required: false
         default: ''
       top_n:
-        description: 'Number of non-winners to track'
+        description: 'Number of top winners to track'
         required: false
-        default: '100'
+        default: '15'
       allow_append:
-        description: 'Allow appending stocks to dates that already exist in the database (manual runs only)'
+        description: 'Allow appending to dates that already have data (use when re-running a backfill after a partial failure)'
         required: false
         default: 'false'
-        type: choice
-        options:
-          - 'false'
-          - 'true'
+        type: boolean
 
-# Same reasoning as daily_top10.yml -- this job only enqueues one or more
-# chunks into the shared data/run_queue.jsonl and wakes queue_runner.yml,
-# which is the workflow that actually holds the "tv-analysis-backfill"
-# concurrency group and does the work. No concurrency block here on purpose;
-# see queue_runner.yml.
+# This job does NOT actually run the tracker anymore -- it just appends one
+# or more job descriptions to data/run_queue.jsonl (one per chunk, if
+# chunk_days was given for a backfill) and wakes up queue_runner.yml, which
+# is the only workflow that does real work and holds the shared
+# "tv-analysis-backfill" concurrency group. Deliberately no concurrency block
+# here: this job is a few seconds of git work, so any number of these can be
+# queued back-to-back (schedule, manual, winners, non-winners, all mixed)
+# without GitHub silently dropping earlier ones. See queue_runner.yml and
+# src/queue_worker.py for why this exists and how draining/chunking works.
 permissions:
   contents: write
   actions: write
@@ -57,7 +59,7 @@ env:
   GIT_LFS_SKIP_SMUDGE: '1'
 
 jobs:
-  enqueue-non-winners:
+  enqueue-winners:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -105,18 +107,18 @@ jobs:
             git pull --rebase origin "${{ github.ref_name }}"
 
             JOB_IDS=$(python src/queue_worker.py enqueue-range \
-              --job-type non_winners \
+              --job-type winners \
               --date "${{ github.event.inputs.date }}" \
               --start-date "${{ github.event.inputs.start_date }}" \
               --end-date "${{ github.event.inputs.end_date }}" \
               --chunk-days "${{ github.event.inputs.chunk_days }}" \
-              --top-n "${{ github.event.inputs.top_n || '60' }}" \
+              --top-n "${{ github.event.inputs.top_n || '15' }}" \
               --allow-append "${{ github.event.inputs.allow_append || 'false' }}" \
-              --queued-by "non_winners:${{ github.run_id }}")
+              --queued-by "winners:${{ github.run_id }}")
 
             git add -f data/run_queue.jsonl
             NUM_JOBS=$(echo "$JOB_IDS" | grep -c .)
-            git commit -m "chore: enqueue $NUM_JOBS non-winners job(s) [skip ci]"
+            git commit -m "chore: enqueue $NUM_JOBS winners job(s) [skip ci]"
 
             if git push origin "HEAD:${{ github.ref_name }}"; then
               echo "Enqueued:"
