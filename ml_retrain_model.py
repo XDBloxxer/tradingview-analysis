@@ -5410,7 +5410,7 @@ def main() -> int:
             if line.strip():
                 logger.info(f"  {line}")
 # ── DIAGNOSTIC: split blind-holdout AUC by train/val symbol overlap ──
-        overlap_df = pd.read_csv("Supabase_Snippet_Untitled_query__7_.csv")
+        overlap_df = pd.read_csv("ml_models/feature_selection/diagnostics/train_val_symbol_overlap.csv")
         overlap_df["detection_date"] = pd.to_datetime(overlap_df["detection_date"]).dt.date
 
         # X_cal_fit shares its index with combined_df, so pull symbol/date straight from there
