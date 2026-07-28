@@ -1,0 +1,150 @@
+name: Queue Runner (Winners / Non-Winners)
+
+# This is the ONLY workflow that actually executes daily_winners_main.py /
+# daily_non_winners_main.py, and the only one holding the shared
+# "tv-analysis-backfill" concurrency group. daily_top10.yml and
+# daily_non_winners_workflow.yml just append job descriptions to
+# data/run_queue.jsonl and trigger this workflow to wake up.
+#
+# Why a single draining runner instead of one GitHub Actions run per queued
+# job: GitHub concurrency groups only ever keep ONE run pending per group,
+# even with cancel-in-progress: false -- that setting only protects a run
+# that's already executing, not ones waiting in line. Queue up a 2nd and 3rd
+# manual run and the 2nd one silently vanishes, leaving only the 3rd. Instead
+# of asking GitHub to hold N pending runs, this workflow itself loops and
+# processes every job in the file, one at a time, until the file is empty.
+# Any number of "wake up" triggers can arrive while it's running -- since
+# they carry no concurrency group themselves, they're never dropped, and
+# even if a *redundant* wake-up trigger of THIS workflow gets dropped by
+# GitHub's one-pending-run limit, the run that does execute will still drain
+# everything that piled up in the queue file, so no queued job is ever lost.
+on:
+  repository_dispatch:
+    types: [process-queue]
+  workflow_dispatch: {}
+
+concurrency:
+  group: tv-analysis-backfill
+  cancel-in-progress: false
+
+jobs:
+  drain-queue:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create directories
+        run: |
+          mkdir -p data/cache
+          mkdir -p logs
+
+      - name: Drain the run queue
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          MAX_ITEMS_PER_RUN: '25'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          ANY_FAILURES=0
+          ITER=0
+
+          while true; do
+            git pull --rebase origin "${{ github.ref_name }}"
+
+            if ! ITEM_JSON=$(python src/queue_worker.py peek); then
+              echo "Queue is empty. Nothing left to do."
+              break
+            fi
+
+            JOB_ID=$(echo "$ITEM_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['id'])")
+            JOB_TYPE=$(echo "$ITEM_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['job_type'])")
+            echo "::group::Processing job $JOB_ID ($JOB_TYPE)"
+
+            set +e
+            python src/queue_worker.py run-next
+            RC=$?
+            set -e
+            echo "::endgroup::"
+
+            if [ "$RC" -ne 0 ]; then
+              echo "Job $JOB_ID failed with exit code $RC"
+              ANY_FAILURES=1
+            fi
+
+            # Persist: the queue file (job removed) + whichever
+            # selection-counts file this job type maintains. Same reasoning
+            # as the old per-workflow "Persist selection counts" steps --
+            # without committing, a chunked backfill's anti-repeat cap
+            # resets on every job.
+            git add -f data/run_queue.jsonl
+            if [ "$JOB_TYPE" = "winners" ]; then
+              git add -f data/winner_selection_counts.json 2>/dev/null || true
+            elif [ "$JOB_TYPE" = "non_winners" ]; then
+              git add -f data/non_winner_selection_counts.json 2>/dev/null || true
+            fi
+
+            if git diff --cached --quiet; then
+              echo "No state changes to commit for job $JOB_ID."
+            else
+              git commit -m "chore: process queued $JOB_TYPE job $JOB_ID [skip ci]"
+              PUSHED=0
+              for i in 1 2 3 4 5; do
+                if git pull --rebase origin "${{ github.ref_name }}" && \
+                   git push origin "HEAD:${{ github.ref_name }}"; then
+                  PUSHED=1
+                  break
+                fi
+                echo "Push attempt $i failed, retrying..."
+                sleep 5
+              done
+              if [ "$PUSHED" -ne 1 ]; then
+                echo "Could not push after job $JOB_ID -- stopping this run; a fresh runner will pick up where this left off."
+                gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
+                exit 1
+              fi
+            fi
+
+            ITER=$((ITER + 1))
+            if [ "$ITER" -ge "$MAX_ITEMS_PER_RUN" ]; then
+              echo "Processed $ITER job(s), hit this run's cap. Re-dispatching a fresh runner for any remaining jobs."
+              gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
+              break
+            fi
+          done
+
+          if [ "$ANY_FAILURES" -ne 0 ]; then
+            echo "One or more queued jobs failed -- see grouped logs above."
+            exit 1
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: queue-runner-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "One or more queued jobs failed. Check the grouped step logs and uploaded artifacts above."
+          echo "Data already written to Supabase before a failure is still there -- only the failed job's remaining work is lost."
