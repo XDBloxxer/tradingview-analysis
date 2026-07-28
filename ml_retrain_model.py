@@ -2922,7 +2922,10 @@ def train_model(
 
     logger.info(f"  Best iteration: {model.best_iteration}")
     logger.info(f"  Best val AUC: {model.best_score:.4f}")
-
+    # right after model.fit(...) in ml_retrain_model.py, temporarily add:
+    booster = model.get_booster()
+    trees_df = booster.trees_to_dataframe()
+    print(trees_df[trees_df['Tree'] == 0][['Node', 'Feature', 'Split', 'Gain', 'Yes', 'No', 'Missing']].to_string())
     # Warn if early stopping fired suspiciously early — indicates the val set
     # is too small, too imbalanced, or temporally non-representative.
     if model.best_iteration < 30:
