@@ -181,7 +181,7 @@ FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 # rows still contribute full signal for the t3_/t5_/t10_ daily features — they
 # are just no longer artificially inflated relative to the richer T-1 rows.
 BASE_CSV_WEIGHT         = 1.0
-T1_WEIGHT               = 2.0
+T1_WEIGHT               = 1.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # Validation window — the most recent N weeks of labelled data are reserved for
