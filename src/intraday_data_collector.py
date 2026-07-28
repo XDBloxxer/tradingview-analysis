@@ -428,7 +428,15 @@ class IntradayDataCollector:
                 'exchange': exchange,
                 'detection_date': detection_date_obj.isoformat(),
                 'snapshot_type': snapshot_type,
-                'snapshot_time': 'daily_bar',   # no specific clock time available
+                # `snapshot_time` is a Postgres `time` column. There's no
+                # specific clock time available for a daily-bar fallback row,
+                # so this must be NULL rather than a sentinel string — writing
+                # a string here (e.g. 'daily_bar') throws a 22007 "invalid
+                # input syntax for type time" error and fails the whole
+                # insert batch. t1_data_source='daily_fallback' (set below)
+                # already carries the "this came from a daily bar, not a
+                # real intraday snapshot" information.
+                'snapshot_time': None,
                 'snapshot_date': prior_date_obj.isoformat(),
                 't1_data_source': 'daily_fallback',
             }
