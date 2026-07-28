@@ -32,11 +32,17 @@ on:
           - 'false'
           - 'true'
 
-
+# Same group name as daily_top10.yml -- see that file for why this is
+# shared across both workflows rather than per-workflow.
+concurrency:
+  group: tv-analysis-backfill
+  cancel-in-progress: false
 
 jobs:
   track-non-winners:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     
     steps:
       - name: Checkout code
@@ -77,6 +83,31 @@ jobs:
           
           echo "Running with args: $ARGS"
           python daily_non_winners_main.py $ARGS
+
+      - name: Persist selection counts
+        # Same reasoning as the winners workflow: without committing
+        # data/non_winner_selection_counts.json back, every chunk of a
+        # multi-run backfill starts with an empty counts file and the
+        # MAX_USES_PER_SYMBOL cap effectively resets each time -- this
+        # matters more here since non-winners is 100% sampled (not real
+        # winners), so it's the only thing preventing the same easy-to-pick
+        # stocks from dominating across the whole backfill.
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f data/non_winner_selection_counts.json 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No change to selection counts, nothing to commit."
+          else
+            git commit -m "chore: update non-winner selection counts [skip ci]"
+            for i in 1 2 3; do
+              git pull --rebase origin "${{ github.ref_name }}" && \
+              git push origin "HEAD:${{ github.ref_name }}" && break
+              echo "Push attempt $i failed, retrying..."
+              sleep 5
+            done
+          fi
       
       - name: Upload logs
         if: always()
