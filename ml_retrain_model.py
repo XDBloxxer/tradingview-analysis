@@ -176,12 +176,16 @@ FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 # importance (RSI_14=0.000155, Volume_Ratio=0.000769) despite being the
 # freshest, most actionable signal available at inference time.
 #
-# With BASE_CSV_WEIGHT=1.0 / T1_WEIGHT=2.0 the model will learn from the
-# intraday signal that actually drives same-day explosive moves. The base CSV
-# rows still contribute full signal for the t3_/t5_/t10_ daily features — they
-# are just no longer artificially inflated relative to the richer T-1 rows.
+# UPDATE (2026-07-28): Reverted T1_WEIGHT 2.0 -> 1.0. The 2x multiplier made
+# sense when T1 rows were a minority needing a boost, but the 180-day rolling
+# window now contains far more T1 rows than base rows by sheer count (e.g.
+# 7576 T1 vs 869 base in a recent run) -- stacking a 2x per-row multiplier on
+# top of an already ~8.7:1 row-count advantage pushed base CSV down to ~5% of
+# total training signal, effectively drowning out whatever the t3_/t5_/t10_
+# multiday features (anchored by base rows) contribute. Equal weighting lets
+# the natural row-count ratio do the work instead of compounding it.
 BASE_CSV_WEIGHT         = 1.0
-T1_WEIGHT               = 2.0
+T1_WEIGHT               = 1.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # Validation window — the most recent N weeks of labelled data are reserved for
@@ -614,6 +618,7 @@ def fetch_table_paginated(
     page_size: int = 1000,
     date_columns: Optional[list] = None,
     cutoff_date: Optional[str] = None,
+    order_column: str = "id",
 ) -> pd.DataFrame:
     """Fetch rows from a Supabase table using pagination.
 
@@ -626,8 +631,26 @@ def fetch_table_paginated(
     still runs afterwards in Python (see FETCH_BUFFER_DAYS), so results are
     identical to fetching the whole table -- only the transferred byte
     count changes.
+
+    BUGFIX: each ``.range()`` call below is a *separate* SQL query, not a
+    cursor over one snapshot. Postgres/PostgREST does NOT guarantee stable
+    row ordering across separate queries unless an explicit ``ORDER BY`` is
+    given -- without one, the planner is free to return rows in scan order,
+    which can shift between two paginated calls seconds apart if there is
+    ANY concurrent write on the table (an UPDATE writes a new MVCC row
+    version, which can land in a different scan position than the old one).
+    On a table like ``ml_training_base`` that other scripts write into
+    out-of-band (e.g. a labeling backfill flipping label 0->1 mid-fetch),
+    this can silently skip or duplicate rows across the page boundary with
+    no error -- e.g. a clean-looking ``pos=0`` result on a table that
+    genuinely has positives, just because they crossed a page boundary at
+    the wrong moment. Pinning an explicit order (primary key by default)
+    makes pagination deterministic and immune to concurrent writes.
     """
-    query = client.table(table).select("*")
+    def _build(q):
+        return q.order(order_column)
+
+    query = _build(client.table(table).select("*"))
 
     if date_columns and cutoff_date:
         # PostgREST or_() syntax: "col1.gte.DATE,col2.gte.DATE,col1.is.null"
@@ -654,20 +677,40 @@ def fetch_table_paginated(
     try:
         rows = _run(query)
     except Exception as e:
+        # Two possible causes bucketed together here: (1) one of date_columns
+        # doesn't exist on this table's schema, or (2) order_column ("id" by
+        # default) doesn't exist. Both are rejected outright by PostgREST
+        # only once .execute() actually runs, not when .order()/.or_() are
+        # called client-side. Don't let either take down the whole retrain --
+        # retry without the date filter first (most common case), and if
+        # that still fails, retry once more with no explicit order at all
+        # (falls back to non-deterministic pagination -- logged loudly).
         if date_columns and cutoff_date:
-            # Most likely cause: one of date_columns doesn't exist on this
-            # table's schema, which PostgREST rejects outright. Don't let a
-            # bandwidth optimization take down the whole retrain -- fall
-            # back to the old unfiltered fetch and flag it loudly so the
-            # date_columns list can be fixed.
             logger.warning(
-                f"  {table}: date-filtered fetch failed ({e}); "
-                "falling back to a full unfiltered fetch. Check that "
-                f"{date_columns} actually exist on '{table}'."
+                f"  {table}: filtered fetch failed ({e}); retrying without "
+                f"the date filter. Check that {date_columns} actually exist "
+                f"on '{table}'."
+            )
+            try:
+                rows = _run(_build(client.table(table).select("*")))
+            except Exception as e2:
+                logger.warning(
+                    f"  {table}: ordered fetch also failed ({e2}); falling "
+                    f"back to unordered pagination. Check that '{order_column}' "
+                    f"actually exists on '{table}'. Row skip/duplication "
+                    "across pages is possible if the table is written to "
+                    "concurrently during this fetch."
+                )
+                rows = _run(client.table(table).select("*"))
+        else:
+            logger.warning(
+                f"  {table}: ordered fetch failed ({e}); falling back to "
+                f"unordered pagination. Check that '{order_column}' actually "
+                f"exists on '{table}'. Row skip/duplication across pages is "
+                "possible if the table is written to concurrently during "
+                "this fetch."
             )
             rows = _run(client.table(table).select("*"))
-        else:
-            raise
 
     df = pd.DataFrame(rows)
     logger.info(f"  {table}: total {len(df)} rows, {len(df.columns)} columns")
