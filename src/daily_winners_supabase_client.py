@@ -124,10 +124,11 @@ class DailyWinnersSupabaseClient:
     #   "Could not find the 'ema20_slope' column of 'winners_market_open' in the schema cache"
     _MISSING_COLUMN_RE = re.compile(r"Could not find the '([^']+)' column")
 
-    def _insert_with_schema_retry(self, table_name: str, rows: List[Dict[str, Any]]):
+    def _insert_with_schema_retry(self, table_name: str, rows: List[Dict[str, Any]],
+                                   use_upsert: bool = False):
         """
-        Insert rows into `table_name`, self-healing against PGRST204
-        "column not found in schema cache" errors.
+        Insert (or upsert) rows into `table_name`, self-healing against
+        PGRST204 "column not found in schema cache" errors.
 
         The DataFrame that produces these rows can grow new derived
         columns (e.g. new indicators) that haven't been added to the
@@ -138,8 +139,13 @@ class DailyWinnersSupabaseClient:
         written. A warning is logged listing everything that was dropped
         so the schema drift is visible and can be fixed with a migration.
 
+        When use_upsert=True, rows are upserted on the (symbol, detection_date)
+        unique key with ignore_duplicates=True instead of inserted, so callers
+        (e.g. backfills) can write without a pre-read existing-symbol check —
+        conflicts are resolved server-side at zero egress cost.
+
         Returns the Supabase response from the (eventually) successful
-        insert.
+        insert/upsert.
         """
         rows = [dict(r) for r in rows]  # don't mutate caller's dicts
         dropped_columns: set = set()
@@ -147,7 +153,14 @@ class DailyWinnersSupabaseClient:
         max_attempts = 25  # generous ceiling; one retry per bad column found
         for attempt in range(max_attempts):
             try:
-                response = self.client.table(table_name).insert(rows).execute()
+                if use_upsert:
+                    response = self.client.table(table_name).upsert(
+                        rows,
+                        ignore_duplicates=True,
+                        on_conflict="symbol,detection_date",
+                    ).execute()
+                else:
+                    response = self.client.table(table_name).insert(rows).execute()
                 if dropped_columns:
                     self.logger.warning(
                         f"Inserted into {table_name} after dropping column(s) not "
@@ -205,13 +218,23 @@ class DailyWinnersSupabaseClient:
             self.logger.debug(f"Could not check existing symbols in {table_name}: {e}")
             return set()
     
-    def write_winners(self, winners: List[Dict[str, Any]]) -> int:
+    def write_winners(self, winners: List[Dict[str, Any]], allow_append: bool = False) -> int:
         """
-        Write daily winners to Supabase
-        ONLY writes NEW symbols that don't already exist for this date
-        
+        Write daily winners to Supabase.
+
+        By default (allow_append=False) only NEW symbols that don't already
+        exist for this date are inserted, protecting scheduled runs from
+        accidentally duplicating data.
+
+        Pass allow_append=True when backfilling/running manually to allow
+        adding stocks to a date that already has records in the database —
+        this skips the pre-read existing-symbol check and upserts instead,
+        at zero extra egress cost.
+
         Args:
             winners: List of winner dictionaries
+            allow_append: If True, skip the existing-symbol filter and write
+                             all provided stocks (subject to DB unique constraints).
             
         Returns:
             Number of rows written
@@ -222,19 +245,26 @@ class DailyWinnersSupabaseClient:
         
         try:
             detection_date = winners[0].get('detection_date')
-            
-            # Get existing symbols for this date
-            existing_symbols = self._get_existing_symbols(self.tables["winners"], detection_date)
-            
-            if existing_symbols:
-                self.logger.info(f"Found {len(existing_symbols)} existing winners for {detection_date}")
-            
-            # Filter out symbols that already exist
-            new_winners = [w for w in winners if w.get('symbol') not in existing_symbols]
-            
-            skipped_count = len(winners) - len(new_winners)
-            if skipped_count > 0:
-                self.logger.info(f"Skipping {skipped_count} winners that already exist in database")
+
+            if allow_append:
+                self.logger.info(
+                    f"allow_append=True: skipping duplicate check for {detection_date}, "
+                    "writing all winners"
+                )
+                new_winners = winners
+            else:
+                # Get existing symbols for this date
+                existing_symbols = self._get_existing_symbols(self.tables["winners"], detection_date)
+
+                if existing_symbols:
+                    self.logger.info(f"Found {len(existing_symbols)} existing winners for {detection_date}")
+
+                # Filter out symbols that already exist
+                new_winners = [w for w in winners if w.get('symbol') not in existing_symbols]
+
+                skipped_count = len(winners) - len(new_winners)
+                if skipped_count > 0:
+                    self.logger.info(f"Skipping {skipped_count} winners that already exist in database")
             
             if not new_winners:
                 self.logger.info("No new winners to write (all already exist)")
@@ -242,10 +272,14 @@ class DailyWinnersSupabaseClient:
             
             # Sanitize all data
             sanitized_winners = [self._sanitize_dict(w) for w in new_winners]
-            
-            # Insert new data only (self-heals if a column isn't in the DB schema yet)
+
+            # When appending/backfilling, use upsert with ignore_duplicates=True
+            # so any symbols already in the DB are silently skipped server-side
+            # rather than requiring a pre-read existing-symbol check (which costs
+            # egress). Normal inserts don't need this because the pre-filter
+            # above already removed them.
             response = self._insert_with_schema_retry(
-                self.tables["winners"], sanitized_winners
+                self.tables["winners"], sanitized_winners, use_upsert=allow_append
             )
             
             count = len(response.data) if response.data else 0
@@ -256,13 +290,20 @@ class DailyWinnersSupabaseClient:
             self.logger.error(f"Error writing winners: {str(e)}", exc_info=True)
             raise
     
-    def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    def write_intraday_data(self, intraday_data: Dict[str, List[Dict[str, Any]]],
+                             allow_append: bool = False) -> Dict[str, int]:
         """
-        Write intraday indicator data to Supabase
-        ONLY writes NEW symbols that don't already exist for this date
+        Write intraday indicator data to Supabase.
+
+        By default (allow_append=False) only NEW symbols that don't already
+        exist for this date are inserted. Pass allow_append=True when
+        backfilling/running manually to allow adding stocks to a date that
+        already has records — this skips the pre-read existing-symbol check
+        and upserts instead, at zero extra egress cost.
         
         Args:
             intraday_data: Dictionary with 'market_open', 'market_close', 'day_prior_open', 'day_prior_close' keys
+            allow_append: If True, skip the existing-symbol filter.
             
         Returns:
             Dictionary with counts for each table
@@ -284,19 +325,26 @@ class DailyWinnersSupabaseClient:
             
             try:
                 detection_date = data[0].get('detection_date')
-                
-                # Get existing symbols for this date
-                existing_symbols = self._get_existing_symbols(self.tables[table_key], detection_date)
-                
-                if existing_symbols:
-                    self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
-                
-                # Filter out symbols that already exist
-                new_data = [d for d in data if d.get('symbol') not in existing_symbols]
-                
-                skipped_count = len(data) - len(new_data)
-                if skipped_count > 0:
-                    self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
+
+                if allow_append:
+                    self.logger.info(
+                        f"allow_append=True: skipping duplicate check for {data_type} "
+                        f"on {detection_date}, writing all records"
+                    )
+                    new_data = data
+                else:
+                    # Get existing symbols for this date
+                    existing_symbols = self._get_existing_symbols(self.tables[table_key], detection_date)
+
+                    if existing_symbols:
+                        self.logger.info(f"Found {len(existing_symbols)} existing {data_type} records for {detection_date}")
+
+                    # Filter out symbols that already exist
+                    new_data = [d for d in data if d.get('symbol') not in existing_symbols]
+
+                    skipped_count = len(data) - len(new_data)
+                    if skipped_count > 0:
+                        self.logger.info(f"Skipping {skipped_count} {data_type} records that already exist")
                 
                 if not new_data:
                     self.logger.info(f"No new {data_type} data to write (all already exist)")
@@ -314,9 +362,11 @@ class DailyWinnersSupabaseClient:
                     self.logger.info(f"DEBUG {data_type} - exchange: {first_record.get('exchange')}")
                     self.logger.info(f"DEBUG {data_type} - detection_date: {first_record.get('detection_date')}")
                 
-                # Insert new data only (self-heals if a column isn't in the DB schema yet)
+                # When appending/backfilling, use upsert with ignore_duplicates=True
+                # so any symbols already in the DB are silently skipped server-side
+                # rather than requiring a pre-read existing-symbol check.
                 response = self._insert_with_schema_retry(
-                    self.tables[table_key], sanitized_data
+                    self.tables[table_key], sanitized_data, use_upsert=allow_append
                 )
                 
                 count = len(response.data) if response.data else 0
