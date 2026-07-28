@@ -73,17 +73,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # GIT_LFS_SKIP_SMUDGE only skips the smudge filter on checkout -- it
-          # does NOT stop Git LFS's post-checkout/post-merge hooks, which still
-          # run after every "git reset --hard" and inspect LFS-tracked paths.
-          # Because ml_models/archive/best_model - Copy.pkl was committed as a
-          # raw binary instead of a real pointer, that hook flags it ("should
-          # have been a pointer, but wasn't") and leaves the tree diverged from
-          # the index again right after our own reset --hard runs -- so the
-          # very next "git pull --rebase" sees fresh unstaged changes and
-          # aborts. This job never touches ml_models/, so just remove the
-          # local LFS hooks entirely and avoid the problem outright.
-          git lfs uninstall --local
+          # ml_models/archive/best_model - Copy.pkl was committed as a raw
+          # binary instead of a real LFS pointer, but .gitattributes still
+          # marks that path as LFS-tracked, and the runner has git-lfs's
+          # filter.lfs.* registered in its GLOBAL/system git config (not
+          # something "git lfs uninstall --local" can remove, since there's
+          # no local registration to strip -- hence its "no such section"
+          # warning). So on every status/diff (including inside "reset --hard"
+          # and "pull --rebase"), git still runs the LFS "clean" filter on the
+          # working-tree file to compare it against the index. That filter
+          # converts the real binary into a pointer for comparison, but the
+          # index blob IS the raw binary (not a pointer) -- they can never
+          # match, so the file shows as permanently "modified" no matter how
+          # many times we reset. This job never touches ml_models/, so just
+          # force the lfs filter to a no-op passthrough locally, overriding
+          # the global config, so git compares raw content directly instead.
+          git config --local filter.lfs.clean "cat"
+          git config --local filter.lfs.smudge "cat"
+          git config --local filter.lfs.process ""
+          git config --local filter.lfs.required false
 
           for i in 1 2 3 4 5; do
             # Defensive: force the working tree to exactly match whatever is
