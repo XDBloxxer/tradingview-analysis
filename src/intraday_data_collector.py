@@ -310,7 +310,9 @@ class IntradayDataCollector:
             # Fetch 60 days of 5-minute data (maximum available from yfinance)
             # This gives roughly 60 * 78 bars/day = 4680 bars
             # Enough for 200-period indicators (which would be ~17 trading days on 5-min)
-            df = ticker.history(period='60d', interval='5m')
+            df = self.rate_limiter.call_with_backoff(
+                ticker.history, period='60d', interval='5m', label=f"{symbol} 5m"
+            )
             
             if df.empty:
                 self.logger.debug(f"No intraday data for {symbol}")
@@ -359,7 +361,10 @@ class IntradayDataCollector:
             end = target_date_only + timedelta(days=1)
 
             ticker = yf.Ticker(symbol)
-            df = ticker.history(start=start.isoformat(), end=end.isoformat(), interval='1d')
+            df = self.rate_limiter.call_with_backoff(
+                ticker.history, start=start.isoformat(), end=end.isoformat(),
+                interval='1d', label=f"{symbol} daily"
+            )
 
             if df.empty or len(df) < 30:
                 # Too little history to compute most indicators meaningfully.
