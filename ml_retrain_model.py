@@ -1216,12 +1216,31 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
 
     def _is_raw_price_line(col_name: str) -> bool:
         """True if the column looks like a raw dollar price rather than % dist from close."""
-        med = _median_abs(col_name)
-        if np.isnan(med):
-            return False   # no data — leave as-is
-        # Normalised % distance from close is almost always in (−50, +50).
-        # Raw dollar price equals the close, so median ≈ median_close >> 50.
-        return med > 50.0
+        if col_name not in df.columns or safe_close is None:
+            return False
+        num   = pd.to_numeric(df[col_name], errors="coerce")
+        ratio = (num / safe_close).dropna()
+        if ratio.empty:
+            return False
+        # FIX: the previous check used a flat `median(|col|) > 50` threshold,
+        # which assumed a raw dollar price line is always numerically > 50.
+        # That's false for this screener's own universe: it targets low-priced,
+        # explosive small caps, so a raw Keltner/BB/Donchian band on a $5-$40
+        # stock sits well under 50 and was being misclassified as "already
+        # normalised" — silently leaving raw dollar price in the feature
+        # matrix for a large share of rows (exactly the price-level leak this
+        # function exists to prevent; see t3_high's 19.2% importance history).
+        #
+        # Anchor to close instead, the same way _is_raw_atr already does:
+        # a raw price line sits close to the stock's own price regardless of
+        # its absolute level, so median(|col| / close) ≈ 1 (generously, 0.3–3×
+        # to allow for volatile/wide bands). A correctly normalised % distance
+        # from close is a small number (typically −50..50) that is NOT
+        # close-relative — dividing it by a low-priced close inflates the
+        # ratio far outside this window, and dividing it by a high-priced
+        # close shrinks it toward zero, so the ranges don't overlap.
+        med_ratio = float(ratio.abs().median())
+        return 0.3 <= med_ratio <= 3.0
 
     def _is_raw_dollar_diff(col_name: str) -> bool:
         """True if MACD/MOM/AO column looks like a raw dollar difference."""
