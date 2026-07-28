@@ -1,8 +1,6 @@
 {
   "excluded_features": [
-    "t1_open_DCL_20_20",
-    "t1_close_BBL_20_2.0_2.0",
-    "t10_bbl_20_2_0_2_0"
+
   ],
   "note": "List feature column names here (as they appear in X) to permanently block them from every stage of the feature-selection pipeline (stability check, correlation clustering, Boruta, RFECV, GA). Applied by default; disable with --no-exclude-features or a different --exclude-features-file. t1_open_DCL_20_20 and t1_close_BBL_20_2.0_2.0 blocked 2026-07-28: after the raw-price normalisation fix in ml_retrain_model.py, RFECV collapsed to 15 features with these two alone carrying ~60% importance and val AUC hit 1.0000 with a fully bimodal probability distribution. Live predictions on the resulting model were degenerate (near-zero confidence across the board, gain regressor flat at ~4.1%), consistent with the classifier having memorized a narrow, non-generalizing split on these two columns rather than learning a real pattern. Re-test with them unblocked once the upstream feature construction/join has been audited for leakage."
 }
