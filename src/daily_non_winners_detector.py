@@ -62,6 +62,11 @@ class DailyNonWinnersDetector:
     # without it (a bigger universe is the better fix, not a higher cap).
     MAX_USES_PER_SYMBOL = 10
 
+    # Parallel scan tuning for the yfinance fallback paths (see fix notes on
+    # _get_filtered_candidates, _get_from_liquid_stocks, _get_random_liquid_stocks).
+    SCAN_WORKERS = 20
+    SCAN_BATCH_SIZE = 60
+
     # Default filters used when learned_filters.json is absent or a key is missing
     DEFAULT_FILTERS = {
         "min_price": 0.25,
@@ -408,7 +413,10 @@ class DailyNonWinnersDetector:
                 f"min_rvol={_fmt(active_filters.get('min_relative_volume'), '.2f')}]..."
             )
 
-            new_candidates = self._get_filtered_candidates(winners_symbols, active_filters, target_date)
+            new_candidates = self._get_filtered_candidates(
+                winners_symbols, active_filters, target_date,
+                target_pool=min_pool * 3,
+            )
 
             added = 0
             for c in new_candidates:
@@ -553,6 +561,7 @@ class DailyNonWinnersDetector:
         exclude_symbols: set,
         filters: dict = None,
         target_date: datetime = None,
+        target_pool: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """
         Fetch a pool of stocks that pass the given filters but did NOT gain ≥20 % intraday.
@@ -567,6 +576,12 @@ class DailyNonWinnersDetector:
             target_date: Date the candidates are being collected for. Required
                 for the yfinance fallback path to fetch the correct historical
                 bar instead of "whatever is most recent."
+            target_pool: Stop the yfinance fallback scan once this many
+                candidates have been gathered, instead of scanning the whole
+                universe. Any shortfall is covered by later loosening passes
+                / Phase 2 fallback in detect_non_winners, so this doesn't
+                need to be exact — just big enough to give the caller
+                headroom. Defaults to a generous flat value if not given.
         """
         if target_date is None:
             target_date = datetime.now()
@@ -709,78 +724,99 @@ class DailyNonWinnersDetector:
         liquid_stocks = [s for s in self._get_liquid_stocks_list() if s not in exclude_symbols]
         candidates = []
 
-        for symbol in liquid_stocks:
-            try:
-                bar = self._fetch_yf_bar_for_date(symbol, target_date)
-                if bar is None:
-                    continue
+        # FIX: this used to be a serial for-loop with an explicit
+        # time.sleep(0.1) per symbol and no early exit — scanning the
+        # entire multi-thousand-symbol universe, once per loosening pass
+        # (up to loosening_passes+1 times per date). At 0.1s/symbol alone
+        # that's minutes per pass before any network latency, and this
+        # function runs on every backfill date. Parallelized via thread
+        # pool (matches the pattern in daily_winners_detector.py's
+        # equivalent fix) and stops once a generous pool has been gathered
+        # rather than exhausting the whole universe every time.
+        target_pool_size = target_pool if target_pool is not None else 200
 
-                change_pct = bar["change_pct"]
-                close      = bar["close"]
-                volume     = bar["volume"]
+        for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
+            batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
-                if change_pct >= 20.0:
-                    continue
-                if close < min_price_filter:
-                    continue
-                if max_price_filter is not None and close > max_price_filter:
-                    continue
-                if volume < min_volume_filter:
-                    continue
-
-                # FIX: These filters used to be TradingView-screener-only —
-                # a backfill run that skipped the screener silently dropped
-                # them. Apply the same bounds here using the metrics computed
-                # by _fetch_yf_bar_for_date, so filter behavior matches
-                # between live and backfill runs.
-                hv10 = bar.get("hv10")
-                if lf.get("min_hv10") is not None and (hv10 is None or hv10 < lf["min_hv10"]):
-                    continue
-                if lf.get("max_hv10") is not None and (hv10 is None or hv10 > lf["max_hv10"]):
-                    continue
-
-                hv20 = bar.get("hv20")
-                if lf.get("min_hv20") is not None and (hv20 is None or hv20 < lf["min_hv20"]):
-                    continue
-                if lf.get("max_hv20") is not None and (hv20 is None or hv20 > lf["max_hv20"]):
-                    continue
-
-                rel_vol = bar.get("relative_volume_10d")
-                min_rel_vol = lf.get("min_relative_volume")
-                if min_rel_vol is None:
-                    min_rel_vol = lf.get("min_volume_ratio")
-                if min_rel_vol is not None and (rel_vol is None or rel_vol < min_rel_vol):
-                    continue
-
-                atr14 = bar.get("atr14")
-                if lf.get("min_atr14") is not None and (atr14 is None or atr14 < lf["min_atr14"]):
-                    continue
-
-                market_cap = bar.get("market_cap")
-                if min_mcap_filter is not None or max_mcap_filter is not None:
-                    if market_cap is None:
+            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
+                future_to_symbol = {
+                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
+                    for symbol in batch
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bar = future.result()
+                    except Exception:
                         continue
-                    if min_mcap_filter is not None and market_cap < min_mcap_filter:
-                        continue
-                    if max_mcap_filter is not None and market_cap > max_mcap_filter:
+                    if bar is None:
                         continue
 
-                candidates.append({
-                    "symbol":     symbol,
-                    "exchange":   "NASDAQ",
-                    "price":      float(close),
-                    "change_pct": float(change_pct),
-                    "volume":     int(volume),
-                    "market_cap": float(market_cap) if market_cap is not None else None,
-                    "high":       float(bar["high"]),
-                    "low":        float(bar["low"]),
-                    "open":       float(bar["open"]),
-                    "close":      float(close),
-                })
-            except Exception:
-                continue
+                    change_pct = bar["change_pct"]
+                    close      = bar["close"]
+                    volume     = bar["volume"]
 
-            time.sleep(0.1)
+                    if change_pct >= 20.0:
+                        continue
+                    if close < min_price_filter:
+                        continue
+                    if max_price_filter is not None and close > max_price_filter:
+                        continue
+                    if volume < min_volume_filter:
+                        continue
+
+                    # FIX: These filters used to be TradingView-screener-only —
+                    # a backfill run that skipped the screener silently dropped
+                    # them. Apply the same bounds here using the metrics computed
+                    # by _fetch_yf_bar_for_date, so filter behavior matches
+                    # between live and backfill runs.
+                    hv10 = bar.get("hv10")
+                    if lf.get("min_hv10") is not None and (hv10 is None or hv10 < lf["min_hv10"]):
+                        continue
+                    if lf.get("max_hv10") is not None and (hv10 is None or hv10 > lf["max_hv10"]):
+                        continue
+
+                    hv20 = bar.get("hv20")
+                    if lf.get("min_hv20") is not None and (hv20 is None or hv20 < lf["min_hv20"]):
+                        continue
+                    if lf.get("max_hv20") is not None and (hv20 is None or hv20 > lf["max_hv20"]):
+                        continue
+
+                    rel_vol = bar.get("relative_volume_10d")
+                    min_rel_vol = lf.get("min_relative_volume")
+                    if min_rel_vol is None:
+                        min_rel_vol = lf.get("min_volume_ratio")
+                    if min_rel_vol is not None and (rel_vol is None or rel_vol < min_rel_vol):
+                        continue
+
+                    atr14 = bar.get("atr14")
+                    if lf.get("min_atr14") is not None and (atr14 is None or atr14 < lf["min_atr14"]):
+                        continue
+
+                    market_cap = bar.get("market_cap")
+                    if min_mcap_filter is not None or max_mcap_filter is not None:
+                        if market_cap is None:
+                            continue
+                        if min_mcap_filter is not None and market_cap < min_mcap_filter:
+                            continue
+                        if max_mcap_filter is not None and market_cap > max_mcap_filter:
+                            continue
+
+                    candidates.append({
+                        "symbol":     symbol,
+                        "exchange":   "NASDAQ",
+                        "price":      float(close),
+                        "change_pct": float(change_pct),
+                        "volume":     int(volume),
+                        "market_cap": float(market_cap) if market_cap is not None else None,
+                        "high":       float(bar["high"]),
+                        "low":        float(bar["low"]),
+                        "open":       float(bar["open"]),
+                        "close":      float(close),
+                    })
+
+            if len(candidates) >= target_pool_size:
+                break
 
         return candidates
 
@@ -963,56 +999,64 @@ class DailyNonWinnersDetector:
         """Get stocks from liquid stock list using yfinance"""
         liquid_stocks = self._get_liquid_stocks_list()
         liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
-        
+
         candidates = []
-        
-        for symbol in liquid_stocks:
+
+        # FIX: was a serial for-loop with time.sleep(0.1) per symbol and no
+        # batching — see _get_filtered_candidates fix notes above for why
+        # that's a multi-minute-per-call bottleneck at universe scale.
+        for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
             if len(candidates) >= limit:
                 break
-            
-            try:
-                bar = self._fetch_yf_bar_for_date(symbol, target_date)
-                if bar is None:
-                    continue
+            batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
-                change_pct = bar['change_pct']
-                close      = bar['close']
-                volume     = bar['volume']
-
-                if max_price_filter is not None and close > max_price_filter:
-                    continue
-
-                market_cap = bar.get('market_cap')
-                if min_market_cap_filter is not None or max_market_cap_filter is not None:
-                    if market_cap is None:
+            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
+                future_to_symbol = {
+                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
+                    for symbol in batch
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bar = future.result()
+                    except Exception:
                         continue
-                    if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
-                        continue
-                    if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                    if bar is None:
                         continue
 
-                if min_change <= change_pct <= max_change:
-                    if close >= self.min_price and volume >= self.min_volume:
-                        candidates.append({
-                            'symbol': symbol,
-                            'exchange': 'NASDAQ',
-                            'price': float(close),
-                            'change_pct': float(change_pct),
-                            'volume': int(volume),
-                            'market_cap': float(market_cap) if market_cap is not None else None,
-                            'high': float(bar['high']),
-                            'low': float(bar['low']),
-                            'open': float(bar['open']),
-                            'close': float(close)
-                        })
-                
-            except Exception as e:
-                continue
-            
-            time.sleep(0.1)
-        
+                    change_pct = bar['change_pct']
+                    close      = bar['close']
+                    volume     = bar['volume']
+
+                    if max_price_filter is not None and close > max_price_filter:
+                        continue
+
+                    market_cap = bar.get('market_cap')
+                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
+                        if market_cap is None:
+                            continue
+                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                            continue
+                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                            continue
+
+                    if min_change <= change_pct <= max_change:
+                        if close >= self.min_price and volume >= self.min_volume:
+                            candidates.append({
+                                'symbol': symbol,
+                                'exchange': 'NASDAQ',
+                                'price': float(close),
+                                'change_pct': float(change_pct),
+                                'volume': int(volume),
+                                'market_cap': float(market_cap) if market_cap is not None else None,
+                                'high': float(bar['high']),
+                                'low': float(bar['low']),
+                                'open': float(bar['open']),
+                                'close': float(close)
+                            })
+
         self._record_selections([c['symbol'] for c in candidates])
-        return candidates
+        return candidates[:limit]
     
     def _get_random_liquid_stocks(
         self,
@@ -1032,57 +1076,63 @@ class DailyNonWinnersDetector:
         ]
         
         candidates = []
-        
-        for symbol in liquid_stocks[:limit * 2]:
+        scan_pool = liquid_stocks[:limit * 2]
+
+        for batch_start in range(0, len(scan_pool), self.SCAN_BATCH_SIZE):
             if len(candidates) >= limit:
                 break
-            
-            try:
-                bar = self._fetch_yf_bar_for_date(symbol, target_date)
-                if bar is None:
-                    continue
+            batch = scan_pool[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
-                change_pct = bar['change_pct']
-                close      = bar['close']
-                volume     = bar['volume']
-
-                # Exclude big gainers (>20%)
-                if change_pct > 20:
-                    continue
-
-                if max_price_filter is not None and close > max_price_filter:
-                    continue
-
-                market_cap = bar.get('market_cap')
-                if min_market_cap_filter is not None or max_market_cap_filter is not None:
-                    if market_cap is None:
+            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
+                future_to_symbol = {
+                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
+                    for symbol in batch
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bar = future.result()
+                    except Exception:
                         continue
-                    if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                    if bar is None:
                         continue
-                    if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+
+                    change_pct = bar['change_pct']
+                    close      = bar['close']
+                    volume     = bar['volume']
+
+                    # Exclude big gainers (>20%)
+                    if change_pct > 20:
                         continue
-                
-                if close >= self.min_price and volume >= self.min_volume:
-                    candidates.append({
-                        'symbol': symbol,
-                        'exchange': 'NASDAQ',
-                        'price': float(close),
-                        'change_pct': float(change_pct),
-                        'volume': int(volume),
-                        'market_cap': float(market_cap) if market_cap is not None else None,
-                        'high': float(bar['high']),
-                        'low': float(bar['low']),
-                        'open': float(bar['open']),
-                        'close': float(close)
-                    })
-                
-            except Exception as e:
-                continue
-            
-            time.sleep(0.1)
-        
+
+                    if max_price_filter is not None and close > max_price_filter:
+                        continue
+
+                    market_cap = bar.get('market_cap')
+                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
+                        if market_cap is None:
+                            continue
+                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                            continue
+                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                            continue
+
+                    if close >= self.min_price and volume >= self.min_volume:
+                        candidates.append({
+                            'symbol': symbol,
+                            'exchange': 'NASDAQ',
+                            'price': float(close),
+                            'change_pct': float(change_pct),
+                            'volume': int(volume),
+                            'market_cap': float(market_cap) if market_cap is not None else None,
+                            'high': float(bar['high']),
+                            'low': float(bar['low']),
+                            'open': float(bar['open']),
+                            'close': float(close)
+                        })
+
         self._record_selections([c['symbol'] for c in candidates])
-        return candidates
+        return candidates[:limit]
     
     def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
         """Check if symbol should be excluded"""
