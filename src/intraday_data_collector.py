@@ -291,13 +291,17 @@ class IntradayDataCollector:
         # the (rate-limited, per-symbol) network call entirely and go straight to
         # the daily-bar T-1 fallback in _process_winner. Small buffer under 60 to
         # be conservative about yfinance's exact cutoff.
+        #
+        # NOTE: deliberately NOT cached — cache_key is per-symbol only (the
+        # underlying fetch is date-independent), so caching this skip decision
+        # would wrongly suppress a real fetch later in the same run if the same
+        # symbol comes up again for a different, in-window target_date.
         target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
         if (datetime.now().date() - target_date_only).days > 58:
             self.logger.debug(
                 f"{symbol}: {target_date_only.isoformat()} is outside yfinance's 5-min "
                 f"window (>58 days old) — skipping 5-min fetch, will use daily fallback."
             )
-            self.cache[cache_key] = None
             return None
 
         try:
