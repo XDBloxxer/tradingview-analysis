@@ -3,7 +3,7 @@
   "max_price": 50.0,
   "min_volume": 100000,
   "min_market_cap": null,
-  "max_market_cap": null,
+  "max_market_cap": 2000000000,
   "min_hv10": 30.0,
   "max_hv10": 490.6525,
   "min_hv20": 30.0,
