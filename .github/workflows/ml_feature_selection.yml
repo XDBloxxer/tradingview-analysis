@@ -112,6 +112,7 @@ jobs:
 
           # Plain JSON/CSV — no LFS needed (only ml_models/*.pkl is LFS-tracked).
           git add ml_models/feature_selection/selected_features.json          || true
+          git add ml_models/feature_selection/stability_frequency.csv         || true
           git add ml_models/feature_selection/stage1_correlation_clusters.csv || true
           git add ml_models/feature_selection/stage2_boruta_history.csv       || true
           git add ml_models/feature_selection/stage3_rfecv_curve.csv          || true
