@@ -822,6 +822,35 @@ def load_base_training_data(client: Client, lookback_days: Optional[int] = None)
             "that mild label drift has occurred. Monitor week-over-week; if the rate "
             "continues rising, investigate ml_training_base for label imbalance."
         )
+    elif pos_rate == 0.0 and len(df) > 0:
+        # Low-end counterpart to the >20%/>25% checks above. ml_training_base
+        # is a mostly-static historical seed table (see docstring above) --
+        # if its winner (label=1) rows happen to be concentrated in older
+        # event_dates than its non-winner rows, a rolling lookback_days
+        # cutoff can silently filter out every positive while keeping all
+        # the negatives. That doesn't fail loudly anywhere downstream: the
+        # combined dataset still trains fine, but has_t1_features becomes a
+        # near-perfect proxy for the label within this all-negative base
+        # subset, and the classifier saturates its achievable AUC in very
+        # few boosting rounds (best_iteration far lower than usual) because
+        # it no longer has to do any real work to separate the base rows.
+        logger.warning(
+            f"BASE DATA WARNING: positive rate is 0.0% (0/{len(df)} rows) within the "
+            f"current lookback window. Expected ~5-20%. ml_training_base is documented "
+            "as a mostly-static seed table -- if its winner rows are dated older than "
+            "its non-winner rows, a rolling lookback cutoff can filter out all positives "
+            "while keeping all negatives. This tends to show up indirectly as an unusually "
+            "low best_iteration during training (has_t1_features becomes a near-perfect "
+            "proxy for the label within this all-negative subset). Check the label/event_date "
+            "distribution in ml_training_base directly, or consider decoupling its fetch "
+            "cutoff from the rolling lookback_days window used for the T-1 tables."
+        )
+    elif pos_rate < 0.05:
+        logger.warning(
+            f"BASE DATA ADVISORY: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows), "
+            "below the expected ~5-20% floor. Not necessarily an error, but worth a glance "
+            "at the label/event_date distribution in ml_training_base if this is new."
+        )
 
     return df
 
