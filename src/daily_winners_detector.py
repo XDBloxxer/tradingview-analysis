@@ -408,6 +408,18 @@ class DailyWinnersDetector:
         return False
     
     def _fetch_from_tradingview(self, target_date: datetime, top_n: int) -> List[Dict[str, Any]]:
+        # TradingView's MarketMovers "gainers" scrape has no historical/point-in-time
+        # mode — it always returns *today's* real-time gainers regardless of what
+        # target_date is passed in. Calling it for a backfill date silently mislabels
+        # today's actual winners as winners for target_date (the exact bug reported:
+        # backfilling 02-04 came back with today's winners). Gate it to live runs only.
+        if not self._is_live(target_date):
+            self.logger.info(
+                f"⏭️  Skipping TradingView MarketMovers for {target_date.date().isoformat()} "
+                f"(not live — TradingView gainers has no point-in-time mode, only 'today')."
+            )
+            return []
+
         try:
             fetch_limit = max(top_n * 10, 500)
             
@@ -522,6 +534,18 @@ class DailyWinnersDetector:
         limit: int,
         exclude_symbols: Set[str]
     ) -> List[Dict[str, Any]]:
+        # Same problem as TradingView: yfinance's `Screener().get_screeners(['day_gainers'])`
+        # is a live "today's movers" endpoint with no target_date parameter — there is
+        # no way to ask it for gainers on a past date. For a backfill date it would
+        # silently hand back today's real winners again. Route straight to the
+        # point-in-time universe scan instead.
+        if not self._is_live(target_date):
+            self.logger.info(
+                f"⏭️  Skipping yfinance day_gainers Screener for {target_date.date().isoformat()} "
+                f"(not live — it only returns today's movers, no historical mode)."
+            )
+            return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+
         try:
             self.logger.info("Fetching from yfinance screener...")
             
