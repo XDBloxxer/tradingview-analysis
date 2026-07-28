@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-07-28T19:25:33.785750+00:00",
+  "trained_at": "2026-07-28T19:36:24.987198+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
   "n_features": 31,
