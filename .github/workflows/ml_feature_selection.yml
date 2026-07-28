@@ -120,6 +120,16 @@ jobs:
 
           git diff --staged --quiet || git commit -m "🧬 Auto feature-selection: $(date +'%Y-%m-%d %H:%M:%S UTC')"
 
+          # Rebase onto whatever landed on main while this (long, up to 3hr)
+          # job was running, so the push below is a fast-forward instead of
+          # getting rejected by a concurrent commit from another workflow.
+          git fetch origin "${GITHUB_REF#refs/heads/}"
+          git rebase "origin/${GITHUB_REF#refs/heads/}" || {
+            echo "Rebase failed — resolve manually.";
+            git rebase --abort;
+            exit 1;
+          }
+
       - name: Push changes
         uses: ad-m/github-push-action@master
         with:
