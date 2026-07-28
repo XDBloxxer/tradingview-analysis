@@ -12,6 +12,7 @@ import random
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import yfinance as yf
 import time
@@ -766,6 +767,16 @@ class DailyWinnersDetector:
             self.logger.error(f"Error in liquid stocks: {e}", exc_info=True)
             return []
 
+    # Scans batches of symbols in parallel rather than one `yf.download` call
+    # at a time. This mattered less before min_change_pct was enforced (any
+    # positive mover passed, so few symbols needed checking) — with a real
+    # 20% floor, most symbols get rejected and the scan has to get much
+    # deeper into the universe to gather enough qualifying candidates.
+    # Serial fetches at that depth is what turned a 15-stock backfill into a
+    # 15-minute wait; concurrency is the fix, not a smaller universe.
+    SCAN_WORKERS = 20
+    SCAN_BATCH_SIZE = 60
+
     def _fetch_from_liquid_stocks_for_date(
         self,
         target_date: datetime,
@@ -776,6 +787,10 @@ class DailyWinnersDetector:
         Backfill-safe counterpart to _fetch_from_liquid_stocks. Uses
         _fetch_yf_bar_for_date so every candidate's OHLC is pinned to
         target_date instead of "whatever yfinance's last row is right now."
+
+        Scans in parallel batches of SCAN_BATCH_SIZE via a thread pool
+        (SCAN_WORKERS workers) instead of one symbol at a time, stopping as
+        soon as enough candidates have been gathered.
         """
         self.logger.info(f"Scanning liquid stocks for {target_date.date().isoformat()}...")
 
@@ -783,38 +798,53 @@ class DailyWinnersDetector:
         liquid_stocks = self._get_liquid_stocks_list()
         liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
 
-        for symbol in liquid_stocks:
-            try:
-                bar = self._fetch_yf_bar_for_date(symbol, target_date)
-                if bar is None:
-                    continue
+        target_pool = limit * 3
+        scanned = 0
 
-                close, volume, change_pct = bar['close'], bar['volume'], bar['change_pct']
-                if (close < self.min_price or close > self.max_price
-                        or volume < self.min_volume or change_pct < self.min_change_pct):
-                    continue
-                if self._is_excluded_symbol(symbol, 'NASDAQ'):
-                    continue
+        for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
+            batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
+            scanned += len(batch)
 
-                candidates.append({
-                    'symbol':     symbol.upper(),
-                    'exchange':   'NASDAQ',
-                    'price':      close,
-                    'change_pct': float(change_pct),
-                    'volume':     volume,
-                    'high':       bar['high'],
-                    'low':        bar['low'],
-                    'open':       bar['open'],
-                    'close':      close,
-                    'source':     'yfinance_liquid_backfill',
-                })
-            except Exception:
-                continue
+            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
+                future_to_symbol = {
+                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
+                    for symbol in batch
+                }
+                for future in as_completed(future_to_symbol):
+                    symbol = future_to_symbol[future]
+                    try:
+                        bar = future.result()
+                    except Exception:
+                        continue
+                    if bar is None:
+                        continue
 
-            if len(candidates) >= limit * 3:
-                # Gather a bit more than `limit` before sorting, same spirit
-                # as the live path's early-exit, but per-symbol so no single
-                # batch failure loses the whole page.
+                    close, volume, change_pct = bar['close'], bar['volume'], bar['change_pct']
+                    if (close < self.min_price or close > self.max_price
+                            or volume < self.min_volume or change_pct < self.min_change_pct):
+                        continue
+                    if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                        continue
+
+                    candidates.append({
+                        'symbol':     symbol.upper(),
+                        'exchange':   'NASDAQ',
+                        'price':      close,
+                        'change_pct': float(change_pct),
+                        'volume':     volume,
+                        'high':       bar['high'],
+                        'low':        bar['low'],
+                        'open':       bar['open'],
+                        'close':      close,
+                        'source':     'yfinance_liquid_backfill',
+                    })
+
+            self.logger.info(
+                f"  Scanned {scanned}/{len(liquid_stocks)} symbols, "
+                f"{len(candidates)}/{target_pool} candidates so far..."
+            )
+
+            if len(candidates) >= target_pool:
                 break
 
         candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
