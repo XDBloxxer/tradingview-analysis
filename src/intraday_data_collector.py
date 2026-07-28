@@ -103,12 +103,69 @@ class IntradayDataCollector:
             # Fetch extended intraday data (5-min bars for past 60 days)
             # This gives us enough bars to calculate 200-period indicators on 5-min data
             intraday_df_extended = self._fetch_intraday_extended(symbol, target_date)
-            
-            if intraday_df_extended is None or len(intraday_df_extended) < 200:
-                self.logger.warning(f"Insufficient intraday data for {symbol} ({len(intraday_df_extended) if intraday_df_extended is not None else 0} bars)")
-                self.stats['failed'] += 1
-                return None
-            
+            five_min_ok = intraday_df_extended is not None and len(intraday_df_extended) >= 200
+
+            if not five_min_ok:
+                # ── T-1 DAILY-BAR FALLBACK ──────────────────────────────────
+                # yfinance only serves 5-min bars for the trailing ~60 days, so
+                # any backfill date older than that (or any date where the
+                # 5-min pull otherwise fails/comes back thin) can NEVER get
+                # real intraday T-1 snapshots — there's no way to conjure
+                # 9:30am-granularity data that yfinance no longer serves.
+                # Rather than silently dropping the symbol for that date (the
+                # old behaviour — this whole row would just vanish), fall
+                # back to a T-1 snapshot computed from daily OHLCV bars,
+                # which yfinance serves with years of history and no such
+                # window limit.
+                #
+                # This is NOT the same feature set as the real 5-min T-1
+                # snapshot and is never presented as if it were: every row
+                # produced this way is tagged t1_data_source='daily_fallback'
+                # (vs '5min' for the real thing) so it can be identified and
+                # down-weighted (e.g. via sample_weight) at training time
+                # instead of silently blending two different-quality feature
+                # sources under one label.
+                n_bars = 0 if intraday_df_extended is None else len(intraday_df_extended)
+                self.logger.warning(
+                    f"5-min intraday pull failed/insufficient for {symbol} on "
+                    f"{target_date.date().isoformat()} ({n_bars} bars, need >=200) — "
+                    f"falling back to daily-bar T-1 approximation (t1_data_source=daily_fallback)."
+                )
+
+                daily_df = self._fetch_daily_extended(symbol, target_date)
+                if daily_df is None:
+                    self.logger.warning(
+                        f"Daily-bar fallback also failed for {symbol} on "
+                        f"{target_date.date().isoformat()} — no T-1 data at all for this row."
+                    )
+                    self.stats['failed'] += 1
+                    return None
+
+                prior_date = self._get_prior_trading_day_daily(target_date, daily_df)
+                if prior_date is None:
+                    self.logger.warning(f"Could not find prior trading day (daily fallback) for {symbol}")
+                    self.stats['failed'] += 1
+                    return None
+
+                day_prior_open_snapshot = self._extract_daily_fallback_snapshot(
+                    daily_df, symbol, exchange, prior_date, target_date, snapshot_type='day_prior_open'
+                )
+                day_prior_close_snapshot = self._extract_daily_fallback_snapshot(
+                    daily_df, symbol, exchange, prior_date, target_date, snapshot_type='day_prior_close'
+                )
+
+                self.stats['success'] += 1
+                # market_open/market_close genuinely require intraday
+                # resolution (they represent a specific same-day clock time)
+                # and aren't approximated here — they stay unset rather than
+                # being faked from a daily bar.
+                return {
+                    'market_open': None,
+                    'market_close': None,
+                    'day_prior_open': day_prior_open_snapshot,
+                    'day_prior_close': day_prior_close_snapshot
+                }
+
             self.stats['success'] += 1
             
             # Extract snapshots at each timepoint by slicing the intraday data
@@ -151,6 +208,15 @@ class IntradayDataCollector:
                     time_window=(time(15, 55), time(16, 0)),
                     detection_date=target_date  # Keep original detection date
                 )
+
+                # Tag real 5-min-derived T-1 rows explicitly (mirrors the
+                # 'daily_fallback' tag added below), so training code can
+                # always key off t1_data_source rather than having to infer
+                # provenance from which columns are populated.
+                if day_prior_open_snapshot is not None:
+                    day_prior_open_snapshot['t1_data_source'] = '5min'
+                if day_prior_close_snapshot is not None:
+                    day_prior_close_snapshot['t1_data_source'] = '5min'
             
             return {
                 'market_open': market_open_snapshot,
@@ -232,7 +298,121 @@ class IntradayDataCollector:
         except Exception as e:
             self.logger.debug(f"Error fetching extended intraday for {symbol}: {e}")
             return None
-    
+
+    # ── T-1 DAILY-BAR FALLBACK HELPERS ──────────────────────────────────────
+    # Used only when the 5-min pull above fails or comes back too thin (see
+    # _process_winner). These compute a T-1 approximation from daily OHLCV,
+    # which yfinance serves with years of history (no 60-day window limit),
+    # explicitly tagged so it's never confused with the real 5-min snapshot.
+
+    def _fetch_daily_extended(self, symbol: str, target_date: datetime) -> Optional[pd.DataFrame]:
+        """Fetch daily bars with enough lookback to compute the same
+        indicator set _calculate_enhanced_indicators produces for the 5-min
+        path, up to and including target_date. Point-in-time correct: only
+        ever requests data ending at target_date, never "whatever's most
+        recent."""
+        cache_key = f"{symbol}:daily_extended:{target_date.date().isoformat()}"
+        if cache_key in self.cache:
+            return self.cache[cache_key]
+
+        try:
+            target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+            # ~400 calendar days covers 252-period (52-week) indicators with
+            # room to spare; yfinance's `end` is exclusive.
+            start = target_date_only - timedelta(days=400)
+            end = target_date_only + timedelta(days=1)
+
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(start=start.isoformat(), end=end.isoformat(), interval='1d')
+
+            if df.empty or len(df) < 30:
+                # Too little history to compute most indicators meaningfully.
+                self.cache[cache_key] = None
+                return None
+
+            df.index = pd.to_datetime(df.index)
+            if df.index.tz is not None:
+                df.index = df.index.tz_localize(None)
+
+            indicators_df = self._calculate_enhanced_indicators(df)
+            self.cache[cache_key] = indicators_df
+            return indicators_df
+
+        except Exception as e:
+            self.logger.debug(f"Error fetching daily-fallback data for {symbol}: {e}")
+            self.cache[cache_key] = None
+            return None
+
+    def _get_prior_trading_day_daily(self, target_date: datetime, daily_df: pd.DataFrame) -> Optional[datetime]:
+        """Same idea as _get_prior_trading_day, but operating on a daily-bar
+        (one row per day) index instead of a 5-min intraday index."""
+        try:
+            target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+            available_dates = sorted(
+                [d for d in daily_df.index.date if d < target_date_obj], reverse=True
+            )
+            if not available_dates:
+                return None
+            return datetime.combine(available_dates[0], datetime.min.time())
+        except Exception as e:
+            self.logger.error(f"Error finding prior trading day (daily fallback): {e}")
+            return None
+
+    def _extract_daily_fallback_snapshot(
+        self,
+        daily_df: pd.DataFrame,
+        symbol: str,
+        exchange: str,
+        prior_date: datetime,
+        detection_date: datetime,
+        snapshot_type: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Daily-bar counterpart to _extract_timepoint_snapshot. There's no
+        intraday resolution here, so day_prior_open and day_prior_close both
+        draw from the SAME daily bar (the prior trading day's full-day
+        indicator values) rather than distinct 9:30am/4:00pm snapshots.
+
+        Every row from this path is tagged t1_data_source='daily_fallback'
+        so it can be identified and down-weighted at training time instead
+        of being silently blended with real 5-min-derived T-1 rows under
+        the same implied data quality.
+        """
+        try:
+            prior_date_obj = prior_date.date() if isinstance(prior_date, datetime) else prior_date
+            detection_date_obj = detection_date.date() if isinstance(detection_date, datetime) else detection_date
+
+            day_rows = daily_df[daily_df.index.date == prior_date_obj]
+            if day_rows.empty:
+                return None
+            bar = day_rows.iloc[-1]
+
+            snapshot = {
+                'symbol': symbol,
+                'exchange': exchange,
+                'detection_date': detection_date_obj.isoformat(),
+                'snapshot_type': snapshot_type,
+                'snapshot_time': 'daily_bar',   # no specific clock time available
+                'snapshot_date': prior_date_obj.isoformat(),
+                't1_data_source': 'daily_fallback',
+            }
+
+            reserved_fields = {
+                'symbol', 'exchange', 'detection_date', 'snapshot_type',
+                'snapshot_time', 'snapshot_date', 't1_data_source',
+            }
+            for col in bar.index:
+                col_lower = col.lower()
+                if col_lower in reserved_fields:
+                    continue
+                snapshot[col_lower] = self._serialize_value(bar[col])
+
+            return snapshot
+
+        except Exception as e:
+            self.logger.error(f"Error building daily-fallback snapshot for {symbol}: {e}", exc_info=True)
+            return None
+
     def _extract_timepoint_snapshot(
         self,
         intraday_df: pd.DataFrame,
