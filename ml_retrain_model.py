@@ -1538,6 +1538,23 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
             return df
         df["label"]  = -1          # placeholder; caller sets the real value
         df["source"] = table
+
+        # ── Non-winners price ceiling guard ────────────────────────────────
+        # non_winners_day_prior_close contains historical rows with prices far
+        # above the $50 range winners are drawn from. Rather than backfilling
+        # or cleaning the table, filter them out here at fetch time so every
+        # future retrain excludes this contamination immediately. Historical
+        # rows in Supabase are left untouched.
+        if table == TABLE_NON_WINNERS_CLOSE and "close" in df.columns:
+            before_n = len(df)
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df = df[df["close"] <= 50.0]
+            dropped = before_n - len(df)
+            if dropped > 0:
+                logger.info(
+                    f"  {table}: dropped {dropped} row(s) with close > $50.0 "
+                    f"({before_n} -> {len(df)})"
+                )
         if T1_MAP_AVAILABLE:
             before = len(df.columns)
             df     = rename_t1_columns(df, prefix=prefix)
