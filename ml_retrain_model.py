@@ -94,7 +94,6 @@ OUTPUTS (same paths as before, drop-in compatible with ml_weekly_retrain.yml):
 
 import json
 import logging
-import math
 import os
 import re
 import sys
@@ -177,16 +176,12 @@ FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 # importance (RSI_14=0.000155, Volume_Ratio=0.000769) despite being the
 # freshest, most actionable signal available at inference time.
 #
-# UPDATE (2026-07-28): Reverted T1_WEIGHT 2.0 -> 1.0. The 2x multiplier made
-# sense when T1 rows were a minority needing a boost, but the 180-day rolling
-# window now contains far more T1 rows than base rows by sheer count (e.g.
-# 7576 T1 vs 869 base in a recent run) -- stacking a 2x per-row multiplier on
-# top of an already ~8.7:1 row-count advantage pushed base CSV down to ~5% of
-# total training signal, effectively drowning out whatever the t3_/t5_/t10_
-# multiday features (anchored by base rows) contribute. Equal weighting lets
-# the natural row-count ratio do the work instead of compounding it.
+# With BASE_CSV_WEIGHT=1.0 / T1_WEIGHT=2.0 the model will learn from the
+# intraday signal that actually drives same-day explosive moves. The base CSV
+# rows still contribute full signal for the t3_/t5_/t10_ daily features — they
+# are just no longer artificially inflated relative to the richer T-1 rows.
 BASE_CSV_WEIGHT         = 1.0
-T1_WEIGHT               = 1.0
+T1_WEIGHT               = 2.0
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # Validation window — the most recent N weeks of labelled data are reserved for
@@ -227,17 +222,6 @@ VAL_WEEKS = 8
 EMBARGO_DAYS_FLOOR = 5
 EMBARGO_DAYS_CAP   = 90
 
-# Rolling-window feature lengths (SMA_50, hv_30, t10_*, ...) are counted in
-# TRADING days, but the embargo gap itself is subtracted from a CALENDAR-day
-# cutoff (pd.Timedelta(days=EMBARGO_DAYS)). A straight day-for-day mapping
-# therefore undercounts the true gap by ~2 non-trading days per 5 trading
-# days (weekends; more around holidays). E.g. a genuine 50-*trading*-day SMA
-# window spans ~70 calendar days, not 50 — so an embargo of exactly 50
-# calendar days still leaves ~20 days of real autocorrelation across the
-# train/val boundary. TRADING_TO_CALENDAR_RATIO converts the inferred
-# trading-day window into an equivalent calendar-day gap before clamping.
-TRADING_TO_CALENDAR_RATIO = 7.0 / 5.0  # 7 calendar days per 5 trading days
-
 # Minimum number of days of pre-embargo data train_val_split will insist on
 # keeping for TRAIN, even if that means shrinking the inferred embargo below
 # what the deepest rolling-window feature would otherwise call for. Purely a
@@ -262,13 +246,8 @@ def _infer_embargo_days(
     floor: int = EMBARGO_DAYS_FLOOR,
     cap: int = EMBARGO_DAYS_CAP,
 ) -> int:
-    """Infer the purge/embargo gap (in CALENDAR days) from the deepest
-    rolling-window length encoded in the given feature column names.
-
-    The raw max window found in column names is a count of TRADING days
-    (that's how every technical indicator here is computed). We convert it
-    to calendar days via TRADING_TO_CALENDAR_RATIO before clamping, since
-    the embargo is ultimately applied against calendar-day timestamps.
+    """Infer the purge/embargo gap (in days) from the deepest rolling-window
+    length encoded in the given feature column names.
 
     Falls back to `floor` if no plausible window length is found (e.g. an
     empty feature list), and clamps the result to `cap` so a stray large
@@ -290,9 +269,8 @@ def _infer_embargo_days(
                 continue
             max_window = max(max_window, n)
 
-    trading_days = max_window if max_window > 0 else floor
-    calendar_days = math.ceil(trading_days * TRADING_TO_CALENDAR_RATIO)
-    return int(max(floor, min(cap, calendar_days)))
+    inferred = max_window if max_window > 0 else floor
+    return int(max(floor, min(cap, inferred)))
 
 
 # ---------------------------------------------------------------------------
@@ -562,22 +540,8 @@ NON_FEATURE_COLS = {
     # are internally price-normalised are retained — they capture the signal
     # without exposing the absolute price level.
     # Both the close-snapshot and open-snapshot variants are excluded.
-    #
-    # FIX: t1_close_Volume / t1_open_Volume were missing from this set even
-    # though they are raw (unnormalised) share counts with exactly the same
-    # generalisation problem as raw OHLC — worse, in fact: base_csv rows and
-    # T-1-collected rows populate this column from two different sources
-    # (TradingView screener vs yfinance intraday) at two different scales,
-    # so raw Volume was effectively acting as a proxy for "which pipeline
-    # produced this row" rather than a real momentum signal. That proxy is
-    # trivially separable, which is almost certainly why best_iteration was
-    # collapsing to single digits: XGBoost saturated its achievable AUC in a
-    # handful of rounds because it didn't have to do any real work. The
-    # normalised counterparts (Volume_Ratio, Volume_MA5/10/20, OBV — see
-    # normalise_t1()) are retained; they capture the same signal without
-    # exposing the raw, source-dependent scale.
-    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open", "t1_close_Volume",
-    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",  "t1_open_Volume",
+    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open",
+    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",
 }
 
 T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
@@ -650,7 +614,6 @@ def fetch_table_paginated(
     page_size: int = 1000,
     date_columns: Optional[list] = None,
     cutoff_date: Optional[str] = None,
-    order_column: str = "id",
 ) -> pd.DataFrame:
     """Fetch rows from a Supabase table using pagination.
 
@@ -663,26 +626,8 @@ def fetch_table_paginated(
     still runs afterwards in Python (see FETCH_BUFFER_DAYS), so results are
     identical to fetching the whole table -- only the transferred byte
     count changes.
-
-    BUGFIX: each ``.range()`` call below is a *separate* SQL query, not a
-    cursor over one snapshot. Postgres/PostgREST does NOT guarantee stable
-    row ordering across separate queries unless an explicit ``ORDER BY`` is
-    given -- without one, the planner is free to return rows in scan order,
-    which can shift between two paginated calls seconds apart if there is
-    ANY concurrent write on the table (an UPDATE writes a new MVCC row
-    version, which can land in a different scan position than the old one).
-    On a table like ``ml_training_base`` that other scripts write into
-    out-of-band (e.g. a labeling backfill flipping label 0->1 mid-fetch),
-    this can silently skip or duplicate rows across the page boundary with
-    no error -- e.g. a clean-looking ``pos=0`` result on a table that
-    genuinely has positives, just because they crossed a page boundary at
-    the wrong moment. Pinning an explicit order (primary key by default)
-    makes pagination deterministic and immune to concurrent writes.
     """
-    def _build(q):
-        return q.order(order_column)
-
-    query = _build(client.table(table).select("*"))
+    query = client.table(table).select("*")
 
     if date_columns and cutoff_date:
         # PostgREST or_() syntax: "col1.gte.DATE,col2.gte.DATE,col1.is.null"
@@ -709,40 +654,20 @@ def fetch_table_paginated(
     try:
         rows = _run(query)
     except Exception as e:
-        # Two possible causes bucketed together here: (1) one of date_columns
-        # doesn't exist on this table's schema, or (2) order_column ("id" by
-        # default) doesn't exist. Both are rejected outright by PostgREST
-        # only once .execute() actually runs, not when .order()/.or_() are
-        # called client-side. Don't let either take down the whole retrain --
-        # retry without the date filter first (most common case), and if
-        # that still fails, retry once more with no explicit order at all
-        # (falls back to non-deterministic pagination -- logged loudly).
         if date_columns and cutoff_date:
+            # Most likely cause: one of date_columns doesn't exist on this
+            # table's schema, which PostgREST rejects outright. Don't let a
+            # bandwidth optimization take down the whole retrain -- fall
+            # back to the old unfiltered fetch and flag it loudly so the
+            # date_columns list can be fixed.
             logger.warning(
-                f"  {table}: filtered fetch failed ({e}); retrying without "
-                f"the date filter. Check that {date_columns} actually exist "
-                f"on '{table}'."
-            )
-            try:
-                rows = _run(_build(client.table(table).select("*")))
-            except Exception as e2:
-                logger.warning(
-                    f"  {table}: ordered fetch also failed ({e2}); falling "
-                    f"back to unordered pagination. Check that '{order_column}' "
-                    f"actually exists on '{table}'. Row skip/duplication "
-                    "across pages is possible if the table is written to "
-                    "concurrently during this fetch."
-                )
-                rows = _run(client.table(table).select("*"))
-        else:
-            logger.warning(
-                f"  {table}: ordered fetch failed ({e}); falling back to "
-                f"unordered pagination. Check that '{order_column}' actually "
-                f"exists on '{table}'. Row skip/duplication across pages is "
-                "possible if the table is written to concurrently during "
-                "this fetch."
+                f"  {table}: date-filtered fetch failed ({e}); "
+                "falling back to a full unfiltered fetch. Check that "
+                f"{date_columns} actually exist on '{table}'."
             )
             rows = _run(client.table(table).select("*"))
+        else:
+            raise
 
     df = pd.DataFrame(rows)
     logger.info(f"  {table}: total {len(df)} rows, {len(df.columns)} columns")
@@ -896,35 +821,6 @@ def load_base_training_data(client: Client, lookback_days: Optional[int] = None)
             "that a short LOOKBACK window is over-representing recent winning periods, or "
             "that mild label drift has occurred. Monitor week-over-week; if the rate "
             "continues rising, investigate ml_training_base for label imbalance."
-        )
-    elif pos_rate == 0.0 and len(df) > 0:
-        # Low-end counterpart to the >20%/>25% checks above. ml_training_base
-        # is a mostly-static historical seed table (see docstring above) --
-        # if its winner (label=1) rows happen to be concentrated in older
-        # event_dates than its non-winner rows, a rolling lookback_days
-        # cutoff can silently filter out every positive while keeping all
-        # the negatives. That doesn't fail loudly anywhere downstream: the
-        # combined dataset still trains fine, but has_t1_features becomes a
-        # near-perfect proxy for the label within this all-negative base
-        # subset, and the classifier saturates its achievable AUC in very
-        # few boosting rounds (best_iteration far lower than usual) because
-        # it no longer has to do any real work to separate the base rows.
-        logger.warning(
-            f"BASE DATA WARNING: positive rate is 0.0% (0/{len(df)} rows) within the "
-            f"current lookback window. Expected ~5-20%. ml_training_base is documented "
-            "as a mostly-static seed table -- if its winner rows are dated older than "
-            "its non-winner rows, a rolling lookback cutoff can filter out all positives "
-            "while keeping all negatives. This tends to show up indirectly as an unusually "
-            "low best_iteration during training (has_t1_features becomes a near-perfect "
-            "proxy for the label within this all-negative subset). Check the label/event_date "
-            "distribution in ml_training_base directly, or consider decoupling its fetch "
-            "cutoff from the rolling lookback_days window used for the T-1 tables."
-        )
-    elif pos_rate < 0.05:
-        logger.warning(
-            f"BASE DATA ADVISORY: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows), "
-            "below the expected ~5-20% floor. Not necessarily an error, but worth a glance "
-            "at the label/event_date distribution in ml_training_base if this is new."
         )
 
     return df
@@ -1234,31 +1130,12 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
 
     def _is_raw_price_line(col_name: str) -> bool:
         """True if the column looks like a raw dollar price rather than % dist from close."""
-        if col_name not in df.columns or safe_close is None:
-            return False
-        num   = pd.to_numeric(df[col_name], errors="coerce")
-        ratio = (num / safe_close).dropna()
-        if ratio.empty:
-            return False
-        # FIX: the previous check used a flat `median(|col|) > 50` threshold,
-        # which assumed a raw dollar price line is always numerically > 50.
-        # That's false for this screener's own universe: it targets low-priced,
-        # explosive small caps, so a raw Keltner/BB/Donchian band on a $5-$40
-        # stock sits well under 50 and was being misclassified as "already
-        # normalised" — silently leaving raw dollar price in the feature
-        # matrix for a large share of rows (exactly the price-level leak this
-        # function exists to prevent; see t3_high's 19.2% importance history).
-        #
-        # Anchor to close instead, the same way _is_raw_atr already does:
-        # a raw price line sits close to the stock's own price regardless of
-        # its absolute level, so median(|col| / close) ≈ 1 (generously, 0.3–3×
-        # to allow for volatile/wide bands). A correctly normalised % distance
-        # from close is a small number (typically −50..50) that is NOT
-        # close-relative — dividing it by a low-priced close inflates the
-        # ratio far outside this window, and dividing it by a high-priced
-        # close shrinks it toward zero, so the ranges don't overlap.
-        med_ratio = float(ratio.abs().median())
-        return 0.3 <= med_ratio <= 3.0
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False   # no data — leave as-is
+        # Normalised % distance from close is almost always in (−50, +50).
+        # Raw dollar price equals the close, so median ≈ median_close >> 50.
+        return med > 50.0
 
     def _is_raw_dollar_diff(col_name: str) -> bool:
         """True if MACD/MOM/AO column looks like a raw dollar difference."""
@@ -1556,23 +1433,6 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
             return df
         df["label"]  = -1          # placeholder; caller sets the real value
         df["source"] = table
-
-        # ── Non-winners price ceiling guard ────────────────────────────────
-        # non_winners_day_prior_close contains historical rows with prices far
-        # above the $50 range winners are drawn from. Rather than backfilling
-        # or cleaning the table, filter them out here at fetch time so every
-        # future retrain excludes this contamination immediately. Historical
-        # rows in Supabase are left untouched.
-        if table == TABLE_NON_WINNERS_CLOSE and "close" in df.columns:
-            before_n = len(df)
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
-            df = df[df["close"] <= 50.0]
-            dropped = before_n - len(df)
-            if dropped > 0:
-                logger.info(
-                    f"  {table}: dropped {dropped} row(s) with close > $50.0 "
-                    f"({before_n} -> {len(df)})"
-                )
         if T1_MAP_AVAILABLE:
             before = len(df.columns)
             df     = rename_t1_columns(df, prefix=prefix)
@@ -2511,73 +2371,26 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
 
     # ── Step 3: Cross-source dedup — T-1 beats base for the same event ────────
-    # A stock may appear in both T-1 (identified by detection_date) and base
-    # (identified by event_date) for the same real-world day. The two source
-    # frames use DIFFERENT date columns for the same underlying event, so the
-    # previous version — which only matched on detection_date — could never
-    # actually catch a base-vs-T-1 duplicate: base rows generally don't
-    # populate detection_date, so `has_det` excluded them from the dedup pass
-    # entirely (hence 0 rows ever dropped here in practice, even when a base
-    # row and a T-1 row referred to the exact same symbol+day).
-    #
-    # Fix: build a single unified key per row — detection_date if present,
-    # else event_date — so a base row and a T-1 row for the same symbol+day
-    # collide on the same key regardless of which date column each happened
-    # to populate. T-1 is concatenated first (line above), so keep="first"
-    # still prefers the richer T-1 row.
+    # A stock may appear in both T-1 (detection_date) and base (event_date) for
+    # the same real-world day.  We prefer the T-1 row (richer features).
+    # We only do this cross-source dedup when detection_date is populated, using
+    # it as the unified date key.  Base rows that have only event_date (no
+    # detection_date) are never incorrectly dropped here.
     cross_sym = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    has_any_date_col = ("detection_date" in combined.columns) or ("event_date" in combined.columns)
-    if cross_sym and has_any_date_col:
+    if cross_sym and "detection_date" in combined.columns:
         n_before_cross = len(combined)
-
-        unified_key = pd.Series(pd.NaT, index=combined.index, dtype="datetime64[ns]")
-        if "detection_date" in combined.columns:
-            unified_key = pd.to_datetime(combined["detection_date"], errors="coerce")
-        if "event_date" in combined.columns:
-            # BUG FIX (cross-source dedup date alignment): detection_date (T-1
-            # rows) is the day BEFORE the explosion, while event_date (base
-            # rows) is the explosion day itself -- the two columns are offset
-            # by 1 business day for the SAME real-world event. Every other
-            # place in this file that reconciles these two date columns
-            # (train_gain_regressor, the lookback filter, the RC2/RC3 merges --
-            # see the other `- pd.tseries.offsets.BDay(1)` usages in this
-            # module) shifts event_date back 1 business day before comparing
-            # it to detection_date. This dedup pass previously compared them
-            # raw, so a base row and a T-1 row describing the exact same
-            # symbol+event never collided on the same key (their dates
-            # differed by 1 day) and BOTH survived as near-duplicate feature
-            # snapshots of the same event -- one could land in train and the
-            # other in val, independent of the (already-correct) per-source
-            # dedup keys above. Shifting event_date -1 BDay here makes the
-            # unified key agree with detection_date for the same event, so
-            # true cross-source duplicates are finally caught.
-            event_parsed = (
-                pd.to_datetime(combined["event_date"], errors="coerce")
-                - pd.tseries.offsets.BDay(1)
-            )
-            # Only fill in where detection_date was missing so we never
-            # overwrite a real T-1 key.
-            unified_key = unified_key.fillna(event_parsed)
-
-        combined["_cross_dedup_key"] = unified_key
-        has_key = unified_key.notna()
-
-        cross_deduped = combined[has_key].drop_duplicates(
-            subset=[cross_sym, "_cross_dedup_key"], keep="first"
+        # Only dedup rows that actually have a detection_date (T-1 rows and any
+        # base rows that happen to have detection_date populated).
+        has_det = combined["detection_date"].notna()
+        cross_deduped = combined[has_det].drop_duplicates(
+            subset=[cross_sym, "detection_date"], keep="first"
         )
-        combined = pd.concat([cross_deduped, combined[~has_key]], ignore_index=True, sort=False)
-        combined = combined.drop(columns=["_cross_dedup_key"])
+        combined = pd.concat([cross_deduped, combined[~has_det]], ignore_index=True, sort=False)
         n_cross_dropped = n_before_cross - len(combined)
         if n_cross_dropped > 0:
             logger.info(
                 f"Cross-source dedup: removed {n_cross_dropped} rows where T-1 and base "
-                f"shared the same (symbol, unified-date) ({n_before_cross} → {len(combined)}), "
-                "using detection_date ?? event_date as the unified key."
-            )
-        else:
-            logger.info(
-                "Cross-source dedup: 0 rows removed — no symbol+date overlap found "
-                "between base and T-1 sources for this run."
+                f"shared the same (symbol, detection_date) ({n_before_cross} → {len(combined)})"
             )
 
     logger.info(f"Combined dataset: {len(combined)} rows")
@@ -2710,15 +2523,8 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
                     f"not present in current data (schema drift): {missing[:10]}..."
                 )
             keep = [c for c in selected if c in X.columns]
-            # NOTE (2026-07-28): has_t1_features used to be force-appended here
-            # even if absent from selected_features.json, on the assumption it's
-            # a harmless structural flag. Temporarily disabled while testing
-            # whether it's a source-provenance leak (base_csv vs T-1 pos_rate
-            # gap) rather than genuine signal -- see symbol-overlap AUC
-            # diagnostic upstream. Re-enable (uncomment) once that's resolved
-            # if has_t1_features is cleared as safe.
-            # if "has_t1_features" in X.columns and "has_t1_features" not in keep:
-            #     keep.append("has_t1_features")
+            if "has_t1_features" in X.columns and "has_t1_features" not in keep:
+                keep.append("has_t1_features")
             X = X[keep]
             logger.info(
                 f"USE_SELECTED_FEATURES active — restricted to {X.shape[1]} features "
@@ -3225,51 +3031,6 @@ def train_val_split(
             f"→ {val_dates.max().date() if not val_dates.empty else '?'}, "
             f"embargoed={n_embargoed}"
         )
-
-        # ── FIX 5: Symbol-level purge ──────────────────────────────────────
-        # The date embargo above only guarantees train/val rows aren't
-        # temporally adjacent. It does NOT stop the same symbol appearing on
-        # both sides of the split. Several top features (hv_20/30, atr_14,
-        # cci, dcm, ema-slope, etc.) are rolling-window indicators that stay
-        # close to a stock's own baseline level for weeks/months. If ticker
-        # X shows up in train in June and again in val in September, the
-        # embargo (a date rule) is satisfied, but the model can still
-        # partially re-identify ticker X from residual level/scale
-        # information in those features rather than learning a genuinely
-        # predictive pattern — inflating val AUC via symbol memorization,
-        # not generalisation. See synthetic_leak_test.py, which reproduces
-        # this exact effect with pure-noise labels and a symbol-autocorrelated
-        # feature under a clean time-only split.
-        #
-        # Fix: any symbol present in val is purged entirely from train
-        # (not moved to val — just dropped), the same way the date embargo
-        # drops rows rather than reassigning them.
-        if "symbol" in df_work.columns:
-            val_symbols = set(df_work.loc[val_idx, "symbol"].dropna().unique())
-            if val_symbols:
-                train_symbols = df_work.loc[train_idx, "symbol"]
-                symbol_overlap_mask = train_symbols.isin(val_symbols)
-                n_overlap = int(symbol_overlap_mask.sum())
-                if n_overlap > 0:
-                    overlap_frac = n_overlap / max(1, len(train_idx))
-                    logger.warning(
-                        f"FIX 5 — Symbol purge: {n_overlap} train rows "
-                        f"({overlap_frac:.1%} of train) share a symbol with "
-                        f"a val row ({len(val_symbols)} distinct val symbols). "
-                        "Dropping these from train to prevent symbol-level "
-                        "leakage (see synthetic_leak_test.py)."
-                    )
-                    train_idx = train_symbols.index[~symbol_overlap_mask]
-                else:
-                    logger.info(
-                        "FIX 5 — Symbol purge: no train/val symbol overlap found."
-                    )
-        else:
-            logger.warning(
-                "FIX 5 — Symbol purge skipped: no 'symbol' column in "
-                "combined_df. Train/val may still share tickers; symbol-level "
-                "leakage cannot be ruled out."
-            )
     else:
         # No date column at all — fall back to sequential split (last resort)
         logger.warning(
