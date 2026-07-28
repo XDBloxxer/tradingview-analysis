@@ -75,6 +75,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # GIT_LFS_SKIP_SMUDGE only skips the smudge filter on checkout -- it
+          # does NOT stop Git LFS's post-checkout/post-merge hooks, which still
+          # run after every "git reset --hard" and inspect LFS-tracked paths.
+          # Because ml_models/archive/best_model - Copy.pkl was committed as a
+          # raw binary instead of a real pointer, that hook flags it ("should
+          # have been a pointer, but wasn't") and leaves the tree diverged from
+          # the index again right after our own reset --hard runs -- so the
+          # very next "git pull --rebase" sees fresh unstaged changes and
+          # aborts. This job never touches ml_models/, so just remove the
+          # local LFS hooks entirely and avoid the problem outright.
+          git lfs uninstall --local
+
           for i in 1 2 3 4 5; do
             # Defensive: force the working tree to exactly match whatever is
             # currently checked out before pulling. Without this, any
