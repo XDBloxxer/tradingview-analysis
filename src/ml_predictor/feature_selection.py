@@ -995,6 +995,17 @@ def _cli() -> int:
              "(the blocklist is applied by default).",
     )
     parser.add_argument("--output-dir", default="ml_models/feature_selection")
+    parser.add_argument(
+        "--lookback-days", type=int, default=365,
+        help="Cap how much T-1/base history is fetched for feature selection "
+             "(server-side, via the same fetch_table_paginated() date filter "
+             "ml_retrain_model.py uses for its own --lookback-days). Deliberately "
+             "much wider than retrain's window (currently 180d) so feature "
+             "selection still sees more market-regime diversity than any single "
+             "retrain does -- this is a ceiling to stop egress growing "
+             "unboundedly as the T-1 tables accumulate, not a tight budget. "
+             "Pass 0 to disable and fetch full history.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -1010,8 +1021,9 @@ def _cli() -> int:
     import ml_retrain_model as rt  # noqa: E402
 
     client = rt.get_supabase_client()
-    base_df = rt.load_base_training_data(client)
-    t1_df = rt.load_t1_data(client)
+    lookback_days = args.lookback_days or None  # 0 → None → unbounded fetch
+    base_df = rt.load_base_training_data(client, lookback_days=lookback_days)
+    t1_df = rt.load_t1_data(client, lookback_days=lookback_days)
     combined_df = rt.combine_datasets(base_df, t1_df)
     X, y, w = rt.prepare_features(combined_df)
 
