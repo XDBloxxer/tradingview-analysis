@@ -556,8 +556,19 @@ class DailyNonWinnersDetector:
         self.logger.info(f"    Slight gainers (+2% to +10%): {slight_gain}")
         self.logger.info(f"    Slight losers (-2% to -10%): {slight_loss}")
         self.logger.info(f"    Bigger losers (< -10%): {big_loss}")
-        
-        return non_winners[:top_n]
+
+        final_non_winners = non_winners[:top_n]
+
+        # Record EVERY selected non-winner here, regardless of which phase
+        # found them (learned-filter pool / range fallback / random-liquid
+        # fallback). Previously this only happened inside the
+        # _get_random_liquid_stocks last-resort path, so on any day where
+        # Phase 1 alone filled the quota (the normal case) nothing was ever
+        # recorded and data/non_winner_selection_counts.json never got
+        # created.
+        self._record_selections([nw['symbol'] for nw in final_non_winners])
+
+        return final_non_winners
     
     def _get_filtered_candidates(
         self,
@@ -1058,7 +1069,6 @@ class DailyNonWinnersDetector:
                                 'close': float(close)
                             })
 
-        self._record_selections([c['symbol'] for c in candidates])
         return candidates[:limit]
     
     def _get_random_liquid_stocks(
@@ -1134,7 +1144,6 @@ class DailyNonWinnersDetector:
                             'close': float(close)
                         })
 
-        self._record_selections([c['symbol'] for c in candidates])
         return candidates[:limit]
     
     def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
