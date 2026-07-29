@@ -40,12 +40,21 @@ def trading_days_between(start_date, end_date):
         d += one_day
 
 
-def run_for_date(target_date: datetime, args, config, logger) -> int:
+def run_for_date(target_date: datetime, args, config, logger, collector=None, backfill_mode: bool = False) -> int:
     """
     Runs the full winners-detection pipeline for a single target_date.
     Identical to the previous single-date main() body — used for both
     normal (single-day) runs and each day inside a --start-date/--end-date
     backfill range.
+
+    collector: an optional pre-built IntradayDataCollector to reuse across
+        multiple dates (range-backfill mode). Reusing it keeps its in-memory
+        per-symbol fetch cache warm across days instead of throwing it away
+        and re-fetching the same symbols from scratch on every date. If not
+        given, one is created fresh (normal single-date behavior).
+    backfill_mode: passed through to a freshly-created collector/rate limiter
+        so backoff settings fail fast on broken symbols (see
+        config['backfill_rate_limiting']).
     """
     target_date_str = target_date.date().isoformat()
 
@@ -116,7 +125,8 @@ def run_for_date(target_date: datetime, args, config, logger) -> int:
         logger.info("  • Candlestick Patterns: Doji, Hammer, Engulfing")
         logger.info("=" * 60)
 
-        collector = IntradayDataCollector(config)
+        if collector is None:
+            collector = IntradayDataCollector(config, backfill_mode=backfill_mode)
         intraday_data = collector.collect_intraday_data(winners, target_date)
 
         logger.info(f"✓ Collected enhanced indicator data for the SAME {len(winners)} winners:")
@@ -232,10 +242,20 @@ def main():
                     f"({len(dates)} trading days, weekends/holidays skipped)")
         logger.info("=" * 60)
 
+        # Build the IntradayDataCollector once and reuse it across every date
+        # in the range: this keeps its per-symbol fetch cache warm (a symbol
+        # that shows up as a winner on multiple days in the range only gets
+        # fetched once) and applies the fail-fast backfill_rate_limiting
+        # overrides instead of the patient live-run backoff settings.
+        shared_collector = IntradayDataCollector(config, backfill_mode=True)
+
         results = {}
         for d in dates:
             target_date = datetime.combine(d, datetime.min.time())
-            results[d.isoformat()] = run_for_date(target_date, args, config, logger)
+            results[d.isoformat()] = run_for_date(
+                target_date, args, config, logger,
+                collector=shared_collector, backfill_mode=True,
+            )
 
         failed = [d for d, rc in results.items() if rc != 0]
         logger.info("")
