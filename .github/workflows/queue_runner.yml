@@ -74,6 +74,18 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # ml_models/archive/best_model - Copy.pkl was committed as a raw
+          # binary instead of a real LFS pointer, and every "git reset --hard"
+          # / "git pull --rebase" reconciles the ENTIRE working tree against
+          # the target commit, so it always trips over this regardless of
+          # what the job actually uses. Unlike the enqueue-only workflows,
+          # THIS workflow's detector scripts do need ml_models/learned_filters.json
+          # at runtime, so we can't exclude all of ml_models/ -- only the
+          # broken archive/ subfolder, which nothing reads.
+          git sparse-checkout init --no-cone
+          printf '/*\n!/ml_models/archive/\n' > .git/info/sparse-checkout
+          git sparse-checkout reapply
+
           ANY_FAILURES=0
           ITER=0
 
