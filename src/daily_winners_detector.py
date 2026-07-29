@@ -303,7 +303,15 @@ class DailyWinnersDetector:
             self.logger.warning(
                 f"⚠️ WARNING: Only found {len(top_winners)}/{top_n} winners after validation."
             )
-        
+
+        # Record EVERY selected winner here, regardless of which path found
+        # them (TradingView / yfinance screener / liquid-stocks fallback).
+        # Previously this only happened inside _fetch_from_liquid_stocks_for_date,
+        # so on any day where TradingView/yfinance successfully returned
+        # candidates (the normal case) nothing was ever recorded and
+        # data/winner_selection_counts.json never got created.
+        self._record_selections([w['symbol'] for w in top_winners])
+
         return top_winners
     
     # ─────────────────────────────────────────────────────────────────────
@@ -854,7 +862,6 @@ class DailyWinnersDetector:
                 break
 
         candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
-        self._record_selections([c['symbol'] for c in candidates])
         self.logger.info(f"✅ Found {len(candidates)} from liquid stocks (backfill, date-pinned)")
         return candidates
     
