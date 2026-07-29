@@ -44,12 +44,19 @@ def trading_days_between(start_date, end_date):
         d += one_day
 
 
-def run_for_date(target_date: datetime, args, config, logger) -> int:
+def run_for_date(target_date: datetime, args, config, logger, collector=None, backfill_mode: bool = False) -> int:
     """
     Runs the full non-winners-detection pipeline for a single target_date.
     Identical to the previous single-date main() body — used for both
     normal (single-day) runs and each day inside a --start-date/--end-date
     backfill range.
+
+    collector: an optional pre-built IntradayDataCollector to reuse across
+        multiple dates (range-backfill mode), keeping its per-symbol fetch
+        cache warm across days instead of throwing it away each iteration.
+    backfill_mode: passed through to a freshly-created collector/rate limiter
+        so backoff settings fail fast on broken symbols (see
+        config['backfill_rate_limiting']).
     """
     target_date_str = target_date.date().isoformat()
 
@@ -121,7 +128,8 @@ def run_for_date(target_date: datetime, args, config, logger) -> int:
         logger.info("  Label: 0 (did NOT explode)")
         logger.info("")
 
-        collector = IntradayDataCollector(config)
+        if collector is None:
+            collector = IntradayDataCollector(config, backfill_mode=backfill_mode)
         intraday_data = collector.collect_intraday_data(non_winners, target_date)
 
         logger.info(f"✓ Collected indicator data for {len(non_winners)} non-winners:")
@@ -254,10 +262,17 @@ def main():
                     f"({len(dates)} trading days, weekends/holidays skipped)")
         logger.info("=" * 60)
 
+        # Build the IntradayDataCollector once and reuse it across every date
+        # in the range (see daily_winners_main.py for the same pattern).
+        shared_collector = IntradayDataCollector(config, backfill_mode=True)
+
         results = {}
         for d in dates:
             target_date = datetime.combine(d, datetime.min.time())
-            results[d.isoformat()] = run_for_date(target_date, args, config, logger)
+            results[d.isoformat()] = run_for_date(
+                target_date, args, config, logger,
+                collector=shared_collector, backfill_mode=True,
+            )
 
         failed = [d for d, rc in results.items() if rc != 0]
         logger.info("")
