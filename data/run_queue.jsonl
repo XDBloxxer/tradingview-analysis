@@ -83,3 +83,4 @@
 {"id":"f4d93d6d38cc","job_type":"non_winners","date":"","start_date":"2026-07-20","end_date":"2026-07-22","top_n":"100","allow_append":"false","queued_at":"2026-07-29T00:08:41.841446+00:00","queued_by":"non_winners:30410232855"}
 {"id":"449100389d19","job_type":"non_winners","date":"","start_date":"2026-07-23","end_date":"2026-07-25","top_n":"100","allow_append":"false","queued_at":"2026-07-29T00:08:41.841451+00:00","queued_by":"non_winners:30410232855"}
 {"id":"a03440526c2e","job_type":"non_winners","date":"","start_date":"2026-07-26","end_date":"2026-07-28","top_n":"100","allow_append":"false","queued_at":"2026-07-29T00:08:41.841458+00:00","queued_by":"non_winners:30410232855"}
+{"id":"8a54d48a6795","job_type":"winners","date":"","start_date":"2026-02-02","end_date":"2026-07-28","top_n":"15","allow_append":"false","queued_at":"2026-07-29T08:20:06.430684+00:00","queued_by":"winners:30435085895"}
