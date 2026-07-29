@@ -102,6 +102,28 @@ rate_limiting:
   retry_delay: 5  # seconds
   exponential_backoff: true
 
+  # Worker counts / batching — safe to raise since requests_per_minute above
+  # is what actually paces Yahoo, not thread count (see rate_limiter.py).
+  intraday_max_workers: 5
+  multiday_max_workers: 5
+  batch_fetch_size: 25
+  use_batch_fetch: false   # forced on automatically in backfill_mode; opt-in here for live runs
+
+# Overrides layered on top of `rate_limiting` above whenever a script runs in
+# backfill mode (currently: daily_winners_main.py --start-date/--end-date).
+# The philosophy here is different from live daily runs: a backfill can just
+# be re-run for whatever symbols/dates failed, so there's no reason to spend
+# 20-40 minutes patiently retrying one broken/delisted ticker before moving
+# on — fail fast and let a second pass mop up stragglers instead.
+backfill_rate_limiting:
+  requests_per_minute: 150
+  max_backoff_attempts: 3
+  max_backoff_delay: 20
+  retry_delay: 3
+  intraday_max_workers: 12
+  batch_fetch_size: 30
+  use_batch_fetch: true
+
 # Logging Settings
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR
