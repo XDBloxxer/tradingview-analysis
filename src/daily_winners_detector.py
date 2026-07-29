@@ -47,7 +47,7 @@ class DailyWinnersDetector:
     # both sides across a backfill without either quota starving the other.
     UNIVERSE_PATH = Path("data/universe_symbols.csv")
     SELECTION_COUNTS_PATH = Path("data/winner_selection_counts.json")
-    MAX_USES_PER_SYMBOL = 10
+    MAX_USES_PER_SYMBOL = 25
 
     # ── WINNER PROFILE FIX ───────────────────────────────────────────────
     # Every candidate path (TradingView, yfinance screener, liquid-stocks
