@@ -76,24 +76,20 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # ml_models/archive/best_model - Copy.pkl was committed as a raw
-          # binary instead of a real LFS pointer, but .gitattributes still
-          # marks that path as LFS-tracked, and the runner has git-lfs's
-          # filter.lfs.* registered in its GLOBAL/system git config (not
-          # something "git lfs uninstall --local" can remove, since there's
-          # no local registration to strip -- hence its "no such section"
-          # warning). So on every status/diff (including inside "reset --hard"
-          # and "pull --rebase"), git still runs the LFS "clean" filter on the
-          # working-tree file to compare it against the index. That filter
-          # converts the real binary into a pointer for comparison, but the
-          # index blob IS the raw binary (not a pointer) -- they can never
-          # match, so the file shows as permanently "modified" no matter how
-          # many times we reset. This job never touches ml_models/, so just
-          # force the lfs filter to a no-op passthrough locally, overriding
-          # the global config, so git compares raw content directly instead.
-          git config --local filter.lfs.clean "cat"
-          git config --local filter.lfs.smudge "cat"
-          git config --local filter.lfs.process ""
-          git config --local filter.lfs.required false
+          # binary instead of a real LFS pointer. The problem is that git
+          # doesn't scope its checks to what a job actually touches -- every
+          # "git reset --hard" / "git pull --rebase" reconciles the ENTIRE
+          # working tree against the target commit, so it always walks past
+          # this file even though this job never reads or writes anything
+          # under ml_models/. Overriding filter.lfs.* config is unreliable
+          # across git/git-lfs versions (it kept getting bypassed). The robust
+          # fix: use sparse-checkout to tell git to never materialize
+          # ml_models/ in the working tree for this job at all. If the file
+          # is never checked out, there's nothing to smudge/diff/complain
+          # about -- the problem structurally can't occur.
+          git sparse-checkout init --no-cone
+          printf '/*\n!/ml_models/\n' > .git/info/sparse-checkout
+          git sparse-checkout reapply
 
           for i in 1 2 3 4 5; do
             # Defensive: force the working tree to exactly match whatever is
