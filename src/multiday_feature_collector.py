@@ -219,6 +219,12 @@ DB_COLUMNS: set = {
     "t5_wma_20",
 }
 
+# This collector hits yfinance directly with no RateLimiter (there's only
+# ever one lightweight `.history()` daily-bar call per symbol here, not the
+# heavier 5-min intraday pulls the IntradayDataCollector does), so raising
+# this doesn't add rate-limit risk the way the intraday collector's worker
+# count does -- it was just left low. Overridable via
+# config['rate_limiting']['multiday_max_workers'].
 MAX_WORKERS = 5
 LOOKBACK_BARS = 260   # ~1 year of daily bars — enough for SMA_200
 
@@ -781,6 +787,9 @@ class MultidayFeatureCollector:
         self.logger = logging.getLogger(__name__)
         self.config = config
 
+        rate_config = config.get("rate_limiting", {})
+        self.max_workers = rate_config.get("multiday_max_workers", MAX_WORKERS)
+
         supabase_url = os.environ.get("SUPABASE_URL")
         supabase_key = os.environ.get("SUPABASE_KEY")
         if not supabase_url or not supabase_key:
@@ -903,7 +912,7 @@ class MultidayFeatureCollector:
         )
 
         rows: List[Dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
             futures = {
                 pool.submit(_process_symbol, sym, det): sym
                 for sym, det in tasks
