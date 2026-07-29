@@ -33,6 +33,11 @@ on:
         required: false
         default: 'false'
         type: boolean
+      skip_queue:
+        description: 'Backfill only: run immediately in this job instead of going through the shared queue. Use for one-off/urgent backfills; leave off for routine/large backfills so they share the queue nicely with other runs.'
+        required: false
+        default: false
+        type: boolean
 
 # This job does NOT actually run the tracker anymore -- it just appends one
 # or more job descriptions to data/run_queue.jsonl (one per chunk, if
@@ -60,6 +65,7 @@ env:
 
 jobs:
   enqueue-winners:
+    if: github.event.inputs.skip_queue != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -132,3 +138,62 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
+
+  # Bypasses data/run_queue.jsonl and queue_runner.yml entirely and just runs
+  # daily_winners_main.py directly in this job. Holds the same
+  # "tv-analysis-backfill" concurrency group as queue_runner.yml so the two
+  # never step on each other/race on the same repo files or Supabase writes --
+  # this run will simply wait its turn if a queue drain is already in
+  # progress. Meant for one-off/urgent backfills where you don't want to wait
+  # behind whatever else is already queued; for routine or large backfills,
+  # leave skip_queue off so it shares the queue nicely with other runs.
+  run-directly:
+    if: github.event.inputs.skip_queue == 'true'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: tv-analysis-backfill
+      cancel-in-progress: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Create directories
+        run: |
+          mkdir -p data/cache
+          mkdir -p logs
+
+      - name: Run winners tracker directly
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS=(--verbose --top-n "${{ github.event.inputs.top_n || '15' }}")
+          if [ -n "${{ github.event.inputs.start_date }}" ] && [ -n "${{ github.event.inputs.end_date }}" ]; then
+            ARGS+=(--start-date "${{ github.event.inputs.start_date }}" --end-date "${{ github.event.inputs.end_date }}")
+          elif [ -n "${{ github.event.inputs.date }}" ]; then
+            ARGS+=(--date "${{ github.event.inputs.date }}")
+          fi
+          # Note: daily_winners_main.py has no --allow-append flag (only the
+          # non-winners script does), so allow_append is intentionally not
+          # passed here -- matches how the queue path already behaves.
+          python daily_winners_main.py "${ARGS[@]}"
+
+      - name: Commit any local changes (e.g. selection-counts JSON)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: winners direct run [skip ci]"
+          git pull --rebase origin "${{ github.ref_name }}"
+          git push origin "HEAD:${{ github.ref_name }}"
