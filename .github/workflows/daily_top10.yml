@@ -140,18 +140,20 @@ jobs:
           gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
 
   # Bypasses data/run_queue.jsonl and queue_runner.yml entirely and just runs
-  # daily_winners_main.py directly in this job. Holds the same
-  # "tv-analysis-backfill" concurrency group as queue_runner.yml so the two
-  # never step on each other/race on the same repo files or Supabase writes --
-  # this run will simply wait its turn if a queue drain is already in
-  # progress. Meant for one-off/urgent backfills where you don't want to wait
-  # behind whatever else is already queued; for routine or large backfills,
-  # leave skip_queue off so it shares the queue nicely with other runs.
+  # daily_winners_main.py directly in this job. Uses its OWN concurrency
+  # group -- separate from queue_runner.yml's "tv-analysis-backfill" and from
+  # the non-winners direct-run's group -- so a winners direct-run and a
+  # non-winners direct-run (or a queue drain) can all proceed at the same
+  # time; they touch different Supabase tables and different local files
+  # (winner_selection_counts.json vs non_winner_selection_counts.json), so
+  # there's nothing to actually race on. This group only serializes repeat
+  # winners-direct triggers against each other, so you don't accidentally
+  # double-run the same backfill.
   run-directly:
     if: github.event.inputs.skip_queue == 'true'
     runs-on: ubuntu-latest
     concurrency:
-      group: tv-analysis-backfill
+      group: tv-analysis-direct-winners
       cancel-in-progress: false
     steps:
       - name: Checkout code
@@ -193,7 +195,31 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --cached --quiet || git commit -m "chore: winners direct run [skip ci]"
-          git pull --rebase origin "${{ github.ref_name }}"
-          git push origin "HEAD:${{ github.ref_name }}"
+
+          # Now that this job has its own concurrency group, it can genuinely
+          # run at the same moment as the non-winners direct-run and/or
+          # queue_runner.yml -- all three push to the same branch, so a
+          # single unconditional push here could lose the race. Same
+          # retry-with-jitter pattern as the enqueue workflows.
+          for i in 1 2 3 4 5; do
+            git add -A
+            git diff --cached --quiet && NOTHING_TO_COMMIT=1 || NOTHING_TO_COMMIT=0
+            if [ "$NOTHING_TO_COMMIT" = "0" ]; then
+              git commit -m "chore: winners direct run [skip ci]"
+            fi
+
+            git pull --rebase origin "${{ github.ref_name }}"
+
+            if [ "$NOTHING_TO_COMMIT" = "1" ]; then
+              echo "Nothing to commit."
+              break
+            fi
+
+            if git push origin "HEAD:${{ github.ref_name }}"; then
+              break
+            fi
+
+            echo "Push attempt $i failed (likely a race with another run), retrying..."
+            git reset --hard HEAD~1
+            sleep $((RANDOM % 5 + 2))
+          done
