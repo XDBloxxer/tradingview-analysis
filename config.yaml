@@ -81,8 +81,15 @@ time_lags:
 
 # Rate Limiting Settings
 rate_limiting:
-  # Requests per minute to TradingView
-  requests_per_minute: 30
+  # Requests per minute, shared across ALL worker threads via a single global
+  # RateLimiter/lock (see src/rate_limiter.py). Raised from 30 -> 90: at 30,
+  # the 20-worker ThreadPoolExecutors used for scanning (SCAN_WORKERS=20 in
+  # both detectors) were bottlenecked to ~1 request every 2s system-wide
+  # regardless of thread count, so the extra workers were mostly idle. Start
+  # here and watch the logs for repeated 429/backoff warnings from
+  # call_with_backoff -- if you see many, dial this back down; if none,
+  # you likely have more headroom to raise it further.
+  requests_per_minute: 90
   
   # Delay between individual symbol requests (seconds)
   delay_between_symbols: 2.0
