@@ -14,17 +14,30 @@ class RateLimiter:
     Rate limiter for API requests with exponential backoff
     """
     
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, backfill_mode: bool = False):
         """
         Initialize rate limiter
-        
+
         Args:
             config: Configuration dictionary with rate_limiting settings
+            backfill_mode: When True, use the `backfill_rate_limiting`
+                overrides (if present in config) layered on top of the
+                base `rate_limiting` section. Backfills can just re-run
+                whatever symbols failed, so there's no need to burn
+                20-40 minutes patiently retrying one broken/delisted
+                ticker the way a live unattended daily run should.
+                Fail fast instead and move on.
         """
         self.logger = logging.getLogger(__name__)
-        
-        rate_config = config.get("rate_limiting", {})
-        
+
+        rate_config = dict(config.get("rate_limiting", {}))
+        self.backfill_mode = backfill_mode
+        if backfill_mode:
+            overrides = config.get("backfill_rate_limiting", {})
+            if overrides:
+                self.logger.info(f"RateLimiter: backfill_mode=True, applying overrides: {overrides}")
+            rate_config.update(overrides)
+
         self.requests_per_minute = rate_config.get("requests_per_minute", 30)
         self.delay_between_symbols = rate_config.get("delay_between_symbols", 2.0)
         self.max_retries = rate_config.get("max_retries", 3)
@@ -39,6 +52,10 @@ class RateLimiter:
         # transient rate-limit/connection blips (capped delay between
         # tries) but still eventually gives up and moves on if a symbol
         # is genuinely, consistently failing.
+        #
+        # In backfill_mode these come from backfill_rate_limiting instead
+        # (fail fast — a handful of consistently-broken symbols shouldn't
+        # each cost 20+ minutes of a backfill run; just skip and move on).
         self.max_backoff_attempts = rate_config.get("max_backoff_attempts", 10)
         self.max_backoff_delay = rate_config.get("max_backoff_delay", 300)  # 5 min ceiling per wait
         
