@@ -1,100 +1,76 @@
 """
-Daily Non-Winners Detector
-Finds stocks that did NOT explode - critical negative examples for ML training
+Daily Winners Detector - DEBUG VERSION
+This version has extensive logging to diagnose why stale stocks pass validation
+
+FIX: All three fetch paths now populate high, low, open, close so the
+     daily_winners table is fully populated after the schema migration.
 """
 
 import json
 import logging
 import random
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
-import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import yfinance as yf
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
-    from tradingview_scraper.symbols.screener import Screener
-    SCREENER_AVAILABLE = True
+    from tradingview_scraper.symbols.market_movers import MarketMovers
 except ImportError:
-    SCREENER_AVAILABLE = False
-    logging.warning("tradingview-scraper not available - will use yfinance only")
+    raise ImportError(
+        "tradingview-scraper is required. Install with: pip install tradingview-scraper"
+    )
 
 from .rate_limiter import RateLimiter
 
 
-class DailyNonWinnersDetector:
+class DailyWinnersDetector:
     """
-    Detects stocks that did NOT explode (negative examples)
-    
-    Strategy:
-    1. Get list of stocks that WERE screened/predicted
-    2. Get list of actual winners for the day
-    3. Non-winners = screened stocks - winners
-    4. Sample diverse non-winners (different changes: flat, slight up, slight down, down)
+    Detects top daily winners - DEBUG VERSION with extensive logging
     """
     
-    # Pattern exclusions (same as winners detector)
-    EXCLUDED_PATTERNS = ['OTC', '.PK', '.OB', '-']
+    EXCLUDED_PATTERNS = [
+        'OTC',  # Over-the-counter
+        '.PK',  # Pink sheets
+        '.OB',  # OTC Bulletin Board
+        '-',    # Often delisted stocks
+    ]
 
-    # ── POINT-IN-TIME UNIVERSE FIX ──────────────────────────────────────────
-    # _get_liquid_stocks_list() used to be a hardcoded ~120-symbol megacap
-    # list (AAPL, MSFT, ... WYNN, LVS). Every backfill date (anything where
-    # _is_live() is False) routes through this fallback, so every historical
-    # non-winner run was sampling from the same ~120 names over and over, and
-    # those names are structurally nothing like the small/micro-cap explosive
-    # universe winners are drawn from -- trivially separable on price/market
-    # cap/volatility alone, independent of any real signal.
-    #
-    # UNIVERSE_PATH must point at a broad symbol list (thousands of tickers,
-    # not ~120) -- e.g. a saved copy of the NASDAQ Trader symbol directory
-    # (nasdaqlisted.txt + otherlisted.txt). This class refuses to silently
-    # fall back to a small list if it's missing; see _get_liquid_stocks_list.
+    # ── POINT-IN-TIME UNIVERSE FIX (mirrors daily_non_winners_detector.py) ──
+    # Same hardcoded ~100-megacap fallback bug, same fix: a broad universe
+    # file with anti-repetition tracking, kept in a SEPARATE counts file from
+    # the non-winners side since winners/non-winners are different quotas —
+    # a symbol legitimately can and should appear as a candidate check on
+    # both sides across a backfill without either quota starving the other.
     UNIVERSE_PATH = Path("data/universe_symbols.csv")
-    SELECTION_COUNTS_PATH = Path("data/non_winner_selection_counts.json")
-    # Sized for the 6-month / 100-per-day backfill: ~126 trading days x 100
-    # = ~12,600 slots needed. With a universe of a few thousand symbols and
-    # per-date filter attrition, MAX_USES_PER_SYMBOL=10 gives comfortable
-    # headroom without collapsing back onto a small repeated subset. Raise
-    # this only if the universe file turns out to be too small to hit 100/day
-    # without it (a bigger universe is the better fix, not a higher cap).
-    MAX_USES_PER_SYMBOL = 10
+    SELECTION_COUNTS_PATH = Path("data/winner_selection_counts.json")
+    MAX_USES_PER_SYMBOL = 25
 
-    # Parallel scan tuning for the yfinance fallback paths (see fix notes on
-    # _get_filtered_candidates, _get_from_liquid_stocks, _get_random_liquid_stocks).
-    SCAN_WORKERS = 20
-    SCAN_BATCH_SIZE = 60
+    # ── WINNER PROFILE FIX ───────────────────────────────────────────────
+    # Every candidate path (TradingView, yfinance screener, liquid-stocks
+    # live, liquid-stocks backfill) was only checking price > min_price,
+    # volume > min_volume, and change_pct > 0 — i.e. "any stock that went up
+    # at all, at any price." That's not what "winner" means anywhere else in
+    # this pipeline:
+    #   - learned_filters.json (derived from 1311 real historical winners)
+    #     caps max_price at 50.0 — winners are the small-cap explosive
+    #     universe, not megacaps that drifted up 0.3%.
+    #   - the non-winners screener hard-excludes change >= 20% specifically
+    #     because that's the boundary that separates "explosive winner" from
+    #     "ordinary mover" (see _screen_by_change_range's `change < 20.0`
+    #     filter in daily_non_winners_detector.py).
+    # Without both of those enforced here, "winners" backfilled from a broad
+    # point-in-time universe (which, unlike the old 120-megacap list, now
+    # legitimately contains high-priced blue chips) can end up being the
+    # least-bad stock in a small random sample rather than an actual
+    # explosive mover — which is exactly the "under 20% gain, priced over
+    # $50" symptom being fixed here.
+    DEFAULT_MAX_PRICE = 50.0
+    DEFAULT_MIN_CHANGE_PCT = 20.0
 
-    # Default filters used when learned_filters.json is absent or a key is missing
-    DEFAULT_FILTERS = {
-        "min_price": 0.25,
-        "max_price": None,
-        "min_volume": 10000,
-        "min_market_cap": None,
-        "max_market_cap": None,
-        "min_hv10": None,
-        "max_hv10": None,
-        "min_hv20": None,
-        "max_hv20": None,
-        "min_atr14": None,
-        "min_relative_volume": None,
-        "min_volume_ratio": None,
-    }
-
-    # Keys from learned_filters.json that this detector is allowed to apply.
-    # learned_filters.json also carries model-driven thresholds (min_hv10,
-    # max_hv10, min_hv20, max_hv20, min_atr14, min_relative_volume,
-    # min_volume_ratio) that are derived from the ML model's winner
-    # distribution — those are intentionally excluded here so the
-    # non-winners pool stays purely price/volume/market-cap filtered and
-    # doesn't inherit model-driven selection bias. Only simple universe
-    # thresholds (price, volume, market cap) are pulled from the learned file.
-    LEARNED_FILTER_ALLOWED_KEYS = {
-        "min_price", "max_price", "min_volume", "min_market_cap", "max_market_cap",
-    }
-    
     def __init__(self, config: dict):
         self.logger = logging.getLogger(__name__)
         self.config = config
@@ -104,96 +80,95 @@ class DailyNonWinnersDetector:
         self.min_price = detection_config.get("min_price", 0.25)
         self.min_volume = detection_config.get("min_volume", 10000)
 
-        # Point-in-time universe + anti-repetition state (see UNIVERSE_PATH
-        # comment above). Loaded once per detector instance so a full
-        # multi-month backfill run shares one consistent view of what's
-        # already been used, instead of re-reading/re-shuffling per date.
+        winners_config = config.get("daily_winners", {})
+        learned = self._load_learned_filters()
+        # learned_filters.json wins if present; config.yaml is next; hardcoded
+        # default is last resort. min_change_pct isn't part of learned_filters.json
+        # (it only carries price/volume/market-cap/volatility bounds), so it comes
+        # from config.yaml's daily_winners section or the class default.
+        self.max_price = learned.get("max_price") or winners_config.get(
+            "max_price", self.DEFAULT_MAX_PRICE
+        )
+        self.min_change_pct = float(
+            winners_config.get("min_change_pct", self.DEFAULT_MIN_CHANGE_PCT)
+        )
+
         self._universe_cache: Optional[List[str]] = None
         self._selection_counts: Dict[str, int] = self._load_selection_counts()
         
         self.rate_limiter = RateLimiter(config)
+        self.market_movers = MarketMovers(export_result=False)
+        self.freshness_cache = {}
         
-        if SCREENER_AVAILABLE:
-            self.screener = Screener()
-        else:
-            self.screener = None
-
-        # Loosening config — edit these two values in config.yaml under non_winners:
-        #   loosening_passes:    how many extra screener attempts before hard fallback
-        #   loosening_step_pct:  how many percent to relax filters per pass
-        non_winners_config = config.get("non_winners", {})
-        self.loosening_passes   = int(non_winners_config.get("loosening_passes",   3))
-        self.loosening_step_pct = float(non_winners_config.get("loosening_step_pct", 20.0))
-        self.min_pool_factor    = float(non_winners_config.get("min_pool_factor",   1.5))
-
-        # NOTE: learned_filters are loaded fresh on each detect_non_winners() call
-        # so that changes to ml_models/learned_filters.json take effect immediately
-        # without restarting the process.
-
         self.logger.info(
-            f"Non-Winners detector initialized: "
+            f"Daily Winners detector initialized (DEBUG MODE): "
             f"min_price={self.min_price}, min_volume={self.min_volume}, "
-            f"loosening_passes={self.loosening_passes}, "
-            f"loosening_step_pct={self.loosening_step_pct}%"
+            f"max_price={self.max_price}, min_change_pct={self.min_change_pct}"
         )
+
+    def _load_learned_filters(self) -> dict:
+        """Load max_price (and nothing else, for now) from
+        ml_models/learned_filters.json if present. Mirrors
+        DailyNonWinnersDetector._load_learned_filters so both sides of the
+        pipeline agree on what a 'winner-shaped' stock looks like — same
+        file, same max_price, so the winners table and the non-winners
+        exclusion boundary stay consistent with each other."""
+        try:
+            filter_path = Path("ml_models/learned_filters.json")
+            if not filter_path.exists():
+                self.logger.info(
+                    "No learned_filters.json found — using default max_price="
+                    f"{self.DEFAULT_MAX_PRICE} for winners."
+                )
+                return {}
+            with open(filter_path) as f:
+                data = json.load(f)
+            return {"max_price": data.get("max_price")}
+        except Exception as e:
+            self.logger.warning(f"Could not load learned_filters.json: {e} — using defaults")
+            return {}
 
     def _is_live(self, target_date: datetime) -> bool:
         """
         True if `target_date` is today (a live run), False if it's a
-        historical backfill date.
-
-        The TradingView screener/scanner endpoints only ever return *current*
-        market data — they have no historical-date parameter. Using them for
-        a backfill silently returns today's data mislabeled as the backfill
-        date (the same class of bug fixed in _fetch_yf_bar_for_date below).
-        Call sites use this to route backfill runs through the date-aware
-        yfinance path exclusively.
+        historical backfill. Only live runs may fall back to "most recent
+        bar" style fetches (period='2d'/'5d' + iloc[-1]); backfills must use
+        a fetch pinned to the exact target_date, or that date's row can get
+        silently overwritten with today's bar (the same class of bug fixed
+        in _backfill_ohlc / _fetch_yf_bar_for_date below).
         """
         if target_date is None:
             return True
         target = target_date.date() if isinstance(target_date, datetime) else target_date
-        return target >= datetime.now().date()
+        return target == datetime.now().date()
 
-    def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, float]]:
+    def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, Any]]:
         """
-        Fetch the daily OHLCV bar for `symbol` on `target_date` specifically,
-        plus derived metrics (change_pct, hv10, hv20, relative_volume_10d,
-        atr14) computed from the trading days immediately preceding
-        target_date — never from "whatever's most recent."
-
-        FIX: The three call sites that used to inline
-            ticker.history(period='2d', interval='1d') ... hist.iloc[-1]
-        always returned whatever the MOST RECENT trading bar was at the
-        moment the code ran — completely ignoring target_date. When this
-        detector was run as part of a historical backfill (looping over many
-        past detection_dates), every single one of those dates got patched
-        with the same "latest" bar, silently duplicating one real snapshot
-        across dozens of rows (confirmed via identical OHLCV values recurring
-        under many different detection_date rows in the DB).
-
-        This fetches an explicit window ending at target_date and returns
-        None if that exact date isn't present (e.g. weekend/holiday/no data),
-        rather than substituting a different day's bar. The window is wide
-        enough (45 calendar days) to compute HV10/HV20/ATR14 — the same
-        metrics the TradingView screener filters on — so backfill runs can
-        apply the full learned-filter set instead of only price/volume.
+        Fetch the daily OHLCV bar for `symbol` on `target_date` specifically
+        (not "whatever's most recent"). Returns None if that exact date isn't
+        present (non-trading day, delisted, no data yet) rather than
+        substituting a different day's bar.
         """
         target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
-        # Need ~25 trading days of lookback for hv20/atr14; yfinance's
-        # `end` is exclusive.
-        start = target_date_only - timedelta(days=45)
+        start = target_date_only - timedelta(days=10)
         end = target_date_only + timedelta(days=1)
 
         try:
-            ticker = yf.Ticker(symbol)
             hist = self.rate_limiter.call_with_backoff(
-                ticker.history, start=start.isoformat(), end=end.isoformat(),
-                interval='1d', label=f"{symbol} date-pinned OHLC"
+                yf.download,
+                symbol,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                interval='1d',
+                progress=False,
+                auto_adjust=True,
+                label=f"{symbol} OHLC bar",
             )
-        except Exception:
+        except Exception as e:
+            self.logger.debug(f"{symbol}: yfinance fetch failed: {e}")
             return None
 
-        if hist.empty:
+        if hist is None or hist.empty:
             return None
 
         idx_dates = hist.index.date
@@ -201,747 +176,352 @@ class DailyNonWinnersDetector:
         if not target_mask.any():
             return None
 
-        target_pos = int(np.where(target_mask)[0][0])
+        target_pos = int(target_mask.nonzero()[0][-1])
         if target_pos == 0:
-            # No prior bar available in the lookback window to compute change_pct from.
             return None
 
-        window = hist.iloc[:target_pos + 1]  # everything up to and including target_date
+        window = hist.iloc[:target_pos + 1]
         latest = window.iloc[-1]
         previous = window.iloc[-2]
 
-        close = float(latest['Close'])
-        prev_close = float(previous['Close'])
+        try:
+            close = float(latest['Close'])
+            prev_close = float(previous['Close'])
+            volume = int(latest['Volume'])
+        except (TypeError, ValueError):
+            return None
+
         if prev_close == 0:
             return None
 
-        result: Dict[str, float] = {
-            'close':      close,
+        return {
+            'close': close,
             'prev_close': prev_close,
             'change_pct': ((close - prev_close) / prev_close) * 100,
-            'volume':     float(latest['Volume']),
-            'high':       float(latest['High']),
-            'low':        float(latest['Low']),
-            'open':       float(latest['Open']),
+            'volume': volume,
+            'high': float(latest['High']),
+            'low': float(latest['Low']),
+            'open': float(latest['Open']),
         }
-
-        # Historical volatility: annualized std of daily log returns.
-        closes = window['Close']
-        log_returns = np.log(closes / closes.shift(1)).dropna()
-        for n, key in ((10, 'hv10'), (20, 'hv20')):
-            if len(log_returns) >= n:
-                result[key] = float(log_returns.tail(n).std() * np.sqrt(252) * 100)
-
-        # Relative volume: target day's volume vs. average of the prior 10 days.
-        volumes = window['Volume']
-        if len(volumes) > 10:
-            avg_vol = float(volumes.iloc[-11:-1].mean())
-            if avg_vol > 0:
-                result['relative_volume_10d'] = float(result['volume'] / avg_vol)
-
-        # ATR(14): average true range over the last 14 days.
-        if len(window) >= 15:
-            highs, lows, closes_prev = window['High'], window['Low'], window['Close'].shift(1)
-            tr = pd.concat([
-                highs - lows,
-                (highs - closes_prev).abs(),
-                (lows - closes_prev).abs(),
-            ], axis=1).max(axis=1)
-            result['atr14'] = float(tr.tail(14).mean())
-
-        # Market cap: yfinance has no historical market-cap series, so this is
-        # always the CURRENT market cap, not the market cap as-of target_date.
-        # That's an acceptable approximation for filtering purposes (shares
-        # outstanding rarely changes enough to flip a stock across a cap
-        # bucket), but it means backfill runs filter on today's cap.
-        try:
-            market_cap = ticker.fast_info["market_cap"]
-            if market_cap:
-                result['market_cap'] = float(market_cap)
-        except Exception:
-            pass
-
-        return result
-
-    def _load_learned_filters(self) -> dict:
-        """Load learned filters from ml_models/learned_filters.json.
-
-        Only price/volume keys (min_price, max_price, min_volume) are taken
-        from the learned file — the model-driven thresholds it also carries
-        (hv10/hv20/atr14/relative_volume/volume_ratio, derived from the ML
-        model's winner distribution) are deliberately ignored here so the
-        non-winners pool isn't shaped by the same model it's meant to
-        provide independent negative examples for.
-
-        Falls back to DEFAULT_FILTERS if the file is missing or unreadable.
-        """
-        defaults = dict(self.DEFAULT_FILTERS)
-        try:
-            filter_path = Path("ml_models/learned_filters.json")
-            if filter_path.exists():
-                with open(filter_path, "r") as f:
-                    learned = json.load(f)
-
-                applied = []
-                skipped_model_driven = []
-                for key, value in learned.items():
-                    if key.startswith("_"):   # skip metadata keys
-                        continue
-                    if value is None:
-                        continue
-                    if key not in self.LEARNED_FILTER_ALLOWED_KEYS:
-                        skipped_model_driven.append(f"{key}={value}")
-                        continue
-                    defaults[key] = value
-                    applied.append(f"{key}={value}")
-
-                if applied:
-                    self.logger.info(f"Loaded learned price/volume filters for non-winners: {', '.join(applied)}")
-                else:
-                    self.logger.info("learned_filters.json found but contained no usable price/volume keys — using defaults")
-                if skipped_model_driven:
-                    self.logger.info(
-                        f"Ignored model-driven learned filters (not applied to non-winners): "
-                        f"{', '.join(skipped_model_driven)}"
-                    )
-            else:
-                self.logger.info("No learned_filters.json found — using permissive defaults for non-winners")
-        except Exception as e:
-            self.logger.warning(f"Could not load learned_filters.json: {e} — using defaults")
-        return defaults
     
-    def _loosen_filters(self, base_filters: dict, step_pct: float, pass_number: int) -> dict:
-        """
-        Return a new filter dict with thresholds loosened by (step_pct * pass_number) %.
-
-        For every min_* key the threshold is reduced, giving more stocks a chance to
-        pass.  For every max_* key the ceiling is raised for the same reason.
-
-        Example: step_pct=20, pass_number=1  →  min values drop by 20 %, max values
-        rise by 20 %.  pass_number=2 with the same step_pct drops/raises by 40 %, etc.
-
-        Args:
-            base_filters: The original learned filters (never mutated).
-            step_pct:     How many percent to relax per pass (set in config under
-                          non_winners.loosening_step_pct, default 20).
-            pass_number:  Which pass this is (1-based so pass 0 = full filters).
-        """
-        lf = dict(base_filters)
-        reduction = (step_pct / 100.0) * pass_number   # e.g. 0.20, 0.40, 0.60 …
-        min_factor = max(0.0, 1.0 - reduction)          # can't go below 0
-        max_factor = 1.0 + reduction                    # no upper bound needed
-
-        for key in list(lf.keys()):
-            if lf[key] is None or key.startswith("_"):
-                continue
-            if key.startswith("min_"):
-                lf[key] = lf[key] * min_factor
-            elif key.startswith("max_"):
-                lf[key] = lf[key] * max_factor
-
-        return lf
-
-    def detect_non_winners(
-        self, 
-        top_n: int = 15, 
-        target_date: datetime = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Detect non-winners (negative examples).
-
-        Strategy:
-        1. Load learned_filters fresh from disk (picks up any changes automatically).
-        2. Apply filters to find a pool of stocks that look like winners but didn't
-           gain ≥20 % intraday.
-        3. If the pool is too small, loosen the filters by loosening_step_pct % per
-           pass and retry up to loosening_passes times, accumulating candidates.
-        4. Only after all passes are exhausted does it fall back to the original
-           random-liquid-stock approach for any remaining slots.
-
-        Tuning knobs (all in config.yaml under non_winners:):
-            loosening_passes   – number of extra screener attempts (default 3)
-            loosening_step_pct – % to relax filters per pass (default 20)
-            min_pool_factor    – minimum pool = top_n * this (default 1.5)
-
-        Args:
-            top_n: Number of non-winners to collect
-            target_date: Target date
-
-        Returns:
-            List of non-winner dictionaries
-        """
+    def detect_top_winners(self, top_n: int = 15, target_date: datetime = None) -> List[Dict[str, Any]]:
         if target_date is None:
             target_date = datetime.now()
-
+        
         target_date_str = target_date.date().isoformat()
-        min_pool = max(top_n, int(top_n * self.min_pool_factor))
+        
+        self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
+        
+        # Fetch MORE than we need initially to account for validation rejections
+        initial_fetch_size = top_n * 2
+        
+        candidates = self._fetch_from_tradingview(target_date, initial_fetch_size)
+        
+        # Supplement with yfinance if needed
+        needed = initial_fetch_size - len(candidates)
+        if needed > 0:
+            self.logger.info(
+                f"TradingView returned {len(candidates)}/{initial_fetch_size}. "
+                f"Fetching {needed} more from yfinance..."
+            )
+            existing_symbols = {c['symbol'] for c in candidates}
+            yf_candidates = self._fetch_from_yfinance_screener(target_date, needed * 2, existing_symbols)
+            candidates.extend(yf_candidates[:needed])
+        
+        if not candidates:
+            self.logger.warning("⚠️ No winners found!")
+            return []
+        
+        # ── Backfill OHLC for any candidate missing it (TradingView path) ──
+        candidates = self._backfill_ohlc(candidates, target_date)
+        
+        self.logger.info(f"Total candidates before validation: {len(candidates)}")
+        
+        skip_validation = self.config.get('daily_winners', {}).get('skip_freshness_validation', False)
+        self.logger.info(f"🔍 skip_freshness_validation config: {skip_validation}")
+        
+        if skip_validation:
+            self.logger.warning("⚠️ SKIPPING freshness validation per config!")
+            validated_candidates = candidates
+        else:
+            self.logger.info(f"🔍 Running batch freshness validation on {len(candidates)} candidates...")
+            validated_candidates = self._batch_verify_freshness(candidates, target_date)
+        
+        if not validated_candidates:
+            self.logger.warning("⚠️ All candidates failed freshness validation!")
+            return []
+        
+        # Sort by change percentage
+        df_results = pd.DataFrame(validated_candidates)
+        df_results = df_results.sort_values('change_pct', ascending=False)
+        
+        # Backfill shortage
+        if len(df_results) < top_n:
+            shortage = top_n - len(df_results)
+            self.logger.warning(
+                f"⚠️ Only {len(df_results)} stocks passed validation (need {top_n}). "
+                f"Shortage: {shortage} stocks"
+            )
+            self.logger.info("💡 Trying to backfill with additional candidates...")
+            
+            existing_symbols = {c['symbol'] for c in candidates}
+            additional_candidates = self._fetch_from_yfinance_screener(
+                target_date, shortage * 3, existing_symbols
+            )
+            
+            if additional_candidates:
+                additional_candidates = self._backfill_ohlc(additional_candidates, target_date)
+                self.logger.info(f"Fetched {len(additional_candidates)} additional candidates")
+                
+                if not skip_validation:
+                    additional_validated = self._batch_verify_freshness(additional_candidates, target_date)
+                else:
+                    additional_validated = additional_candidates
+                
+                if additional_validated:
+                    self.logger.info(f"✅ {len(additional_validated)} additional candidates passed validation")
+                    validated_candidates.extend(additional_validated)
+                    df_results = pd.DataFrame(validated_candidates)
+                    df_results = df_results.sort_values('change_pct', ascending=False)
+        
+        top_winners = df_results.head(top_n).to_dict('records')
+        
+        for winner in top_winners:
+            winner['detection_date'] = target_date_str
+            winner['detection_time'] = '16:00:00'
+        
+        self.logger.info(f"✅ Found top {len(top_winners)} daily winners (target: {top_n}):")
+        for i, winner in enumerate(top_winners, 1):
+            source = winner.pop('source', 'unknown')
+            self.logger.info(
+                f"  #{i}: {winner['exchange']}:{winner['symbol']} "
+                f"(+{winner['change_pct']:.2f}%) @ ${winner['price']:.2f}, "
+                f"vol={winner['volume']:,} [{source}]"
+            )
+        
+        if len(top_winners) < top_n:
+            self.logger.warning(
+                f"⚠️ WARNING: Only found {len(top_winners)}/{top_n} winners after validation."
+            )
 
-        # ── Load filters fresh every run ─────────────────────────────────────
-        # This means edits to learned_filters.json are picked up automatically
-        # without restarting anything.
-        base_filters = self._load_learned_filters()
+        # Record EVERY selected winner here, regardless of which path found
+        # them (TradingView / yfinance screener / liquid-stocks fallback).
+        # Previously this only happened inside _fetch_from_liquid_stocks_for_date,
+        # so on any day where TradingView/yfinance successfully returned
+        # candidates (the normal case) nothing was ever recorded and
+        # data/winner_selection_counts.json never got created.
+        self._record_selections([w['symbol'] for w in top_winners])
 
-        self.logger.info(f"Detecting non-winners for {target_date_str}...")
+        return top_winners
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # OHLC backfill — fetches daily bar OHLC for any candidate that came
+    # in without it (mainly the TradingView MarketMovers path).
+    # Uses a single yf.download() batch call for efficiency.
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _backfill_ohlc(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_date: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        For any candidate missing high/low/open/close, fetch from yfinance
+        daily bars (1d interval) and fill them in — for `target_date`
+        specifically.
+
+        TradingView MarketMovers only returns close + change + volume.
+        yfinance Screener returns regularMarketPrice but not the full OHLC bar.
+        This method patches both.
+
+        FIX: This previously called yf.download(period='2d') and always took
+        the LAST row (iloc[-1]) regardless of what date was being backfilled.
+        When this ran as part of a bulk catch-up job across many historical
+        detection_dates, every candidate — no matter which historical date it
+        belonged to — got patched with whatever the most-recent trading bar
+        happened to be at the moment the script ran. That silently wrote the
+        same OHLC snapshot into the table under dozens of different
+        detection_date rows (confirmed via duplicate symbol+OHLC combinations
+        spanning ~38 distinct dates with identical values).
+
+        The fix fetches an explicit [target_date, target_date + 1 day) window
+        and selects the row matching target_date, rather than "whatever's
+        last." If the market was closed that day (weekend/holiday) or data
+        isn't available for that exact date, we skip the backfill for that
+        candidate rather than silently substituting a different day's bar.
+        """
+        missing = [c for c in candidates
+                   if any(c.get(f) is None for f in ('high', 'low', 'open', 'close'))]
+
+        if not missing:
+            return candidates
+
+        symbols = list({c['symbol'] for c in missing})
+        target_date_only = target_date.date()
+        # yfinance's `end` is exclusive, so request a small window and filter
+        # down to the exact date rather than relying on "last row returned."
+        start = target_date_only
+        end = target_date_only + timedelta(days=1)
+
         self.logger.info(
-            f"Strategy: up to {self.loosening_passes} loosening pass(es) at "
-            f"{self.loosening_step_pct}%/pass → need pool ≥ {min_pool}"
+            f"Backfilling OHLC for {len(symbols)} candidates via yfinance "
+            f"daily bars for {target_date_only.isoformat()}..."
         )
 
-        # Get actual winners to exclude
-        winners_symbols = self._get_winners_symbols(target_date)
-        self.logger.info(f"Found {len(winners_symbols)} winners to exclude")
-
-        # ── Phase 1: progressive learned-filter candidates ───────────────────
-        all_candidates: Dict[str, Dict] = {}   # symbol → data  (deduped across passes)
-        passes_needed = 0
-
-        # Pass 0 = full filters; passes 1…loosening_passes = progressively looser
-        for pass_idx in range(self.loosening_passes + 1):
-            if pass_idx == 0:
-                active_filters = base_filters
-                label = "full filters"
-            else:
-                active_filters = self._loosen_filters(
-                    base_filters, self.loosening_step_pct, pass_idx
-                )
-                relaxed_pct = self.loosening_step_pct * pass_idx
-                label = f"loosened {relaxed_pct:.0f}%"
-
-            def _fmt(v, spec):
-                return format(v, spec) if v is not None else "None"
-            self.logger.info(
-                f"Phase 1 pass {pass_idx} ({label}): fetching candidates "
-                f"[min_price={_fmt(active_filters.get('min_price'), '.3f')}, "
-                f"min_volume={_fmt(active_filters.get('min_volume'), '.0f')}, "
-                f"min_rvol={_fmt(active_filters.get('min_relative_volume'), '.2f')}]..."
+        try:
+            data = self.rate_limiter.call_with_backoff(
+                yf.download,
+                symbols,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                interval='1d',
+                group_by='ticker',
+                progress=False,
+                threads=True,
+                auto_adjust=True,
+                label=f"bulk OHLC backfill ({len(symbols)} symbols) {target_date_only.isoformat()}",
             )
 
-            new_candidates = self._get_filtered_candidates(
-                winners_symbols, active_filters, target_date,
-                target_pool=min_pool * 3,
-            )
-
-            added = 0
-            for c in new_candidates:
-                if c["symbol"] not in all_candidates:
-                    all_candidates[c["symbol"]] = c
-                    added += 1
-
-            passes_needed = pass_idx
-            self.logger.info(
-                f"  Pass {pass_idx}: +{added} new symbols "
-                f"(cumulative pool: {len(all_candidates)})"
-            )
-
-            if len(all_candidates) >= min_pool:
-                self.logger.info(
-                    f"  Pool size {len(all_candidates)} ≥ {min_pool} — "
-                    f"stopping after pass {pass_idx} ({label})"
+            if data.empty:
+                self.logger.warning(
+                    f"yfinance returned no OHLC data for {target_date_only.isoformat()} "
+                    "(likely a non-trading day, or data not yet available) — "
+                    "skipping backfill rather than substituting another day's bar."
                 )
-                break
-
-        if passes_needed > 0:
-            self.logger.info(
-                f"  NOTE: needed {passes_needed} loosening pass(es) "
-                f"(filters relaxed by {self.loosening_step_pct * passes_needed:.0f}% total) "
-                f"to reach pool of {len(all_candidates)}"
-            )
-
-        filtered_candidates = list(all_candidates.values())
-        self.logger.info(f"  Final learned-filter pool: {len(filtered_candidates)} stocks")
-
-        non_winners: List[Dict] = []
-
-        if filtered_candidates:
-            filtered_map: Dict[str, Dict] = {c["symbol"]: c for c in filtered_candidates}
-            filtered_syms = set(filtered_map.keys())
-
-            def _pick_from_filtered(min_chg, max_chg, n):
-                picked = []
-                already = {nw["symbol"] for nw in non_winners}
-                for sym, data in filtered_map.items():
-                    if sym in already:
-                        continue
-                    if min_chg <= data["change_pct"] <= max_chg:
-                        picked.append(data)
-                    if len(picked) >= n:
-                        break
-                return picked
-
-            flat_count        = int(top_n * 0.3)
-            slight_gain_count = int(top_n * 0.3)
-            slight_loss_count = int(top_n * 0.2)
-
-            flat_stocks    = _pick_from_filtered(-2.0,  2.0,  flat_count)
-            non_winners.extend(flat_stocks)
-            self.logger.info(f"  Flat  (-2% to +2%):  {len(flat_stocks)}/{flat_count} from filtered pool")
-
-            slight_gainers = _pick_from_filtered(2.0,  10.0, slight_gain_count)
-            non_winners.extend(slight_gainers)
-            self.logger.info(f"  Slight gain (+2% to +10%): {len(slight_gainers)}/{slight_gain_count} from filtered pool")
-
-            slight_losers  = _pick_from_filtered(-10.0, -2.0, slight_loss_count)
-            non_winners.extend(slight_losers)
-            self.logger.info(f"  Slight loss (-2% to -10%): {len(slight_losers)}/{slight_loss_count} from filtered pool")
-
-            big_loss_count = top_n - len(non_winners)
-            big_losers     = _pick_from_filtered(-50.0, -10.0, big_loss_count)
-            non_winners.extend(big_losers)
-            self.logger.info(f"  Big loss (< -10%): {len(big_losers)}/{big_loss_count} from filtered pool")
-        else:
-            self.logger.info("  No filtered candidates returned from any pass — skipping Phase 1")
-            filtered_syms = set()
-
-        # ── Phase 2: fallback for any remaining shortage ─────────────────────
-        if len(non_winners) < top_n:
-            shortage = top_n - len(non_winners)
-            self.logger.info(
-                f"Phase 2 (hard fallback): Only {len(non_winners)}/{top_n} after all loosening passes. "
-                f"Filling {shortage} slots via random-liquid-stock method..."
-            )
-
-            already_syms = {nw["symbol"] for nw in non_winners}
-            per_cat_needed = max(shortage // 4, 1)
-
-            fallback: List[Dict] = []
-            for min_chg, max_chg in [(-2.0, 2.0), (2.0, 10.0), (-10.0, -2.0), (-50.0, -10.0)]:
-                if len(fallback) >= shortage:
-                    break
-                batch = self._get_stocks_by_change_range(
-                    target_date, min_chg, max_chg,
-                    per_cat_needed * 2,
-                    winners_symbols | already_syms | filtered_syms,
-                    max_price_filter=base_filters.get("max_price"),
-                    min_market_cap_filter=base_filters.get("min_market_cap"),
-                    max_market_cap_filter=base_filters.get("max_market_cap"),
-                )
-                for stock in batch:
-                    if stock["symbol"] not in already_syms and stock["symbol"] not in filtered_syms:
-                        fallback.append(stock)
-                        already_syms.add(stock["symbol"])
-                    if len(fallback) >= shortage:
-                        break
-
-            if len(fallback) < shortage:
-                remaining = shortage - len(fallback)
-                self.logger.info(f"  Still {remaining} short — using fully random liquid stocks")
-                random_stocks = self._get_random_liquid_stocks(
-                    target_date, remaining * 2,
-                    winners_symbols,
-                    already_syms | filtered_syms,
-                    max_price_filter=base_filters.get("max_price"),
-                    min_market_cap_filter=base_filters.get("min_market_cap"),
-                    max_market_cap_filter=base_filters.get("max_market_cap"),
-                )
-                fallback.extend(random_stocks[:remaining])
-
-            non_winners.extend(fallback[:shortage])
-            self.logger.info(f"  Fallback added {len(fallback[:shortage])} stocks")
-
-        # Add metadata
-        for nw in non_winners:
-            nw['detection_date'] = target_date_str
-            nw['detection_time'] = '16:00:00'
-        
-        self.logger.info(f"✓ Collected {len(non_winners)} diverse non-winners:")
-        
-        # Log distribution
-        flat = sum(1 for nw in non_winners if -2 <= nw['change_pct'] <= 2)
-        slight_gain = sum(1 for nw in non_winners if 2 < nw['change_pct'] <= 10)
-        slight_loss = sum(1 for nw in non_winners if -10 <= nw['change_pct'] < -2)
-        big_loss = sum(1 for nw in non_winners if nw['change_pct'] < -10)
-        
-        self.logger.info(f"  Distribution:")
-        self.logger.info(f"    Flat (-2% to +2%): {flat}")
-        self.logger.info(f"    Slight gainers (+2% to +10%): {slight_gain}")
-        self.logger.info(f"    Slight losers (-2% to -10%): {slight_loss}")
-        self.logger.info(f"    Bigger losers (< -10%): {big_loss}")
-
-        final_non_winners = non_winners[:top_n]
-
-        # Record EVERY selected non-winner here, regardless of which phase
-        # found them (learned-filter pool / range fallback / random-liquid
-        # fallback). Previously this only happened inside the
-        # _get_random_liquid_stocks last-resort path, so on any day where
-        # Phase 1 alone filled the quota (the normal case) nothing was ever
-        # recorded and data/non_winner_selection_counts.json never got
-        # created.
-        self._record_selections([nw['symbol'] for nw in final_non_winners])
-
-        return final_non_winners
-    
-    def _get_filtered_candidates(
-        self,
-        exclude_symbols: set,
-        filters: dict = None,
-        target_date: datetime = None,
-        target_pool: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Fetch a pool of stocks that pass the given filters but did NOT gain ≥20 % intraday.
-
-        Uses the TradingView screener when available (applying filter values as screener
-        constraints), otherwise falls back to yfinance on the liquid-stocks list.
-        In both cases only stocks with change_pct < 20 % are returned.
-
-        Args:
-            exclude_symbols: Symbols to exclude (winners + already-selected)
-            filters: Filter dict to apply.  Defaults to self.learned_filters.
-            target_date: Date the candidates are being collected for. Required
-                for the yfinance fallback path to fetch the correct historical
-                bar instead of "whatever is most recent."
-            target_pool: Stop the yfinance fallback scan once this many
-                candidates have been gathered, instead of scanning the whole
-                universe. Any shortfall is covered by later loosening passes
-                / Phase 2 fallback in detect_non_winners, so this doesn't
-                need to be exact — just big enough to give the caller
-                headroom. Defaults to a generous flat value if not given.
-        """
-        if target_date is None:
-            target_date = datetime.now()
-        lf = filters if filters is not None else self.learned_filters
-
-        # Map from learned_filters keys → (tv_column, operation)
-        TV_FILTER_MAP = {
-            "min_price":           ("close",                    "greater"),
-            "max_price":           ("close",                    "less"),
-            "min_volume":          ("volume",                   "greater"),
-            "min_market_cap":      ("market_cap_basic",         "greater"),
-            "max_market_cap":      ("market_cap_basic",         "less"),
-            "min_hv10":            ("historical_volatility_10", "greater"),
-            "max_hv10":            ("historical_volatility_10", "less"),
-            "min_hv20":            ("historical_volatility_20", "greater"),
-            "max_hv20":            ("historical_volatility_20", "less"),
-            "min_relative_volume": ("relative_volume_10d_calc", "greater"),
-            "min_volume_ratio":    ("relative_volume_10d_calc", "greater"),
-        }
-
-        # FIX: TradingView's screener has no historical-date parameter — it
-        # only ever reflects the current market. Using it during a backfill
-        # would silently label today's screen results as the backfill date.
-        # Route backfill runs straight to the (now date-aware) yfinance path.
-        if SCREENER_AVAILABLE and self.screener and self._is_live(target_date):
-            # Build TradingView filter list from learned values
-            tv_col_bounds: Dict[str, Dict] = {}
-            for filter_key, (tv_col, operation) in TV_FILTER_MAP.items():
-                value = lf.get(filter_key)
-                if value is None:
-                    continue
-                if tv_col not in tv_col_bounds:
-                    tv_col_bounds[tv_col] = {}
-                if operation == "greater":
-                    existing = tv_col_bounds[tv_col].get("min")
-                    if existing is None or value > existing:
-                        tv_col_bounds[tv_col]["min"] = value
-                elif operation == "less":
-                    existing = tv_col_bounds[tv_col].get("max")
-                    if existing is None or value < existing:
-                        tv_col_bounds[tv_col]["max"] = value
-
-            tv_filters = []
-            for tv_col, bounds in tv_col_bounds.items():
-                if "min" in bounds:
-                    tv_filters.append({"left": tv_col, "operation": "greater", "right": bounds["min"]})
-                if "max" in bounds:
-                    tv_filters.append({"left": tv_col, "operation": "less",    "right": bounds["max"]})
-
-            # Also hard-exclude winners (change >= 20 %)
-            tv_filters.append({"left": "change", "operation": "less", "right": 20.0})
-
-            try:
-                result = self.screener.screen(
-                    market="america",
-                    filters=tv_filters,
-                    sort_by="volume",
-                    sort_order="desc",
-                    limit=500,
-                )
-
-                if result.get("status") != "success" or not result.get("data"):
-                    self.logger.warning("Learned-filter screener returned no results")
-                    return []
-
-                candidates = []
-                for item in result["data"]:
-                    try:
-                        symbol_full = item.get("symbol", "")
-                        if ":" in symbol_full:
-                            exchange_prefix, symbol = symbol_full.split(":", 1)
-                        else:
-                            symbol = symbol_full
-                            exchange_prefix = "NASDAQ"
-
-                        if not symbol or symbol in exclude_symbols:
-                            continue
-                        if self._is_excluded_symbol(symbol, exchange_prefix):
-                            continue
-
-                        price      = float(item.get("close",  0))
-                        change_pct = float(item.get("change", 0))
-                        volume     = int(item.get("volume",   0))
-                        market_cap = item.get("market_cap_basic")
-
-                        if price < self.min_price or volume < self.min_volume:
-                            continue
-                        if change_pct >= 20.0:
-                            continue
-
-                        # FIX: the screener's own "close < max_price" constraint
-                        # (built into tv_filters above) was being trusted blindly.
-                        # In practice the TradingView screener has returned rows
-                        # that violate the requested bound, so re-check every
-                        # bound explicitly here — the same way min_price/min_volume
-                        # already are — instead of assuming the upstream filter
-                        # worked.
-                        max_price = lf.get("max_price")
-                        if max_price is not None and price > max_price:
-                            continue
-
-                        min_mcap = lf.get("min_market_cap")
-                        max_mcap = lf.get("max_market_cap")
-                        if min_mcap is not None or max_mcap is not None:
-                            if market_cap is None:
-                                continue
-                            market_cap = float(market_cap)
-                            if min_mcap is not None and market_cap < min_mcap:
-                                continue
-                            if max_mcap is not None and market_cap > max_mcap:
-                                continue
-
-                        candidates.append({
-                            "symbol":     symbol.strip().upper(),
-                            "exchange":   exchange_prefix,
-                            "price":      float(price),
-                            "change_pct": float(change_pct),
-                            "volume":     int(volume),
-                            "market_cap": float(market_cap) if market_cap is not None else None,
-                            "high":       float(item.get("high", price)),
-                            "low":        float(item.get("low",  price)),
-                            "open":       float(item.get("open", price)),
-                            "close":      float(price),
-                        })
-                    except Exception:
-                        continue
-
                 return candidates
 
-            except Exception as e:
-                self.logger.warning(f"Learned-filter screener error: {e} — falling back to yfinance")
+            # Build a quick lookup: symbol → OHLC bar for target_date_only.
+            ohlc_lookup: Dict[str, Dict[str, float]] = {}
 
-        # ── yfinance fallback ────────────────────────────────────────────────
-        min_price_filter  = lf.get("min_price",  self.min_price)
-        max_price_filter  = lf.get("max_price",  None)
-        min_volume_filter = lf.get("min_volume", self.min_volume)
-        min_mcap_filter    = lf.get("min_market_cap")
-        max_mcap_filter    = lf.get("max_market_cap")
+            def _row_for_target_date(frame: pd.DataFrame):
+                """Return the row whose index date matches target_date_only,
+                or None if that exact date isn't present in the response."""
+                if frame.empty:
+                    return None
+                idx_dates = frame.index.date
+                matches = frame.loc[idx_dates == target_date_only]
+                if matches.empty:
+                    return None
+                return matches.iloc[0]
 
-        liquid_stocks = [s for s in self._get_liquid_stocks_list() if s not in exclude_symbols]
-        candidates = []
-
-        # FIX: this used to be a serial for-loop with an explicit
-        # time.sleep(0.1) per symbol and no early exit — scanning the
-        # entire multi-thousand-symbol universe, once per loosening pass
-        # (up to loosening_passes+1 times per date). At 0.1s/symbol alone
-        # that's minutes per pass before any network latency, and this
-        # function runs on every backfill date. Parallelized via thread
-        # pool (matches the pattern in daily_winners_detector.py's
-        # equivalent fix) and stops once a generous pool has been gathered
-        # rather than exhausting the whole universe every time.
-        target_pool_size = target_pool if target_pool is not None else 200
-
-        for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
-            batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
-
-            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
-                future_to_symbol = {
-                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
-                    for symbol in batch
-                }
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
+            if len(symbols) == 1:
+                # Single-symbol download: columns are Open/High/Low/Close/Volume (no ticker level)
+                row = _row_for_target_date(data)
+                if row is not None:
+                    ohlc_lookup[symbols[0]] = {
+                        'open':  float(row.get('Open',  row.get('open',  0))),
+                        'high':  float(row.get('High',  row.get('high',  0))),
+                        'low':   float(row.get('Low',   row.get('low',   0))),
+                        'close': float(row.get('Close', row.get('close', 0))),
+                    }
+            else:
+                # Multi-symbol: columns are MultiIndex (ticker, field)
+                for sym in symbols:
                     try:
-                        bar = future.result()
+                        if sym not in data.columns.get_level_values(0):
+                            continue
+                        sym_data = data[sym].dropna(how='all')
+                        row = _row_for_target_date(sym_data)
+                        if row is None:
+                            continue
+                        ohlc_lookup[sym] = {
+                            'open':  float(row.get('Open',  row.get('open',  0))),
+                            'high':  float(row.get('High',  row.get('high',  0))),
+                            'low':   float(row.get('Low',   row.get('low',   0))),
+                            'close': float(row.get('Close', row.get('close', 0))),
+                        }
                     except Exception:
                         continue
-                    if bar is None:
-                        continue
 
-                    change_pct = bar["change_pct"]
-                    close      = bar["close"]
-                    volume     = bar["volume"]
+        except Exception as e:
+            self.logger.warning(f"OHLC backfill failed: {e}")
+            return candidates
 
-                    if change_pct >= 20.0:
-                        continue
-                    if close < min_price_filter:
-                        continue
-                    if max_price_filter is not None and close > max_price_filter:
-                        continue
-                    if volume < min_volume_filter:
-                        continue
+        # Patch candidates in-place
+        patched = 0
+        skipped_no_match = 0
+        for c in candidates:
+            sym = c.get('symbol')
+            if sym in ohlc_lookup:
+                bar = ohlc_lookup[sym]
+                for field in ('open', 'high', 'low', 'close'):
+                    if c.get(field) is None:
+                        c[field] = bar[field]
+                # Also align price with close if it was 0 / None
+                if not c.get('price') and bar['close']:
+                    c['price'] = bar['close']
+                patched += 1
+            elif sym in {m['symbol'] for m in missing}:
+                skipped_no_match += 1
 
-                    # FIX: These filters used to be TradingView-screener-only —
-                    # a backfill run that skipped the screener silently dropped
-                    # them. Apply the same bounds here using the metrics computed
-                    # by _fetch_yf_bar_for_date, so filter behavior matches
-                    # between live and backfill runs.
-                    hv10 = bar.get("hv10")
-                    if lf.get("min_hv10") is not None and (hv10 is None or hv10 < lf["min_hv10"]):
-                        continue
-                    if lf.get("max_hv10") is not None and (hv10 is None or hv10 > lf["max_hv10"]):
-                        continue
-
-                    hv20 = bar.get("hv20")
-                    if lf.get("min_hv20") is not None and (hv20 is None or hv20 < lf["min_hv20"]):
-                        continue
-                    if lf.get("max_hv20") is not None and (hv20 is None or hv20 > lf["max_hv20"]):
-                        continue
-
-                    rel_vol = bar.get("relative_volume_10d")
-                    min_rel_vol = lf.get("min_relative_volume")
-                    if min_rel_vol is None:
-                        min_rel_vol = lf.get("min_volume_ratio")
-                    if min_rel_vol is not None and (rel_vol is None or rel_vol < min_rel_vol):
-                        continue
-
-                    atr14 = bar.get("atr14")
-                    if lf.get("min_atr14") is not None and (atr14 is None or atr14 < lf["min_atr14"]):
-                        continue
-
-                    market_cap = bar.get("market_cap")
-                    if min_mcap_filter is not None or max_mcap_filter is not None:
-                        if market_cap is None:
-                            continue
-                        if min_mcap_filter is not None and market_cap < min_mcap_filter:
-                            continue
-                        if max_mcap_filter is not None and market_cap > max_mcap_filter:
-                            continue
-
-                    candidates.append({
-                        "symbol":     symbol,
-                        "exchange":   "NASDAQ",
-                        "price":      float(close),
-                        "change_pct": float(change_pct),
-                        "volume":     int(volume),
-                        "market_cap": float(market_cap) if market_cap is not None else None,
-                        "high":       float(bar["high"]),
-                        "low":        float(bar["low"]),
-                        "open":       float(bar["open"]),
-                        "close":      float(close),
-                    })
-
-            if len(candidates) >= target_pool_size:
-                break
-
+        self.logger.info(
+            f"✓ OHLC backfilled for {patched}/{len(missing)} candidates "
+            f"for {target_date_only.isoformat()}"
+            + (f" ({skipped_no_match} skipped — no bar for that exact date, "
+               "left unpatched rather than guessing)" if skipped_no_match else "")
+        )
         return candidates
 
-    def _get_winners_symbols(self, target_date: datetime) -> set:
-        """Get set of symbols that were winners on this date"""
-        try:
-            # Import here to avoid circular dependency
-            from .daily_winners_supabase_client import DailyWinnersSupabaseClient
-            
-            client = DailyWinnersSupabaseClient(self.config)
-            winners_df = client.read_winners(
-                start_date=target_date.date().isoformat(),
-                end_date=target_date.date().isoformat()
-            )
-            
-            if winners_df.empty:
-                return set()
-            
-            return set(winners_df['symbol'].tolist())
-            
-        except Exception as e:
-            self.logger.warning(f"Could not fetch winners: {e}")
-            return set()
+    # ─────────────────────────────────────────────────────────────────────
+    # Existing helpers (unchanged except _fetch_from_tradingview which now
+    # includes high/low/open when the scraper returns them)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
+        if exchange == 'OTC':
+            return True
+        symbol_upper = symbol.upper()
+        for pattern in self.EXCLUDED_PATTERNS:
+            if pattern in symbol_upper:
+                return True
+        if len(symbol) > 5:
+            return True
+        return False
     
-    def _get_stocks_by_change_range(
-        self,
-        target_date: datetime,
-        min_change: float,
-        max_change: float,
-        limit: int,
-        exclude_symbols: set,
-        max_price_filter: Optional[float] = None,
-        min_market_cap_filter: Optional[float] = None,
-        max_market_cap_filter: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Get stocks within a specific change percentage range
-        
-        Args:
-            target_date: Target date
-            min_change: Minimum change %
-            max_change: Maximum change %
-            limit: Number of stocks to get
-            exclude_symbols: Symbols to exclude (winners)
-            max_price_filter: Optional price ceiling from learned_filters.json.
-                               Applied here so Phase 2 fallback candidates stay
-                               within the same price range as Phase 1 instead of
-                               pulling from the uncapped liquid-stocks list.
-            min_market_cap_filter: Optional market-cap floor from learned_filters.json.
-            max_market_cap_filter: Optional market-cap ceiling from learned_filters.json.
-            
-        Returns:
-            List of stock dictionaries
-        """
-        try:
-            if SCREENER_AVAILABLE and self.screener and self._is_live(target_date):
-                return self._screen_by_change_range(
-                    min_change, max_change, limit, exclude_symbols,
-                    max_price_filter=max_price_filter,
-                    min_market_cap_filter=min_market_cap_filter,
-                    max_market_cap_filter=max_market_cap_filter,
-                )
-            else:
-                return self._get_from_liquid_stocks(
-                    target_date, min_change, max_change, limit, exclude_symbols,
-                    max_price_filter=max_price_filter,
-                    min_market_cap_filter=min_market_cap_filter,
-                    max_market_cap_filter=max_market_cap_filter,
-                )
-        except Exception as e:
-            self.logger.error(f"Error getting stocks in range {min_change}% to {max_change}%: {e}")
+    def _fetch_from_tradingview(self, target_date: datetime, top_n: int) -> List[Dict[str, Any]]:
+        # TradingView's MarketMovers "gainers" scrape has no historical/point-in-time
+        # mode — it always returns *today's* real-time gainers regardless of what
+        # target_date is passed in. Calling it for a backfill date silently mislabels
+        # today's actual winners as winners for target_date (the exact bug reported:
+        # backfilling 02-04 came back with today's winners). Gate it to live runs only.
+        if not self._is_live(target_date):
+            self.logger.info(
+                f"⏭️  Skipping TradingView MarketMovers for {target_date.date().isoformat()} "
+                f"(not live — TradingView gainers has no point-in-time mode, only 'today')."
+            )
             return []
-    
-    def _screen_by_change_range(
-        self,
-        min_change: float,
-        max_change: float,
-        limit: int,
-        exclude_symbols: set,
-        max_price_filter: Optional[float] = None,
-        min_market_cap_filter: Optional[float] = None,
-        max_market_cap_filter: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """Use TradingView screener to find stocks in change range"""
+
         try:
-            filters = [
-                {'left': 'close', 'operation': 'greater', 'right': self.min_price},
-                {'left': 'volume', 'operation': 'greater', 'right': self.min_volume},
-                {'left': 'change', 'operation': 'greater', 'right': min_change},
-                {'left': 'change', 'operation': 'less', 'right': max_change}
-            ]
-            if max_price_filter is not None:
-                filters.append({'left': 'close', 'operation': 'less', 'right': max_price_filter})
-            if min_market_cap_filter is not None:
-                filters.append({'left': 'market_cap_basic', 'operation': 'greater', 'right': min_market_cap_filter})
-            if max_market_cap_filter is not None:
-                filters.append({'left': 'market_cap_basic', 'operation': 'less', 'right': max_market_cap_filter})
+            fetch_limit = max(top_n * 10, 500)
             
-            result = self.screener.screen(
-                market='america',
-                filters=filters,
-                sort_by='volume',
-                sort_order='desc',
-                limit=limit * 2
+            result = self.market_movers.scrape(
+                market='stocks-usa',
+                category='gainers',
+                limit=fetch_limit
             )
             
-            if result['status'] != 'success' or not result.get('data'):
+            if result['status'] != 'success':
+                self.logger.error(f"TradingView API error: {result.get('status')}")
                 return []
             
-            candidates = []
-            for item in result['data']:
+            data = result.get('data', [])
+            if not data:
+                self.logger.warning("No data from TradingView")
+                return []
+            
+            self.logger.info(f"Received {len(data)} gainers from TradingView")
+            
+            all_candidates = []
+            filtered_counts = {
+                'excluded_pattern': 0,
+                'low_price': 0,
+                'high_price': 0,
+                'low_volume': 0,
+                'no_change': 0,
+                'parse_error': 0
+            }
+            
+            for item in data:
                 try:
                     symbol_full = item.get('symbol', '')
                     if ':' in symbol_full:
@@ -950,79 +530,294 @@ class DailyNonWinnersDetector:
                         symbol = symbol_full
                         exchange_prefix = 'NASDAQ'
                     
+                    if not symbol:
+                        continue
+                    
+                    exchange_map = {
+                        'NASDAQ': 'NASDAQ',
+                        'NYSE':   'NYSE',
+                        'AMEX':   'AMEX',
+                        'BATS':   'NASDAQ'
+                    }
+                    exchange = exchange_map.get(exchange_prefix, exchange_prefix)
+                    
+                    if self._is_excluded_symbol(symbol, exchange):
+                        filtered_counts['excluded_pattern'] += 1
+                        self.logger.debug(f"🚫 Filtered (pattern): {exchange}:{symbol}")
+                        continue
+                    
+                    price      = float(item.get('close', 0))
+                    change_pct = float(item.get('change', 0))
+                    volume     = int(item.get('volume', 0))
+                    
+                    if price < self.min_price:
+                        filtered_counts['low_price'] += 1
+                        self.logger.debug(f"🚫 Filtered (price): {symbol} ${price:.2f}")
+                        continue
+                    
+                    if price > self.max_price:
+                        filtered_counts['high_price'] += 1
+                        self.logger.debug(f"🚫 Filtered (price > max): {symbol} ${price:.2f}")
+                        continue
+                    
+                    if volume < self.min_volume:
+                        filtered_counts['low_volume'] += 1
+                        self.logger.debug(f"🚫 Filtered (volume): {symbol} {volume:,}")
+                        continue
+                    
+                    if change_pct < self.min_change_pct:
+                        filtered_counts['no_change'] += 1
+                        continue
+                    
+                    # Capture OHLC from TradingView if available; None otherwise
+                    # (None fields are backfilled by _backfill_ohlc)
+                    all_candidates.append({
+                        'symbol':     symbol.strip().upper(),
+                        'exchange':   exchange,
+                        'price':      float(price),
+                        'change_pct': float(change_pct),
+                        'volume':     int(volume),
+                        'high':       float(item['high'])  if item.get('high')  else None,
+                        'low':        float(item['low'])   if item.get('low')   else None,
+                        'open':       float(item['open'])  if item.get('open')  else None,
+                        'close':      float(item['close']) if item.get('close') else float(price),
+                        'source':     'tradingview',
+                    })
+                    
+                    self.logger.debug(f"✅ Passed filters: {exchange}:{symbol} +{change_pct:.2f}%")
+                    
+                except Exception:
+                    filtered_counts['parse_error'] += 1
+                    continue
+            
+            self.logger.info(
+                f"TradingView filtering: total={len(data)}, "
+                f"excluded={filtered_counts['excluded_pattern']}, "
+                f"low_price={filtered_counts['low_price']}, "
+                f"high_price={filtered_counts['high_price']}, "
+                f"low_volume={filtered_counts['low_volume']}, "
+                f"no_change={filtered_counts['no_change']}, "
+                f"passed={len(all_candidates)}"
+            )
+            
+            return all_candidates
+            
+        except Exception as e:
+            self.logger.error(f"Error fetching from TradingView: {e}", exc_info=True)
+            return []
+    
+    def _fetch_from_yfinance_screener(
+        self, 
+        target_date: datetime, 
+        limit: int,
+        exclude_symbols: Set[str]
+    ) -> List[Dict[str, Any]]:
+        # Same problem as TradingView: yfinance's `Screener().get_screeners(['day_gainers'])`
+        # is a live "today's movers" endpoint with no target_date parameter — there is
+        # no way to ask it for gainers on a past date. For a backfill date it would
+        # silently hand back today's real winners again. Route straight to the
+        # point-in-time universe scan instead.
+        if not self._is_live(target_date):
+            self.logger.info(
+                f"⏭️  Skipping yfinance day_gainers Screener for {target_date.date().isoformat()} "
+                f"(not live — it only returns today's movers, no historical mode)."
+            )
+            return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+
+        try:
+            self.logger.info("Fetching from yfinance screener...")
+            
+            try:
+                from yfinance import Screener
+                
+                screener = Screener()
+                gainers_data = screener.get_screeners(['day_gainers'], count=limit * 2)
+                
+                if not gainers_data or 'day_gainers' not in gainers_data:
+                    return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+                
+                quotes = gainers_data['day_gainers'].get('quotes', [])
+                candidates = []
+                
+                for quote in quotes:
+                    symbol = quote.get('symbol', '')
                     if not symbol or symbol in exclude_symbols:
                         continue
-                    
-                    if self._is_excluded_symbol(symbol, exchange_prefix):
+                    if self._is_excluded_symbol(symbol, 'NASDAQ'):
                         continue
                     
-                    price = float(item.get('close', 0))
-                    change_pct = float(item.get('change', 0))
-                    volume = int(item.get('volume', 0))
-                    market_cap = item.get('market_cap_basic')
+                    price      = quote.get('regularMarketPrice', 0)
+                    change_pct = quote.get('regularMarketChangePercent', 0)
+                    volume     = quote.get('regularMarketVolume', 0)
                     
-                    if price < self.min_price or volume < self.min_volume:
+                    if (price < self.min_price or price > self.max_price
+                            or volume < self.min_volume or change_pct < self.min_change_pct):
                         continue
-                    if max_price_filter is not None and price > max_price_filter:
-                        continue
-                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
-                        if market_cap is None:
-                            continue
-                        market_cap = float(market_cap)
-                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
-                            continue
-                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
-                            continue
-                    
                     candidates.append({
-                        'symbol': symbol.strip().upper(),
-                        'exchange': exchange_prefix,
-                        'price': float(price),
+                        'symbol':     symbol.upper(),
+                        'exchange':   quote.get('exchange', 'NASDAQ'),
+                        'price':      float(price),
                         'change_pct': float(change_pct),
-                        'volume': int(volume),
-                        'market_cap': float(market_cap) if market_cap is not None else None,
-                        'high': float(item.get('high', price)),
-                        'low': float(item.get('low', price)),
-                        'open': float(item.get('open', price)),
-                        'close': float(price)
+                        'volume':     int(volume),
+                        'high':       float(quote['regularMarketDayHigh'])  if quote.get('regularMarketDayHigh')  else None,
+                        'low':        float(quote['regularMarketDayLow'])   if quote.get('regularMarketDayLow')   else None,
+                        'open':       float(quote['regularMarketOpen'])     if quote.get('regularMarketOpen')     else None,
+                        'close':      float(price),
+                        'source':     'yfinance_screener',
                     })
                     
                     if len(candidates) >= limit:
                         break
-                        
-                except Exception as e:
-                    continue
+                
+                self.logger.info(f"✅ Found {len(candidates)} from yfinance Screener")
+                return candidates
+                
+            except (ImportError, AttributeError) as e:
+                self.logger.warning(f"Screener unavailable: {e}")
+                return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
+                
+        except Exception as e:
+            self.logger.error(f"Error in yfinance screener: {e}", exc_info=True)
+            return []
+    
+    def _fetch_from_liquid_stocks(
+        self,
+        target_date: datetime,
+        limit: int,
+        exclude_symbols: Set[str]
+    ) -> List[Dict[str, Any]]:
+        if not self._is_live(target_date):
+            return self._fetch_from_liquid_stocks_for_date(target_date, limit, exclude_symbols)
+
+        try:
+            self.logger.info("Scanning liquid stocks...")
             
+            candidates = []
+            liquid_stocks = self._get_liquid_stocks_list()
+            liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
+            
+            batch_size = 50
+            for i in range(0, len(liquid_stocks), batch_size):
+                batch = liquid_stocks[i:i + batch_size]
+                
+                try:
+                    data = self.rate_limiter.call_with_backoff(
+                        yf.download,
+                        batch,
+                        period='2d',
+                        interval='1d',
+                        group_by='ticker',
+                        progress=False,
+                        threads=True,
+                        auto_adjust=True,
+                        label=f"live liquid batch ({len(batch)} symbols)",
+                    )
+                    
+                    if data.empty:
+                        continue
+                    
+                    for symbol in batch:
+                        if symbol in exclude_symbols:
+                            continue
+                        
+                        try:
+                            if len(batch) == 1:
+                                stock_data = data
+                            else:
+                                if symbol not in data.columns.get_level_values(0):
+                                    continue
+                                stock_data = data[symbol]
+                            
+                            if stock_data.empty or len(stock_data) < 2:
+                                continue
+                            
+                            latest   = stock_data.iloc[-1]
+                            previous = stock_data.iloc[-2]
+                            
+                            close      = float(latest['Close'])
+                            prev_close = float(previous['Close'])
+                            volume     = int(latest['Volume'])
+                            change_pct = ((close - prev_close) / prev_close) * 100
+                            
+                            if (close < self.min_price or close > self.max_price
+                                    or volume < self.min_volume or change_pct < self.min_change_pct):
+                                continue
+                            if self._is_excluded_symbol(symbol, 'NASDAQ'):
+                                continue
+                            
+                            candidates.append({
+                                'symbol':     symbol.upper(),
+                                'exchange':   'NASDAQ',
+                                'price':      close,
+                                'change_pct': float(change_pct),
+                                'volume':     volume,
+                                # Full OHLC available from daily bar
+                                'high':       float(latest['High']),
+                                'low':        float(latest['Low']),
+                                'open':       float(latest['Open']),
+                                'close':      close,
+                                'source':     'yfinance_liquid',
+                            })
+                            
+                        except Exception:
+                            continue
+                
+                except Exception:
+                    continue
+                
+                if len(candidates) >= limit:
+                    break
+                
+                time.sleep(0.3)
+            
+            if candidates:
+                candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)
+                candidates = candidates[:limit]
+            
+            self.logger.info(f"✅ Found {len(candidates)} from liquid stocks")
             return candidates
             
         except Exception as e:
-            self.logger.error(f"TradingView screener error: {e}")
+            self.logger.error(f"Error in liquid stocks: {e}", exc_info=True)
             return []
-    
-    def _get_from_liquid_stocks(
+
+    # Scans batches of symbols in parallel rather than one `yf.download` call
+    # at a time. This mattered less before min_change_pct was enforced (any
+    # positive mover passed, so few symbols needed checking) — with a real
+    # 20% floor, most symbols get rejected and the scan has to get much
+    # deeper into the universe to gather enough qualifying candidates.
+    # Serial fetches at that depth is what turned a 15-stock backfill into a
+    # 15-minute wait; concurrency is the fix, not a smaller universe.
+    SCAN_WORKERS = 20
+    SCAN_BATCH_SIZE = 60
+
+    def _fetch_from_liquid_stocks_for_date(
         self,
         target_date: datetime,
-        min_change: float,
-        max_change: float,
         limit: int,
-        exclude_symbols: set,
-        max_price_filter: Optional[float] = None,
-        min_market_cap_filter: Optional[float] = None,
-        max_market_cap_filter: Optional[float] = None,
+        exclude_symbols: Set[str]
     ) -> List[Dict[str, Any]]:
-        """Get stocks from liquid stock list using yfinance"""
+        """
+        Backfill-safe counterpart to _fetch_from_liquid_stocks. Uses
+        _fetch_yf_bar_for_date so every candidate's OHLC is pinned to
+        target_date instead of "whatever yfinance's last row is right now."
+
+        Scans in parallel batches of SCAN_BATCH_SIZE via a thread pool
+        (SCAN_WORKERS workers) instead of one symbol at a time, stopping as
+        soon as enough candidates have been gathered.
+        """
+        self.logger.info(f"Scanning liquid stocks for {target_date.date().isoformat()}...")
+
+        candidates = []
         liquid_stocks = self._get_liquid_stocks_list()
         liquid_stocks = [s for s in liquid_stocks if s not in exclude_symbols]
 
-        candidates = []
+        target_pool = limit * 3
+        scanned = 0
 
-        # FIX: was a serial for-loop with time.sleep(0.1) per symbol and no
-        # batching — see _get_filtered_candidates fix notes above for why
-        # that's a multi-minute-per-call bottleneck at universe scale.
         for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
-            if len(candidates) >= limit:
-                break
             batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
+            scanned += len(batch)
 
             with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
                 future_to_symbol = {
@@ -1038,129 +833,197 @@ class DailyNonWinnersDetector:
                     if bar is None:
                         continue
 
-                    change_pct = bar['change_pct']
-                    close      = bar['close']
-                    volume     = bar['volume']
-
-                    if max_price_filter is not None and close > max_price_filter:
+                    close, volume, change_pct = bar['close'], bar['volume'], bar['change_pct']
+                    if (close < self.min_price or close > self.max_price
+                            or volume < self.min_volume or change_pct < self.min_change_pct):
+                        continue
+                    if self._is_excluded_symbol(symbol, 'NASDAQ'):
                         continue
 
-                    market_cap = bar.get('market_cap')
-                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
-                        if market_cap is None:
-                            continue
-                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
-                            continue
-                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
-                            continue
+                    candidates.append({
+                        'symbol':     symbol.upper(),
+                        'exchange':   'NASDAQ',
+                        'price':      close,
+                        'change_pct': float(change_pct),
+                        'volume':     volume,
+                        'high':       bar['high'],
+                        'low':        bar['low'],
+                        'open':       bar['open'],
+                        'close':      close,
+                        'source':     'yfinance_liquid_backfill',
+                    })
 
-                    if min_change <= change_pct <= max_change:
-                        if close >= self.min_price and volume >= self.min_volume:
-                            candidates.append({
-                                'symbol': symbol,
-                                'exchange': 'NASDAQ',
-                                'price': float(close),
-                                'change_pct': float(change_pct),
-                                'volume': int(volume),
-                                'market_cap': float(market_cap) if market_cap is not None else None,
-                                'high': float(bar['high']),
-                                'low': float(bar['low']),
-                                'open': float(bar['open']),
-                                'close': float(close)
-                            })
+            self.logger.info(
+                f"  Scanned {scanned}/{len(liquid_stocks)} symbols, "
+                f"{len(candidates)}/{target_pool} candidates so far..."
+            )
 
-        return candidates[:limit]
-    
-    def _get_random_liquid_stocks(
-        self,
-        target_date: datetime,
-        limit: int,
-        exclude_winners: set,
-        exclude_existing: set,
-        max_price_filter: Optional[float] = None,
-        min_market_cap_filter: Optional[float] = None,
-        max_market_cap_filter: Optional[float] = None,
-    ) -> List[Dict[str, Any]]:
-        """Get random stocks from liquid list as fallback"""
-        liquid_stocks = self._get_liquid_stocks_list()
-        liquid_stocks = [
-            s for s in liquid_stocks 
-            if s not in exclude_winners and s not in exclude_existing
-        ]
-        
-        candidates = []
-        scan_pool = liquid_stocks[:limit * 2]
-
-        for batch_start in range(0, len(scan_pool), self.SCAN_BATCH_SIZE):
-            if len(candidates) >= limit:
+            if len(candidates) >= target_pool:
                 break
-            batch = scan_pool[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
-            with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
-                future_to_symbol = {
-                    executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
-                    for symbol in batch
-                }
-                for future in as_completed(future_to_symbol):
-                    symbol = future_to_symbol[future]
+        candidates = sorted(candidates, key=lambda x: x['change_pct'], reverse=True)[:limit]
+        self.logger.info(f"✅ Found {len(candidates)} from liquid stocks (backfill, date-pinned)")
+        return candidates
+    
+    def _batch_verify_freshness(
+        self, 
+        candidates: List[Dict[str, Any]], 
+        target_date: datetime,
+        batch_size: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Enhanced debug version — shows exactly why each symbol passes or fails."""
+        if not candidates:
+            return []
+        
+        valid_candidates = []
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+
+        if not self._is_live(target_date):
+            # period='5d' below fetches the 5 days most recent to *right now*,
+            # not the 5 days around target_date. For a historical backfill
+            # that makes days_diff go negative (always <= 5), so it silently
+            # passed and stamped today's OHLC onto old candidates — the same
+            # class of bug fixed in _backfill_ohlc. Route backfills through
+            # the date-pinned helper instead.
+            return self._verify_freshness_for_date(candidates, target_date)
+
+        symbols = [c['symbol'] for c in candidates]
+        
+        self.logger.info("=" * 80)
+        self.logger.info(f"🔍 FRESHNESS VALIDATION DEBUG - Target date: {target_date_obj}")
+        self.logger.info("=" * 80)
+        
+        for i in range(0, len(symbols), batch_size):
+            batch_symbols    = symbols[i:i + batch_size]
+            batch_candidates = candidates[i:i + batch_size]
+            
+            self.logger.info(f"📦 Batch {i//batch_size + 1}: Checking {len(batch_symbols)} symbols")
+            
+            try:
+                data = self.rate_limiter.call_with_backoff(
+                    yf.download,
+                    batch_symbols,
+                    period='5d',
+                    interval='1d',
+                    group_by='ticker',
+                    progress=False,
+                    threads=True,
+                    auto_adjust=True,
+                    label=f"freshness batch {i//batch_size + 1}",
+                )
+                
+                if data.empty:
+                    self.logger.warning(f"⚠️ No data returned for batch {i//batch_size + 1}")
+                    continue
+                
+                for symbol, candidate in zip(batch_symbols, batch_candidates):
+                    self.logger.info(f"\n{'='*60}")
+                    self.logger.info(f"🔍 Checking: {symbol}")
+                    
                     try:
-                        bar = future.result()
-                    except Exception:
-                        continue
-                    if bar is None:
-                        continue
-
-                    change_pct = bar['change_pct']
-                    close      = bar['close']
-                    volume     = bar['volume']
-
-                    # Exclude big gainers (>20%)
-                    if change_pct > 20:
-                        continue
-
-                    if max_price_filter is not None and close > max_price_filter:
-                        continue
-
-                    market_cap = bar.get('market_cap')
-                    if min_market_cap_filter is not None or max_market_cap_filter is not None:
-                        if market_cap is None:
+                        if len(batch_symbols) == 1:
+                            symbol_data = data
+                        else:
+                            if symbol not in data.columns.get_level_values(0):
+                                self.logger.warning(f"  ❌ {symbol}: Not in response data")
+                                continue
+                            symbol_data = data[symbol]
+                        
+                        if symbol_data.empty:
+                            self.logger.warning(f"  ❌ {symbol}: Empty data frame")
                             continue
-                        if min_market_cap_filter is not None and market_cap < min_market_cap_filter:
+                        
+                        available_dates = symbol_data.index.date
+                        self.logger.info(f"  📅 Available dates: {[str(d) for d in available_dates]}")
+                        
+                        last_date   = symbol_data.index[-1].date()
+                        last_close  = symbol_data['Close'].iloc[-1]
+                        last_volume = symbol_data['Volume'].iloc[-1]
+                        
+                        self.logger.info(f"  📊 Last trading day: {last_date}")
+                        self.logger.info(f"  💰 Last close: {'NaN' if pd.isna(last_close) else f'${last_close:.2f}'}")
+                        self.logger.info(f"  📈 Last volume: {'NaN' if pd.isna(last_volume) else f'{last_volume:,}'}")
+                        
+                        days_diff = (target_date_obj - last_date).days
+                        self.logger.info(f"  ⏱️  Age: {days_diff} days old")
+                        
+                        if days_diff > 5:
+                            self.logger.warning(f"  ❌ REJECTED: Data is {days_diff} days old (limit: 5)")
                             continue
-                        if max_market_cap_filter is not None and market_cap > max_market_cap_filter:
+                        if pd.isna(last_close) or pd.isna(last_volume):
+                            self.logger.warning(f"  ❌ REJECTED: NaN close or volume")
                             continue
+                        if last_volume < self.min_volume:
+                            self.logger.warning(f"  ❌ REJECTED: volume {last_volume:,} < {self.min_volume:,}")
+                            continue
+                        
+                        # ── Opportunistically fill OHLC from this validation fetch ──
+                        row = symbol_data.iloc[-1]
+                        for field, col in (('high', 'High'), ('low', 'Low'),
+                                           ('open', 'Open'), ('close', 'Close')):
+                            if candidate.get(field) is None and not pd.isna(row.get(col, float('nan'))):
+                                candidate[field] = float(row[col])
+                        
+                        self.logger.info(f"  ✅✅ {symbol} PASSED ALL VALIDATION CHECKS")
+                        valid_candidates.append(candidate)
+                        
+                    except Exception as e:
+                        self.logger.error(f"  ❌ {symbol}: Error: {e}", exc_info=True)
+                        continue
+                
+                if i + batch_size < len(symbols):
+                    time.sleep(0.5)
+                
+            except Exception as e:
+                self.logger.error(f"❌ Batch {i//batch_size + 1} error: {e}", exc_info=True)
+                continue
+        
+        self.logger.info("\n" + "=" * 80)
+        self.logger.info(f"📊 VALIDATION SUMMARY: "
+                         f"total={len(candidates)}, "
+                         f"passed={len(valid_candidates)}, "
+                         f"rejected={len(candidates)-len(valid_candidates)}")
+        self.logger.info("=" * 80 + "\n")
+        
+        return valid_candidates
 
-                    if close >= self.min_price and volume >= self.min_volume:
-                        candidates.append({
-                            'symbol': symbol,
-                            'exchange': 'NASDAQ',
-                            'price': float(close),
-                            'change_pct': float(change_pct),
-                            'volume': int(volume),
-                            'market_cap': float(market_cap) if market_cap is not None else None,
-                            'high': float(bar['high']),
-                            'low': float(bar['low']),
-                            'open': float(bar['open']),
-                            'close': float(close)
-                        })
+    def _verify_freshness_for_date(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_date: datetime,
+    ) -> List[Dict[str, Any]]:
+        """
+        Backfill-safe counterpart to _batch_verify_freshness. Validates and
+        fills OHLC using _fetch_yf_bar_for_date so nothing gets compared
+        against, or overwritten with, "whatever's most recent right now."
+        """
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        valid_candidates = []
 
-        return candidates[:limit]
-    
-    def _is_excluded_symbol(self, symbol: str, exchange: str) -> bool:
-        """Check if symbol should be excluded"""
-        if exchange == 'OTC':
-            return True
-        
-        symbol_upper = symbol.upper()
-        for pattern in self.EXCLUDED_PATTERNS:
-            if pattern in symbol_upper:
-                return True
-        
-        if len(symbol) > 5:
-            return True
-        
-        return False
-    
+        for candidate in candidates:
+            symbol = candidate['symbol']
+            bar = self._fetch_yf_bar_for_date(symbol, target_date)
+            if bar is None:
+                self.logger.warning(f"  ❌ {symbol}: no bar for {target_date_obj} — rejected")
+                continue
+            if bar['volume'] < self.min_volume:
+                self.logger.warning(f"  ❌ {symbol}: volume {bar['volume']:,} < {self.min_volume:,}")
+                continue
+
+            for field, key in (('high', 'high'), ('low', 'low'),
+                                ('open', 'open'), ('close', 'close')):
+                if candidate.get(field) is None:
+                    candidate[field] = bar[key]
+
+            valid_candidates.append(candidate)
+
+        self.logger.info(
+            f"📊 VALIDATION SUMMARY (backfill, date-pinned): "
+            f"total={len(candidates)}, passed={len(valid_candidates)}, "
+            f"rejected={len(candidates)-len(valid_candidates)}"
+        )
+        return valid_candidates
+
     def _load_selection_counts(self) -> Dict[str, int]:
         if self.SELECTION_COUNTS_PATH.exists():
             try:
@@ -1176,9 +1039,6 @@ class DailyNonWinnersDetector:
             json.dump(self._selection_counts, f, indent=2)
 
     def _record_selections(self, symbols: List[str]) -> None:
-        """Bump usage counts for symbols actually selected this call, and
-        persist immediately so a crash mid-backfill doesn't lose the count
-        (which would let over-used symbols get picked again)."""
         if not symbols:
             return
         for s in symbols:
@@ -1186,28 +1046,15 @@ class DailyNonWinnersDetector:
         self._save_selection_counts()
 
     def _get_liquid_stocks_list(self) -> List[str]:
-        """
-        Broad, shuffled, non-overused symbol pool for backfill sampling.
-
-        Replaces the old hardcoded ~120-megacap list. That list caused every
-        backfill date to sample from the same tiny pool of blue-chip names —
-        trivially separable from winners on price/market-cap/volatility
-        alone, and heavily duplicated across dates since there was nowhere
-        else to draw from.
-
-        This loads UNIVERSE_PATH (thousands of tickers expected, not ~120),
-        excludes any symbol that has already hit MAX_USES_PER_SYMBOL across
-        this backfill run, and shuffles on every call so scan order (and
-        therefore which symbols fill a date's quota first) varies date to
-        date instead of always favoring the same alphabetically-first names.
-        """
+        """Broad, shuffled, non-overused symbol pool for backfill sampling.
+        See daily_non_winners_detector.py's version of this method for the
+        full rationale — same fix, same reasoning, applied here too."""
         if self._universe_cache is None:
             if not self.UNIVERSE_PATH.exists():
                 raise FileNotFoundError(
                     f"Universe file not found at {self.UNIVERSE_PATH}. Refusing to "
-                    f"fall back to a small hardcoded list — that's the exact repetition "
-                    f"bug this replaces. Populate a broad symbol list (e.g. NASDAQ "
-                    f"Trader nasdaqlisted.txt + otherlisted.txt) at that path first."
+                    f"fall back to a small hardcoded list. Populate a broad symbol "
+                    f"list at that path first (see build_universe.py)."
                 )
             df = pd.read_csv(self.UNIVERSE_PATH)
             self._universe_cache = sorted(set(df["symbol"].astype(str).str.upper().tolist()))
