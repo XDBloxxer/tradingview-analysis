@@ -157,6 +157,82 @@ class DailyNonWinnersDetector:
         target = target_date.date() if isinstance(target_date, datetime) else target_date
         return target >= datetime.now().date()
 
+    # How many symbols to pack into a single yf.download() batch call when
+    # prefetching daily bars for a scan (see _batch_prefetch_daily_bars).
+    # Mirrors the equivalent fix in daily_winners_detector.py — this scan
+    # went through _fetch_yf_bar_for_date's per-symbol yf.Ticker().history()
+    # call the same way winners' did, still funneling through the one
+    # shared RateLimiter regardless of SCAN_WORKERS thread count.
+    DAILY_BATCH_FETCH_SIZE = 30
+
+    def _batch_prefetch_daily_bars(self, symbols: List[str], target_date: datetime) -> None:
+        """
+        Warm self._daily_bar_cache with 1d bars (45-day lookback, same
+        window _fetch_yf_bar_for_date uses for hv10/hv20/atr14) for
+        `symbols` using yf.download(), which fans a multi-ticker request
+        out internally in ONE call instead of one rate-limited
+        yf.Ticker().history() call per symbol.
+
+        Any symbol not found in the batch response (bad ticker, delisted,
+        no data, etc.) simply falls through to _fetch_yf_bar_for_date's
+        normal per-symbol path unchanged.
+
+        NOTE: this does NOT prefetch market_cap — that comes from
+        ticker.fast_info, a separate per-symbol call that yf.download's
+        batch response doesn't include, and _fetch_yf_bar_for_date still
+        makes that call individually (outside the rate limiter, as before)
+        even for cache hits.
+        """
+        if not hasattr(self, "_daily_bar_cache"):
+            self._daily_bar_cache: Dict[str, Any] = {}
+
+        target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+        start = target_date_only - timedelta(days=45)
+        end = target_date_only + timedelta(days=1)
+
+        eligible = [s for s in symbols if s not in self._daily_bar_cache]
+        if not eligible:
+            return
+
+        batch_size = getattr(self, "DAILY_BATCH_FETCH_SIZE", 30)
+        for i in range(0, len(eligible), batch_size):
+            batch = eligible[i:i + batch_size]
+            try:
+                data = self.rate_limiter.call_with_backoff(
+                    yf.download,
+                    batch,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
+                    interval='1d',
+                    group_by='ticker',
+                    progress=False,
+                    threads=True,
+                    auto_adjust=True,
+                    label=f"daily bar prefetch[{i}:{i + len(batch)}]",
+                )
+            except Exception as e:
+                self.logger.debug(
+                    f"Daily bar batch prefetch failed for group {i}:{i + len(batch)} — {e}. "
+                    f"Symbols in this group fall back to individual fetches."
+                )
+                continue
+
+            if data is None or data.empty:
+                continue
+
+            for symbol in batch:
+                try:
+                    if len(batch) == 1:
+                        stock_data = data
+                    else:
+                        if symbol not in data.columns.get_level_values(0):
+                            continue
+                        stock_data = data[symbol].dropna(how='all')
+                    if not stock_data.empty:
+                        self._daily_bar_cache[symbol] = stock_data
+                except Exception:
+                    continue
+
     def _fetch_yf_bar_for_date(self, symbol: str, target_date: datetime) -> Optional[Dict[str, float]]:
         """
         Fetch the daily OHLCV bar for `symbol` on `target_date` specifically,
@@ -187,14 +263,18 @@ class DailyNonWinnersDetector:
         start = target_date_only - timedelta(days=45)
         end = target_date_only + timedelta(days=1)
 
-        try:
-            ticker = yf.Ticker(symbol)
-            hist = self.rate_limiter.call_with_backoff(
-                ticker.history, start=start.isoformat(), end=end.isoformat(),
-                interval='1d', label=f"{symbol} date-pinned OHLC"
-            )
-        except Exception:
-            return None
+        ticker = yf.Ticker(symbol)  # still needed below for fast_info market_cap
+        cached = getattr(self, "_daily_bar_cache", {}).get(symbol)
+        if cached is not None:
+            hist = cached
+        else:
+            try:
+                hist = self.rate_limiter.call_with_backoff(
+                    ticker.history, start=start.isoformat(), end=end.isoformat(),
+                    interval='1d', label=f"{symbol} date-pinned OHLC"
+                )
+            except Exception:
+                return None
 
         if hist.empty:
             return None
@@ -755,6 +835,8 @@ class DailyNonWinnersDetector:
         for batch_start in range(0, len(liquid_stocks), self.SCAN_BATCH_SIZE):
             batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
+            self._batch_prefetch_daily_bars(batch, target_date)
+
             with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
                 future_to_symbol = {
                     executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
@@ -1027,6 +1109,8 @@ class DailyNonWinnersDetector:
                 break
             batch = liquid_stocks[batch_start:batch_start + self.SCAN_BATCH_SIZE]
 
+            self._batch_prefetch_daily_bars(batch, target_date)
+
             with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
                 future_to_symbol = {
                     executor.submit(self._fetch_yf_bar_for_date, symbol, target_date): symbol
@@ -1098,6 +1182,8 @@ class DailyNonWinnersDetector:
             if len(candidates) >= limit:
                 break
             batch = scan_pool[batch_start:batch_start + self.SCAN_BATCH_SIZE]
+
+            self._batch_prefetch_daily_bars(batch, target_date)
 
             with ThreadPoolExecutor(max_workers=self.SCAN_WORKERS) as executor:
                 future_to_symbol = {
