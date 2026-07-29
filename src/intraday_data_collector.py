@@ -29,14 +29,46 @@ class IntradayDataCollector:
     
     MAX_WORKERS = 5
     LOOKBACK_DAYS = 90
-    
-    def __init__(self, config: dict):
+
+    # How many tickers to pack into a single yf.download() batch call.
+    # yf.download natively fans a multi-ticker request out over its own
+    # internal thread pool in ONE call, so this replaces N separate
+    # rate-limited ticker.history() round-trips with a much smaller number
+    # of batched round-trips. Configurable via config['backfill_rate_limiting']
+    # or config['rate_limiting']['batch_fetch_size'].
+    BATCH_FETCH_SIZE = 25
+
+    def __init__(self, config: dict, backfill_mode: bool = False):
         self.logger = logging.getLogger(__name__)
         self.config = config
-        self.rate_limiter = RateLimiter(config)
+        self.backfill_mode = backfill_mode
+        self.rate_limiter = RateLimiter(config, backfill_mode=backfill_mode)
         self.stats = {'total': 0, 'success': 0, 'failed': 0}
         self.cache = {}
-        self.logger.info("Intraday data collector initialized (FIXED - uses intraday indicators)")
+
+        rate_config = config.get("rate_limiting", {})
+        backfill_config = config.get("backfill_rate_limiting", {}) if backfill_mode else {}
+
+        # Worker count and batch size can both be raised for backfills since
+        # the global RateLimiter (or, for the batched path, the coarser
+        # per-batch pacing) is what actually protects Yahoo from being
+        # hammered -- more worker threads mostly just means less idle time
+        # waiting on I/O, not more requests/sec.
+        self.MAX_WORKERS = backfill_config.get(
+            "intraday_max_workers", rate_config.get("intraday_max_workers", self.MAX_WORKERS)
+        )
+        self.BATCH_FETCH_SIZE = backfill_config.get(
+            "batch_fetch_size", rate_config.get("batch_fetch_size", self.BATCH_FETCH_SIZE)
+        )
+        self.use_batch_fetch = backfill_config.get(
+            "use_batch_fetch", rate_config.get("use_batch_fetch", backfill_mode)
+        )
+
+        self.logger.info(
+            f"Intraday data collector initialized (FIXED - uses intraday indicators) "
+            f"[backfill_mode={backfill_mode}, max_workers={self.MAX_WORKERS}, "
+            f"batch_fetch={self.use_batch_fetch} size={self.BATCH_FETCH_SIZE}]"
+        )
     
     def collect_intraday_data(
         self,
@@ -53,7 +85,11 @@ class IntradayDataCollector:
             'day_prior_open': [],
             'day_prior_close': []
         }
-        
+
+        if self.use_batch_fetch:
+            symbols = [w.get('symbol') for w in winners if w.get('symbol')]
+            self._batch_prefetch_5min(symbols, target_date)
+
         with ThreadPoolExecutor(max_workers=self.MAX_WORKERS) as executor:
             future_to_winner = {
                 executor.submit(self._process_winner, winner, target_date): winner
@@ -276,6 +312,93 @@ class IntradayDataCollector:
             self.logger.error(f"Error finding prior trading day: {e}")
             return None
     
+    def _batch_prefetch_5min(self, symbols: List[str], target_date: datetime) -> None:
+        """
+        Warm self.cache with 5-min bars for as many symbols as possible using
+        yf.download(), which fans a multi-ticker request out internally in
+        ONE call instead of one rate-limited ticker.history() call per
+        symbol. Symbols outside yfinance's ~58-day 5-min window are skipped
+        here exactly like _fetch_intraday_extended already skips them (they
+        fall through to the daily-bar fallback instead).
+
+        This only populates the cache; _fetch_intraday_extended/_process_winner
+        still run per-symbol afterward but hit the cache instead of the
+        network for anything successfully prefetched here. Any symbol NOT
+        found in the batch response (bad ticker, delisted, etc.) simply
+        falls through to the normal per-symbol path unchanged.
+        """
+        target_date_only = target_date.date() if isinstance(target_date, datetime) else target_date
+        if (datetime.now().date() - target_date_only).days > 58:
+            self.logger.debug(
+                f"Batch prefetch: {target_date_only.isoformat()} is outside the 5-min "
+                f"window — skipping batch fetch entirely, all symbols go to daily fallback."
+            )
+            return
+
+        eligible = [s for s in symbols if f"{s}:intraday_extended" not in self.cache]
+        if not eligible:
+            return
+
+        self.logger.info(
+            f"Batch prefetching 5-min bars for {len(eligible)} symbols "
+            f"in groups of {self.BATCH_FETCH_SIZE}..."
+        )
+
+        for i in range(0, len(eligible), self.BATCH_FETCH_SIZE):
+            batch = eligible[i:i + self.BATCH_FETCH_SIZE]
+            try:
+                df = self.rate_limiter.call_with_backoff(
+                    yf.download,
+                    tickers=batch,
+                    period="60d",
+                    interval="5m",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    threads=True,
+                    progress=False,
+                    label=f"batch[{i}:{i+len(batch)}]",
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Batch prefetch failed for group {i}:{i+len(batch)} — {e}. "
+                    f"Symbols in this group fall back to individual fetches."
+                )
+                continue
+
+            if df is None or df.empty:
+                continue
+
+            for symbol in batch:
+                try:
+                    if len(batch) == 1:
+                        sym_df = df
+                    elif symbol in df.columns.get_level_values(0):
+                        sym_df = df[symbol].dropna(how="all")
+                    else:
+                        continue
+
+                    if sym_df is None or sym_df.empty:
+                        continue
+
+                    sym_df = sym_df.rename(columns=str.title)  # Open/High/Low/Close/Volume
+                    sym_df.index = pd.to_datetime(sym_df.index)
+                    if sym_df.index.tz is None:
+                        sym_df.index = sym_df.index.tz_localize('America/New_York')
+                    else:
+                        sym_df.index = sym_df.index.tz_convert('America/New_York')
+
+                    indicators_df = self._calculate_enhanced_indicators(sym_df)
+                    self.cache[f"{symbol}:intraday_extended"] = indicators_df
+                except Exception as e:
+                    self.logger.debug(f"Batch prefetch: could not process {symbol} — {e}")
+                    continue
+
+        cached_count = sum(1 for s in eligible if f"{s}:intraday_extended" in self.cache)
+        self.logger.info(
+            f"Batch prefetch complete: {cached_count}/{len(eligible)} symbols cached "
+            f"(remainder will fetch individually)."
+        )
+
     def _fetch_intraday_extended(self, symbol: str, target_date: datetime) -> Optional[pd.DataFrame]:
         """
         Fetch extended intraday data (5-min bars for past 60 days)
