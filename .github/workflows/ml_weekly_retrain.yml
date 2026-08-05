@@ -27,6 +27,11 @@ on:
         required: false
         default: false
         type: boolean
+      use_base_training_data:
+        description: 'Include the legacy ml_training_base seed table (t3_/t5_/t10_ only, no t1_) in the training set'
+        required: false
+        default: false
+        type: boolean
 
 # CRITICAL: Grant write permissions to push model updates
 permissions:
@@ -70,6 +75,10 @@ jobs:
           # Filter-aware hard-negative sampling using ml_models/learned_filters.json.
           # Disabled by default on the scheduled run; opt in via workflow_dispatch.
           USE_LEARNED_FILTERS: ${{ github.event.inputs.use_learned_filters || 'false' }}
+          # Legacy ml_training_base seed table (t3_/t5_/t10_ only, no t1_).
+          # Disabled by default — training uses T-1 data only. Opt in via
+          # workflow_dispatch if bootstrapping a brand-new database.
+          USE_BASE_TRAINING_DATA: ${{ github.event.inputs.use_base_training_data || 'false' }}
         run: |
           LOOKBACK="${{ github.event.inputs.lookback_days }}"
           USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
