@@ -791,7 +791,27 @@ def _table_max_date(client: Client, table: str, date_column: str) -> Optional[st
 
 
 def load_base_training_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
-    """Load original CSV data from ml_training_base."""
+    """Load original CSV data from ml_training_base.
+
+    OPT-IN GATE (added alongside the T1-everywhere migration): ml_training_base
+    was the original bootstrap seed table (t3_/t5_/t10_ features only, no t1_
+    features, and no guarantee it was built under the same price/quality rules
+    as the current data pipeline). Once a database has T1 data on every row,
+    this table is legacy and should not silently keep feeding into retrains
+    just because its rows haven't aged past lookback_days yet.
+
+    Default is now OFF. Set USE_BASE_TRAINING_DATA=1/true/yes in the environment
+    (or pass --use-base-training-data on the CLI) to include it again — e.g. if
+    you're bootstrapping a brand-new database and genuinely want the seed data.
+    """
+    if os.environ.get("USE_BASE_TRAINING_DATA", "").lower() not in ("1", "true", "yes"):
+        logger.info(
+            f"'{TABLE_BASE}' SKIPPED (USE_BASE_TRAINING_DATA not set — default is off). "
+            "Training will use T-1 data only. Pass --use-base-training-data or set "
+            "USE_BASE_TRAINING_DATA=1 to include the legacy seed table."
+        )
+        return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
+
     logger.info(f"Loading base training data from '{TABLE_BASE}'...")
 
     cutoff = _fetch_cutoff(lookback_days)
@@ -931,6 +951,10 @@ def load_base_training_data(client: Client, lookback_days: Optional[int] = None)
 
 def audit_base_data(base_df: pd.DataFrame) -> None:
     """Call this immediately after load_base_training_data() to catch label corruption."""
+    if base_df.empty:
+        logger.info("BASE DATA AUDIT: base_df is empty (skipped or no rows in lookback window) — nothing to audit.")
+        return
+
     n_pos = int((base_df['label'] == 1).sum())
     n_neg = int((base_df['label'] == 0).sum())
     pos_rate = n_pos / len(base_df)
@@ -4803,6 +4827,16 @@ def main() -> int:
             "Equivalent to setting USE_LEARNED_FILTERS=1 in the environment."
         ),
     )
+    parser.add_argument(
+        "--use-base-training-data", action="store_true", default=False,
+        help=(
+            "Include the legacy ml_training_base seed table (t3_/t5_/t10_ "
+            "features only, no t1_) in the training set (default: False — "
+            "T-1 data only). Equivalent to setting USE_BASE_TRAINING_DATA=1 "
+            "in the environment. Only useful when bootstrapping a brand-new "
+            "database that doesn't yet have enough T-1 history on its own."
+        ),
+    )
     args = parser.parse_args()
 
     if args.verbose:
@@ -4812,11 +4846,15 @@ def main() -> int:
     if args.use_learned_filters:
         os.environ["USE_LEARNED_FILTERS"] = "true"
 
+    if args.use_base_training_data:
+        os.environ["USE_BASE_TRAINING_DATA"] = "true"
+
     logger.info("=" * 60)
     logger.info("ML RETRAIN — FULL RETRAIN FROM SCRATCH")
     logger.info(f"  lookback_days       : {args.lookback_days}")
     logger.info(f"  use_all_timepoints  : {args.use_all_timepoints}")
     logger.info(f"  use_learned_filters : {os.environ.get('USE_LEARNED_FILTERS', '').lower() in ('1', 'true', 'yes')}")
+    logger.info(f"  use_base_training_data : {os.environ.get('USE_BASE_TRAINING_DATA', '').lower() in ('1', 'true', 'yes')}")
     logger.info(f"  verbose             : {args.verbose}")
     logger.info("=" * 60)
 
