@@ -393,6 +393,29 @@ class ExplosionPredictor:
             with open(metadata_path) as f:
                 self.metadata = json.load(f)
 
+        # SPARSE-COLUMN CONSISTENCY FIX: build_scaler() in ml_retrain_model.py
+        # determines "sparse" (mostly-missing, e.g. t1_ intraday) columns from
+        # coverage computed on the *training set*, and that exact list is what
+        # decides which columns get NaN restored after scaling (so XGBoost uses
+        # its learned missing-value branch instead of a mean-imputed value).
+        # Previously _scale_features() below recomputed "sparse" from the
+        # coverage of whatever batch was being predicted — for a single-row
+        # prediction that degenerates to "columns that are NaN in this row",
+        # and for a multi-row screening batch it can disagree with training
+        # coverage entirely, giving some features a different representation
+        # at inference than the model was trained on. Loading the persisted
+        # list here (written by save_outputs() at training time) makes the two
+        # paths use identical sparse-column membership.
+        self._trained_sparse_cols = list(self.metadata.get("sparse_cols", []))
+        if not self._trained_sparse_cols:
+            self.logger.warning(
+                "model_metadata.json has no 'sparse_cols' (older model or "
+                "not yet retrained with the fix) — _scale_features() will "
+                "fall back to per-batch sparse-column inference, which can "
+                "be inconsistent with how the model was trained. Retrain "
+                "with the updated ml_retrain_model.py to populate this."
+            )
+
         if hasattr(self.scaler, "feature_names_in_"):
             self.feature_names = list(self.scaler.feature_names_in_)
         else:
@@ -699,14 +722,32 @@ class ExplosionPredictor:
         # genuinely missing for a particular stock (e.g. insufficient history),
         # we must pass NaN rather than 0.0 so XGBoost routes it through the same
         # "missing" branch it learned during training — not the "value=mean" path.
+        #
+        # CONSISTENCY FIX: sparse-column membership must come from the training
+        # set's coverage (persisted in model_metadata.json as "sparse_cols" by
+        # save_outputs()), not be recomputed from this inference batch's own
+        # coverage. Recomputing per-batch is what build_scaler()'s docstring
+        # explicitly warns against — a column dense in training but missing in
+        # this batch (or vice versa) would otherwise be classified differently
+        # than it was during training, silently changing that feature's
+        # representation between train and predict.
         SPARSE_THRESHOLD = 0.5  # must match build_scaler() in ml_retrain_model.py
 
+        trained_sparse_cols = getattr(self, "_trained_sparse_cols", None)
+        if trained_sparse_cols:
+            sparse_cols = [c for c in trained_sparse_cols if c in X.columns]
+        else:
+            # Fallback for models trained before this fix (no sparse_cols in
+            # metadata) — recompute from this batch's own coverage, same as
+            # before. Consistency with training is not guaranteed in this path;
+            # retrain with the updated ml_retrain_model.py to remove it.
+            coverage = X.notna().mean()
+            sparse_cols = [
+                c for c in coverage[coverage < SPARSE_THRESHOLD].index
+                if c != "has_t1_features"
+            ]
+
         # Capture NaN mask BEFORE filling (only for sparse columns)
-        coverage = X.notna().mean()
-        sparse_cols = [
-            c for c in coverage[coverage < SPARSE_THRESHOLD].index
-            if c != "has_t1_features"
-        ]
         nan_mask_sparse = X[sparse_cols].isna() if sparse_cols else None
 
         X_filled      = X.fillna(mean_series)
