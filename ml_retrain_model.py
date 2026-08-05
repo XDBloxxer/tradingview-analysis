@@ -2922,10 +2922,6 @@ def train_model(
 
     logger.info(f"  Best iteration: {model.best_iteration}")
     logger.info(f"  Best val AUC: {model.best_score:.4f}")
-    # right after model.fit(...) in ml_retrain_model.py, temporarily add:
-    booster = model.get_booster()
-    trees_df = booster.trees_to_dataframe()
-    print(trees_df[trees_df['Tree'] == 0][['Node', 'Feature', 'Split', 'Gain', 'Yes', 'No', 'Missing']].to_string())
     # Warn if early stopping fired suspiciously early — indicates the val set
     # is too small, too imbalanced, or temporally non-representative.
     if model.best_iteration < 30:
@@ -4339,8 +4335,17 @@ def save_outputs(
     training_stats: dict,
     gain_regressor=None,
     top10_training_stats: dict | None = None,
+    sparse_cols: list | None = None,
 ) -> None:
-    """Save model, scaler, gain regressor, feature importance, and metadata."""
+    """Save model, scaler, gain regressor, feature importance, and metadata.
+
+    sparse_cols: the list of columns build_scaler() determined were sparse
+    (<50% coverage) on the training set. Persisted into model_metadata.json
+    so that explosion_predictor.py can reuse the exact same column list for
+    post-scaling NaN restoration at inference time, instead of recomputing
+    "sparse" from the coverage of whatever batch is being predicted (which
+    is inconsistent — see _scale_features() in explosion_predictor.py).
+    """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
     joblib.dump(model,  MODEL_PATH,  protocol=4)
@@ -4376,6 +4381,7 @@ def save_outputs(
         "gain_regressor_trained": gain_regressor is not None,
         "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
                                   "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
+        "sparse_cols":            list(sparse_cols) if sparse_cols else [],
         **training_stats,
     }
     if top10_training_stats:
@@ -5665,7 +5671,7 @@ def main() -> int:
 
     # ── Save ──────────────────────────────────────────────────────────────────
     save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor,
-                 top10_training_stats=top10_training_stats)
+                 top10_training_stats=top10_training_stats, sparse_cols=_sparse_cols)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("")
