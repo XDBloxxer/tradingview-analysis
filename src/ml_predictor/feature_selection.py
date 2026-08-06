@@ -824,6 +824,8 @@ def run_pipeline(
     run_stability_check: bool = True,
     stability_n_runs: int = 8,
     stability_min_frequency: float = 0.75,
+    stability_gate: bool = True,
+    stability_min_pool_size: int = 8,
     exclude_features: Optional[list[str]] = None,
 ) -> PipelineResult:
     """
@@ -843,12 +845,24 @@ def run_pipeline(
 
     `run_stability_check` defaults to True: Stages 1-3 are first repeated
     `stability_n_runs` times over block-bootstrapped resamples (see
-    stability_select()) and the per-feature selection frequency +
-    mean importance is written to `stability_frequency.csv`. This does not
-    change what feeds the rest of the pipeline (Boruta/RFECV/GA below still
-    run once on the full data, as before) — it's a diagnostic to check
-    whether that single run's output is actually stable, so you don't have
-    to eyeball tallies across separately-launched runs by hand.
+    stability_select()) and the per-feature selection frequency + mean
+    importance is written to `stability_frequency.csv`.
+
+    `stability_gate` defaults to True: when the stability check runs, its
+    `stable_features` (frequency >= stability_min_frequency) become the
+    candidate pool for Stages 1-4 below, instead of the full input feature
+    set. This makes the stability check an actual gate rather than a
+    diagnostic that gets computed and then ignored — previously Stages 1-4
+    always ran on the full X regardless of what the stability check found,
+    so a feature could fail its own 0.75 bar and still ship. Set
+    stability_gate=False to restore the old diagnostic-only behavior (still
+    writes stability_frequency.csv, but Stages 1-4 see the full X).
+
+    If gating is on and the stable pool comes out smaller than
+    stability_min_pool_size, this raises rather than silently continuing
+    with too few candidates — a near-empty stable set usually means
+    min_frequency/n_runs need revisiting, not that the pipeline should
+    proceed on 1-2 features.
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -874,6 +888,32 @@ def run_pipeline(
             f"{len(stability.stable_features)} features stable at "
             f">= {stability_min_frequency:.0%} frequency"
         )
+
+        if stability_gate:
+            if len(stability.stable_features) < stability_min_pool_size:
+                raise ValueError(
+                    f"[stability] gate enabled but only "
+                    f"{len(stability.stable_features)} feature(s) reached "
+                    f">= {stability_min_frequency:.0%} frequency across "
+                    f"{stability_n_runs} runs (need >= {stability_min_pool_size} "
+                    f"to proceed). Lower stability_min_frequency, raise "
+                    f"stability_n_runs, or set stability_gate=False to fall "
+                    f"back to diagnostic-only mode and review "
+                    f"stability_frequency.csv manually before shipping."
+                )
+            logger.info(
+                f"[stability] gating Stages 1-4 to the "
+                f"{len(stability.stable_features)} stable feature(s) "
+                f"(was {X.shape[1]} candidate columns)"
+            )
+            X = X[stability.stable_features]
+        else:
+            logger.info(
+                "[stability] gate disabled (stability_gate=False) — "
+                "Stages 1-4 will see the full candidate pool regardless of "
+                "the stability result above; review stability_frequency.csv "
+                "manually."
+            )
 
     logger.info("=" * 70)
     logger.info(f"STAGE 0: starting from {X.shape[1]} features")
@@ -941,6 +981,9 @@ def run_pipeline(
         "boruta_alpha": boruta_alpha,
         "rfecv_min_features": rfecv_min_features,
         "excluded_features": list(exclude_features) if exclude_features else [],
+        "stability_check_ran": run_stability_check,
+        "stability_gate_enabled": stability_gate if run_stability_check else None,
+        "stability_min_frequency": stability_min_frequency if run_stability_check else None,
     }
     with open(out / "selected_features.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -981,6 +1024,20 @@ def _cli() -> int:
     )
     parser.add_argument("--stability-n-runs", type=int, default=8)
     parser.add_argument("--stability-min-frequency", type=float, default=0.75)
+    parser.add_argument(
+        "--no-stability-gate", action="store_true",
+        help="Compute the stability check (unless --no-stability-check is also "
+             "set) but don't use it to restrict Stages 1-4's candidate pool — "
+             "restores the old diagnostic-only behavior. Gating is ON by "
+             "default: stable_features (>= --stability-min-frequency) become "
+             "the only candidates Stages 1-4 can select from.",
+    )
+    parser.add_argument(
+        "--stability-min-pool-size", type=int, default=8,
+        help="If stability gating is on and fewer than this many features "
+             "reach the frequency bar, raise instead of proceeding on a "
+             "too-small pool.",
+    )
     parser.add_argument(
         "--exclude-features-file",
         default=DEFAULT_EXCLUDED_FEATURES_PATH,
@@ -1079,6 +1136,8 @@ def _cli() -> int:
         run_stability_check=not args.no_stability_check,
         stability_n_runs=args.stability_n_runs,
         stability_min_frequency=args.stability_min_frequency,
+        stability_gate=not args.no_stability_gate,
+        stability_min_pool_size=args.stability_min_pool_size,
         exclude_features=exclude_features,
     )
     return 0
