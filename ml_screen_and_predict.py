@@ -72,6 +72,7 @@ import sys
 import pandas as pd
 import json
 import numpy as np
+from ta.trend import ADXIndicator
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -906,6 +907,21 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         ind["atr_pct"] = 0.0
 
     # ── ADX / DMI ──────────────────────────────────────────────────────────
+    # FIX: previously hand-rolled with flat .rolling(14).mean() smoothing,
+    # which decays much faster than Wilder's recursive smoothing that the
+    # real training-time source (ta.trend.ADXIndicator, used directly in
+    # intraday_data_collector.py) actually uses. Diverged most during trend
+    # reversals / choppy stretches — exactly where it matters. Now calling
+    # the same ta library class training uses, so this can't drift again.
+    _adx_ind = ADXIndicator(high=h, low=l, close=c, window=14)
+    ind["adx"]    = safe(_adx_ind.adx(), 20.0)
+    ind["adx+di"] = safe(_adx_ind.adx_pos(), 20.0)
+    ind["adx-di"] = safe(_adx_ind.adx_neg(), 20.0)
+
+    # NOTE: pdm/ndm/dx below are kept (unchanged, still flat-rolling) purely
+    # because `dx` is reused by the ADXR calc further down. ADXR has the same
+    # shape of smoothing mismatch as adx/adx+di/adx-di did — not fixed here,
+    # since it wasn't part of this fix's scope, but worth addressing next.
     up_move = h.diff()
     dn_move = -l.diff()
     pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
@@ -914,9 +930,6 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     pdi   = 100 * pdm.rolling(14).mean() / atr14
     ndi   = 100 * ndm.rolling(14).mean() / atr14
     dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
-    ind["adx"]    = safe(dx.rolling(14).mean(), 20.0)
-    ind["adx+di"] = safe(pdi, 20.0)
-    ind["adx-di"] = safe(ndi, 20.0)
 
     # ── Bollinger Bands ────────────────────────────────────────────────────
     bb_mid = c.rolling(20).mean()
