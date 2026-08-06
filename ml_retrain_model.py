@@ -924,19 +924,17 @@ def load_base_training_data(client: Client, lookback_days: Optional[int] = None)
         # event_dates than its non-winner rows, a rolling lookback_days
         # cutoff can silently filter out every positive while keeping all
         # the negatives. That doesn't fail loudly anywhere downstream: the
-        # combined dataset still trains fine, but has_t1_features becomes a
-        # near-perfect proxy for the label within this all-negative base
-        # subset, and the classifier saturates its achievable AUC in very
-        # few boosting rounds (best_iteration far lower than usual) because
-        # it no longer has to do any real work to separate the base rows.
+        # combined dataset still trains fine, but the classifier can end up
+        # doing very little real work to separate this all-negative base
+        # subset from the (real) positives elsewhere in the data, which
+        # tends to show up indirectly as an unusually low best_iteration.
         logger.warning(
             f"BASE DATA WARNING: positive rate is 0.0% (0/{len(df)} rows) within the "
             f"current lookback window. Expected ~5-20%. ml_training_base is documented "
             "as a mostly-static seed table -- if its winner rows are dated older than "
             "its non-winner rows, a rolling lookback cutoff can filter out all positives "
             "while keeping all negatives. This tends to show up indirectly as an unusually "
-            "low best_iteration during training (has_t1_features becomes a near-perfect "
-            "proxy for the label within this all-negative subset). Check the label/event_date "
+            "low best_iteration during training. Check the label/event_date "
             "distribution in ml_training_base directly, or consider decoupling its fetch "
             "cutoff from the rolling lookback_days window used for the T-1 tables."
         )
@@ -2691,36 +2689,34 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 
     X = X.replace([np.inf, -np.inf], np.nan)
 
-    # ── FIX: has_t1_features binary flag ────────────────────────────────────
-    # T-1 rows (from winners_day_prior_close / non_winners_day_prior_close)
-    # have a 'source' column containing 'day_prior'.  Base CSV rows do not.
-    # XGBoost handles missingness natively but only when values are actually NaN.
-    # After fillna(col_mean), all base rows receive the same imputed constant
-    # for every t1_ column, making those features look constant for 85% of rows
-    # and causing XGBoost to ignore them entirely in feature importance.
-    # Adding a binary 'has_t1_features' column lets XGBoost build a distinct
-    # decision branch for "rows where t1_ data is real" vs "rows where it is
-    # imputed", restoring t1_ signal without any schema or scaler changes.
-    # At inference time (explosion_predictor.py) this column is always set to
-    # 1.0 because live predictions always have T-1 intraday data.
+    # ── REMOVED (2026-08-06): has_t1_features binary flag ───────────────────
+    # This used to be added as a trained feature so XGBoost could branch on
+    # "is this row real T-1 data or an imputed base-CSV row" separately from
+    # the t1_ columns themselves. Removed because it's a source-provenance
+    # leak risk: if T-1 rows and base-CSV rows have different positive rates
+    # for reasons unrelated to real stock behavior (different collection eras,
+    # different selection criteria), the model can partly learn "this row
+    # came from the T-1 pipeline" as a shortcut instead of learning from the
+    # actual indicator values. It was also a source of train/inference
+    # skew — explosion_predictor.py force-set it to 1.0 for every live
+    # prediction, so whatever split the model learned between flag=0 and
+    # flag=1 rows during training silently applied to 100% of live rows.
+    #
+    # Now that t1_ lookback covers 180 days and t1 coverage is ~100% of the
+    # training set, base-CSV rows are a small-to-negligible minority anyway,
+    # so this flag bought little signal for real (non-provenance) reasons.
+    # Log-only diagnostic below replaces it — same visibility, no leak risk.
     if "source" in df.columns:
-        X["has_t1_features"] = (
-            df["source"].str.contains("day_prior", na=False).astype(float)
-        )
+        n_t1_rows = int(df["source"].str.contains("day_prior", na=False).sum())
     else:
-        # Fallback: infer from NaN coverage of t1_ columns — if >50% of t1_
-        # columns are populated for a row it is almost certainly a T-1 row.
         t1_cols = [c for c in X.columns if c.startswith(("t1_close_", "t1_open_"))]
-        if t1_cols:
-            X["has_t1_features"] = (X[t1_cols].notna().mean(axis=1) > 0.5).astype(float)
-        else:
-            X["has_t1_features"] = 0.0
-
-    n_t1_rows = int(X["has_t1_features"].sum())
+        n_t1_rows = (
+            int((X[t1_cols].notna().mean(axis=1) > 0.5).sum()) if t1_cols else 0
+        )
     n_base_rows = len(X) - n_t1_rows
     logger.info(
-        f"has_t1_features flag: {n_t1_rows} T-1 rows (flag=1), "
-        f"{n_base_rows} base rows (flag=0)"
+        f"Row source mix (diagnostic only, not a feature): "
+        f"{n_t1_rows} T-1 rows, {n_base_rows} base rows"
     )
 
     # ── OPTIONAL: restrict to a pre-computed feature subset ────────────────
@@ -2742,15 +2738,8 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
                     f"not present in current data (schema drift): {missing[:10]}..."
                 )
             keep = [c for c in selected if c in X.columns]
-            # NOTE (2026-07-28): has_t1_features used to be force-appended here
-            # even if absent from selected_features.json, on the assumption it's
-            # a harmless structural flag. Temporarily disabled while testing
-            # whether it's a source-provenance leak (base_csv vs T-1 pos_rate
-            # gap) rather than genuine signal -- see symbol-overlap AUC
-            # diagnostic upstream. Re-enable (uncomment) once that's resolved
-            # if has_t1_features is cleared as safe.
-            # if "has_t1_features" in X.columns and "has_t1_features" not in keep:
-            #     keep.append("has_t1_features")
+            # (has_t1_features removed entirely 2026-08-06 — see prepare_features()
+            # above. It's no longer added to X, so there's nothing to re-add here.)
             X = X[keep]
             logger.info(
                 f"USE_SELECTED_FEATURES active — restricted to {X.shape[1]} features "
@@ -2819,8 +2808,6 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
     # all t1_ features to appear constant for 85% of rows and be ignored.
     coverage = X_train.notna().mean()
     sparse_cols = coverage[coverage < SPARSE_THRESHOLD].index.tolist()
-    # has_t1_features is binary (0/1) and always dense — never restore NaN on it
-    sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
     if sparse_cols:
         nan_mask = X_train[sparse_cols].isna()
         X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask, other=np.nan)
@@ -2880,7 +2867,6 @@ def scale_with_fitted_scaler(
         )
         coverage = X.notna().mean()
         sparse_cols = coverage[coverage < sparse_threshold].index.tolist()
-        sparse_cols = [c for c in sparse_cols if c != "has_t1_features"]
 
     if sparse_cols:
         nan_mask = X[sparse_cols].isna()
