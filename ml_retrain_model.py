@@ -32,11 +32,14 @@ FIXES IN THIS VERSION:
 
   3. scale_pos_weight capped at [0.5, 5.0] — avoids extreme corrections when the
      training set happens to be very imbalanced in either direction.
-     SPW_MAX is intentionally kept at 5.0 even though the raw imbalance is ~8.7x:
-     combining SPW=10 with eval_metric="auc" pushes raw probabilities so high that
-     STRONG_BUY thresholds become meaningless.  Base-rate mismatch between the val
-     calibration set and the screened inference universe is corrected via prior-
-     probability correction in train_model() instead of via a higher SPW.
+     SPW_MAX is intentionally kept at 5.0 even though the raw imbalance can run
+     well above that (e.g. ~13x at a 7% positive rate, higher than the ~8.7x
+     seen when this cap was first set — the cap matters more as the imbalance
+     grows, not less): combining a higher SPW with eval_metric="auc" pushes raw
+     probabilities so high that STRONG_BUY thresholds become meaningless.
+     Base-rate mismatch between the val calibration set and the screened
+     inference universe is corrected via prior-probability correction in
+     train_model() instead of via a higher SPW.
 
   4. Intraday-high label support — if actual_high_pct is available and exceeds
      INTRADAY_WIN_THRESHOLD, those rows are also treated as winners (label=1).
@@ -391,8 +394,11 @@ INTRADAY_WIN_THRESHOLD = 20.0  # %
 # definition.  A stock that hits ≥20% intraday is a winner regardless of close price.
 
 # scale_pos_weight caps — prevent extreme corrections while still respecting
-# the actual class imbalance (~8.8x in production data).
-# SPW_MAX raised from 3.0 → 5.0: the previous cap of 3.0 on an 8.8x imbalance
+# the actual class imbalance. scale_pos_weight is always computed live from
+# n_neg/n_pos in train_model() (never hardcoded), so this cap holds regardless
+# of where the true ratio drifts to — at a 7% positive rate that's ~13x, up
+# from the ~8.8x seen when SPW_MAX was last tuned; both clamp to the same 5.0.
+# SPW_MAX raised from 3.0 → 5.0: the previous cap of 3.0 on an ~8.8x imbalance
 # under-weighted positives so severely that the logloss surface was distorted,
 # making it harder for early stopping to detect genuine improvement and
 # contributing to the model halting at best_iteration=12.
@@ -2399,23 +2405,26 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
         return base_df.copy()
 
     t1_count = len(t1_df)
-    if t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT:
-        # FIX (2026-06-03): Previously this branch forced base weights to 1.0,
-        # overriding BASE_CSV_WEIGHT and accidentally making T-1 rows equal to
-        # (or lower than) base rows when T1_WEIGHT < BASE_CSV_WEIGHT. Now we
-        # always apply BASE_CSV_WEIGHT / T1_WEIGHT so the intentional weighting
-        # is respected regardless of how many T-1 rows are present.
-        logger.info(
-            f"T-1 data ({t1_count} rows) >= threshold ({MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
-            f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
-        )
-        base_df = base_df.copy()
-        base_df["sample_weight"] = BASE_CSV_WEIGHT
-    else:
-        logger.info(
-            f"T-1 data ({t1_count} rows) < threshold ({MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
-            f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
-        )
+    # NOTE (2026-08-06): This used to branch on t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
+    # with different behaviour in each branch. Since the 2026-06-03 fix below,
+    # both branches apply the exact same BASE_CSV_WEIGHT / T1_WEIGHT values —
+    # the threshold no longer changes what happens, only what gets logged. Left
+    # as a single unconditional path; MIN_T1_ROWS_FOR_EQUAL_WEIGHT is still used
+    # for the informational "equal_weight_applied" metadata field at save time.
+    #
+    # FIX (2026-06-03): Previously the >= branch forced base weights to 1.0,
+    # overriding BASE_CSV_WEIGHT and accidentally making T-1 rows equal to
+    # (or lower than) base rows when T1_WEIGHT < BASE_CSV_WEIGHT. Now we
+    # always apply BASE_CSV_WEIGHT / T1_WEIGHT so the intentional weighting
+    # is respected regardless of how many T-1 rows are present.
+    logger.info(
+        f"T-1 data: {t1_count} rows "
+        f"({'>=' if t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT else '<'} "
+        f"threshold {MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
+        f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
+    )
+    base_df = base_df.copy()
+    base_df["sample_weight"] = BASE_CSV_WEIGHT
 
     # ── Step 1: Deduplicate each frame independently, using its own natural key ──
     #
@@ -2800,12 +2809,18 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
     # Fill any remaining NaN (e.g. columns with all-NaN that have no mean) with 0.
     X_scaled      = X_scaled.fillna(0.0)
 
-    # ── Restore NaN for sparse (t1_) columns so XGBoost uses missing-value branches ──
-    # Identify columns with low coverage in the training set.  These are almost
-    # always t1_ intraday columns which are NaN for every base-CSV row.
-    # Restoring NaN lets XGBoost route base rows through its learned "missing"
-    # branch rather than treating them as "value = column mean", which was causing
-    # all t1_ features to appear constant for 85% of rows and be ignored.
+    # ── Restore NaN for sparse columns so XGBoost uses missing-value branches ──
+    # Identify columns with low coverage in the training set. This used to be
+    # almost always t1_ intraday columns (NaN for every base-CSV row, back when
+    # base rows were a large fraction of the dataset and t1 coverage was
+    # inconsistent). With t1_/t3_/t5_/t10_ coverage now near 100%, this set is
+    # typically small or empty — coverage is measured fresh from X_train every
+    # run, so whatever is genuinely sparse (e.g. a short-history stock missing
+    # a long-window indicator) is still caught correctly; nothing here assumes
+    # which columns should be sparse.
+    # Restoring NaN lets XGBoost route these rows through its learned "missing"
+    # branch rather than treating them as "value = column mean", which was
+    # previously causing t1_ features to appear near-constant and be ignored.
     coverage = X_train.notna().mean()
     sparse_cols = coverage[coverage < SPARSE_THRESHOLD].index.tolist()
     if sparse_cols:
