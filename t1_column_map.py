@@ -42,72 +42,64 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "volume":           "Volume",
 
     # ── MOVING AVERAGES ────────────────────────────────────────────────────
+    # WMA_10/20, HMA_9/20, VWMA_20, EMA_12/26 pruned (2026-08-06): no code in
+    # intraday_data_collector.py ever computes these — they were permanently
+    # all-NaN for every T-1 row. If any of these are wanted as real T-1
+    # features, implement the computation in intraday_data_collector.py
+    # first, then add the mapping back here.
     "sma5":             "SMA_5",
     "sma10":            "SMA_10",
     "sma20":            "SMA_20",
     "sma50":            "SMA_50",
     "ema5":             "EMA_5",
     "ema10":            "EMA_10",
-    "ema12":            "EMA_12",
     "ema20":            "EMA_20",
-    "ema26":            "EMA_26",
     "ema50":            "EMA_50",
-    "wma10":            "WMA_10",
-    "wma20":            "WMA_20",
-    "hma9":             "HMA_9",
-    "hma20":            "HMA_20",
-    "vwma20":           "VWMA_20",
 
     # ── MA DERIVED ─────────────────────────────────────────────────────────
+    # EMA_12_26_Diff pruned along with EMA_12/EMA_26 above (same reason).
     "price_vs_sma20":       "Price_vs_SMA20",
     "price_vs_sma50":       "Price_vs_SMA50",
     "price_vs_ema20":       "Price_vs_EMA20",
     "sma_20_50_diff":       "SMA_20_50_Diff",
-    "ema_12_26_diff":       "EMA_12_26_Diff",
     "sma20_slope":          "SMA_20_Slope",
     "ema20_slope":          "EMA_20_Slope",
 
     # ── MACD ───────────────────────────────────────────────────────────────
+    # MACD_ROC and the fast-MACD trio (MACD_Fast/MACDh_Fast/MACDs_Fast)
+    # pruned (2026-08-06): never computed in intraday_data_collector.py —
+    # no 5/13/1 MACD instance exists there, and macd_roc is only computed
+    # live in ml_screen_and_predict.py (a different pipeline), not stored.
     "macd.macd":            "MACD_12_26_9",
     "macd_diff":            "MACDh_12_26_9",
     "macd.signal":          "MACDs_12_26_9",
-    "macd_roc":             "MACD_ROC",
-    "macd_fast":            "MACD_Fast",
-    "macdh_fast":           "MACDh_Fast",
-    "macds_fast":           "MACDs_Fast",
 
     # ── RSI ────────────────────────────────────────────────────────────────
     # "rsi" is the canonical source; "rsi14" and "rsi[1]" are aliases.
     # rename_t1_columns keeps whichever appears first in the DataFrame.
+    # RSI_7/21/28 and RSI_14_Slope pruned (2026-08-06): only RSI_14 is
+    # actually computed here.
     "rsi":              "RSI_14",
     "rsi14":            "RSI_14",       # alias — deduped at runtime
     "rsi[1]":           "RSI_14",       # shifted bar — deduped at runtime
-    "rsi7":             "RSI_7",
-    "rsi21":            "RSI_21",
-    "rsi28":            "RSI_28",
-    "rsi_14_slope":     "RSI_14_Slope",
 
     # ── STOCHASTIC ─────────────────────────────────────────────────────────
     # Short forms ("stoch.k/d") are canonical; long forms are aliases.
+    # STOCHh_14_3_3 (histogram never derived) and the entire 5/3/1 variant
+    # (STOCHk/d/h_5_3_1) pruned (2026-08-06): not computed here.
     "stoch.k":              "STOCHk_14_3_3",
     "stochk_14_3_3":        "STOCHk_14_3_3",   # alias — deduped at runtime
     "stoch.d":              "STOCHd_14_3_3",
     "stochd_14_3_3":        "STOCHd_14_3_3",   # alias — deduped at runtime
-    "stochh_14_3_3":        "STOCHh_14_3_3",
-    "stochk_5_3_1":         "STOCHk_5_3_1",
-    "stochd_5_3_1":         "STOCHd_5_3_1",
-    "stochh_5_3_1":         "STOCHh_5_3_1",
 
     # ── STOCH RSI ──────────────────────────────────────────────────────────
-    "stochrsi_k":           "STOCHRSIk_14_14_3_3",
-    "stochrsik_14_14_3_3":  "STOCHRSIk_14_14_3_3",  # alias — deduped at runtime
-    "stochrsi_d":           "STOCHRSId_14_14_3_3",
-    "stochrsid_14_14_3_3":  "STOCHRSId_14_14_3_3",  # alias — deduped at runtime
+    # Pruned entirely (2026-08-06): no StochRSI import/computation exists in
+    # intraday_data_collector.py.
 
     # ── OSCILLATORS ────────────────────────────────────────────────────────
+    # CCI_14 pruned (2026-08-06): only CCI_20 is computed here.
     "w.r":              "WILLR_14",
     "cci20":            "CCI_20",
-    "cci":              "CCI_14",
     "uo":               "UO",
     "ao":               "AO",
     "tsi":              "TSI_13_25_13",
@@ -142,31 +134,30 @@ INTRADAY_TO_MODEL: dict[str, str] = {
 
     # ── ATR / VOLATILITY ───────────────────────────────────────────────────
     # "atr" is canonical; "atr14" is an alias — deduped at runtime.
+    # ATR_7/ATR_20 pruned (2026-08-06): only the 14-period ATR is computed.
     "atr":              "ATR_14",
     "atr14":            "ATR_14",       # alias — deduped at runtime
-    "atr7":             "ATR_7",
-    "atr20":            "ATR_20",
     "atr_pct":          "ATR_14_Slope",   # no exact match — closest
     "volatility_10d":   "HV_10",
     "volatility_20d":   "HV_20",
     "volatility_30d":   "HV_30",
 
     # ── VOLUME ─────────────────────────────────────────────────────────────
+    # OBV_SMA20 pruned (2026-08-06): never computed here.
     "volume_sma5":      "Volume_MA5",
     "volume_sma10":     "Volume_MA10",
     "volume_sma20":     "Volume_MA20",
     "volume_ratio":     "Volume_Ratio",
     "obv":              "OBV",
-    "obv_sma20":        "OBV_SMA20",
 
     # ── TREND / ADX ────────────────────────────────────────────────────────
     # "adx+di" / "adx-di" are canonical; "_pos" / "_neg" are aliases.
+    # ADXR_14_2 pruned (2026-08-06): never computed here.
     "adx":              "ADX_14",
     "adx+di":           "DMP_14",
     "adx_pos":          "DMP_14",       # alias — deduped at runtime
     "adx-di":           "DMN_14",
     "adx_neg":          "DMN_14",       # alias — deduped at runtime
-    "adxr":             "ADXR_14_2",
 
     # ── AROON ──────────────────────────────────────────────────────────────
     "aroon_down":       "AROOND_25",
@@ -174,51 +165,22 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "aroon_indicator":  "AROONOSC_25",
 
     # ── SUPERTREND ─────────────────────────────────────────────────────────
-    "supert":           "SUPERT_10_3",
-    "supert_d":         "SUPERTd_10_3",
-    "supert_l":         "SUPERTl_10_3",
-    "supert_s":         "SUPERTs_10_3",
+    # Pruned entirely (2026-08-06): no Supertrend computation exists in
+    # intraday_data_collector.py.
 
     # ── MISC ───────────────────────────────────────────────────────────────
     # "roc" / "roc10" and "mom" / "mom10" and "gap_%" / "gap_pct" are aliases.
+    # MFI_14, ROC_20, MOM_20 pruned (2026-08-06): never computed here — only
+    # the 10-period ROC/MOM exist (see the separate ROC window=12-vs-10 fix
+    # elsewhere; that's a different, already-addressed bug).
     "vwap":             "VWAP",
     "cmf":              "CMF_20",
-    "mfi":              "MFI_14",
     "roc":              "ROC_10",
     "roc10":            "ROC_10",       # alias — deduped at runtime
-    "roc20":            "ROC_20",
     "mom":              "MOM_10",
     "mom10":            "MOM_10",       # alias — deduped at runtime
-    "mom20":            "MOM_20",
     "gap_%":            "Gap_Pct",
     "gap_pct":          "Gap_Pct",      # alias — deduped at runtime
-    # ── NEW: previously missing ──────────────────────────────────────────
-    "hma9":                 "HMA_9",
-    "hma20":                "HMA_20",
-    "price_vs_sma50":       "Price_vs_SMA50",
-    "sma_20_slope":         "SMA_20_Slope",
-    "ema_20_slope":         "EMA_20_Slope",
-    "macd_roc":             "MACD_ROC",
-    "macd_fast":            "MACD_Fast",
-    "macdh_fast":           "MACDh_Fast",
-    "macds_fast":           "MACDs_Fast",
-    "rsi_14_slope":         "RSI_14_Slope",
-    "stochh_14_3_3":        "STOCHh_14_3_3",
-    "stochk_5_3_1":         "STOCHk_5_3_1",
-    "stochd_5_3_1":         "STOCHd_5_3_1",
-    "stochh_5_3_1":         "STOCHh_5_3_1",
-    "stochrsik_14_14_3_3":  "STOCHRSIk_14_14_3_3",
-    "stochrsid_14_14_3_3":  "STOCHRSId_14_14_3_3",
-    "cci":                  "CCI_14",
-    "obv_sma20":            "OBV_SMA20",
-    "adxr":                 "ADXR_14_2",
-    "supert":               "SUPERT_10_3",
-    "supert_d":             "SUPERTd_10_3",
-    "supert_l":             "SUPERTl_10_3",
-    "supert_s":             "SUPERTs_10_3",
-    "mfi":                  "MFI_14",
-    "roc20":                "ROC_20",
-    "mom20":                "MOM_20",
 }
 
 # Columns that are metadata — never renamed, just preserved or dropped
