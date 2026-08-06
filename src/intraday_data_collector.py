@@ -745,7 +745,16 @@ class IntradayDataCollector:
             pass
         
         try:
-            roc = ROCIndicator(close=df['Close'], window=12)
+            # FIX: was window=12, but t1_column_map.py maps this column to
+            # "ROC_10" — the name base training (multiday_feature_collector.py)
+            # uses for a genuine 10-period ROC ({"kind": "roc", "length": 10}).
+            # Matching the window here so T-1 rows collected from now on are
+            # a true 10-period ROC, consistent with what the trained feature
+            # name claims. (Fix-forward only: existing historical rows keep
+            # their window=12 values — no backfill, since ROC needs the raw
+            # price series N bars back, which isn't recoverable from the
+            # stored value alone.)
+            roc = ROCIndicator(close=df['Close'], window=10)
             result['roc'] = roc.roc()
         except:
             pass
