@@ -1002,7 +1002,11 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     tsi_denom = double_smooth_apc.replace(0, np.nan)
     tsi_series = 100 * double_smooth_pc / tsi_denom
     ind["tsi"]       = safe(tsi_series, 0.0)
-    ind["kst"]       = ind["tsi"]
+    # NOTE: previously had ind["kst"] = ind["tsi"] here — a bare duplicate of
+    # the TSI value mislabeled as KST (a structurally different indicator,
+    # never actually computed in this file). t1_column_map.py no longer maps
+    # "kst" to anything, so that duplicate was dead weight. Removed rather
+    # than left in place, to avoid it being mistaken for real signal later.
 
     # ── Ultimate Oscillator ────────────────────────────────────────────────
     bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
