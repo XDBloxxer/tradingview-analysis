@@ -768,8 +768,13 @@ def build_features_from_tv_data(
             sma20 = result.get(f"{prefix}_sma_20")
             if ema20: result[f"{prefix}_price_vs_ema20"] = (close_v / ema20 - 1) * 100
             if sma20: result[f"{prefix}_price_vs_sma20"] = (close_v / sma20 - 1) * 100
-            if ema20 and ema50: result[f"{prefix}_ema_12_26_diff"] = ema20 - ema50
-            if ema10 and ema20: result[f"{prefix}_sma_20_50_diff"] = ema10 - ema20
+            # EMA_12_26_Diff intentionally NOT computed: EMA_12/EMA_26 are
+            # deliberately left unfetched above (period mismatch with the TV
+            # screener's own EMA fields) — faking it from ema20/ema50 gave a
+            # correct-looking feature holding the wrong indicator entirely.
+            # Left unset so the model imputes it, same as EMA_26 itself.
+            sma50 = result.get(f"{prefix}_sma_50")
+            if sma20 and sma50: result[f"{prefix}_sma_20_50_diff"] = sma20 - sma50
         else:
             ema20 = result.get(f"{prefix}_EMA_20")
             ema50 = result.get(f"{prefix}_EMA_50")
@@ -777,8 +782,13 @@ def build_features_from_tv_data(
             sma20 = result.get(f"{prefix}_SMA_20")
             if ema20: result[f"{prefix}_Price_vs_EMA20"] = (close_v / ema20 - 1) * 100
             if sma20: result[f"{prefix}_Price_vs_SMA20"] = (close_v / sma20 - 1) * 100
-            if ema20 and ema50: result[f"{prefix}_EMA_12_26_Diff"] = ema20 - ema50
-            if ema10 and ema20: result[f"{prefix}_SMA_20_50_Diff"] = ema10 - ema20
+            # EMA_12_26_Diff intentionally NOT computed: EMA_12/EMA_26 are
+            # deliberately left unfetched above (period mismatch with the TV
+            # screener's own EMA fields) — faking it from ema20/ema50 gave a
+            # correct-looking feature holding the wrong indicator entirely.
+            # Left unset so the model imputes it, same as EMA_26 itself.
+            sma50 = result.get(f"{prefix}_SMA_50")
+            if sma20 and sma50: result[f"{prefix}_SMA_20_50_Diff"] = sma20 - sma50
 
     if close and close > 0:
         _derived(feature_prefix, close)
