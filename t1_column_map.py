@@ -111,7 +111,19 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "uo":               "UO",
     "ao":               "AO",
     "tsi":              "TSI_13_25_13",
-    "kst":              "TSIs_13_25_13",   # closest equivalent
+    # NOTE: "kst" is intentionally NOT mapped here. intraday_data_collector.py
+    # computes a genuine KST (Know Sure Thing) indicator, which is a
+    # structurally different calculation from TSI (True Strength Index) —
+    # they are not interchangeable. Previously "kst" was mapped to
+    # "TSIs_13_25_13" as a "closest equivalent," which meant the trained
+    # feature TSIs_13_25_13 held real TSI-signal values for base-sourced rows
+    # but real KST values for T-1-sourced rows: two different indicators
+    # sharing one feature name. Per this module's own convention, source
+    # columns with no mapping entry are safely dropped by rename_t1_columns,
+    # so kst/kst_signal are simply excluded rather than mislabeled. If KST is
+    # wanted as a feature, it should be added as its own named feature to
+    # BOTH multiday_feature_collector.py (base training) and here — not
+    # aliased onto an existing TSI feature.
 
     # ── BOLLINGER BANDS ────────────────────────────────────────────────────
     "bb.lower":         "BBL_20_2.0_2.0",
