@@ -182,18 +182,17 @@ def main() -> int:
                         if col not in META_COLS and col not in sample:
                             sample[col] = match.iloc[0][col]
 
-            # Pad missing model features with intelligent defaults
-            for feat in existing_features:
-                if feat not in sample:
-                    fl = feat.lower()
-                    if any(x in fl for x in ("rsi", "stoch", "willr", "cci")):
-                        sample[feat] = 50.0
-                    elif "volume" in fl or "obv" in fl:
-                        sample[feat] = 100_000.0
-                    elif any(x in fl for x in ("price", "close", "open", "high", "low")):
-                        sample[feat] = 50.0
-                    else:
-                        sample[feat] = 0.0
+            # NOTE: missing model features are intentionally left unset here
+            # (not filled with a synthetic default). When this dict becomes a
+            # DataFrame row below, pandas fills any key that's absent from a
+            # given sample with NaN. That matches the main pipeline
+            # (ml_retrain_model.py), which deliberately preserves NaN so
+            # XGBoost can use its native missing-value branch logic instead
+            # of learning from a fabricated constant. Previously this filled
+            # RSI/stoch-like features with 50, volume-like with 100_000,
+            # price-like with 50, and everything else with 0 — those look
+            # like real values to the model and get treated as such, which
+            # is worse than saying "this feature is missing."
 
             sample["label"] = 1 if is_winner else 0
             samples.append(sample)
@@ -243,12 +242,20 @@ def main() -> int:
     # ── STEP 5: Feature matrix ────────────────────────────────────────────
     for feat in existing_features:
         if feat not in df.columns:
-            df[feat] = 0.0
+            # Entire column absent from every sample (e.g. a model feature
+            # this data source never provides) — NaN, not 0, so it's treated
+            # as genuinely missing rather than as a real zero value.
+            df[feat] = np.nan
 
     # existing_features never contains "_sort_date" (it comes from the saved
     # model's schema, not from our sample dicts), so this selection already
     # excludes it — no explicit drop needed.
-    X = df[existing_features].copy().fillna(0)
+    #
+    # No .fillna(0) here: NaN is preserved deliberately so XGBoost's native
+    # missing-value handling applies, matching ml_retrain_model.py. Note
+    # StandardScaler.transform() (Step 7 below) passes NaN through unchanged
+    # rather than erroring, so this is safe to scale directly.
+    X = df[existing_features].copy()
     y = df["label"].copy()
 
     # ── STEP 6: Train/test split (chronological) ──────────────────────────
@@ -291,6 +298,7 @@ def main() -> int:
         learning_rate=0.01,
         subsample=0.8,
         colsample_bytree=0.8,
+        missing=np.nan,  # explicit: NaN = genuinely missing, not imputed
         scale_pos_weight=spw,
         random_state=42,
         eval_metric="logloss",
