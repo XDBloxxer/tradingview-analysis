@@ -3523,6 +3523,18 @@ _HIGH_GAIN_MULTIPLIER = 3.0     # legacy fallback if n_high_gain or
 REG_CONFIDENCE_WEIGHT_MIN = 1.0
 REG_CONFIDENCE_WEIGHT_MAX = 2.5
 
+# RC10 FIX: Hard cap on the COMBINED weight after RC8 (winner + high-gain)
+# and RC9 (confidence) multipliers are all applied on top of the base
+# sample_weight. Each individual factor above is independently clamped, but
+# nothing previously capped their product — in the worst case
+# (label-corrected + winner + high-gain + high-confidence all on one row)
+# that's up to ~1.5 * 8.0 * 5.0 * 2.5 =~ 150x a normal row's weight, which
+# would let a handful of rare, high-conviction rows dominate the regressor's
+# splits far more than any single factor's clamp intended. This cap is
+# applied AFTER all multipliers, so it only trims the tail — most rows are
+# far below it and are completely unaffected.
+REG_TOTAL_WEIGHT_CAP = 20.0
+
 
 
 # Minimum number of gain-labeled rows required in the classifier's TRAIN split
@@ -4135,6 +4147,34 @@ def train_gain_regressor(
         logger.info(
             "  RC9: skipped — clf_proba not present in this run's feature "
             "matrix (older training path); winner rows keep RC8 weighting only."
+        )
+
+    # ------------------------------------------------------------------
+    # RC10 FIX: Diagnose and cap the COMBINED weight after RC8 + RC9.
+    # Log the full distribution first (so the cap's effect, if any, is
+    # visible) then clip the tail. Applied to all rows, not just winners —
+    # base sample_weight alone (e.g. the 1.5x label-correction bump) is
+    # already folded into w_reg by this point, so this is the true final
+    # per-row weight the regressor will train on.
+    # ------------------------------------------------------------------
+    w_reg_desc = w_reg.describe(percentiles=[0.5, 0.95, 0.99])
+    logger.info(
+        f"  RC10: pre-cap w_reg distribution — "
+        f"min={w_reg_desc['min']:.2f}  median={w_reg_desc['50%']:.2f}  "
+        f"p95={w_reg_desc['95%']:.2f}  p99={w_reg_desc['99%']:.2f}  "
+        f"max={w_reg_desc['max']:.2f}"
+    )
+    n_capped = int((w_reg > REG_TOTAL_WEIGHT_CAP).sum())
+    if n_capped > 0:
+        w_reg = w_reg.clip(upper=REG_TOTAL_WEIGHT_CAP)
+        logger.info(
+            f"  RC10: capped {n_capped} row(s) at REG_TOTAL_WEIGHT_CAP="
+            f"{REG_TOTAL_WEIGHT_CAP:.1f} (were above it pre-cap)"
+        )
+    else:
+        logger.info(
+            f"  RC10: no rows exceeded REG_TOTAL_WEIGHT_CAP={REG_TOTAL_WEIGHT_CAP:.1f} "
+            "— cap had no effect this run"
         )
 
     X_reg_valid = X_reg[valid_gain_mask]
@@ -5698,6 +5738,8 @@ def main() -> int:
         "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
                                     "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights",
                                     "RC8_data_driven_winner_weighting",
+                                    "RC9_confidence_scaled_weighting",
+                                    "RC10_combined_weight_cap",
                                     "LEAK_FREE_train_split_only_with_fallback"],
     }
 
