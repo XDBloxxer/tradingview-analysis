@@ -593,10 +593,13 @@ class ExplosionPredictor:
     def prepare_features(self, data_df: pd.DataFrame) -> pd.DataFrame:
         self.logger.info(f"Preparing features for {len(data_df)} stocks")
 
-        # FIX #6: Explicitly set has_t1_features = 1.0 in the input data BEFORE
-        # the feature loop so the column is found via a direct match and never
-        # appears in missing_names / the "MISSING features" log line.
-        # Live inference always has real T-1 intraday data, so this is always 1.
+        # LEGACY COMPAT ONLY (2026-08-06): has_t1_features was removed from
+        # ml_retrain_model.py's prepare_features() as a source-provenance
+        # leak risk — new models will not have it in self.feature_names, so
+        # this block is a no-op for them. It's kept only so that a model
+        # trained BEFORE this change (which still expects the column) doesn't
+        # break; once you retrain, this branch stops firing for that model
+        # and can be deleted.
         if "has_t1_features" in self.feature_names:
             data_df = data_df.copy()
             data_df["has_t1_features"] = 1.0
