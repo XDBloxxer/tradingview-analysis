@@ -166,6 +166,12 @@ def main() -> int:
                 if col not in META_COLS:
                     sample[col] = row[col]
 
+            # Keep the detection date for chronological sorting below.
+            # NOTE: this is deliberately kept OUTSIDE the META_COLS-filtered
+            # loop above (which drops detection_date) and is never added to
+            # `existing_features`, so it never leaks into the model's X matrix.
+            sample["_sort_date"] = row.get("detection_date")
+
             if not open_df.empty:
                 match = open_df[
                     (open_df["symbol"]         == row.get("symbol")) &
@@ -207,18 +213,68 @@ def main() -> int:
                 f"(pos={int(df['label'].sum())}, "
                 f"neg={int(len(df)-df['label'].sum())})")
 
+    # ── STEP 4b: Sort chronologically ───────────────────────────────────────
+    # `all_samples` above is built as [all winners..., all non-winners...],
+    # so df is currently ordered as one big class-block, not by time. The
+    # split below relies on row *position*, so if we don't sort first, the
+    # "chronological" split is actually a winners-vs-non-winners split in
+    # disguise (train ends up mostly winners, test mostly non-winners), which
+    # produces a near-meaningless test set and a badly biased fine-tune.
+    df["_sort_date"] = pd.to_datetime(df["_sort_date"], errors="coerce")
+
+    n_undated = int(df["_sort_date"].isna().sum())
+    if n_undated:
+        logger.warning(
+            f"{n_undated} sample(s) have no usable detection_date and can't "
+            "be placed chronologically — dropping them from this run."
+        )
+        df = df.dropna(subset=["_sort_date"])
+
+    if df.empty:
+        logger.error("❌ No samples left with a valid detection_date after sorting.")
+        return 1
+
+    df = df.sort_values("_sort_date").reset_index(drop=True)
+    logger.info(
+        f"Chronological range: {df['_sort_date'].min().date()} → "
+        f"{df['_sort_date'].max().date()}"
+    )
+
     # ── STEP 5: Feature matrix ────────────────────────────────────────────
     for feat in existing_features:
         if feat not in df.columns:
             df[feat] = 0.0
 
+    # existing_features never contains "_sort_date" (it comes from the saved
+    # model's schema, not from our sample dicts), so this selection already
+    # excludes it — no explicit drop needed.
     X = df[existing_features].copy().fillna(0)
     y = df["label"].copy()
 
     # ── STEP 6: Train/test split (chronological) ──────────────────────────
+    # Now that df/X/y are sorted by date, a positional slice is genuinely a
+    # time-based split: train = earlier dates, test = later dates.
     split = int(len(X) * (1 - args.test_size))
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
+
+    # Cheap safety net: a fine-tune with only one class in train or test
+    # fails deep inside XGBoost with a confusing error, or silently produces
+    # a useless AUC. Fail loudly here instead, with a message that points at
+    # the actual cause (usually too few samples for --test-size, or a
+    # lookback window with almost no winners).
+    if y_train.nunique() < 2:
+        logger.error(
+            f"❌ Train split has only one class present (n={len(y_train)}). "
+            "Increase --lookback-days or lower --test-size."
+        )
+        return 1
+    if y_test.nunique() < 2:
+        logger.warning(
+            f"⚠️  Test split has only one class present (n={len(y_test)}). "
+            "Test AUC/F1 below will not be meaningful — increase "
+            "--lookback-days or lower --test-size for a better holdout."
+        )
 
     # ── STEP 7: Scale (reuse existing scaler) ─────────────────────────────
     X_train_s = existing_scaler.transform(X_train)
