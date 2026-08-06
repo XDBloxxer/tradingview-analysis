@@ -1120,8 +1120,12 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["macdh_fast"] = safe(macd_fast_line - macd_fast_sig)
     ind["macds_fast"] = safe(macd_fast_sig)
     # MACD ROC = rate of change of standard MACD line
+    # Matches base training (multiday_feature_collector.py):
+    #   df["macd_roc"] = df["MACD_12_26_9"].pct_change(1) * 100
+    # Previously used pct_change(3), a 3-bar window that didn't match the
+    # 1-bar window base training was actually computed with.
     macd_std = ema12 - ema26  # already computed above
-    ind["macd_roc"] = safe(macd_std.pct_change(3) * 100, 0.0)
+    ind["macd_roc"] = safe(macd_std.pct_change(1) * 100, 0.0)
 
     # ── Stochastic variants ───────────────────────────────────────────────
     stk_raw = (100 * (c - l.rolling(14).min()) /
