@@ -394,8 +394,11 @@ class ExplosionPredictor:
                 self.metadata = json.load(f)
 
         # SPARSE-COLUMN CONSISTENCY FIX: build_scaler() in ml_retrain_model.py
-        # determines "sparse" (mostly-missing, e.g. t1_ intraday) columns from
-        # coverage computed on the *training set*, and that exact list is what
+        # determines "sparse" (mostly-missing in the training set — historically
+        # t1_ intraday columns back when t1 coverage was inconsistent; now
+        # whatever genuinely has low coverage, e.g. long-window indicators for
+        # short-history stocks) columns from coverage computed on the *training
+        # set*, and that exact list is what
         # decides which columns get NaN restored after scaling (so XGBoost uses
         # its learned missing-value branch instead of a mean-imputed value).
         # Previously _scale_features() below recomputed "sparse" from the
