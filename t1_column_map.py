@@ -183,6 +183,28 @@ INTRADAY_TO_MODEL: dict[str, str] = {
     "gap_pct":          "Gap_Pct",      # alias — deduped at runtime
 }
 
+# ---------------------------------------------------------------------------
+# Intentionally-unmapped T-1 source columns
+# ---------------------------------------------------------------------------
+# intraday_data_collector.py also computes kama, vortex_pos, vortex_neg,
+# mass_index, dpo, psar, psar_up, and psar_down for every T-1 snapshot (some
+# even pass through its normalization loop). None of these have an entry
+# above.
+#
+# This is intentional, not an oversight: none of these indicators exist in
+# the base/multiday feature set either (checked against the t3_/t5_/t10_
+# column names produced by multiday_feature_collector.py — no kama, vortex,
+# mass_index, dpo, or psar variant appears there). Per this module's own
+# convention (see the "kst" note above), a source column with no live
+# counterpart in the model's feature vocabulary is safely dropped by
+# rename_t1_columns() rather than mapped to a same-window-but-wrong-indicator
+# stand-in or a dead target no other row ever populates (see t1_column_map.py
+# bug fix 2026-08-06: "cci" → "CCI_14" was exactly this mistake).
+#
+# If any of these are wanted as real model features, they need to be added
+# to BOTH multiday_feature_collector.py (base training) and here — not
+# mapped one-sided from T-1 alone.
+
 # Columns that are metadata — never renamed, just preserved or dropped
 METADATA_COLS = {
     "id", "created_at", "updated_at", "symbol", "exchange",
