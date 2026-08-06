@@ -1503,15 +1503,23 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             )
             logger.debug(f"  normalise_t1: re-derived {sma_diff_col}")
 
-    # Price_vs_MA: price is always 0% from itself after normalisation,
-    # so price_vs_MA = 0 − normalised_MA = −normalised_MA.
+    # Price_vs_MA: base (multiday_feature_collector.py) defines this as
+    # (close - MA) / MA * 100 = (close/MA - 1) * 100 — i.e. it divides by
+    # the MA, not by close. The stored MA columns here are normalised to
+    # "% distance from close": normalised_MA = (MA/close - 1)*100, so
+    # MA/close = 1 + normalised_MA/100. Negating (−normalised_MA) instead
+    # gives (close-MA)/close*100, which divides by CLOSE — only matching
+    # base when close ~= MA and diverging on large moves. Derive
+    # algebraically instead so both paths divide by MA:
+    #   (close/MA - 1)*100 = (1 / (1 + normalised_MA/100) - 1) * 100
     for ma_col, vs_col in [
         (sma20, f"{prefix}_Price_vs_SMA20"),
         (sma50, f"{prefix}_Price_vs_SMA50"),
         (ema20, f"{prefix}_Price_vs_EMA20"),
     ]:
         if ma_col in df.columns and not _is_raw_price_line(ma_col):
-            df[vs_col] = -pd.to_numeric(df[ma_col], errors="coerce")
+            _norm_ma = pd.to_numeric(df[ma_col], errors="coerce")
+            df[vs_col] = (1.0 / (1.0 + _norm_ma / 100.0) - 1.0) * 100.0
             logger.debug(f"  normalise_t1: re-derived {vs_col}")
 
     # ATR_14_Slope: diff of normalised ATR (matches multiday atr_14_slope)
