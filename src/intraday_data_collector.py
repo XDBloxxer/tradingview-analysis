@@ -1129,15 +1129,21 @@ class IntradayDataCollector:
                 result['sma_20_50_diff'] = result['sma20'] - result['sma50']
 
             # price_vs_* ratios: re-derive from normalised MAs.
-            # normalised MA = (MA/close - 1)*100, so price_vs_MA = -normalised_MA
-            # (price is always 0% from itself; MA distance is the negative).
-            # We negate so positive means price is above the MA (matches multiday).
+            # normalised MA (stored in sma20/sma50/ema20) = (MA/close - 1)*100
+            #   => MA/close = 1 + normalised_MA/100
+            # Base (multiday_feature_collector.py) defines price_vs_MA as
+            #   (close - MA) / MA * 100  =  (close/MA - 1) * 100
+            # i.e. divides by the MA, NOT by close. Simply negating the
+            # normalised MA (the old approach) divides by close instead,
+            # which only agrees with base when close ~= MA and diverges on
+            # large moves. Derive algebraically so both paths divide by MA:
+            #   (close/MA - 1)*100 = (1 / (1 + normalised_MA/100) - 1) * 100
             if 'sma20' in result.columns:
-                result['price_vs_sma20'] = -result['sma20']
+                result['price_vs_sma20'] = (1.0 / (1.0 + result['sma20'] / 100.0) - 1.0) * 100
             if 'sma50' in result.columns:
-                result['price_vs_sma50'] = -result['sma50']
+                result['price_vs_sma50'] = (1.0 / (1.0 + result['sma50'] / 100.0) - 1.0) * 100
             if 'ema20' in result.columns:
-                result['price_vs_ema20'] = -result['ema20']
+                result['price_vs_ema20'] = (1.0 / (1.0 + result['ema20'] / 100.0) - 1.0) * 100
 
         # ── C. Volume → ratio to volume_ma20 ─────────────────────────────────
         # Raw volume MAs are absolute share counts that act as a market-cap
