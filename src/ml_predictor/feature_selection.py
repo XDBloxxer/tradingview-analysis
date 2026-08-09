@@ -1185,7 +1185,7 @@ def _cli() -> int:
     parser.add_argument("--corr-threshold", type=float, default=0.90)
     parser.add_argument("--boruta-iterations", type=int, default=100)
     parser.add_argument("--boruta-alpha", type=float, default=0.05)
-    parser.add_argument("--rfecv-min-features", type=int, default=8)
+    parser.add_argument("--rfecv-min-features", type=int, default=5)
     parser.add_argument("--rfecv-step", type=int, default=5)
     parser.add_argument("--skip-genetic", action="store_true")
     parser.add_argument(
@@ -1206,7 +1206,7 @@ def _cli() -> int:
              "the only candidates Stages 1-4 can select from.",
     )
     parser.add_argument(
-        "--stability-min-pool-size", type=int, default=8,
+        "--stability-min-pool-size", type=int, default=5,
         help="If stability gating is on and fewer than this many features "
              "reach the frequency bar, raise instead of proceeding on a "
              "too-small pool.",
