@@ -137,6 +137,8 @@ def time_aware_splits(
     n_splits: int = 5,
     min_train_frac: float = 0.4,
     gap: int = 0,
+    symbols: Optional[pd.Series] = None,
+    embargo_days: int = 0,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     Walk-forward CV splits ordered by `dates` (ties broken by index order).
@@ -150,6 +152,31 @@ def time_aware_splits(
     (mirrors FIX 2 in ml_retrain_model.train_val_split — mistake/undated rows
     must never leak into a validation slice).
 
+    LEAK GUARDS (mirror FIX 4 / FIX 5 in ml_retrain_model.train_val_split —
+    added because this function's own folds were shown to be vulnerable to
+    exactly this leakage; see synthetic_leak_test.py):
+
+      embargo_days: rows dated within `embargo_days` calendar days immediately
+        before a fold's test window are dropped from that fold's TRAIN split
+        entirely (not moved to test). Several of the strongest features here
+        (hv_20/30, cci, dmn, ...) are rolling-window indicators up to 30
+        trading days deep, so without this gap, a train row right before a
+        fold boundary and a test row right after it have highly overlapping
+        (autocorrelated) rolling-window feature vectors — inflating fold AUC
+        via boundary adjacency rather than genuine generalisation.
+        0 (default) disables this, preserving old behaviour for any existing
+        caller that doesn't pass it.
+
+      symbols: if provided (same length/order as `dates`), any symbol present
+        in a fold's test window is purged from that fold's TRAIN split
+        entirely. hv_20/30/cci/dmn-style rolling-window indicators stay close
+        to a stock's own baseline level for weeks/months, so without this,
+        a model can partially re-identify a symbol from a *different* time
+        window instead of learning a genuinely predictive pattern — this is
+        exactly what synthetic_leak_test.py demonstrates against this
+        function. None (default) disables this, preserving old behaviour for
+        any existing caller that doesn't pass it.
+
     Returns a list of (train_idx, test_idx) pairs of *positional* indices
     into `dates.reset_index(drop=True)`. Each successive fold's test window
     is a later, non-overlapping slice of the timeline — this is the walk-
@@ -158,6 +185,14 @@ def time_aware_splits(
     d = pd.to_datetime(dates, errors="coerce").reset_index(drop=True)
     n = len(d)
     nat_mask = d.isna()
+
+    sym: Optional[pd.Series] = None
+    if symbols is not None:
+        sym = pd.Series(symbols).reset_index(drop=True)
+        if len(sym) != n:
+            raise ValueError(
+                f"symbols (len={len(sym)}) must be the same length as dates (len={n})"
+            )
 
     dated_pos = np.where(~nat_mask)[0]
     order = dated_pos[np.argsort(d.iloc[dated_pos].values)]  # positions sorted by date
@@ -180,6 +215,38 @@ def time_aware_splits(
         train_pos = order[: max(train_end - gap, 0)]
         test_pos = order[train_end:test_end]
         train_pos = np.concatenate([train_pos, nat_positions])
+
+        n_embargoed = 0
+        if embargo_days > 0 and len(test_pos) > 0:
+            test_start = d.iloc[test_pos].min()
+            embargo_start = test_start - pd.Timedelta(days=embargo_days)
+            train_dates = d.iloc[train_pos]
+            embargo_mask = (
+                train_dates.notna()
+                & (train_dates >= embargo_start)
+                & (train_dates < test_start)
+            ).values
+            if embargo_mask.any():
+                n_embargoed = int(embargo_mask.sum())
+                train_pos = train_pos[~embargo_mask]
+
+        n_purged = 0
+        if sym is not None and len(test_pos) > 0:
+            test_symbols = set(sym.iloc[test_pos].dropna().unique())
+            if test_symbols:
+                overlap_mask = sym.iloc[train_pos].isin(test_symbols).values
+                if overlap_mask.any():
+                    n_purged = int(overlap_mask.sum())
+                    train_pos = train_pos[~overlap_mask]
+
+        if n_embargoed or n_purged:
+            logger.debug(
+                f"[time_aware_splits] fold {i}: dropped {n_embargoed} embargoed "
+                f"row(s) (<{embargo_days}d before test) and {n_purged} symbol-"
+                f"overlap row(s) from train (train now {len(train_pos)} rows, "
+                f"test {len(test_pos)} rows)."
+            )
+
         splits.append((train_pos, test_pos))
     return splits
 
@@ -443,6 +510,8 @@ def rfecv_time_aware(
     max_depth: int = 5,
     n_estimators: int = 200,
     random_state: int = 42,
+    symbols: Optional[pd.Series] = None,
+    embargo_days: int = 0,
 ) -> tuple[list[str], pd.DataFrame]:
     """
     Manual RFECV loop (not sklearn.feature_selection.RFECV, which only
@@ -453,6 +522,11 @@ def rfecv_time_aware(
       2. Drop the `step` weakest features.
       3. Re-fit and re-evaluate with time_aware_splits().
 
+    `symbols` / `embargo_days` are forwarded straight to time_aware_splits()
+    — see that function's docstring. Pass both whenever you have a symbol
+    column available; without them, this AUC curve can be inflated by
+    symbol-level and date-boundary leakage (see synthetic_leak_test.py).
+
     Returns (features_at_best_score, curve_df) where curve_df has one row
     per elimination round (n_features, mean_auc, std_auc) — plot this to
     find the elbow ("AUC barely moves after 60 features, then degrades").
@@ -462,7 +536,9 @@ def rfecv_time_aware(
     Xc, yv = _prep_xy(X, y)
     Xc = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
     remaining = list(Xc.columns)
-    splits = time_aware_splits(dates, n_splits=n_splits)
+    splits = time_aware_splits(
+        dates, n_splits=n_splits, symbols=symbols, embargo_days=embargo_days,
+    )
     sample_weight = w.values if w is not None else np.ones(len(yv))
 
     curve_rows = []
@@ -553,6 +629,8 @@ def genetic_search(
     candidate_features: list[str],
     w: Optional[pd.Series] = None,
     config: Optional[GAConfig] = None,
+    symbols: Optional[pd.Series] = None,
+    embargo_days: int = 0,
 ) -> tuple[list[str], pd.DataFrame]:
     """
     Genetic-algorithm search over subsets of `candidate_features`
@@ -565,6 +643,11 @@ def genetic_search(
     penalty per feature, so the search doesn't just converge to "keep
     everything".
 
+    `symbols` / `embargo_days` are forwarded straight to time_aware_splits()
+    — see that function's docstring. Without them, the GA's fitness signal
+    can be won by symbol-level/date-boundary leakage instead of a genuinely
+    predictive subset (see synthetic_leak_test.py).
+
     Returns (best_feature_subset, generation_log_df).
     """
     import xgboost as xgb
@@ -574,7 +657,9 @@ def genetic_search(
 
     Xc, yv = _prep_xy(X, y)
     Xc = Xc.fillna(Xc.median(numeric_only=True)).fillna(0.0)
-    splits = time_aware_splits(dates, n_splits=config.n_splits)
+    splits = time_aware_splits(
+        dates, n_splits=config.n_splits, symbols=symbols, embargo_days=embargo_days,
+    )
     sample_weight = w.values if w is not None else np.ones(len(yv))
     n_feat = len(candidate_features)
     max_features = config.max_features or n_feat
@@ -681,6 +766,8 @@ def stability_select(
     rfecv_min_features: int = 8,
     rfecv_step: int = 5,
     random_state: int = 42,
+    symbols: Optional[pd.Series] = None,
+    embargo_days: int = 0,
 ) -> StabilityResult:
     """
     Answer "which features should I actually run" directly, instead of
@@ -706,6 +793,10 @@ def stability_select(
     Returns features with frequency >= min_frequency as `stable_features`,
     but the full `frequency` table is the more useful artifact: it lets you
     manually pick a cutoff instead of trusting a single hard-coded one.
+
+    `symbols` / `embargo_days` are forwarded to each run's internal
+    rfecv_time_aware() call (resampled alongside X/y/dates for each block
+    bootstrap) — see time_aware_splits()'s docstring for why this matters.
     """
     rng = np.random.RandomState(random_state)
     Xc, yv_full = _prep_xy(X, y)
@@ -732,6 +823,7 @@ def stability_select(
         y_run = y.iloc[idx].reset_index(drop=True)
         dates_run = dates.iloc[idx].reset_index(drop=True)
         w_run = w.iloc[idx].reset_index(drop=True) if w is not None else None
+        symbols_run = symbols.iloc[idx].reset_index(drop=True) if symbols is not None else None
 
         logger.info(f"[stability] run {run_i + 1}/{n_runs} (n={len(X_run)})")
 
@@ -751,6 +843,7 @@ def stability_select(
             X_run[boruta_features], y_run, dates_run, w=w_run,
             min_features=rfecv_min_features, step=rfecv_step,
             random_state=random_state + run_i,
+            symbols=symbols_run, embargo_days=embargo_days,
         )
         per_run_features.append(rfecv_features)
 
@@ -827,6 +920,8 @@ def run_pipeline(
     stability_gate: bool = True,
     stability_min_pool_size: int = 8,
     exclude_features: Optional[list[str]] = None,
+    symbols: Optional[pd.Series] = None,
+    embargo_days: int = 0,
 ) -> PipelineResult:
     """
     Run the pipeline and persist artifacts to `output_dir`.
@@ -842,6 +937,20 @@ def run_pipeline(
     The `_cli()` entry point below carves out a train-only slice (mirroring
     ml_retrain_model.py's _compute_val_cutoff()/VAL_WEEKS) before calling
     this function; any other caller must do the same.
+
+    LEAK GUARDS — `symbols` and `embargo_days` (mirror FIX 4/FIX 5 in
+    ml_retrain_model.train_val_split): Stages 3 (RFECV) and 4 (GA), plus the
+    RFECV call inside the Stage-0.5 stability check, all fit/evaluate across
+    walk-forward folds via time_aware_splits(). Without a symbol column and
+    an embargo gap, those folds are vulnerable to the same symbol-level and
+    date-boundary leakage documented in ml_retrain_model.py and reproduced in
+    synthetic_leak_test.py — features get selected for how well they let the
+    model "recognise" a stock or lean on autocorrelated rolling windows
+    across the fold boundary, not for genuine predictive power. Pass the
+    combined dataset's `symbol` column as `symbols` and a calendar-day
+    embargo (e.g. via ml_retrain_model._infer_embargo_days(X.columns)) as
+    `embargo_days` whenever they're available — both default to "off" only
+    so this stays backward compatible for callers that can't supply them.
 
     `run_stability_check` defaults to True: Stages 1-3 are first repeated
     `stability_n_runs` times over block-bootstrapped resamples (see
@@ -881,6 +990,8 @@ def run_pipeline(
             boruta_alpha=boruta_alpha,
             rfecv_min_features=rfecv_min_features,
             rfecv_step=rfecv_step,
+            symbols=symbols,
+            embargo_days=embargo_days,
         )
         stability.frequency.to_csv(out / "stability_frequency.csv", index=False)
         logger.info(
@@ -938,6 +1049,7 @@ def run_pipeline(
     rfecv_features, rfecv_curve = rfecv_time_aware(
         X[boruta_features], y, dates, w=w,
         min_features=rfecv_min_features, step=rfecv_step,
+        symbols=symbols, embargo_days=embargo_days,
     )
     rfecv_curve.to_csv(out / "stage3_rfecv_curve.csv", index=False)
 
@@ -953,7 +1065,10 @@ def run_pipeline(
         # independent of rfecv_min_features, so the GA can actually explore
         # down to a genuinely small subset instead of a derived one.
         cfg = ga_config or GAConfig()
-        ga_features, ga_log = genetic_search(X[rfecv_features], y, dates, rfecv_features, w=w, config=cfg)
+        ga_features, ga_log = genetic_search(
+            X[rfecv_features], y, dates, rfecv_features, w=w, config=cfg,
+            symbols=symbols, embargo_days=embargo_days,
+        )
         ga_log.to_csv(out / "stage4_ga_log.csv", index=False)
 
     final_features = ga_features if ga_features is not None else rfecv_features
@@ -984,6 +1099,8 @@ def run_pipeline(
         "stability_check_ran": run_stability_check,
         "stability_gate_enabled": stability_gate if run_stability_check else None,
         "stability_min_frequency": stability_min_frequency if run_stability_check else None,
+        "embargo_days": embargo_days,
+        "symbol_purge_enabled": symbols is not None,
     }
     with open(out / "selected_features.json", "w") as f:
         json.dump(summary, f, indent=2)
@@ -1053,6 +1170,23 @@ def _cli() -> int:
     )
     parser.add_argument("--output-dir", default="ml_models/feature_selection")
     parser.add_argument(
+        "--embargo-days", type=int, default=-1,
+        help="Calendar-day purge/embargo gap applied at every walk-forward "
+             "fold boundary inside Stages 3/4 (and the Stage-0.5 stability "
+             "check), mirroring FIX 4 in ml_retrain_model.train_val_split. "
+             "-1 (default) auto-infers it from the deepest rolling-window "
+             "feature name still in play, via the same "
+             "ml_retrain_model._infer_embargo_days() the production retrain "
+             "uses. Pass 0 to disable explicitly.",
+    )
+    parser.add_argument(
+        "--no-symbol-purge", action="store_true",
+        help="Disable the per-fold symbol purge (FIX 5) applied by default "
+             "inside Stages 3/4 and the stability check. Leave this off "
+             "unless you're specifically trying to reproduce the old "
+             "(leaky) behaviour — see synthetic_leak_test.py.",
+    )
+    parser.add_argument(
         "--lookback-days", type=int, default=365,
         help="Cap how much T-1/base history is fetched for feature selection "
              "(server-side, via the same fetch_table_paginated() date filter "
@@ -1087,6 +1221,43 @@ def _cli() -> int:
     date_col = "detection_date" if "detection_date" in combined_df.columns else "event_date"
     dates = combined_df[date_col] if date_col in combined_df.columns else pd.Series(pd.NaT, index=combined_df.index)
 
+    # ── LEAK FIX: symbol column for the per-fold purge (FIX 5) ──────────────
+    # combine_datasets() already normalises the ticker column to "symbol"
+    # (see ml_retrain_model.load_base_training_data), so this should always
+    # be present for real production data. Missing it doesn't hard-fail —
+    # it just means Stages 3/4 fall back to date-only folds and can't guard
+    # against symbol-level leakage, same as train_val_split()'s own fallback.
+    if args.no_symbol_purge:
+        symbols = None
+        logging.getLogger(__name__).info(
+            "[leak-guard] --no-symbol-purge set — Stages 3/4 will NOT purge "
+            "symbol overlap across fold boundaries."
+        )
+    elif "symbol" in combined_df.columns:
+        symbols = combined_df["symbol"]
+    else:
+        symbols = None
+        logging.getLogger(__name__).warning(
+            "[leak-guard] no 'symbol' column in combined_df — Stages 3/4 "
+            "cannot purge symbol overlap across fold boundaries. Train/test "
+            "folds may still share tickers; symbol-level leakage (see "
+            "synthetic_leak_test.py) cannot be ruled out."
+        )
+
+    # ── LEAK FIX: embargo gap for the same folds (FIX 4) ─────────────────────
+    # Reuses ml_retrain_model's own inference logic so the gap used here
+    # matches what the production retrain applies at its train/val boundary,
+    # instead of maintaining a second, possibly-drifting copy of the same
+    # "deepest rolling window -> calendar days" calculation.
+    if args.embargo_days >= 0:
+        embargo_days = args.embargo_days
+    else:
+        embargo_days = rt._infer_embargo_days(list(X.columns))
+    logging.getLogger(__name__).info(
+        f"[leak-guard] embargo_days={embargo_days} "
+        f"(source: {'CLI override' if args.embargo_days >= 0 else 'auto-inferred from feature names'})"
+    )
+
     # ── LEAK FIX: restrict feature selection to train-only rows ─────────────
     # Stages 1 (correlation-cluster representative pick) and 2 (Boruta) each
     # fit directly on whatever X/y they're given, with no internal time split
@@ -1115,6 +1286,8 @@ def _cli() -> int:
     if w is not None:
         w = w.loc[fs_train_mask]
     dates = dates.loc[fs_train_mask]
+    if symbols is not None:
+        symbols = symbols.loc[fs_train_mask]
 
     exclude_features: list[str] = []
     if not args.no_exclude_features:
@@ -1139,6 +1312,8 @@ def _cli() -> int:
         stability_gate=not args.no_stability_gate,
         stability_min_pool_size=args.stability_min_pool_size,
         exclude_features=exclude_features,
+        symbols=symbols,
+        embargo_days=embargo_days,
     )
     return 0
 
