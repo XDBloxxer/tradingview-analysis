@@ -1064,7 +1064,7 @@ def run_pipeline(
     stability_n_runs: int = 15,
     stability_min_frequency: float = 0.5,
     stability_gate: bool = True,
-    stability_min_pool_size: int = 8,
+    stability_min_pool_size: float = 8,
     exclude_features: Optional[list[str]] = None,
     exclude_base_features: Optional[list[str]] = None,
     symbols: Optional[pd.Series] = None,
@@ -1123,6 +1123,15 @@ def run_pipeline(
     with too few candidates — a near-empty stable set usually means
     min_frequency/n_runs need revisiting, not that the pipeline should
     proceed on 1-2 features.
+
+    `stability_min_pool_size` accepts either an absolute count (value >= 1,
+    e.g. 8) or a fraction of the total candidate clusters found this run
+    (value in (0, 1), e.g. 0.2). Use the fraction form whenever the
+    candidate column count varies run to run — e.g. via `exclude_features`
+    for a one-off investigation — since a fixed absolute floor gets
+    proportionally harsher to clear as the candidate pool shrinks (needing
+    8 stable clusters out of 20 total is a much stricter bar than 8 out of
+    140, even though both are "8").
     """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1154,18 +1163,33 @@ def run_pipeline(
         )
 
         if stability_gate:
-            if len(stability.stable_features) < stability_min_pool_size:
+            total_clusters = len(stability.cluster_frequency)
+            # Resolve absolute-vs-fraction pool-size floor. Values < 1 are a
+            # fraction of this run's total candidate clusters (so the bar
+            # scales with the candidate pool instead of staying a fixed
+            # count regardless of how many columns went in — see docstring
+            # above for why a fixed absolute floor gets disproportionately
+            # strict once exclude_features/exclude_base_features shrink the
+            # pool). Values >= 1 behave exactly as before.
+            if stability_min_pool_size < 1:
+                effective_pool_size = max(1, round(stability_min_pool_size * total_clusters))
+            else:
+                effective_pool_size = stability_min_pool_size
+            if len(stability.stable_features) < effective_pool_size:
                 raise ValueError(
                     f"[stability] gate enabled but only "
                     f"{len(stability.stable_features)} signal cluster(s) reached "
                     f">= {stability_min_frequency:.0%} frequency across "
-                    f"{stability_n_runs} runs (need >= {stability_min_pool_size} "
-                    f"to proceed). This is now measured on cross-run signal "
-                    f"clusters (see stability_cluster_frequency.csv), not raw "
-                    f"column names, so a low count here reflects genuine "
-                    f"instability rather than cluster-representative name "
-                    f"churn. Lower stability_min_frequency, raise "
-                    f"stability_n_runs, or set stability_gate=False to fall "
+                    f"{stability_n_runs} runs (need >= {effective_pool_size} "
+                    f"of {total_clusters} candidate cluster(s) to proceed). "
+                    f"This is now measured on cross-run signal clusters (see "
+                    f"stability_cluster_frequency.csv), not raw column names, "
+                    f"so a low count here reflects genuine instability rather "
+                    f"than cluster-representative name churn. Lower "
+                    f"stability_min_frequency, raise stability_n_runs, pass a "
+                    f"fractional stability_min_pool_size (e.g. 0.2) if the "
+                    f"candidate pool is unusually small this run (e.g. from "
+                    f"exclude_features), or set stability_gate=False to fall "
                     f"back to diagnostic-only mode and review both CSVs "
                     f"manually before shipping."
                 )
@@ -1311,10 +1335,15 @@ def _cli() -> int:
              "the only candidates Stages 1-4 can select from.",
     )
     parser.add_argument(
-        "--stability-min-pool-size", type=int, default=8,
-        help="If stability gating is on and fewer than this many features "
-             "reach the frequency bar, raise instead of proceeding on a "
-             "too-small pool.",
+        "--stability-min-pool-size", type=float, default=8,
+        help="If stability gating is on and fewer than this many stable "
+             "signal clusters reach the frequency bar, raise instead of "
+             "proceeding on a too-small pool. Values >= 1 are an absolute "
+             "count (default: 8). Values in (0, 1) are a fraction of the "
+             "total candidate clusters found this run instead, e.g. 0.2 -- "
+             "use this when the candidate column count varies run to run "
+             "(e.g. via --exclude-features-file), since a fixed absolute "
+             "floor gets proportionally stricter as the pool shrinks.",
     )
     parser.add_argument(
         "--exclude-features-file",
