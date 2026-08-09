@@ -1,19 +1,18 @@
 {
-  "stage0_count": 8,
-  "stage1_corr_count": 8,
-  "stage2_boruta_count": 8,
-  "stage3_rfecv_count": 8,
+  "stage0_count": 7,
+  "stage1_corr_count": 7,
+  "stage2_boruta_count": 7,
+  "stage3_rfecv_count": 7,
   "stage4_ga_count": null,
-  "final_count": 8,
+  "final_count": 7,
   "final_features": [
-    "t1_open_SMA_20_50_Diff",
-    "t1_close_DCM_20_20",
-    "t5_hv_30",
-    "t1_open_Volume_MA10",
-    "t1_open_Volume_MA5",
-    "t1_open_Volume_Ratio",
-    "t1_open_ROC_10",
-    "t1_open_Price_vs_SMA20"
+    "t1_close_RSI_14",
+    "t1_close_ROC_10",
+    "t1_close_EMA_20",
+    "t1_close_KCLe_20_2",
+    "t1_open_SMA_20_Slope",
+    "t1_open_DCM_20_20",
+    "t1_open_Price_vs_EMA20"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
@@ -22,7 +21,11 @@
   "excluded_features": [],
   "excluded_base_features": [
     "DCL_20_20",
-    "BBL_20_2.0_2.0"
+    "BBL_20_2.0_2.0",
+    "Price_vs_SMA20",
+    "Volume_MA10",
+    "Volume_Ratio",
+    "Volume_MA5"
   ],
   "stability_check_ran": true,
   "stability_gate_enabled": true,

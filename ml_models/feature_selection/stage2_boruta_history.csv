@@ -1,9 +1,8 @@
 feature,hits,hit_rate,p_value,status
-t1_open_SMA_20_50_Diff,100,1.0,0.0,confirmed
-t1_close_DCM_20_20,100,1.0,0.0,confirmed
-t5_hv_30,100,1.0,0.0,confirmed
-t1_open_Volume_MA10,100,1.0,0.0,confirmed
-t1_open_Volume_MA5,100,1.0,0.0,confirmed
-t1_open_Volume_Ratio,100,1.0,0.0,confirmed
-t1_open_Price_vs_SMA20,100,1.0,0.0,confirmed
-t1_open_ROC_10,98,0.98,0.0,confirmed
+t1_close_RSI_14,100,1.0,0.0,confirmed
+t1_close_ROC_10,100,1.0,0.0,confirmed
+t1_close_EMA_20,100,1.0,0.0,confirmed
+t1_close_KCLe_20_2,100,1.0,0.0,confirmed
+t1_open_SMA_20_Slope,100,1.0,0.0,confirmed
+t1_open_DCM_20_20,100,1.0,0.0,confirmed
+t1_open_Price_vs_EMA20,100,1.0,0.0,confirmed
