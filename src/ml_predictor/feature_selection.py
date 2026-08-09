@@ -812,7 +812,7 @@ def stability_select(
     dates: pd.Series,
     w: Optional[pd.Series] = None,
     n_runs: int = 8,
-    min_frequency: float = 0.75,
+    min_frequency: float = 0.6,
     block_frac: float = 0.85,
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
