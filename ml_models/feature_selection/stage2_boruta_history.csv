@@ -1,8 +1,7 @@
 feature,hits,hit_rate,p_value,status
-t1_open_ATR_14,100,1.0,0.0,confirmed
 t1_close_EMA_50,100,1.0,0.0,confirmed
+t1_open_ATR_14,100,1.0,0.0,confirmed
 t1_close_DCM_20_20,100,1.0,0.0,confirmed
-t1_open_SMA_20_50_Diff,100,1.0,0.0,confirmed
 t1_close_SMA_20_Slope,100,1.0,0.0,confirmed
-t5_hv_30,100,1.0,0.0,confirmed
-t1_open_Price_vs_SMA50,100,1.0,0.0,confirmed
+t1_close_EMA_20_Slope,100,1.0,0.0,confirmed
+t1_open_KCLe_20_2,100,1.0,0.0,confirmed
