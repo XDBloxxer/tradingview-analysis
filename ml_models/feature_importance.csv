@@ -1,7 +1,6 @@
 feature,importance
-t1_close_DCM_20_20,0.414756
-t1_open_KCLe_20_2,0.321494
-t1_close_SMA_20_Slope,0.136409
-t1_close_EMA_50,0.050463
-t1_close_EMA_20_Slope,0.03887
-t1_open_ATR_14,0.038008
+t1_open_DCM_20_20,0.360872
+t1_open_HV_20,0.260394
+t1_close_KCUe_20_2,0.203641
+t1_close_EMA_50,0.135629
+t1_open_ATR_14,0.039463
