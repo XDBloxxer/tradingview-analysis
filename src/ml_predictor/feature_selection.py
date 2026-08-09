@@ -972,7 +972,7 @@ def run_pipeline(
     stability_n_runs: int = 30,
     stability_min_frequency: float = 0.5,
     stability_gate: bool = True,
-    stability_min_pool_size: int = 6,
+    stability_min_pool_size: int = 5,
     exclude_features: Optional[list[str]] = None,
     exclude_base_features: Optional[list[str]] = None,
     symbols: Optional[pd.Series] = None,
