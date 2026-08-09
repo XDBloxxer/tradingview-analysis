@@ -817,7 +817,7 @@ def stability_select(
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
     boruta_alpha: float = 0.05,
-    rfecv_min_features: int = 8,
+    rfecv_min_features: int = 5,
     rfecv_step: int = 5,
     random_state: int = 42,
     symbols: Optional[pd.Series] = None,
@@ -964,7 +964,7 @@ def run_pipeline(
     # FIX: 20 was too close to typical Boruta output (~24 in practice), so
     # RFECV took a single elimination step and produced a 2-point "curve"
     # instead of an actual elbow. Lower default so it walks a real range.
-    rfecv_min_features: int = 8,
+    rfecv_min_features: int = 5,
     rfecv_step: int = 5,
     run_genetic_polish: bool = True,
     ga_config: Optional[GAConfig] = None,
