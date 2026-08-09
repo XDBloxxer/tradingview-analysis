@@ -1,30 +1,29 @@
 {
-  "stage0_count": 390,
-  "stage1_corr_count": 167,
-  "stage2_boruta_count": 50,
-  "stage3_rfecv_count": 40,
+  "stage0_count": 5,
+  "stage1_corr_count": 5,
+  "stage2_boruta_count": 5,
+  "stage3_rfecv_count": 5,
   "stage4_ga_count": null,
-  "final_count": 40,
+  "final_count": 5,
   "final_features": [
-    "t1_close_DMN_14",
-    "t3_cci_14",
-    "t10_cci_20",
-    "t5_hv_30",
-    "t3_hv_20",
-    "t5_hv_20",
-    "t10_hv_30",
-    "t1_open_HV_20",
-    "t5_dmn_14",
-    "t10_dmn_14",
-    "t5_rsi_14_slope"
+    "t1_open_SMA_20_50_Diff",
+    "t1_close_DCM_20_20",
+    "t1_open_Volume_MA10",
+    "t1_close_Volume_MA5",
+    "t1_close_Price_vs_EMA20"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
   "boruta_alpha": 0.05,
   "rfecv_min_features": 8,
-  "excluded_features": [
-    "t1_open_DCL_20_20",
-    "t1_close_BBL_20_2.0_2.0",
-    "has_t1_features"
-  ]
+  "excluded_features": [],
+  "excluded_base_features": [
+    "DCL_20_20",
+    "BBL_20_2.0_2.0"
+  ],
+  "stability_check_ran": true,
+  "stability_gate_enabled": true,
+  "stability_min_frequency": 0.75,
+  "embargo_days": 70,
+  "symbol_purge_enabled": true
 }
