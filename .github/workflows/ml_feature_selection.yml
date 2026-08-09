@@ -54,6 +54,11 @@ on:
         required: false
         default: '365'
         type: string
+      stability_min_pool_size:
+        description: 'Stability gate floor: >=1 for an absolute cluster count (default 8), or a fraction like 0.2 for 20% of this run''s candidate clusters. Use a fraction when excluded_features has meaningfully shrunk the candidate pool (e.g. an investigation run), since a fixed absolute floor gets disproportionately strict as the pool shrinks.'
+        required: false
+        default: '8'
+        type: string
 
 permissions:
   contents: write
@@ -108,8 +113,9 @@ jobs:
           SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
           USE_EXCLUDED="${{ github.event.inputs.use_excluded_features || 'true' }}"
           LOOKBACK="${{ github.event.inputs.lookback_days || '365' }}"
+          STABILITY_MIN_POOL="${{ github.event.inputs.stability_min_pool_size || '8' }}"
 
-          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN --lookback-days $LOOKBACK"
+          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN --lookback-days $LOOKBACK --stability-min-pool-size $STABILITY_MIN_POOL"
           if [ "$SKIP_GA" = "true" ]; then
             ARGS="$ARGS --skip-genetic"
           fi
@@ -127,6 +133,7 @@ jobs:
           # Plain JSON/CSV — no LFS needed (only ml_models/*.pkl is LFS-tracked).
           git add ml_models/feature_selection/selected_features.json          || true
           git add ml_models/feature_selection/stability_frequency.csv         || true
+          git add ml_models/feature_selection/stability_cluster_frequency.csv || true
           git add ml_models/feature_selection/stage1_correlation_clusters.csv || true
           git add ml_models/feature_selection/stage2_boruta_history.csv       || true
           git add ml_models/feature_selection/stage3_rfecv_curve.csv          || true
