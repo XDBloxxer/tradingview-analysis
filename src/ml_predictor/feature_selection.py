@@ -812,12 +812,12 @@ def stability_select(
     dates: pd.Series,
     w: Optional[pd.Series] = None,
     n_runs: int = 8,
-    min_frequency: float = 0.6,
+    min_frequency: float = 0.75,
     block_frac: float = 0.85,
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
     boruta_alpha: float = 0.05,
-    rfecv_min_features: int = 5,
+    rfecv_min_features: int = 8,
     rfecv_step: int = 5,
     random_state: int = 42,
     symbols: Optional[pd.Series] = None,
@@ -964,15 +964,15 @@ def run_pipeline(
     # FIX: 20 was too close to typical Boruta output (~24 in practice), so
     # RFECV took a single elimination step and produced a 2-point "curve"
     # instead of an actual elbow. Lower default so it walks a real range.
-    rfecv_min_features: int = 5,
+    rfecv_min_features: int = 8,
     rfecv_step: int = 5,
     run_genetic_polish: bool = True,
     ga_config: Optional[GAConfig] = None,
     run_stability_check: bool = True,
-    stability_n_runs: int = 30,
-    stability_min_frequency: float = 0.5,
+    stability_n_runs: int = 8,
+    stability_min_frequency: float = 0.75,
     stability_gate: bool = True,
-    stability_min_pool_size: int = 5,
+    stability_min_pool_size: int = 8,
     exclude_features: Optional[list[str]] = None,
     exclude_base_features: Optional[list[str]] = None,
     symbols: Optional[pd.Series] = None,
@@ -1185,7 +1185,7 @@ def _cli() -> int:
     parser.add_argument("--corr-threshold", type=float, default=0.90)
     parser.add_argument("--boruta-iterations", type=int, default=100)
     parser.add_argument("--boruta-alpha", type=float, default=0.05)
-    parser.add_argument("--rfecv-min-features", type=int, default=5)
+    parser.add_argument("--rfecv-min-features", type=int, default=8)
     parser.add_argument("--rfecv-step", type=int, default=5)
     parser.add_argument("--skip-genetic", action="store_true")
     parser.add_argument(
@@ -1206,7 +1206,7 @@ def _cli() -> int:
              "the only candidates Stages 1-4 can select from.",
     )
     parser.add_argument(
-        "--stability-min-pool-size", type=int, default=5,
+        "--stability-min-pool-size", type=int, default=8,
         help="If stability gating is on and fewer than this many features "
              "reach the frequency bar, raise instead of proceeding on a "
              "too-small pool.",
