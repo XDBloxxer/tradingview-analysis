@@ -49,6 +49,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -70,62 +71,115 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXCLUDED_FEATURES_PATH = "ml_models/feature_selection/excluded_features.json"
 
 
-def load_excluded_features(path: str | Path) -> list[str]:
+def load_excluded_features(path: str | Path) -> tuple[list[str], list[str]]:
     """
     Load a manual feature blocklist for the selection pipeline.
 
-    Expected JSON shape is a simple list of column names:
+    Returns (exact_names, base_names):
 
-        ["some_leaky_feature", "another_feature_to_never_use"]
+      exact_names: matched literally against column names — use for one-off
+        columns that don't follow the lag/side-prefix convention (e.g.
+        "has_t1_features").
 
-    A dict with an "excluded_features" key (list[str]) is also accepted, so
-    the file can carry comments/metadata alongside the list if you want:
+      base_names: matched against the BASE indicator name after stripping
+        the lag/side prefix (t1_open_/t1_close_/t3_/t5_/t10_), case-
+        insensitively. One entry here blocks every lag AND every open/close
+        variant of that indicator at once — e.g. "DCL_20_20" blocks
+        t1_open_DCL_20_20, t1_close_DCL_20_20, t3_dcl_20_20, t5_dcl_20_20,
+        and t10_dcl_20_20 together. Prefer this for anything leaky in
+        principle, not just the one lag/side that happened to get tested —
+        blocking only one twin of an open/close pair (as happened with
+        t1_open_DCL_20_20 while t1_close_DCL_20_20 stayed live and scored a
+        1.000 univariate AUC) leaves the leak fully exploitable.
 
-        {"excluded_features": ["some_leaky_feature"], "note": "why"}
+    Expected JSON shape:
 
-    Missing file -> returns [] (nothing excluded) rather than raising, so
-    this is safe to point at a path that doesn't exist yet.
+        {
+          "excluded_features": ["some_one_off_column"],
+          "excluded_base_features": ["DCL_20_20", "BBL_20_2.0_2.0"],
+          "note": "why"
+        }
+
+    A bare JSON list (old format) is treated as `excluded_features` only,
+    with an empty `excluded_base_features`, for backward compatibility.
+
+    Missing file -> returns ([], []) (nothing excluded) rather than raising,
+    so this is safe to point at a path that doesn't exist yet.
     """
     p = Path(path)
     if not p.exists():
         logger.info(f"[exclude] no blocklist file at {p} — nothing excluded")
-        return []
+        return [], []
 
     with open(p) as f:
         data = json.load(f)
 
     if isinstance(data, list):
-        excluded = data
+        exact = [str(c) for c in data]
+        base: list[str] = []
     elif isinstance(data, dict):
-        excluded = data.get("excluded_features", [])
+        exact = [str(c) for c in data.get("excluded_features", [])]
+        base = [str(c) for c in data.get("excluded_base_features", [])]
     else:
         raise ValueError(
             f"{p}: expected a JSON list or a dict with an 'excluded_features' "
             f"key, got {type(data).__name__}"
         )
 
-    excluded = [str(c) for c in excluded]
-    logger.info(f"[exclude] loaded {len(excluded)} feature(s) to exclude from {p}")
-    return excluded
+    logger.info(
+        f"[exclude] loaded {len(exact)} exact-name and {len(base)} "
+        f"base-indicator exclusion(s) from {p}"
+    )
+    return exact, base
 
 
-def apply_feature_exclusions(X: pd.DataFrame, excluded_features: list[str]) -> pd.DataFrame:
+# Lag/side prefixes stripped when matching base-indicator exclusions — keep
+# in sync with the T-1/T-3/T-5/T-10 column-naming convention used throughout
+# ml_retrain_model.py / multiday_feature_collector.py.
+_LAG_SIDE_PREFIX_RE = re.compile(r"^t(?:1_(?:open|close)|3|5|10)_", re.IGNORECASE)
+
+
+def _base_feature_name(col: str) -> str:
+    """Strip the t1_open_/t1_close_/t3_/t5_/t10_ prefix, lowercase the rest."""
+    return _LAG_SIDE_PREFIX_RE.sub("", col).lower()
+
+
+def apply_feature_exclusions(
+    X: pd.DataFrame,
+    excluded_features: list[str],
+    excluded_base_features: Optional[list[str]] = None,
+) -> pd.DataFrame:
     """
-    Drop `excluded_features` from X before any selection stage sees them.
+    Drop `excluded_features` (exact match) and `excluded_base_features`
+    (matched against every lag/side variant of the base indicator name,
+    case-insensitively — see load_excluded_features docstring) from X
+    before any selection stage sees them.
 
     Names in the blocklist that aren't actually present in X are logged and
     ignored (not an error) — the pipeline's feature set changes over time,
     so a stale entry shouldn't break the run.
     """
-    if not excluded_features:
-        return X
+    excluded_base_features = excluded_base_features or []
+
     present = [c for c in excluded_features if c in X.columns]
     missing = [c for c in excluded_features if c not in X.columns]
     if missing:
-        logger.info(f"[exclude] {len(missing)} blocklisted name(s) not present in X (ignored): {missing}")
-    if present:
-        logger.info(f"[exclude] dropping {len(present)} blocklisted feature(s): {present}")
-    return X.drop(columns=present)
+        logger.info(f"[exclude] {len(missing)} blocklisted exact name(s) not present in X (ignored): {missing}")
+
+    base_targets = {b.lower() for b in excluded_base_features}
+    base_matches = [c for c in X.columns if _base_feature_name(c) in base_targets]
+    matched_bases = {_base_feature_name(c) for c in base_matches}
+    unmatched_bases = base_targets - matched_bases
+    if unmatched_bases:
+        logger.info(
+            f"[exclude] {len(unmatched_bases)} base-indicator exclusion(s) "
+            f"matched no column in X (ignored): {sorted(unmatched_bases)}"
+        )
+
+    to_drop = sorted(set(present) | set(base_matches))
+    if to_drop:
+        logger.info(f"[exclude] dropping {len(to_drop)} blocklisted feature(s): {to_drop}")
+    return X.drop(columns=to_drop) if to_drop else X
 
 
 # ===========================================================================
@@ -920,6 +974,7 @@ def run_pipeline(
     stability_gate: bool = True,
     stability_min_pool_size: int = 8,
     exclude_features: Optional[list[str]] = None,
+    exclude_base_features: Optional[list[str]] = None,
     symbols: Optional[pd.Series] = None,
     embargo_days: int = 0,
 ) -> PipelineResult:
@@ -976,8 +1031,8 @@ def run_pipeline(
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    if exclude_features:
-        X = apply_feature_exclusions(X, exclude_features)
+    if exclude_features or exclude_base_features:
+        X = apply_feature_exclusions(X, exclude_features or [], exclude_base_features)
 
     if run_stability_check:
         logger.info("STAGE 0.5: stability check (bootstrapped Stages 1-3)")
@@ -1096,6 +1151,7 @@ def run_pipeline(
         "boruta_alpha": boruta_alpha,
         "rfecv_min_features": rfecv_min_features,
         "excluded_features": list(exclude_features) if exclude_features else [],
+        "excluded_base_features": list(exclude_base_features) if exclude_base_features else [],
         "stability_check_ran": run_stability_check,
         "stability_gate_enabled": stability_gate if run_stability_check else None,
         "stability_min_frequency": stability_min_frequency if run_stability_check else None,
@@ -1290,8 +1346,9 @@ def _cli() -> int:
         symbols = symbols.loc[fs_train_mask]
 
     exclude_features: list[str] = []
+    exclude_base_features: list[str] = []
     if not args.no_exclude_features:
-        exclude_features = load_excluded_features(args.exclude_features_file)
+        exclude_features, exclude_base_features = load_excluded_features(args.exclude_features_file)
     else:
         logging.getLogger(__name__).info(
             "[exclude] --no-exclude-features set — ignoring any blocklist file"
@@ -1312,6 +1369,7 @@ def _cli() -> int:
         stability_gate=not args.no_stability_gate,
         stability_min_pool_size=args.stability_min_pool_size,
         exclude_features=exclude_features,
+        exclude_base_features=exclude_base_features,
         symbols=symbols,
         embargo_days=embargo_days,
     )
