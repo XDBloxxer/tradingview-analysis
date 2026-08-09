@@ -1,6 +1,9 @@
 feature,cluster_id,cluster_size,model_importance,label_corr_abs,nan_rate,kept_as_representative
-t1_open_SMA_20_50_Diff,1,1,0.09617,0.0374,0.0079,True
-t1_close_DCM_20_20,2,1,0.11701,0.0287,0.0,True
-t1_open_Volume_MA10,3,1,0.47993,0.4831,0.0,True
-t1_close_Volume_MA5,4,1,0.29026,0.4327,0.0,True
-t1_close_Price_vs_EMA20,5,1,0.01663,0.008,0.0,True
+t1_open_SMA_20_50_Diff,1,1,0.02428,0.0331,0.0077,True
+t1_close_DCM_20_20,2,1,0.03636,0.0287,0.0,True
+t5_hv_30,3,1,0.0209,0.2465,0.039,True
+t1_open_Volume_MA10,4,1,0.32133,0.4802,0.0,True
+t1_open_Volume_MA5,5,1,0.08031,0.4421,0.0,True
+t1_open_Volume_Ratio,6,1,0.24233,0.3317,0.0,True
+t1_open_ROC_10,7,1,0.01886,0.0838,0.0,True
+t1_open_Price_vs_SMA20,8,1,0.25563,0.0,0.0005,True
