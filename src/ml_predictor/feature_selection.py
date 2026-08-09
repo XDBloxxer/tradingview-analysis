@@ -799,10 +799,38 @@ def genetic_search(
 # Stability wrapper — re-run Stages 1-3 across resamples, report frequency
 # ===========================================================================
 
+class _UnionFind:
+    """Tiny union-find over feature names, used to merge same-signal
+    features that correlation_cluster_selection groups together under
+    *different* representative names on different bootstrap runs (its
+    representative choice is itself run-dependent, since it fits on a
+    different resample each time). Without this, two runs that both find
+    the same underlying signal but surface it via two different correlated
+    columns count as "disagreeing" at the raw-feature level, which is the
+    root cause of exact-name stability frequencies collapsing even when
+    the pipeline is behaving consistently."""
+
+    def __init__(self) -> None:
+        self.parent: dict[str, str] = {}
+
+    def find(self, x: str) -> str:
+        self.parent.setdefault(x, x)
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a: str, b: str) -> None:
+        ra, rb = self.find(a), self.find(b)
+        if ra != rb:
+            self.parent[ra] = rb
+
+
 @dataclass
 class StabilityResult:
-    frequency: pd.DataFrame  # one row per feature: times_selected, frequency, mean_importance
-    stable_features: list[str]  # features selected in >= min_frequency of runs
+    frequency: pd.DataFrame  # one row per raw feature name: times_selected, frequency, mean_importance (diagnostic)
+    cluster_frequency: pd.DataFrame  # one row per cross-run signal cluster: representative_feature, cluster_members, times_selected, frequency
+    stable_features: list[str]  # cluster representatives selected in >= min_frequency of runs (this is the actual gate pool)
     per_run_features: list[list[str]]  # raw per-run RFECV output, for auditing
 
 
@@ -837,16 +865,29 @@ def stability_select(
     `stable_features` if you still want a GA polish pass on a pre-vetted,
     stable pool.
 
-    A feature's `frequency` is the fraction of the `n_runs` in which it
-    survived all the way to that run's RFECV output. `mean_importance` is
-    its average _quick_model_importance() score across the runs it
-    appeared in (NaN if it never appeared) — use this to break ties among
-    equally-stable features, the same way the retrained feature_importance
-    ranking was used earlier to prioritize among the old GA "stable 4".
+    A raw feature's `frequency` (in the `frequency` table) is the fraction
+    of the `n_runs` in which that exact column name survived all the way to
+    that run's RFECV output. `mean_importance` is its average
+    _quick_model_importance() score across the runs it appeared in (NaN if
+    it never appeared).
 
-    Returns features with frequency >= min_frequency as `stable_features`,
-    but the full `frequency` table is the more useful artifact: it lets you
-    manually pick a cutoff instead of trusting a single hard-coded one.
+    That raw-name frequency understates stability whenever correlated
+    columns trade places across runs: correlation_cluster_selection picks
+    one representative per cluster independently each bootstrap, so the
+    *same* underlying signal can legitimately surface under two different
+    column names in two different runs. To correct for this, every run's
+    correlation clusters are also folded into a union-find structure, and
+    `cluster_frequency` reports, per cross-run signal cluster, the fraction
+    of runs in which *any* member of that cluster was RFECV-selected — the
+    question that actually matters for "is this signal stable", as opposed
+    to "did this exact column name win the representative tiebreak every
+    time". `stable_features` (and the gate in run_pipeline) is now built
+    from `cluster_frequency`, using each stable cluster's most-frequently-
+    and most-importantly-selected raw member as its representative name.
+
+    Both tables are still written out (see run_pipeline) so you can
+    manually pick a different cutoff, or audit disagreements between the
+    two views, instead of trusting a single hard-coded threshold blindly.
 
     `symbols` / `embargo_days` are forwarded to each run's internal
     rfecv_time_aware() call (resampled alongside X/y/dates for each block
@@ -861,6 +902,8 @@ def stability_select(
     importance_sums: dict[str, float] = {}
     importance_counts: dict[str, int] = {}
     per_run_features: list[list[str]] = []
+    uf = _UnionFind()
+    cluster_hits: dict[str, int] = {}  # union-find root -> # runs where any member was RFECV-selected
 
     for run_i in range(n_runs):
         # Contiguous block resample: pick a random start, take a
@@ -881,9 +924,17 @@ def stability_select(
 
         logger.info(f"[stability] run {run_i + 1}/{n_runs} (n={len(X_run)})")
 
-        corr_features, _ = correlation_cluster_selection(
+        corr_features, corr_report = correlation_cluster_selection(
             X_run, y_run, corr_threshold=corr_threshold,
         )
+        # Union every pair of features that co-clustered this run so a
+        # feature selected under a different (but equally valid)
+        # cluster-mate name in another run still counts as the same signal.
+        for _, group in corr_report.groupby("cluster_id"):
+            members = group["feature"].tolist()
+            for other in members[1:]:
+                uf.union(members[0], other)
+
         boruta_result = boruta_select(
             X_run[corr_features], y_run, w=w_run,
             n_iterations=boruta_iterations, alpha=boruta_alpha,
@@ -904,10 +955,15 @@ def stability_select(
         Xc_run, yv_run = _prep_xy(X_run[rfecv_features], y_run)
         run_importance = _quick_model_importance(Xc_run, yv_run, random_state=random_state + run_i)
 
+        run_clusters_hit: set[str] = set()
         for feat in rfecv_features:
             counts[feat] = counts.get(feat, 0) + 1
             importance_sums[feat] = importance_sums.get(feat, 0.0) + float(run_importance.get(feat, 0.0))
             importance_counts[feat] = importance_counts.get(feat, 0) + 1
+            run_clusters_hit.add(uf.find(feat))
+
+        for root in run_clusters_hit:
+            cluster_hits[root] = cluster_hits.get(root, 0) + 1
 
     rows = []
     for feat, k in counts.items():
@@ -922,16 +978,52 @@ def stability_select(
         ["frequency", "mean_importance"], ascending=[False, False]
     ).reset_index(drop=True)
 
-    stable_features = frequency.loc[
-        frequency["frequency"] >= min_frequency, "feature"
-    ].tolist()
+    # Cluster-level frequency: the actual gate pool. A cluster counts as
+    # "selected" in a run if any of its (run-varying) correlated members
+    # was RFECV-selected that run.
+    cluster_members: dict[str, list[str]] = {}
+    for feat in counts:
+        cluster_members.setdefault(uf.find(feat), []).append(feat)
 
+    cluster_rows = []
+    stable_features: list[str] = []
+    for root, members in cluster_members.items():
+        hits = cluster_hits.get(root, 0)
+        freq = round(hits / n_runs, 3)
+        # Representative: most-often-selected raw member, tie-broken by
+        # mean importance — mirrors correlation_cluster_selection's own
+        # tiebreak logic so the chosen name stays interpretable downstream.
+        rep = max(
+            members,
+            key=lambda f: (
+                counts.get(f, 0),
+                importance_sums.get(f, 0.0) / max(importance_counts.get(f, 1), 1),
+            ),
+        )
+        cluster_rows.append({
+            "representative_feature": rep,
+            "cluster_members": ", ".join(sorted(members)),
+            "cluster_size": len(members),
+            "times_selected": hits,
+            "frequency": freq,
+        })
+        if freq >= min_frequency:
+            stable_features.append(rep)
+
+    cluster_frequency = pd.DataFrame(cluster_rows).sort_values(
+        ["frequency", "times_selected"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    raw_stable_count = int((frequency["frequency"] >= min_frequency).sum())
     logger.info(
-        f"[stability] {len(stable_features)}/{len(frequency)} features "
-        f"selected in >= {min_frequency:.0%} of {n_runs} runs"
+        f"[stability] {len(stable_features)}/{len(cluster_frequency)} signal "
+        f"cluster(s) selected in >= {min_frequency:.0%} of {n_runs} runs "
+        f"(raw exact-name overlap alone would have found "
+        f"{raw_stable_count}/{len(frequency)})"
     )
     return StabilityResult(
         frequency=frequency,
+        cluster_frequency=cluster_frequency,
         stable_features=stable_features,
         per_run_features=per_run_features,
     )
@@ -1009,18 +1101,22 @@ def run_pipeline(
 
     `run_stability_check` defaults to True: Stages 1-3 are first repeated
     `stability_n_runs` times over block-bootstrapped resamples (see
-    stability_select()) and the per-feature selection frequency + mean
-    importance is written to `stability_frequency.csv`.
+    stability_select()). Both the raw per-feature-name selection frequency
+    (`stability_frequency.csv`, diagnostic) and the cross-run signal-cluster
+    frequency that corrects for correlated columns trading places between
+    runs (`stability_cluster_frequency.csv`, what the gate actually uses)
+    are written out.
 
     `stability_gate` defaults to True: when the stability check runs, its
-    `stable_features` (frequency >= stability_min_frequency) become the
-    candidate pool for Stages 1-4 below, instead of the full input feature
-    set. This makes the stability check an actual gate rather than a
-    diagnostic that gets computed and then ignored — previously Stages 1-4
-    always ran on the full X regardless of what the stability check found,
-    so a feature could fail its own 0.75 bar and still ship. Set
-    stability_gate=False to restore the old diagnostic-only behavior (still
-    writes stability_frequency.csv, but Stages 1-4 see the full X).
+    `stable_features` (cluster frequency >= stability_min_frequency, one
+    representative name per stable cluster) become the candidate pool for
+    Stages 1-4 below, instead of the full input feature set. This makes the
+    stability check an actual gate rather than a diagnostic that gets
+    computed and then ignored — previously Stages 1-4 always ran on the
+    full X regardless of what the stability check found, so a feature could
+    fail its own 0.75 bar and still ship. Set stability_gate=False to
+    restore the old diagnostic-only behavior (both CSVs are still written,
+    but Stages 1-4 see the full X).
 
     If gating is on and the stable pool comes out smaller than
     stability_min_pool_size, this raises rather than silently continuing
@@ -1049,9 +1145,11 @@ def run_pipeline(
             embargo_days=embargo_days,
         )
         stability.frequency.to_csv(out / "stability_frequency.csv", index=False)
+        stability.cluster_frequency.to_csv(out / "stability_cluster_frequency.csv", index=False)
         logger.info(
-            f"[stability] wrote {out / 'stability_frequency.csv'} — "
-            f"{len(stability.stable_features)} features stable at "
+            f"[stability] wrote {out / 'stability_frequency.csv'} and "
+            f"{out / 'stability_cluster_frequency.csv'} — "
+            f"{len(stability.stable_features)} signal cluster(s) stable at "
             f">= {stability_min_frequency:.0%} frequency"
         )
 
@@ -1059,13 +1157,17 @@ def run_pipeline(
             if len(stability.stable_features) < stability_min_pool_size:
                 raise ValueError(
                     f"[stability] gate enabled but only "
-                    f"{len(stability.stable_features)} feature(s) reached "
+                    f"{len(stability.stable_features)} signal cluster(s) reached "
                     f">= {stability_min_frequency:.0%} frequency across "
                     f"{stability_n_runs} runs (need >= {stability_min_pool_size} "
-                    f"to proceed). Lower stability_min_frequency, raise "
+                    f"to proceed). This is now measured on cross-run signal "
+                    f"clusters (see stability_cluster_frequency.csv), not raw "
+                    f"column names, so a low count here reflects genuine "
+                    f"instability rather than cluster-representative name "
+                    f"churn. Lower stability_min_frequency, raise "
                     f"stability_n_runs, or set stability_gate=False to fall "
-                    f"back to diagnostic-only mode and review "
-                    f"stability_frequency.csv manually before shipping."
+                    f"back to diagnostic-only mode and review both CSVs "
+                    f"manually before shipping."
                 )
             logger.info(
                 f"[stability] gating Stages 1-4 to the "
@@ -1078,6 +1180,7 @@ def run_pipeline(
                 "[stability] gate disabled (stability_gate=False) — "
                 "Stages 1-4 will see the full candidate pool regardless of "
                 "the stability result above; review stability_frequency.csv "
+                "and stability_cluster_frequency.csv "
                 "manually."
             )
 
@@ -1192,8 +1295,10 @@ def _cli() -> int:
         "--no-stability-check", action="store_true",
         help="Skip the stability check (on by default): repeating Stages 1-3 "
              "over block-bootstrapped resamples first and writing "
-             "stability_frequency.csv (per-feature selection frequency + "
-             "mean importance) before running the normal single-pass pipeline.",
+             "stability_frequency.csv (raw per-feature-name frequency, "
+             "diagnostic) and stability_cluster_frequency.csv (cross-run "
+             "signal-cluster frequency, what the gate uses) before running "
+             "the normal single-pass pipeline.",
     )
     parser.add_argument("--stability-n-runs", type=int, default=8)
     parser.add_argument("--stability-min-frequency", type=float, default=0.75)
