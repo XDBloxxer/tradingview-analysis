@@ -10,12 +10,7 @@
     "Volume_MA20",
     "Price_vs_EMA20",
     "Price_vs_EMA50",
-    "Price_vs_SMA50",
-    "KCLe_20_2",
-    "ATR_14_Slope",
-    "SMA_20_Slope",
-    "EMA_20_Slope"
-    
+    "Price_vs_SMA50"
   ],
   "note": "excluded_base_features entries block EVERY lag/side variant of that indicator (t1_open_*, t1_close_*, t3_*, t5_*, t10_*), matched case-insensitively after stripping the prefix -- see apply_feature_exclusions() in feature_selection.py. DCL_20_20 and BBL_20_2.0_2.0 originally blocked 2026-07-28 (as exact names, one lag/side each) after RFECV collapsed to 15 features with these two alone carrying ~60% importance and val AUC hit 1.0000 with a fully bimodal probability distribution; live predictions were degenerate (near-zero confidence, gain regressor flat at ~4.1%). Only t1_open_DCL_20_20 and t1_close_BBL_20_2.0_2.0 were listed, leaving t1_close_DCL_20_20 (univariate AUC 1.000000) and t1_open_BBL_20_2.0_2.0 (univariate AUC 0.955) unblocked and fully exploitable -- confirmed via diagnose_feature_leakage.py on 2026-08-09 with symbol-purge + embargo leak guards active, so this is leakage baked into the feature/label construction itself, not time- or symbol-boundary leakage. Root cause not yet identified -- check whether DCL_20_20/BBL_20_2.0_2.0 construction overlaps with the winner/non-winner label definition or detector-selection criteria before re-testing with these unblocked."
 }
