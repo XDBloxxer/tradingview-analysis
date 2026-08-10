@@ -1,5 +1,12 @@
 feature,cluster_id,cluster_size,model_importance,label_corr_abs,nan_rate,kept_as_representative
-t1_close_SMA_20_Slope,1,1,0.15459,0.0,0.0001,True
-t1_close_EMA_20_Slope,2,1,0.06958,0.0001,0.0001,True
-t1_open_KCLe_20_2,3,1,0.44293,0.0009,0.0,True
-t1_close_DCM_20_20,4,1,0.33289,0.0279,0.0,True
+t1_close_ROC_10,1,1,0.03614,0.0806,0.0,True
+t1_close_RSI_14,2,1,0.02103,0.0135,0.0,True
+t5_hv_30,3,1,0.03268,0.2395,0.0243,True
+t1_close_BBB_20_2.0_2.0,4,1,0.03129,0.218,0.0,True
+t1_close_SMA_20_Slope,5,1,0.09079,0.0,0.0001,True
+t1_close_EMA_20_Slope,6,1,0.02291,0.0001,0.0001,True
+t1_open_DCU_20_20,7,1,0.10512,0.0214,0.0,True
+t1_close_DCM_20_20,8,1,0.26139,0.0279,0.0,True
+t1_open_KCLe_20_2,9,1,0.29385,0.0009,0.0,True
+t1_close_BBU_20_2.0_2.0,10,1,0.07568,0.0277,0.0,True
+t1_open_ATR_14,11,1,0.02912,0.0901,0.0,True
