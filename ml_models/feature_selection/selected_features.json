@@ -1,16 +1,15 @@
 {
-  "stage0_count": 6,
-  "stage1_corr_count": 5,
-  "stage2_boruta_count": 5,
-  "stage3_rfecv_count": 5,
+  "stage0_count": 4,
+  "stage1_corr_count": 4,
+  "stage2_boruta_count": 4,
+  "stage3_rfecv_count": 4,
   "stage4_ga_count": null,
-  "final_count": 5,
+  "final_count": 4,
   "final_features": [
-    "t1_open_HV_20",
-    "t1_open_DCM_20_20",
-    "t1_close_KCUe_20_2",
-    "t1_close_EMA_50",
-    "t1_open_ATR_14"
+    "t1_close_SMA_20_Slope",
+    "t1_close_EMA_20_Slope",
+    "t1_open_KCLe_20_2",
+    "t1_close_DCM_20_20"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
@@ -27,11 +26,7 @@
     "Volume_MA20",
     "Price_vs_EMA20",
     "Price_vs_EMA50",
-    "Price_vs_SMA50",
-    "KCLe_20_2",
-    "ATR_14_Slope",
-    "SMA_20_Slope",
-    "EMA_20_Slope"
+    "Price_vs_SMA50"
   ],
   "stability_check_ran": true,
   "stability_gate_enabled": true,
