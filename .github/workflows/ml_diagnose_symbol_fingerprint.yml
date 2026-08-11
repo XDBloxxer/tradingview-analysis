@@ -1,0 +1,92 @@
+name: ML Diagnose Symbol-Fingerprint Leak
+
+# One-off diagnostic, follow-up to "ML Diagnose Feature Leakage": for a
+# family of features (default HV_10/20/30 + BBB_20_2.0_2.0), decomposes
+# each into a between-symbol component (per-symbol mean, broadcast to every
+# row of that symbol) and a within-symbol component (day-to-day deviation
+# from that mean), and scores each half against the label separately.
+#
+# High AUC on the between-symbol component with the within-symbol component
+# near 0.5 means the feature is only "predictive" because it re-identifies
+# which stock a row belongs to (see synthetic_leak_test.py) -- not because
+# that day's value says anything. High within-symbol AUC means there's real
+# day-to-day signal even holding the symbol constant.
+#
+# Run this manually after diagnose_feature_leakage.py flags a smooth,
+# whole-family univariate AUC gradient (rather than one rogue column) on a
+# feature family that's autocorrelated per-symbol, to tell apart "real
+# signal, keep it" from "fingerprint leak, block or symbol-demean it".
+#
+# Read-only: does not write or commit anything, just prints a report and
+# uploads it as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of T-1/base history to fetch (0 = unbounded)'
+        required: false
+        default: '365'
+        type: string
+      features:
+        description: >-
+          Space-separated exact column names to test (e.g.
+          "t1_close_HV_10 t1_open_HV_10 t1_close_HV_20"). Leave blank to
+          auto-scan every lag/side variant of HV_10/HV_20/HV_30 and
+          BBB_20_2.0_2.0.
+        required: false
+        default: ''
+        type: string
+      min_symbol_rows:
+        description: 'Drop symbols with fewer than this many train-only rows'
+        required: false
+        default: '2'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-symbol-fingerprint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run symbol-fingerprint diagnostic
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '365' }}
+        run: |
+          FEATURES="${{ github.event.inputs.features }}"
+          MIN_ROWS="${{ github.event.inputs.min_symbol_rows || '2' }}"
+          if [ -n "$FEATURES" ]; then
+            python diagnose_symbol_fingerprint_leak.py --features $FEATURES --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
+          else
+            python diagnose_symbol_fingerprint_leak.py --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbol-fingerprint-report
+          path: symbol_fingerprint_report.txt
+          retention-days: 30
