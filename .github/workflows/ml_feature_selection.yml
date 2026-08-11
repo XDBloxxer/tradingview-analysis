@@ -59,6 +59,16 @@ on:
         required: false
         default: '8'
         type: string
+      stability_min_frequency:
+        description: 'Stability gate bar: a signal cluster must be selected in at least this fraction of stability_n_runs bootstrap runs to count as "stable" (default 0.75). Lower this (e.g. 0.5-0.6) if a run is failing the gate with only a handful of clusters clearing 0.75 but diagnose_feature_leakage.py came back clean -- that combination usually means real multicollinearity-driven instability, not leakage, and the bar is just stricter than the data supports right now.'
+        required: false
+        default: '0.75'
+        type: string
+      no_stability_gate:
+        description: 'Compute the stability check and write both CSVs, but don''t use it to restrict Stages 1-4 (diagnostic-only mode). Use this to inspect stability_cluster_frequency.csv without the run hard-failing, e.g. right after a leak-diagnostic came back clean and you want to see the full candidate list before deciding where to set stability_min_frequency.'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -114,13 +124,18 @@ jobs:
           USE_EXCLUDED="${{ github.event.inputs.use_excluded_features || 'true' }}"
           LOOKBACK="${{ github.event.inputs.lookback_days || '365' }}"
           STABILITY_MIN_POOL="${{ github.event.inputs.stability_min_pool_size || '8' }}"
+          STABILITY_MIN_FREQ="${{ github.event.inputs.stability_min_frequency || '0.75' }}"
+          NO_STABILITY_GATE="${{ github.event.inputs.no_stability_gate || 'false' }}"
 
-          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN --lookback-days $LOOKBACK --stability-min-pool-size $STABILITY_MIN_POOL"
+          ARGS="--verbose --corr-threshold $CORR --boruta-iterations $BORUTA_ITER --rfecv-min-features $RFECV_MIN --lookback-days $LOOKBACK --stability-min-pool-size $STABILITY_MIN_POOL --stability-min-frequency $STABILITY_MIN_FREQ"
           if [ "$SKIP_GA" = "true" ]; then
             ARGS="$ARGS --skip-genetic"
           fi
           if [ "$USE_EXCLUDED" = "false" ]; then
             ARGS="$ARGS --no-exclude-features"
+          fi
+          if [ "$NO_STABILITY_GATE" = "true" ]; then
+            ARGS="$ARGS --no-stability-gate"
           fi
 
           python -m src.ml_predictor.feature_selection $ARGS
