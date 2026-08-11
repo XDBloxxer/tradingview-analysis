@@ -118,6 +118,11 @@ import joblib
 # because pickle looks up the class by module path at unpickling time and
 # src.ml_predictor.prior_corrected_model must already be imported.
 from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
+from src.ml_predictor.symbol_demeaning import (
+    demean_live_features,
+    load_symbol_baselines,
+    DEFAULT_BASELINE_PATH as _SYMBOL_DEMEAN_BASELINE_PATH,
+)
 
 _META_COLS = {"symbol", "exchange"}
 
@@ -309,6 +314,11 @@ class ExplosionPredictor:
         self._diag_done    = False
         # FIX 1: detected prefix for external callers
         self._model_feature_prefix: str = "t1_close"
+        # Symbol-fingerprint demeaning (2026-08-11): baselines written by
+        # ml_retrain_model.py's most recent retrain — see symbol_demeaning.py.
+        # Loaded once here rather than per-predict() call; a fresh retrain
+        # means a fresh ExplosionPredictor instance anyway (new model file).
+        self._hv_symbol_baselines: dict = load_symbol_baselines(_SYMBOL_DEMEAN_BASELINE_PATH)
 
         self._load_model()
 
@@ -660,6 +670,22 @@ class ExplosionPredictor:
         if not self._diag_done:
             self._log_feature_diagnostics(feature_df, match_log)
             self._diag_done = True
+
+        # ── FIX (2026-08-11): symbol-fingerprint demeaning for HV_10/20/30 ──
+        # Mirrors the training-side transform in ml_retrain_model.py's
+        # prepare_features(). A live row has no in-process history to compute
+        # a trailing mean from, so this subtracts each symbol's PERSISTED
+        # baseline (saved by the last retrain) instead. Symbols with no
+        # stored baseline are left RAW — see demean_live_features() docstring.
+        if "symbol" in feature_df.columns and self._hv_symbol_baselines:
+            feature_df = demean_live_features(
+                feature_df, feature_df["symbol"], self._hv_symbol_baselines
+            )
+        elif "symbol" not in feature_df.columns:
+            self.logger.info(
+                "[symbol-demean] no 'symbol' column in live features — skipping HV "
+                "symbol-fingerprint demeaning for this batch (raw HV values kept as-is)"
+            )
 
         return feature_df
 
