@@ -42,6 +42,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -84,12 +85,23 @@ def _parse_args():
     return p.parse_args()
 
 
-def mean_fold_auc(X: pd.DataFrame, y: pd.Series, col: str, splits) -> tuple[float, float]:
+def mean_fold_auc(
+    X: pd.DataFrame, y: pd.Series, col: str, splits,
+    sample_weight: Optional[pd.Series] = None,
+) -> tuple[float, float]:
     """Univariate guarded AUC for one column: fit a single-feature model per
     fold (mirrors the 'quick model importance' style scoring the pipeline
     itself uses, rather than a raw-value AUC, so this is scored the same way
     the model actually consumes the feature). Returns (mean, std) across
-    folds with usable class balance on both sides."""
+    folds with usable class balance on both sides.
+
+    sample_weight, if given, is passed through to XGBClassifier.fit() so
+    this scores columns the same way the production classifier/regressor
+    actually train on them -- e.g. daily_fallback T-1 rows down-weighted by
+    ml_retrain_model.load_t1_data. Without this, a fix that only changes
+    sample_weight (nothing about the raw/demeaned feature values themselves)
+    is invisible to this script even when it's correctly wired through
+    everywhere else."""
     x = X[[col]].copy()
     x[col] = x[col].fillna(x[col].median())
     aucs = []
@@ -98,7 +110,10 @@ def mean_fold_auc(X: pd.DataFrame, y: pd.Series, col: str, splits) -> tuple[floa
         if y_tr.nunique() < 2 or y_te.nunique() < 2:
             continue
         m = XGBClassifier(n_estimators=200, max_depth=4, eval_metric="auc", random_state=42)
-        m.fit(x.iloc[train_idx], y_tr)
+        fit_kwargs = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight.iloc[train_idx].values
+        m.fit(x.iloc[train_idx], y_tr, **fit_kwargs)
         pred = m.predict_proba(x.iloc[test_idx])[:, 1]
         auc = roc_auc_score(y_te, pred)
         aucs.append(max(auc, 1 - auc))  # direction-agnostic, matches the diagnostics
@@ -150,6 +165,12 @@ def main():
     y_tr_full = y.loc[train_mask].reset_index(drop=True)
     symbol_tr = symbol.loc[train_mask].reset_index(drop=True)
     dates_tr = dates.loc[train_mask].reset_index(drop=True)
+    if "sample_weight" in combined_df.columns:
+        weight_tr = combined_df["sample_weight"].loc[train_mask].reset_index(drop=True).astype(float)
+    else:
+        weight_tr = None
+        print("[warn] no sample_weight column found -- scoring unweighted "
+              "(daily_fallback down-weighting will NOT be reflected below)")
 
     X_demeaned_full = demean_training_features(
         X_raw_full.loc[train_mask].reset_index(drop=True),
@@ -166,6 +187,8 @@ def main():
         y_tr_full = y_tr_full.loc[keep].reset_index(drop=True)
         symbol_tr = symbol_tr.loc[keep].reset_index(drop=True)
         dates_tr = dates_tr.loc[keep].reset_index(drop=True)
+        if weight_tr is not None:
+            weight_tr = weight_tr.loc[keep].reset_index(drop=True)
         print(f"[--exclude-cold-start] dropped {n_dropped} cold-start row(s) "
               f"(each symbol's first appearance) before scoring")
 
@@ -173,6 +196,10 @@ def main():
           f"unique symbols={symbol_tr.nunique()}")
     print(f"Guard: n_splits={args.n_splits}, embargo_days={args.embargo_days}, "
           f"symbols=purged per fold\n")
+    if weight_tr is not None:
+        n_downweighted = int((weight_tr < 1.0).sum())
+        print(f"Scoring WITH sample_weight ({n_downweighted}/{len(weight_tr)} "
+              f"row(s) below full weight, e.g. daily_fallback T-1 rows)\n")
 
     unguarded_splits = time_aware_splits(dates_tr, n_splits=args.n_splits)
     guarded_splits = time_aware_splits(
@@ -181,9 +208,9 @@ def main():
 
     rows = []
     for col in hv_cols:
-        raw_unguarded, _ = mean_fold_auc(X_raw, y_tr_full, col, unguarded_splits)
-        raw_guarded, raw_std = mean_fold_auc(X_raw, y_tr_full, col, guarded_splits)
-        demeaned_guarded, dem_std = mean_fold_auc(X_demeaned, y_tr_full, col, guarded_splits)
+        raw_unguarded, _ = mean_fold_auc(X_raw, y_tr_full, col, unguarded_splits, sample_weight=weight_tr)
+        raw_guarded, raw_std = mean_fold_auc(X_raw, y_tr_full, col, guarded_splits, sample_weight=weight_tr)
+        demeaned_guarded, dem_std = mean_fold_auc(X_demeaned, y_tr_full, col, guarded_splits, sample_weight=weight_tr)
         rows.append({
             "feature": col,
             "raw_unguarded_auc": raw_unguarded,
