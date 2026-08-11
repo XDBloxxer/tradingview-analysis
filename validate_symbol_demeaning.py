@@ -54,6 +54,7 @@ from src.ml_predictor.feature_selection import time_aware_splits  # noqa: E402
 from src.ml_predictor.symbol_demeaning import (  # noqa: E402
     DEFAULT_DEMEAN_BASES,
     _matching_columns,
+    compute_cold_start_mask,
     demean_training_features,
 )
 
@@ -66,6 +67,14 @@ def _parse_args():
     p.add_argument("--n-splits", type=int, default=5)
     p.add_argument("--embargo-days", type=int, default=15)
     p.add_argument("--bases", nargs="+", default=list(DEFAULT_DEMEAN_BASES))
+    p.add_argument(
+        "--exclude-cold-start", action="store_true",
+        help="Drop each symbol's first-appearance row (no prior history, so "
+             "demeaning leaves it at its raw value) before scoring. Isolates "
+             "whether a FAIL is coming from steady-state demeaned rows or is "
+             "an artifact of cold-start rows still carrying the raw "
+             "between-symbol fingerprint.",
+    )
     p.add_argument(
         "--lookback-days", type=int,
         default=int(os.environ.get("LOOKBACK_DAYS", "365") or 0) or None,
@@ -147,6 +156,18 @@ def main():
         symbol_tr, dates_tr, bases=args.bases,
     )
     X_demeaned = X_demeaned_full[hv_cols]
+
+    if args.exclude_cold_start:
+        cold_start = compute_cold_start_mask(symbol_tr, dates_tr)
+        keep = ~cold_start.reset_index(drop=True)
+        n_dropped = int((~keep).sum())
+        X_raw = X_raw.loc[keep].reset_index(drop=True)
+        X_demeaned = X_demeaned.loc[keep].reset_index(drop=True)
+        y_tr_full = y_tr_full.loc[keep].reset_index(drop=True)
+        symbol_tr = symbol_tr.loc[keep].reset_index(drop=True)
+        dates_tr = dates_tr.loc[keep].reset_index(drop=True)
+        print(f"[--exclude-cold-start] dropped {n_dropped} cold-start row(s) "
+              f"(each symbol's first appearance) before scoring")
 
     print(f"Train-only rows: {len(X_raw)}  (cutoff={cutoff.date()})  "
           f"unique symbols={symbol_tr.nunique()}")
