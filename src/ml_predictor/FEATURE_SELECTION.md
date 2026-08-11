@@ -99,11 +99,15 @@ features, report = correlation_cluster_selection(X, y, corr_threshold=0.85)
   merging genuinely distinct signals; 0.85–0.90 is a reasonable range.
 - `--boruta-iterations`: 100 is a solid default; bump to 200+ if the
   confirmed/tentative split near the boundary looks noisy.
-- `--rfecv-min-features` (default 8): keep this well below your expected
+- `--rfecv-min-features` (default 4): keep this well below your expected
   Boruta output count. If it's set close to (or above) how many features
-  Boruta actually confirms, RFECV only gets to take one elimination step
-  and you get a 2-point "curve" instead of a real elbow — check
-  `stage3_rfecv_curve.csv` and confirm it has more than 2-3 rows.
+  Boruta actually confirms, RFECV only gets to take one or two elimination
+  steps and you get a 2-3 point "curve" instead of a real elbow — check
+  `stage3_rfecv_curve.csv` and confirm it has more than 2-3 rows. In
+  practice Boruta has been confirming 9-18 features per run, so a floor of
+  8 (the old default) was still too close and produced curves like
+  18->13->8, 15->10->8, 12->8. 4 gives RFECV room to actually walk down
+  and find an elbow instead of hopping straight to the wall.
 - `GAConfig.min_features` (default 5) is intentionally independent of
   `--rfecv-min-features`. Earlier versions derived the GA's floor from the
   RFECV parameter, so the GA would mechanically converge to that derived
