@@ -39,6 +39,7 @@ Usage (same env/credentials as ml_retrain_model.py):
     python validate_symbol_demeaning.py --n-splits 5 --embargo-days 15
 """
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -65,6 +66,12 @@ def _parse_args():
     p.add_argument("--n-splits", type=int, default=5)
     p.add_argument("--embargo-days", type=int, default=15)
     p.add_argument("--bases", nargs="+", default=list(DEFAULT_DEMEAN_BASES))
+    p.add_argument(
+        "--lookback-days", type=int,
+        default=int(os.environ.get("LOOKBACK_DAYS", "365") or 0) or None,
+        help="Days of T-1/base history to fetch (0/unset env = unbounded). "
+             "Defaults to $LOOKBACK_DAYS for parity with the other diagnostic scripts.",
+    )
     return p.parse_args()
 
 
@@ -94,8 +101,8 @@ def mean_fold_auc(X: pd.DataFrame, y: pd.Series, col: str, splits) -> tuple[floa
 def main():
     args = _parse_args()
     client = rt.get_supabase_client()
-    base_df = rt.load_base_training_data(client, lookback_days=365)
-    t1_df = rt.load_t1_data(client, lookback_days=365)
+    base_df = rt.load_base_training_data(client, lookback_days=args.lookback_days)
+    t1_df = rt.load_t1_data(client, lookback_days=args.lookback_days)
     combined_df = rt.combine_datasets(base_df, t1_df)
 
     if "symbol" not in combined_df.columns:
