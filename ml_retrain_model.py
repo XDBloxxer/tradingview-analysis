@@ -201,12 +201,32 @@ T1_WEIGHT               = 1.0
 # validate_symbol_demeaning.py's "ML Validate Symbol-Demeaning Fix" run
 # 2026-08-11, which found the residual leak (that survives both symbol-
 # demeaning and cold-start exclusion) is concentrated specifically in the
-# t1_* columns, not t3/t5/t10. Down-weight rather than drop, since dropping
-# would remove real signal too (not every daily_fallback row is bad, just
-# noisier), and flows through everywhere sample_weight already does:
-# feature-selection stability/RFECV/GA (via prepare_features -> w), the
-# classifier (sample_weight=w_train.values), and the gain regressor (w_reg
-# derived from combined_df["sample_weight"]).
+# t1_* columns, not t3/t5/t10.
+#
+# UPDATE (2026-08-11): A flat T1_DAILY_FALLBACK_WEIGHT multiplier applied to
+# *every* daily_fallback row -- regardless of label -- doesn't fix the actual
+# problem. crosstab_check.py showed the skew is asymmetric across labels:
+#   5min share: non-winners=5.1%, winners=30.8%  (25.7pp gap)
+# That gap is a real (and explainable) artifact of the collection pipeline --
+# winners are identified live off a same-day screener so they're far more
+# likely to land inside yfinance's 60-day 5-min window, while the much
+# larger non-winner batch is more often backfilled later and falls outside
+# it -- but a flat discount on daily_fallback rows shrinks both labels'
+# fallback mass by the same factor and leaves the *ratio* (and therefore the
+# leak) untouched. label=1 rows are still ~6x more likely to be tagged
+# '5min' than label=0 rows after a flat multiplier, so t1_data_source (and
+# anything correlated with it) remains a usable label proxy.
+#
+# Fix: inverse-propensity reweight t1_data_source *within each label* so
+# that, after weighting, both labels see the same 5min/daily_fallback mix --
+# the same mix the whole dataset has overall. This removes the
+# source-as-label-proxy signal while still leaving every row with some
+# nonzero weight (no rows dropped) and leaving the *overall* 5min vs.
+# daily_fallback balance of the dataset unchanged (we reweight toward the
+# global marginal, not toward an arbitrary 50/50 split). See
+# _t1_source_propensity_weights() below; computed per-run since the actual
+# label x source mix drifts over time as the live pipeline catches up.
+# Old flat multiplier kept only as an emergency/degenerate-case fallback.
 T1_DAILY_FALLBACK_WEIGHT = 0.5
 # Rows with no t1_data_source tag at all (collected before this field
 # existed, or the column was silently dropped on insert by the schema-retry
@@ -214,6 +234,75 @@ T1_DAILY_FALLBACK_WEIGHT = 0.5
 # have the column yet -- see migration note in symbol_demeaning.py) default
 # to full weight rather than being penalised for a gap we can't attribute.
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
+
+
+def _t1_source_propensity_weights(
+    source: pd.Series,
+    label: pd.Series,
+    *,
+    min_cell_count: int = 20,
+    weight_cap: tuple[float, float] = (0.2, 5.0),
+) -> pd.Series:
+    """
+    Inverse-propensity multiplier that equalises the t1_data_source mix
+    (5min vs. daily_fallback, or any other tag) *within each label* so it
+    matches the dataset's overall (label-agnostic) mix.
+
+    Why per-label, not a flat discount: a flat multiplier on daily_fallback
+    rows shrinks both labels' fallback mass by the same factor and leaves
+    the label=1 vs label=0 *ratio* of 5min/daily_fallback untouched -- the
+    model can still learn t1_data_source as a label proxy. Reweighting each
+    (label, source) cell to the global marginal removes that correlation
+    directly: for each label, P(source | label) after reweighting equals
+    P(source) overall, so source carries no residual information about
+    label.
+
+    Anchoring to the *global* marginal (rather than e.g. forcing 50/50)
+    keeps the dataset's overall 5min/daily_fallback balance where it
+    started -- only the cross-label skew is corrected, not the base rate.
+
+    Parameters
+    ----------
+    source : per-row category (e.g. t1_data_source); NaN rows get weight 1.0
+             untouched, matching the "untagged rows keep full weight" policy
+             used elsewhere for this column.
+    label  : per-row label (0/1).
+    min_cell_count : a label group smaller than this is left at weight 1.0
+             for all its rows -- too few rows to estimate a stable
+             per-source propensity, and a noisy correction is worse than
+             none.
+    weight_cap : clamp bounds so degenerate cells (a source that's almost
+             entirely one label) don't produce extreme multipliers that
+             swamp everything else in sample_weight.
+
+    Returns
+    -------
+    pd.Series of per-row multipliers, aligned to `source`'s index, meant to
+    be multiplied into the existing sample_weight (not used standalone).
+    """
+    weights = pd.Series(1.0, index=source.index)
+    mask = source.notna() & label.notna()
+    if mask.sum() == 0:
+        return weights
+
+    s = source[mask]
+    l = label[mask]
+    overall_props = s.value_counts(normalize=True)
+
+    for lbl, lbl_mask in l.groupby(l).groups.items():
+        n_lbl = len(lbl_mask)
+        if n_lbl < min_cell_count:
+            continue  # too few rows for a stable estimate -- leave at 1.0
+        lbl_props = s.loc[lbl_mask].value_counts(normalize=True)
+        for src_val, p_target in overall_props.items():
+            p_actual = lbl_props.get(src_val, 0.0)
+            if p_actual <= 0:
+                continue  # this label never saw this source -- nothing to reweight
+            w = float(np.clip(p_target / p_actual, weight_cap[0], weight_cap[1]))
+            row_mask = (l.index.isin(lbl_mask)) & (s == src_val)
+            weights.loc[s.index[row_mask]] = w
+
+    return weights
 
 # Validation window — the most recent N weeks of labelled data are reserved for
 # validation; everything before that window is used for training.
@@ -1768,15 +1857,43 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
     if "t1_data_source" in combined.columns:
         fallback_mask = combined["t1_data_source"] == "daily_fallback"
         n_fallback = int(fallback_mask.sum())
-        combined.loc[fallback_mask, "sample_weight"] = (
-            combined.loc[fallback_mask, "sample_weight"] * T1_DAILY_FALLBACK_WEIGHT
-        )
         n_untagged = int(combined["t1_data_source"].isna().sum())
-        logger.info(
-            f"  t1_data_source: {n_fallback} daily_fallback row(s) down-weighted "
-            f"{T1_DAILY_FALLBACK_WEIGHT}x, {n_untagged} untagged row(s) left at "
-            f"full weight, {len(combined) - n_fallback - n_untagged} real 5min row(s)"
+
+        propensity_w = _t1_source_propensity_weights(
+            combined["t1_data_source"], combined["label"]
         )
+        used_propensity = not propensity_w.eq(1.0).all()
+
+        if used_propensity:
+            combined["sample_weight"] = combined["sample_weight"] * propensity_w
+            # Log the resulting per-label source mix so a skew regression is
+            # visible in retrain logs without re-running crosstab_check.py.
+            _mix = (
+                combined.assign(_w=propensity_w)
+                .groupby(["label", "t1_data_source"])["_w"]
+                .agg(["count", "mean"])
+            )
+            logger.info(
+                f"  t1_data_source: propensity-reweighted per label to match "
+                f"the overall {combined['t1_data_source'].value_counts(normalize=True).to_dict()} "
+                f"mix ({n_fallback} daily_fallback row(s), {n_untagged} untagged "
+                f"row(s) left at 1.0x). Per (label, source) multiplier:\n{_mix}"
+            )
+        else:
+            # Fallback for degenerate cases (e.g. one label has < min_cell_count
+            # tagged rows this run) where propensity reweighting couldn't be
+            # estimated for any group -- keep the old flat discount rather than
+            # silently leaving daily_fallback rows at full, unweighted trust.
+            combined.loc[fallback_mask, "sample_weight"] = (
+                combined.loc[fallback_mask, "sample_weight"] * T1_DAILY_FALLBACK_WEIGHT
+            )
+            logger.warning(
+                f"  t1_data_source: propensity reweighting was a no-op this run "
+                f"(too few rows in at least one label group) -- fell back to a "
+                f"flat {T1_DAILY_FALLBACK_WEIGHT}x discount on {n_fallback} "
+                f"daily_fallback row(s). This does NOT correct the label-skew "
+                f"leak by itself; check t1_data_source counts per label."
+            )
     else:
         logger.warning(
             "  t1_data_source column not present after load/merge -- cannot "
