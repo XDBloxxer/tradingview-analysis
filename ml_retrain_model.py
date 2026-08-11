@@ -196,6 +196,23 @@ FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
 # the natural row-count ratio do the work instead of compounding it.
 BASE_CSV_WEIGHT         = 1.0
 T1_WEIGHT               = 1.0
+# T-1 rows tagged t1_data_source='daily_fallback' (intraday_data_collector.py)
+# are a coarser daily-bar approximation, not a real 5-min T-1 snapshot -- see
+# validate_symbol_demeaning.py's "ML Validate Symbol-Demeaning Fix" run
+# 2026-08-11, which found the residual leak (that survives both symbol-
+# demeaning and cold-start exclusion) is concentrated specifically in the
+# t1_* columns, not t3/t5/t10. Down-weight rather than drop, since dropping
+# would remove real signal too (not every daily_fallback row is bad, just
+# noisier), and flows through everywhere sample_weight already does:
+# feature-selection stability/RFECV/GA (via prepare_features -> w), the
+# classifier (sample_weight=w_train.values), and the gain regressor (w_reg
+# derived from combined_df["sample_weight"]).
+T1_DAILY_FALLBACK_WEIGHT = 0.5
+# Rows with no t1_data_source tag at all (collected before this field
+# existed, or the column was silently dropped on insert by the schema-retry
+# self-heal in daily_winners_supabase_client.py because the DB table doesn't
+# have the column yet -- see migration note in symbol_demeaning.py) default
+# to full weight rather than being penalised for a gap we can't attribute.
 MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
 
 # Validation window — the most recent N weeks of labelled data are reserved for
@@ -1673,7 +1690,18 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
                 join_key = ["symbol", "detection_date"]
                 # Guard: only keep join keys that actually exist in open_df
                 open_key_cols = [c for c in join_key if c in open_df.columns]
-                open_slim = open_df[open_key_cols + open_feature_cols]
+                # Carry open's t1_data_source along under a temp name so a row
+                # whose close-side snapshot is missing/untagged can still be
+                # weighted correctly off the open-side tag (coalesced below).
+                # We don't just prefer open over close -- close's tag is kept
+                # canonical when both are present, matching the existing
+                # "close-table metadata wins" convention for this merge.
+                carry_cols = list(open_feature_cols)
+                has_open_source = "t1_data_source" in open_df.columns
+                if has_open_source:
+                    open_df = open_df.rename(columns={"t1_data_source": "_open_t1_data_source"})
+                    carry_cols.append("_open_t1_data_source")
+                open_slim = open_df[open_key_cols + carry_cols]
 
                 merged = close_df.merge(
                     open_slim,
@@ -1685,6 +1713,18 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
                 dup_cols = [c for c in merged.columns if c.endswith("_open_dup")]
                 if dup_cols:
                     merged = merged.drop(columns=dup_cols)
+
+                # Coalesce t1_data_source: prefer close's tag (canonical, per
+                # the "close-table metadata wins" convention above), fall back
+                # to open's tag only when close's is missing/NaN.
+                if "_open_t1_data_source" in merged.columns:
+                    if "t1_data_source" in merged.columns:
+                        merged["t1_data_source"] = merged["t1_data_source"].fillna(
+                            merged["_open_t1_data_source"]
+                        )
+                    else:
+                        merged["t1_data_source"] = merged["_open_t1_data_source"]
+                    merged = merged.drop(columns=["_open_t1_data_source"])
 
                 # Deduplicate within this label's merged frame (outer join can
                 # introduce duplicates when join keys match multiple times)
@@ -1724,6 +1764,26 @@ def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.Data
 
     combined = pd.concat(frames, ignore_index=True, sort=False)
     combined["sample_weight"] = T1_WEIGHT
+
+    if "t1_data_source" in combined.columns:
+        fallback_mask = combined["t1_data_source"] == "daily_fallback"
+        n_fallback = int(fallback_mask.sum())
+        combined.loc[fallback_mask, "sample_weight"] = (
+            combined.loc[fallback_mask, "sample_weight"] * T1_DAILY_FALLBACK_WEIGHT
+        )
+        n_untagged = int(combined["t1_data_source"].isna().sum())
+        logger.info(
+            f"  t1_data_source: {n_fallback} daily_fallback row(s) down-weighted "
+            f"{T1_DAILY_FALLBACK_WEIGHT}x, {n_untagged} untagged row(s) left at "
+            f"full weight, {len(combined) - n_fallback - n_untagged} real 5min row(s)"
+        )
+    else:
+        logger.warning(
+            "  t1_data_source column not present after load/merge -- cannot "
+            "down-weight daily_fallback rows this run. Check that the "
+            "winners_day_prior_open/close and non_winners_day_prior_open/close "
+            "tables actually have a t1_data_source column (see migration note)."
+        )
 
     t1_feature_cols = [c for c in combined.columns
                        if c.startswith("t1_close_") or c.startswith("t1_open_")]
