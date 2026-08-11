@@ -125,6 +125,40 @@ def demean_training_features(
     return X
 
 
+def compute_cold_start_mask(symbols: pd.Series, dates: pd.Series) -> pd.Series:
+    """
+    Boolean Series, aligned to the original index of `symbols`/`dates`: True
+    for a row that is a symbol's FIRST appearance (by date, ties broken by
+    original row order) — i.e. exactly the rows demean_training_features()
+    leaves at their raw, un-demeaned value because there's no strictly-
+    earlier history to subtract for that symbol yet.
+
+    This depends only on symbol/date ordering, not on any feature column, so
+    it's identical to the row-level cold-start mask demean_training_features()
+    computes internally per-column (columns only differ from each other if a
+    symbol has NaNs in one base but not another on its first row, which does
+    not change whether the row itself is cold-start).
+
+    Useful for diagnostics that want to score demeaned features on
+    steady-state rows only, separate from rows still carrying the raw
+    between-symbol fingerprint by construction.
+    """
+    orig_index = pd.Series(symbols).index
+    order = pd.DataFrame(
+        {
+            "symbol": pd.Series(symbols).values,
+            "date": pd.to_datetime(pd.Series(dates).values, errors="coerce"),
+        },
+        index=orig_index,
+    )
+    order["_orig_order"] = np.arange(len(order))
+    sort_idx = order.sort_values(["symbol", "date", "_orig_order"]).index
+
+    is_first = (order.loc[sort_idx].groupby("symbol").cumcount() == 0)
+    is_first.index = sort_idx
+    return is_first.reindex(orig_index)
+
+
 def compute_symbol_baselines(
     df: pd.DataFrame,
     symbols: pd.Series,
