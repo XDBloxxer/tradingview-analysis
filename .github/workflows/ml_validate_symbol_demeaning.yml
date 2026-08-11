@@ -1,0 +1,104 @@
+name: ML Validate Symbol-Demeaning Fix
+
+# Step 3 of the HV symbol-fingerprint fix, follow-up to "ML Diagnose
+# Symbol-Fingerprint Leak". That diagnostic showed HV_10/20/30 is mostly a
+# symbol-fingerprint effect (between_symbol_auc 0.79-0.84) with a smaller
+# real day-to-day signal (within_symbol_auc 0.55-0.60), and
+# src/ml_predictor/symbol_demeaning.py causally demeans HV before every
+# model (training + live scoring) sees it.
+#
+# This workflow runs validate_symbol_demeaning.py, which checks that under
+# the SAME guarded CV every selection stage uses
+# (time_aware_splits(..., symbols=, embargo_days=)):
+#   (a) raw HV's guarded AUC drops well below its unguarded AUC -- the
+#       guard is doing its job, and
+#   (b) demeaned HV's guarded AUC holds in that same lowered band rather
+#       than falling further -- the demeaning didn't throw away the real
+#       within-symbol signal.
+#
+# Read-only: does not write or commit anything (no model files, no
+# baselines), just prints a report, uploads it as a workflow artifact, and
+# fails the job if the expected pattern doesn't hold.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of T-1/base history to fetch (0 = unbounded)'
+        required: false
+        default: '365'
+        type: string
+      n_splits:
+        description: 'Number of walk-forward CV folds'
+        required: false
+        default: '5'
+        type: string
+      embargo_days:
+        description: 'Embargo gap (days) before each fold test window'
+        required: false
+        default: '15'
+        type: string
+      bases:
+        description: >-
+          Space-separated base indicator names to validate (e.g.
+          "HV_10 HV_20 HV_30"). Leave blank to use the default
+          symbol_demeaning.DEFAULT_DEMEAN_BASES.
+        required: false
+        default: ''
+        type: string
+  schedule:
+    # Re-validate weekly so a future retrain that changes the data mix
+    # (new symbols, more history) can't silently regress the fix without
+    # anyone noticing.
+    - cron: '0 13 * * 1'  # Mondays 13:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  validate-symbol-demeaning:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run symbol-demeaning validation
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '365' }}
+        shell: bash
+        run: |
+          set -o pipefail
+          BASES="${{ github.event.inputs.bases }}"
+          N_SPLITS="${{ github.event.inputs.n_splits || '5' }}"
+          EMBARGO_DAYS="${{ github.event.inputs.embargo_days || '15' }}"
+          if [ -n "$BASES" ]; then
+            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" --bases $BASES | tee symbol_demeaning_validation_report.txt
+          else
+            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" | tee symbol_demeaning_validation_report.txt
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: symbol-demeaning-validation-report
+          path: symbol_demeaning_validation_report.txt
+          retention-days: 30
