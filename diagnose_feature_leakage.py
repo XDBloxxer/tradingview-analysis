@@ -27,7 +27,16 @@ What it does:
 Anything with univariate AUC > ~0.75 on its own, or a NaN-rate gap of more
 than ~5-10 percentage points between classes, deserves a hard look before
 you trust any downstream feature-selection or model AUC number.
+
+By default this applies the SAME manual feature blocklist
+(ml_models/feature_selection/excluded_features.json, or --exclude-features-file)
+that feature_selection.py's CLI applies before it ever starts selecting --
+so a column you've already blocked won't show up here re-flagging itself.
+Pass --no-exclude-features to scan the raw, unblocked feature set instead
+(e.g. to confirm a newly-added block target actually looks suspicious
+before you add it).
 """
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -38,15 +47,49 @@ from sklearn.metrics import roc_auc_score
 
 sys.path.insert(0, str(Path(__file__).parent))
 import ml_retrain_model as rt  # noqa: E402
+from src.ml_predictor.feature_selection import (  # noqa: E402
+    DEFAULT_EXCLUDED_FEATURES_PATH,
+    apply_feature_exclusions,
+    load_excluded_features,
+)
+
+
+def _parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument(
+        "--exclude-features-file",
+        default=DEFAULT_EXCLUDED_FEATURES_PATH,
+        help="JSON blocklist file to apply before scanning "
+             f"(default: {DEFAULT_EXCLUDED_FEATURES_PATH}), same format/semantics "
+             "as feature_selection.py's --exclude-features-file.",
+    )
+    p.add_argument(
+        "--no-exclude-features", action="store_true",
+        help="Scan the raw feature set, ignoring the blocklist file entirely "
+             "(the blocklist is applied by default, matching feature_selection.py).",
+    )
+    return p.parse_args()
 
 
 def main():
+    args = _parse_args()
     lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365")) or None  # 0 -> unbounded
     client = rt.get_supabase_client()
     base_df = rt.load_base_training_data(client, lookback_days=lookback_days)
     t1_df = rt.load_t1_data(client, lookback_days=lookback_days)
     combined_df = rt.combine_datasets(base_df, t1_df)
     X, y, w = rt.prepare_features(combined_df)
+
+    if args.no_exclude_features:
+        print("[exclude] --no-exclude-features set — scanning raw feature set, blocklist ignored\n")
+    else:
+        exclude_features, exclude_base_features = load_excluded_features(args.exclude_features_file)
+        n_before = X.shape[1]
+        X = apply_feature_exclusions(X, exclude_features, exclude_base_features)
+        print(
+            f"[exclude] applied blocklist from {args.exclude_features_file}: "
+            f"{n_before} -> {X.shape[1]} column(s)\n"
+        )
 
     date_col = "detection_date" if "detection_date" in combined_df.columns else "event_date"
     dates = combined_df[date_col] if date_col in combined_df.columns else pd.Series(pd.NaT, index=combined_df.index)
