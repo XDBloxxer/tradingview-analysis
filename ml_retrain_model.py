@@ -122,6 +122,12 @@ from sklearn.preprocessing import StandardScaler
 # __main__ at load time.  Import it here so the name is available in this
 # module's namespace (used below when wrapping the calibrated model).
 from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
+from src.ml_predictor.symbol_demeaning import (
+    demean_training_features,
+    compute_symbol_baselines,
+    save_symbol_baselines,
+    DEFAULT_BASELINE_PATH as SYMBOL_DEMEAN_BASELINE_PATH,
+)
 from supabase import create_client, Client
 from xgboost import XGBClassifier
 
@@ -2697,6 +2703,25 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
     X = X.replace([np.inf, -np.inf], np.nan)
+
+    # ── FIX (2026-08-11): symbol-fingerprint demeaning for HV_10/20/30 ─────
+    # diagnose_symbol_fingerprint_leak.py showed HV_10/20/30's ~0.75-0.76 raw
+    # AUC is ~80% "which stock is this" (between-symbol AUC 0.79-0.84) and
+    # only ~20% real day-to-day signal (within-symbol AUC 0.55-0.60). Rather
+    # than excluding HV outright (which would throw away the real slice),
+    # every lag/side variant of HV_10/20/30 is replaced here with the
+    # causally-demeaned residual: raw − that symbol's trailing mean computed
+    # from strictly earlier rows only. See src/ml_predictor/symbol_demeaning.py
+    # for the full mechanics and cold-start handling. This changes what the
+    # model is trained on, not how data is collected — combined_df / df still
+    # carry the raw values untouched.
+    if "symbol" in df.columns and "detection_date" in df.columns:
+        X = demean_training_features(X, df["symbol"], df["detection_date"])
+    else:
+        logger.warning(
+            "[symbol-demean] 'symbol'/'detection_date' not in df — skipping HV "
+            "symbol-fingerprint demeaning for this run (raw HV values kept as-is)"
+        )
 
     # ── REMOVED (2026-08-06): has_t1_features binary flag ───────────────────
     # This used to be added as a trained feature so XGBoost could branch on
@@ -5296,6 +5321,23 @@ def main() -> int:
     # ── Prepare features ──────────────────────────────────────────────────────
     X, y, w = prepare_features(combined_df)
     feature_names = list(X.columns)
+
+    # ── Persist symbol-demeaning baselines for live scoring ────────────────
+    # prepare_features() just demeaned HV_10/20/30 in X against each symbol's
+    # trailing (causal) history *within this training run*. Live scoring
+    # (explosion_predictor.py) sees one row at a time with no such history to
+    # compute a trailing mean from, so it needs a persisted "as of now" mean
+    # per symbol instead. Compute that from the same combined_df (raw values,
+    # untouched by prepare_features) and write it out here, once per retrain.
+    if "symbol" in combined_df.columns:
+        try:
+            _hv_baselines = compute_symbol_baselines(combined_df, combined_df["symbol"])
+            if _hv_baselines:
+                save_symbol_baselines(_hv_baselines, SYMBOL_DEMEAN_BASELINE_PATH)
+            else:
+                logger.info("[symbol-demean] no HV baseline columns found in combined_df — nothing saved")
+        except Exception as e:
+            logger.warning(f"[symbol-demean] failed to compute/save baselines (non-fatal): {e}")
 
     # ── Scale ─────────────────────────────────────────────────────────────────
     # ── FIX 1: Time-based train/val split (on RAW features, before scaling) ───────
