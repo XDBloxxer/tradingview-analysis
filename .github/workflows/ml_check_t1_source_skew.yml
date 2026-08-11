@@ -1,0 +1,67 @@
+name: ML Check T1-Data-Source Label Skew
+
+# One-off, cheap diagnostic: does the 5min-vs-daily_fallback ratio
+# (t1_data_source) differ between winners and non-winners?
+#
+# Context: intraday_data_collector.py tags every T-1 row '5min' (real
+# intraday snapshot) or 'daily_fallback' (coarser daily-bar approximation
+# used when yfinance's 5-min window -- trailing 60 days from *now*, not
+# from the target date -- doesn't cover it). Most rows end up
+# 'daily_fallback' simply because most of the training window was
+# backfilled long after the fact. That alone isn't a leak. It's only a
+# leak if the ratio itself differs by label -- e.g. because winners and
+# non-winners were backfilled in separate batches/timings. This workflow
+# answers exactly that, and nothing else.
+#
+# Read-only: prints two small tables and uploads them as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of T-1 history to fetch (0 = unbounded)'
+        required: false
+        default: '365'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  check-t1-source-skew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run t1_data_source vs label crosstab
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '365' }}
+        run: |
+          python crosstab_check.py | tee t1_source_skew_report.txt
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: t1-source-skew-report
+          path: t1_source_skew_report.txt
+          retention-days: 30
