@@ -845,7 +845,7 @@ def stability_select(
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
     boruta_alpha: float = 0.05,
-    rfecv_min_features: int = 8,
+    rfecv_min_features: int = 4,
     rfecv_step: int = 5,
     random_state: int = 42,
     symbols: Optional[pd.Series] = None,
@@ -1053,10 +1053,13 @@ def run_pipeline(
     corr_threshold: float = 0.90,
     boruta_iterations: int = 100,
     boruta_alpha: float = 0.05,
-    # FIX: 20 was too close to typical Boruta output (~24 in practice), so
-    # RFECV took a single elimination step and produced a 2-point "curve"
-    # instead of an actual elbow. Lower default so it walks a real range.
-    rfecv_min_features: int = 8,
+    # FIX: 20, then 8, were both too close to typical Boruta output (now
+    # observed at 9-18 confirmed features), so RFECV only got 1-3
+    # elimination steps and produced a 2-3 point "curve" instead of an
+    # actual elbow (e.g. 18->13->8, 15->10->8, 12->8). Push the floor well
+    # below Boruta's confirmed range so RFECV has room to walk a real curve
+    # on every run, independent of how many features Boruta confirms.
+    rfecv_min_features: int = 4,
     rfecv_step: int = 5,
     run_genetic_polish: bool = True,
     ga_config: Optional[GAConfig] = None,
@@ -1312,7 +1315,7 @@ def _cli() -> int:
     parser.add_argument("--corr-threshold", type=float, default=0.90)
     parser.add_argument("--boruta-iterations", type=int, default=100)
     parser.add_argument("--boruta-alpha", type=float, default=0.05)
-    parser.add_argument("--rfecv-min-features", type=int, default=8)
+    parser.add_argument("--rfecv-min-features", type=int, default=4)
     parser.add_argument("--rfecv-step", type=int, default=5)
     parser.add_argument("--skip-genetic", action="store_true")
     parser.add_argument(
