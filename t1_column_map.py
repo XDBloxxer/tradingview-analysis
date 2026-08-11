@@ -210,6 +210,13 @@ METADATA_COLS = {
     "id", "created_at", "updated_at", "symbol", "exchange",
     "detection_date", "snapshot_type", "snapshot_time", "snapshot_date",
     "label", "source", "sample_weight",
+    # t1_data_source: '5min' (real intraday snapshot) vs 'daily_fallback'
+    # (coarser daily-bar approximation used when yfinance's 5-min window
+    # doesn't cover the target date -- see intraday_data_collector.py).
+    # Preserved as-is so downstream code (ml_retrain_model.load_t1_data)
+    # can discount daily_fallback rows' sample_weight instead of silently
+    # treating both sources as equally reliable.
+    "t1_data_source",
 }
 
 
