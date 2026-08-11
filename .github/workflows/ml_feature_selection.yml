@@ -35,9 +35,9 @@ on:
         default: '100'
         type: string
       rfecv_min_features:
-        description: 'RFECV floor on feature count'
+        description: 'RFECV floor on feature count (keep well below Boruta''s typical 9-18 confirmed count so RFECV walks a real curve)'
         required: false
-        default: '8'
+        default: '4'
         type: string
       skip_genetic:
         description: 'Skip the GA polish stage (faster, RFECV output only)'
@@ -109,7 +109,7 @@ jobs:
         run: |
           CORR="${{ github.event.inputs.corr_threshold || '0.90' }}"
           BORUTA_ITER="${{ github.event.inputs.boruta_iterations || '100' }}"
-          RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '8' }}"
+          RFECV_MIN="${{ github.event.inputs.rfecv_min_features || '4' }}"
           SKIP_GA="${{ github.event.inputs.skip_genetic || 'false' }}"
           USE_EXCLUDED="${{ github.event.inputs.use_excluded_features || 'true' }}"
           LOOKBACK="${{ github.event.inputs.lookback_days || '365' }}"
