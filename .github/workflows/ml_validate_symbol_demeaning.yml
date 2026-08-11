@@ -46,6 +46,16 @@ on:
         required: false
         default: ''
         type: string
+      exclude_cold_start:
+        description: >-
+          Drop each symbol's first-appearance row (no prior history, so
+          demeaning leaves it at its raw value) before scoring. Use this to
+          check whether a FAIL is coming from steady-state demeaned rows or
+          is an artifact of cold-start rows still carrying the raw
+          between-symbol fingerprint.
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Re-validate weekly so a future retrain that changes the data mix
     # (new symbols, more history) can't silently regress the fix without
@@ -89,10 +99,15 @@ jobs:
           BASES="${{ github.event.inputs.bases }}"
           N_SPLITS="${{ github.event.inputs.n_splits || '5' }}"
           EMBARGO_DAYS="${{ github.event.inputs.embargo_days || '15' }}"
+          EXCLUDE_COLD_START="${{ github.event.inputs.exclude_cold_start || 'false' }}"
+          EXTRA_ARGS=""
+          if [ "$EXCLUDE_COLD_START" = "true" ]; then
+            EXTRA_ARGS="--exclude-cold-start"
+          fi
           if [ -n "$BASES" ]; then
-            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" --bases $BASES | tee symbol_demeaning_validation_report.txt
+            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" --bases $BASES $EXTRA_ARGS | tee symbol_demeaning_validation_report.txt
           else
-            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" | tee symbol_demeaning_validation_report.txt
+            python validate_symbol_demeaning.py --n-splits "$N_SPLITS" --embargo-days "$EMBARGO_DAYS" $EXTRA_ARGS | tee symbol_demeaning_validation_report.txt
           fi
 
       - name: Upload report
