@@ -126,6 +126,7 @@ from src.ml_predictor.symbol_demeaning import (
 from src.ml_predictor.feature_scaling import (
     apply_winsor_bounds,
     scale_with_fitted_scaler,
+    normalise_t1_features,
 )
 
 _META_COLS = {"symbol", "exchange"}
@@ -641,6 +642,27 @@ class ExplosionPredictor:
         if "has_t1_features" in self.feature_names:
             data_df = data_df.copy()
             data_df["has_t1_features"] = 1.0
+
+        # ── FIX (2026-08-12): t1_ unit normalisation, shared with training ──
+        # normalise_t1_features() (src.ml_predictor.feature_scaling) detects,
+        # PER ROW, whether each t1_ price/MACD/ATR/volume column is still in
+        # raw dollar/cumulative-volume scale and converts it to the same %
+        # distance / % of close / volume-ratio scale multiday_feature_collector
+        # writes at collection time. ml_retrain_model.py calls this on the
+        # RAW loaded DataFrame (before feature selection trims columns down),
+        # using t1_close_Close / t1_open_Close as the per-row close anchor.
+        # Previously prediction had no equivalent step and relied entirely on
+        # the assumption that live data is always already normalised by
+        # intraday_data_collector.py. This must run on data_df — NOT on the
+        # already-trimmed feature_df built below — because the close anchor
+        # column may not itself be a selected model feature and would
+        # otherwise be missing by the time normalisation ran, silently
+        # disabling the price/MACD/ATR detection groups that need it.
+        # Idempotent: a no-op on rows the collector already normalised, and a
+        # real safety net if it didn't.
+        for _t1_prefix in ("t1_close", "t1_open"):
+            if any(c.startswith(f"{_t1_prefix}_") for c in data_df.columns):
+                data_df = normalise_t1_features(data_df, prefix=_t1_prefix)
 
         input_norm_to_col: Dict[str, str] = {_norm(c): c for c in data_df.columns}
 
