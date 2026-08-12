@@ -1403,6 +1403,7 @@ def _cli() -> int:
     # is identical to what train_model() actually sees.
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     import ml_retrain_model as rt  # noqa: E402
+    from src.ml_predictor.feature_scaling import compute_winsor_bounds, apply_winsor_bounds  # noqa: E402
 
     client = rt.get_supabase_client()
     lookback_days = args.lookback_days or None  # 0 → None → unbounded fetch
@@ -1410,6 +1411,29 @@ def _cli() -> int:
     t1_df = rt.load_t1_data(client, lookback_days=lookback_days)
     combined_df = rt.combine_datasets(base_df, t1_df)
     X, y, w = rt.prepare_features(combined_df)
+
+    # WINSORIZATION CONSISTENCY FIX: the production retrain (ml_retrain_model.py
+    # main()) winsorizes X to per-column [0.5th, 99.5th] percentile bounds
+    # (see src/ml_predictor/feature_scaling.py) before the final model ever
+    # trains on it. Without this step here, feature selection's correlation
+    # clustering / Boruta / RFECV / genetic-search stages would all be scored
+    # on data still containing the extreme outlier rows (e.g. sub-penny-close
+    # blowups) that the actual deployed model never sees — a feature could be
+    # kept or dropped based on how it behaves on rows that don't exist in the
+    # final training data. Bounds are computed once here on the full X (this
+    # pipeline doesn't have a single fixed train/val split the way the final
+    # retrain does — it runs many different walk-forward folds across its
+    # four stages — so there's no single "train-only" slice to fit bounds on
+    # without doing it separately per fold, which would make Stage 1's
+    # cluster selection and Stage 2/3/4's fold scoring use different bounds).
+    # This mirrors prepare_features() itself, which is likewise computed once
+    # on the full combined_df before any fold splitting happens.
+    _winsor_bounds = compute_winsor_bounds(X)
+    X = apply_winsor_bounds(X, _winsor_bounds)
+    logger.info(
+        f"Winsorized {len(_winsor_bounds)} feature column(s) to [0.5th, 99.5th] "
+        "percentile bounds before feature selection (matches production retrain)."
+    )
 
     date_col = "detection_date" if "detection_date" in combined_df.columns else "event_date"
     dates = combined_df[date_col] if date_col in combined_df.columns else pd.Series(pd.NaT, index=combined_df.index)
