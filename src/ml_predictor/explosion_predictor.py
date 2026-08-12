@@ -123,6 +123,10 @@ from src.ml_predictor.symbol_demeaning import (
     load_symbol_baselines,
     DEFAULT_BASELINE_PATH as _SYMBOL_DEMEAN_BASELINE_PATH,
 )
+from src.ml_predictor.feature_scaling import (
+    apply_winsor_bounds,
+    scale_with_fitted_scaler,
+)
 
 _META_COLS = {"symbol", "exchange"}
 
@@ -426,6 +430,27 @@ class ExplosionPredictor:
                 "not yet retrained with the fix) — _scale_features() will "
                 "fall back to per-batch sparse-column inference, which can "
                 "be inconsistent with how the model was trained. Retrain "
+                "with the updated ml_retrain_model.py to populate this."
+            )
+
+        # WINSORIZATION CONSISTENCY FIX: build_scaler() in ml_retrain_model.py
+        # (via src.ml_predictor.feature_scaling) winsorizes each column to a
+        # [0.5th, 99.5th] percentile band fit on X_train BEFORE fitting the
+        # scaler, so the scaler's mean_/std_ are never dragged by a handful
+        # of outlier rows. Persisted here so _scale_features() applies the
+        # SAME train-derived bounds to live features before calling
+        # scaler.transform() — otherwise a live outlier value training would
+        # have clipped flows through unclipped, landing on a scale the model
+        # never saw during training.
+        raw_winsor_bounds = self.metadata.get("winsor_bounds", {})
+        self._trained_winsor_bounds = {
+            col: (float(lo), float(hi)) for col, (lo, hi) in raw_winsor_bounds.items()
+        }
+        if not self._trained_winsor_bounds:
+            self.logger.warning(
+                "model_metadata.json has no 'winsor_bounds' (older model or "
+                "not yet retrained with the fix) — live features will be "
+                "scaled without the outlier clip training used. Retrain "
                 "with the updated ml_retrain_model.py to populate this."
             )
 
@@ -738,60 +763,31 @@ class ExplosionPredictor:
             for c in non_numeric:
                 X[c] = pd.to_numeric(X[c], errors="coerce")
 
-        if hasattr(self.scaler, "feature_names_in_"):
-            mean_series = (
-                pd.Series(self.scaler.mean_, index=list(self.scaler.feature_names_in_))
-                .reindex(X.columns)
-            )
-        else:
-            mean_series = pd.Series(self.scaler.mean_, index=X.columns)
-
-        # NaN RESTORATION FIX: mirrors build_scaler() in ml_retrain_model.py.
-        # Sparse columns (t1_ intraday features) had NaN restored after scaling
-        # during training so XGBoost learns native missing-value branches for them.
-        # At inference, live predictions always supply real t1_ data, so in practice
-        # there are no NaN values to restore here.  However, if a t1_ column is
-        # genuinely missing for a particular stock (e.g. insufficient history),
-        # we must pass NaN rather than 0.0 so XGBoost routes it through the same
-        # "missing" branch it learned during training — not the "value=mean" path.
+        # SHARED-IMPLEMENTATION FIX: this used to be a hand-rolled
+        # re-implementation of build_scaler()'s transform path (own
+        # mean_series/fillna/sparse-restoration logic, and no winsorization
+        # step at all). It now calls the exact same
+        # feature_scaling.scale_with_fitted_scaler() that
+        # ml_retrain_model.py uses to transform the validation split during
+        # training — same winsorization bounds, same sparse-column NaN
+        # restoration, same fill/transform order. There is only one
+        # implementation of "how a feature gets scaled" in the whole
+        # pipeline now; training and prediction both call it.
         #
-        # CONSISTENCY FIX: sparse-column membership must come from the training
-        # set's coverage (persisted in model_metadata.json as "sparse_cols" by
-        # save_outputs()), not be recomputed from this inference batch's own
-        # coverage. Recomputing per-batch is what build_scaler()'s docstring
-        # explicitly warns against — a column dense in training but missing in
-        # this batch (or vice versa) would otherwise be classified differently
-        # than it was during training, silently changing that feature's
-        # representation between train and predict.
-        SPARSE_THRESHOLD = 0.5  # must match build_scaler() in ml_retrain_model.py
+        # CONSISTENCY FIX: sparse-column membership and winsorization bounds
+        # both come from the training set (persisted in model_metadata.json
+        # by save_outputs()), not recomputed from this inference batch — see
+        # _load_model() above for why recomputing per-batch would be
+        # inconsistent with how the model was trained.
+        sparse_cols = getattr(self, "_trained_sparse_cols", None) or None
+        winsor_bounds = getattr(self, "_trained_winsor_bounds", None) or None
 
-        trained_sparse_cols = getattr(self, "_trained_sparse_cols", None)
-        if trained_sparse_cols:
-            sparse_cols = [c for c in trained_sparse_cols if c in X.columns]
-        else:
-            # Fallback for models trained before this fix (no sparse_cols in
-            # metadata) — recompute from this batch's own coverage, same as
-            # before. Consistency with training is not guaranteed in this path;
-            # retrain with the updated ml_retrain_model.py to remove it.
-            coverage = X.notna().mean()
-            sparse_cols = [
-                c for c in coverage[coverage < SPARSE_THRESHOLD].index
-                if c != "has_t1_features"
-            ]
-
-        # Capture NaN mask BEFORE filling (only for sparse columns)
-        nan_mask_sparse = X[sparse_cols].isna() if sparse_cols else None
-
-        X_filled      = X.fillna(mean_series)
-        X_scaled_vals = self.scaler.transform(X_filled)
-        X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
-        X_scaled      = X_scaled.fillna(0.0)  # handles all-NaN columns with no mean
-
-        # Restore NaN for sparse columns so XGBoost uses its learned missing-value branch
-        if nan_mask_sparse is not None and sparse_cols:
-            X_scaled.loc[:, sparse_cols] = X_scaled[sparse_cols].where(~nan_mask_sparse, other=np.nan)
-
-        return X_scaled
+        return scale_with_fitted_scaler(
+            self.scaler,
+            X,
+            sparse_threshold_cols=sparse_cols,
+            winsor_bounds=winsor_bounds,
+        )
 
     # -------------------------------------------------------------------------
     # FIX 2: Enhanced bimodal/compression/narrow-band detection
