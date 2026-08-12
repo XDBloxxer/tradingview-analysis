@@ -1527,6 +1527,36 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         # Raw OBV for even a thinly traded stock easily hits tens of thousands.
         return med > 10_000.0
 
+    # ── Outlier guard for close-anchored % conversions ──────────────────────
+    # BUG FIX: safe_close only guards against close == 0, not close ≈ 0. For
+    # sub-penny stocks (close e.g. $0.0002) an ordinary dollar-scale move
+    # divided by that close explodes into a percentage in the tens of
+    # thousands, even though the underlying value was never "raw" in a
+    # meaningful sense. That contaminates X_train_raw fed to build_scaler()
+    # (StandardScaler's mean_/std_ get dragged by a handful of these rows,
+    # compressing genuine signal for every normal-priced stock) and
+    # contaminates the top10_training_stats percentile snapshot saved to
+    # model_metadata.json — which explosion_predictor.py then uses as the
+    # live clip bounds (percentiles[0], percentiles[-1]), so the guard rail
+    # itself becomes [-hundreds_of_thousands, +thousands] and stops guarding
+    # anything. Clip every close-anchored % conversion to a generous but
+    # finite band immediately after computing it, before it can reach the
+    # scaler fit or the metadata snapshot.
+    _PRICE_LINE_CLIP_PCT = 100.0   # % distance from close
+    _DOLLAR_DIFF_CLIP_PCT = 200.0  # % of close (MACD/MOM/AO/slopes)
+    _ATR_CLIP_PCT = 100.0          # % of close
+
+    def _clip_inplace(mask: "pd.Series", col_name: str, bound: float) -> None:
+        vals = pd.to_numeric(df.loc[mask, col_name], errors="coerce")
+        clipped = vals.clip(-bound, bound)
+        n_clipped = int((clipped != vals).sum())
+        df.loc[mask, col_name] = clipped
+        if n_clipped:
+            logger.debug(
+                f"  normalise_t1: {col_name} → clipped {n_clipped} row(s) to "
+                f"±{bound} after % conversion (sub-penny-close outlier guard)"
+            )
+
     # ── A. Price lines → (value / close − 1) × 100 ──────────────────────────
     PRICE_LINE_COLS = [
         f"{prefix}_SMA_5",   f"{prefix}_SMA_10",  f"{prefix}_SMA_20",  f"{prefix}_SMA_50",
@@ -1551,6 +1581,7 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             df.loc[raw_mask, col] = (
                 num.loc[raw_mask] / safe_close.loc[raw_mask] - 1
             ) * 100
+            _clip_inplace(raw_mask, col, _PRICE_LINE_CLIP_PCT)
             normalised_count += 1
             logger.debug(
                 f"  normalise_t1: {col} → % dist from close ({n_raw} raw row(s))"
@@ -1581,6 +1612,7 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             n_raw = int(raw_mask.sum())
             num = pd.to_numeric(df[col], errors="coerce")
             df.loc[raw_mask, col] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+            _clip_inplace(raw_mask, col, _DOLLAR_DIFF_CLIP_PCT)
             normalised_count += 1
             logger.debug(
                 f"  normalise_t1: {col} → % of close ({n_raw} raw row(s))"
@@ -1599,6 +1631,7 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
                 n_raw = int(raw_mask.sum())
                 num = pd.to_numeric(df[atr_col], errors="coerce")
                 df.loc[raw_mask, atr_col] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+                _clip_inplace(raw_mask, atr_col, _ATR_CLIP_PCT)
                 normalised_count += 1
                 logger.debug(
                     f"  normalise_t1: {atr_col} → % of close ({n_raw} raw row(s))"
@@ -1736,6 +1769,7 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
         n_raw = int(raw_mask.sum())
         num = pd.to_numeric(df[col_name], errors="coerce")
         df.loc[raw_mask, col_name] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+        _clip_inplace(raw_mask, col_name, _DOLLAR_DIFF_CLIP_PCT)
         logger.debug(
             f"  normalise_t1: {col_name} → % of close, in place "
             f"({n_raw} raw row(s), no re-derivation)"
@@ -3121,10 +3155,78 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 # Scaling
 # ---------------------------------------------------------------------------
 
-def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, list]:
+_WINSOR_LOWER_PCT = 0.5   # per-column winsorization bounds, fit on train only
+_WINSOR_UPPER_PCT = 99.5
+
+
+def compute_winsor_bounds(
+    X_train: pd.DataFrame,
+    lower_pct: float = _WINSOR_LOWER_PCT,
+    upper_pct: float = _WINSOR_UPPER_PCT,
+) -> dict:
     """
-    Fit scaler on train-split rows only. Returns scaler, scaled X_train, and
-    the list of sparse column names determined from training-set coverage.
+    Compute per-column (lower, upper) winsorization bounds from X_train only.
+
+    GENERAL OUTLIER GUARD: the per-feature clips added to normalise_t1_features()
+    catch the close-anchored % conversions (price lines / MACD-MOM-AO / ATR /
+    slopes), but any OTHER column — multiday features, ratios, anything not
+    routed through that function — can still carry a handful of extreme rows
+    into StandardScaler.fit(). StandardScaler has no built-in outlier
+    resistance: a single blown-out row shifts mean_ and inflates std_ for that
+    column, which compresses every other (normal) row's scaled value toward
+    zero and quietly destroys signal. This computes a generous per-column
+    [0.5th, 99.5th] percentile band from the TRAINING split only (never val —
+    that would leak val-set information into the bound), to be applied before
+    the scaler ever sees the data.
+
+    Columns that are entirely NaN, or have too few non-NaN values to form a
+    meaningful percentile (< 20 observations), are skipped (no bound stored —
+    left unclipped, since a bound estimated from a handful of points is
+    itself unreliable).
+    """
+    bounds: dict = {}
+    for col in X_train.columns:
+        s = X_train[col].dropna()
+        if len(s) < 20:
+            continue
+        lo = float(np.percentile(s, lower_pct))
+        hi = float(np.percentile(s, upper_pct))
+        if hi <= lo:
+            # Degenerate (near-constant) column — nothing meaningful to clip.
+            continue
+        bounds[col] = (lo, hi)
+    return bounds
+
+
+def apply_winsor_bounds(X: pd.DataFrame, bounds: dict) -> pd.DataFrame:
+    """
+    Clip each column in X to the (lower, upper) bound in `bounds`, if present.
+    NaN is preserved (clip leaves NaN untouched). Columns not in `bounds`
+    (e.g. skipped as degenerate/too-sparse during fitting) pass through
+    unmodified. Safe to call on train (bounds computed from itself, so this
+    only trims the very rows that produced the tails) or val/any other split
+    (bounds always come from train — no leakage).
+    """
+    X = X.copy()
+    for col, (lo, hi) in bounds.items():
+        if col in X.columns:
+            X[col] = X[col].clip(lower=lo, upper=hi)
+    return X
+
+
+def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, list, dict]:
+    """
+    Fit scaler on train-split rows only. Returns scaler, scaled X_train, the
+    list of sparse column names determined from training-set coverage, and
+    the per-column winsorization bounds used before fitting.
+
+    WINSORIZATION FIX: X_train is winsorized (clipped to per-column [0.5th,
+    99.5th] percentile bounds fit on X_train itself) BEFORE the scaler sees
+    it, so a handful of extreme-outlier rows in any column can no longer
+    drag StandardScaler's mean_/std_ and compress every other row's signal.
+    The bounds are returned so the caller can apply the SAME (train-derived)
+    bounds to X_val / any other split via apply_winsor_bounds() — never
+    re-fit bounds on non-train data, or val information leaks into training.
 
     LEAKAGE FIX: The scaler is now fit exclusively on X_train so that
     validation-set rows never influence the scaler's mean_ / std_ parameters.
@@ -3148,9 +3250,25 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
     """
     SPARSE_THRESHOLD = 0.5   # columns with < 50% coverage get NaN restored post-scale
 
+    winsor_bounds = compute_winsor_bounds(X_train)
+    n_winsor_cols = len(winsor_bounds)
+    X_train_w = apply_winsor_bounds(X_train, winsor_bounds)
+    if n_winsor_cols:
+        n_cells_clipped = int(
+            sum(
+                ((X_train[col] < lo) | (X_train[col] > hi)).sum()
+                for col, (lo, hi) in winsor_bounds.items()
+            )
+        )
+        logger.info(
+            f"Winsorized {n_winsor_cols} columns to [{_WINSOR_LOWER_PCT}, "
+            f"{_WINSOR_UPPER_PCT}] percentile bounds (train-fit only); "
+            f"{n_cells_clipped} cell(s) clipped before scaler fit."
+        )
+
     scaler        = StandardScaler()
-    col_means     = X_train.mean()           # computed on train rows only
-    X_filled      = X_train.fillna(col_means)
+    col_means     = X_train_w.mean()           # computed on winsorized train rows only
+    X_filled      = X_train_w.fillna(col_means)
     scaler.fit(X_filled)                     # fit on train rows only — no val leakage
 
     X_scaled_vals = scaler.transform(X_filled)
@@ -3181,7 +3299,7 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
             f"Examples: {sparse_cols[:5]}"
         )
 
-    return scaler, X_scaled, sparse_cols
+    return scaler, X_scaled, sparse_cols, winsor_bounds
 
 
 def scale_with_fitted_scaler(
@@ -3189,10 +3307,17 @@ def scale_with_fitted_scaler(
     X: pd.DataFrame,
     sparse_threshold_cols: list | None = None,
     sparse_threshold: float = 0.5,
+    winsor_bounds: dict | None = None,
 ) -> pd.DataFrame:
     """
     Transform X using an already-fitted scaler (e.g. to scale the val set or
     to reassemble a full scaled DataFrame for the gain regressor).
+
+    WINSORIZATION FIX: pass the SAME winsor_bounds dict returned by
+    build_scaler() (fit on X_train only) so X is clipped the same way before
+    being filled/transformed — keeps val (and any other split) on consistent
+    footing with what the scaler was actually fit on, with no re-fitting of
+    bounds on non-train data.
 
     NaN RESTORATION FIX: mirrors build_scaler — sparse columns have NaN restored
     after scaling so XGBoost receives genuinely missing values rather than 0.0.
@@ -3208,8 +3333,10 @@ def scale_with_fitted_scaler(
     hasn't been updated yet), coverage is re-computed from X as before and a
     DeprecationWarning is logged so callers know to pass the list.
     """
+    X_w = apply_winsor_bounds(X, winsor_bounds) if winsor_bounds else X
+
     col_means = pd.Series(scaler.mean_, index=X.columns)
-    X_filled  = X.fillna(col_means)
+    X_filled  = X_w.fillna(col_means)
 
     X_scaled_vals = scaler.transform(X_filled)
     X_scaled      = pd.DataFrame(X_scaled_vals, columns=X.columns, index=X.index)
@@ -5676,9 +5803,10 @@ def main() -> int:
     # so the scaler's mean_ / std_ were computed using val-set rows, making AUC
     # metrics slightly optimistic and the scaler non-reproducible on train-only data.
     logger.info("Fitting scaler on train split only (leakage fix)...")
-    scaler, X_train, _sparse_cols = build_scaler(X_train_raw)                    # fit + transform train
+    scaler, X_train, _sparse_cols, _winsor_bounds = build_scaler(X_train_raw)      # fit + transform train
     X_val                          = scale_with_fitted_scaler(scaler, X_val_raw,
-                                         sparse_threshold_cols=_sparse_cols)     # transform val only
+                                         sparse_threshold_cols=_sparse_cols,
+                                         winsor_bounds=_winsor_bounds)             # transform val only
 
     # Reassemble a scaled DataFrame (train + val, original row order) kept for
     # any downstream use that needs the surviving rows in order. Note: rows
@@ -6059,16 +6187,24 @@ def main() -> int:
 
     # ── Top-10 feature distribution snapshot (for PSI drift detection) ───────
     # Store per-feature mean, std, and percentile buckets (deciles) computed on
-    # the raw (unscaled) training split for the top-10 most important features.
-    # explosion_predictor.py loads these at inference time and logs a WARNING if
-    # PSI > 0.2 on any top feature, indicating a distribution shift between the
-    # training and live feature sets.
+    # the *winsorized* (see build_scaler/_winsor_bounds above) training split
+    # for the top-10 most important features. explosion_predictor.py loads
+    # these at inference time and (a) logs a WARNING if PSI > 0.2 on any top
+    # feature, and (b) clips live values to [percentiles[0], percentiles[-1]]
+    # as a guard rail. Using X_train_raw directly here would re-introduce the
+    # exact contamination the winsorization above was added to prevent: a
+    # handful of outlier rows (e.g. sub-penny-close blowups) would make the
+    # stored percentiles — and therefore the live clip bounds — as wide as
+    # the outliers themselves, defeating the guard rail. Applying the same
+    # train-fit winsor bounds here keeps this snapshot consistent with what
+    # the scaler and model actually trained on.
+    X_train_for_stats = apply_winsor_bounds(X_train_raw, _winsor_bounds) if _winsor_bounds else X_train_raw
     top10_features = fi_df.head(10)["feature"].tolist()
     top10_training_stats: dict = {}
     for feat in top10_features:
-        if feat not in X_train_raw.columns:
+        if feat not in X_train_for_stats.columns:
             continue
-        col = X_train_raw[feat].dropna()
+        col = X_train_for_stats[feat].dropna()
         if len(col) < 10:
             continue
         # 10 equal-width buckets covering the observed training range, plus one
