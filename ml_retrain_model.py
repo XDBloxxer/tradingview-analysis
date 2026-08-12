@@ -3958,6 +3958,7 @@ def train_gain_regressor(
             y_tr   = y_reg_log.loc[_tr_idx]
             y_va   = y_reg_log.loc[_va_idx]
             w_tr   = w_reg_valid.loc[_tr_idx]
+            w_va   = w_reg_valid.loc[_va_idx]
             # Keep raw (non-log) val targets for human-readable MAE reporting
             y_va_raw = y_reg_valid.loc[_va_idx]
             logger.info(
@@ -3972,16 +3973,18 @@ def train_gain_regressor(
             y_tr = y_reg_log.iloc[:_split_pos]
             y_va = y_reg_log.iloc[_split_pos:]
             w_tr = w_reg_valid.iloc[:_split_pos]
+            w_va = w_reg_valid.iloc[_split_pos:]
             y_va_raw = y_reg_valid.iloc[_split_pos:]
             logger.info(
                 f"  Gain regressor sequential split (no date column): "
                 f"{len(X_tr)} train / {len(X_va)} val"
             )
     else:
-        X_tr, X_va, y_tr, y_va, w_tr = (
-            X_reg_fill, X_reg_fill, y_reg_log, y_reg_log, w_reg_valid
+        X_tr, X_va, y_tr, y_va, w_tr, w_va = (
+            X_reg_fill, X_reg_fill, y_reg_log, y_reg_log, w_reg_valid, w_reg_valid
         )
         y_va_raw = y_reg_valid
+
 
     # Log gain distribution (in original % space) to diagnose compression
     y_tr_raw_arr = np.expm1(y_tr.values if hasattr(y_tr, "values") else y_tr)
@@ -4031,10 +4034,31 @@ def train_gain_regressor(
         n_jobs=-1,
         early_stopping_rounds=30,
     )
+    # EVAL-SET WEIGHT FIX (2026-08-12): early_stopping_rounds monitors RMSE on
+    # eval_set, and XGBoost's sklearn API evaluates that RMSE UNWEIGHTED unless
+    # sample_weight_eval_set is passed explicitly — it does NOT reuse
+    # sample_weight from training. ~85% of rows here are the RC1 "explicit 0.0
+    # anchor" non-winners (2355 of 2777), so an unweighted val RMSE is
+    # trivially minimised by predicting ~0 for every row regardless of
+    # features: that's a lower unweighted RMSE than any model that actually
+    # learns the RC8/RC9-upweighted winner-gain signal, because the anchor
+    # rows outnumber winners ~6:1 in val too. That silently defeated the
+    # RC8 (7x winner) / RC9 (confidence-scaled) sample weighting for the
+    # PURPOSES OF EARLY STOPPING even though .fit()'s training loss itself
+    # was correctly weighted — early stopping halted at the first round
+    # whose unweighted val RMSE looked best, which is best_iteration=0 (flat
+    # ~0% prediction) every time, regardless of how well later rounds learned
+    # the actual winner-gain pattern. Passing the SAME per-row weights used
+    # in training to sample_weight_eval_set makes the monitored metric
+    # weighted RMSE, consistent with what the model is actually optimising —
+    # early stopping now selects the iteration that's genuinely best at
+    # predicting winner gains, not the iteration that best predicts the
+    # anchor rows' constant zero.
     regressor.fit(
         X_tr, y_tr,
         sample_weight=w_tr.values,
         eval_set=[(X_va, y_va)],
+        sample_weight_eval_set=[w_va.values],
         verbose=False,
     )
 
