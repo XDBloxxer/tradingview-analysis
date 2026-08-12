@@ -1,13 +1,20 @@
 representative_feature,cluster_members,cluster_size,times_selected,frequency
-t1_open_EMA_20,t1_open_EMA_20,1,8,1.0
-t1_open_SMA_20_Slope,t1_open_SMA_20_Slope,1,7,0.875
-t1_close_ROC_10,"t1_close_ROC_10, t1_open_ROC_10",2,6,0.75
-t1_open_SMA_50,"t1_close_MACD_12_26_9, t1_open_SMA_50, t3_ema_50, t5_ema_50",4,6,0.75
-t1_close_MOM_10,"t1_close_MOM_10, t1_open_MOM_10, t3_ema_20, t3_ema_26, t3_macds_fast",5,5,0.625
-t3_bbb_20_2_0_2_0,t3_bbb_20_2_0_2_0,1,4,0.5
-t1_close_SMA_20_Slope,"t1_close_EMA_20_Slope, t1_close_SMA_20_Slope",2,3,0.375
-t1_close_RSI_14,"t1_close_RSI_14, t1_open_RSI_14",2,2,0.25
-t1_close_ATR_14,"t1_close_ATR_14, t1_open_ATR_14",2,2,0.25
-t1_close_SMA_20,t1_close_SMA_20,1,2,0.25
-t5_atr_20,t5_atr_20,1,1,0.125
-t3_atr_7,t3_atr_7,1,1,0.125
+t5_hv_30,"t1_close_HV_30, t1_open_HV_30, t3_hv_30, t5_hv_30",4,8,1.0
+t1_open_ATR_14_Slope,t1_open_ATR_14_Slope,1,8,1.0
+t1_open_VWAP,"t1_close_VWAP, t1_open_VWAP",2,8,1.0
+t3_atr_20,"t3_atr_14, t3_atr_20, t3_atr_7, t5_atr_20",4,8,1.0
+t5_obv,"t10_obv_sma20, t3_obv_sma20, t5_obv",3,7,0.875
+t1_close_HV_10,t1_close_HV_10,1,7,0.875
+t3_kcle_20_2,t3_kcle_20_2,1,7,0.875
+t10_hv_30,"t10_hv_20, t10_hv_30",2,6,0.75
+t10_superts_10_3,"t10_dcu_20_20, t10_superts_10_3",2,6,0.75
+t3_superts_10_3,"t3_ema_50, t3_superts_10_3, t5_ema_50",3,6,0.75
+t3_bbb_20_2_0_2_0,t3_bbb_20_2_0_2_0,1,5,0.625
+t10_kcle_20_2,t10_kcle_20_2,1,5,0.625
+t1_open_ROC_10,"t1_close_ROC_10, t1_open_ROC_10",2,4,0.5
+t1_close_OBV,"t1_close_OBV, t1_open_OBV",2,4,0.5
+t1_open_ATR_14,"t1_close_ATR_14, t1_open_ATR_14",2,4,0.5
+t1_open_DCL_20_20,t1_open_DCL_20_20,1,4,0.5
+t1_open_Gap_Pct,t1_open_Gap_Pct,1,3,0.375
+t1_open_BBL_20_2.0_2.0,t1_open_BBL_20_2.0_2.0,1,1,0.125
+t3_hma_20,t3_hma_20,1,1,0.125

@@ -1,15 +1,20 @@
 {
-  "stage0_count": 6,
-  "stage1_corr_count": 5,
-  "stage2_boruta_count": 5,
-  "stage3_rfecv_count": 4,
+  "stage0_count": 10,
+  "stage1_corr_count": 9,
+  "stage2_boruta_count": 9,
+  "stage3_rfecv_count": 9,
   "stage4_ga_count": null,
-  "final_count": 4,
+  "final_count": 9,
   "final_features": [
-    "t1_close_ROC_10",
-    "t1_open_SMA_50",
-    "t1_open_SMA_20_Slope",
-    "t1_open_MOM_10"
+    "t5_hv_30",
+    "t1_close_HV_10",
+    "t10_superts_10_3",
+    "t3_superts_10_3",
+    "t3_atr_20",
+    "t1_open_VWAP",
+    "t1_open_ATR_14_Slope",
+    "t3_kcle_20_2",
+    "t5_obv"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
@@ -17,16 +22,6 @@
   "rfecv_min_features": 4,
   "excluded_features": [],
   "excluded_base_features": [
-    "DCL_20_20",
-    "DCM_20_20",
-    "DCU_20_20",
-    "BBL_20_2.0_2.0",
-    "BBB_20_2.0_2.0",
-    "BBM_20_2.0_2.0",
-    "BBU_20_2.0_2.0",
-    "KCLe_20_2",
-    "KCBe_20_2",
-    "KCUe_20_2",
     "Price_vs_SMA20",
     "Price_vs_SMA50",
     "Price_vs_EMA20",
@@ -34,11 +29,12 @@
     "Volume_MA5",
     "Volume_MA10",
     "Volume_MA20",
-    "Volume_Ratio"
+    "Volume_Ratio",
+    "SMA_20_50_Diff"
   ],
   "stability_check_ran": true,
   "stability_gate_enabled": true,
-  "stability_min_frequency": 0.5,
+  "stability_min_frequency": 0.75,
   "embargo_days": 70,
   "symbol_purge_enabled": true
 }
