@@ -1451,6 +1451,27 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             mask = mask | (num.abs() > safe_close * 0.5)
         return mask
 
+    def _raw_slope_mask(col_name: str) -> "pd.Series | None":
+        """Per-row boolean mask for the Slope columns (SMA_20_Slope,
+        EMA_20_Slope, ATR_14_Slope): True where the row's value looks like a
+        raw dollar-scale slope (from a pre-fix collector row) rather than a
+        %-point change already computed on normalised units.
+
+        These three columns arrive in `df` ALREADY POPULATED by
+        rename_t1_columns() — the intraday collector computes them as a
+        genuine diff(1) over its own continuous per-symbol bar series (see
+        `sma20_slope`/`ema20_slope`/`atr_pct` in
+        intraday_data_collector.py) and that value is correct as collected.
+        The only thing that can be wrong with it is units: pre-fix collector
+        rows computed the diff BEFORE normalising the underlying MA/ATR, so
+        their slope is a raw dollar-per-bar change, not a %-point change.
+        Same magnitude heuristic as the other dollar-diff columns (group B).
+        """
+        if col_name not in df.columns:
+            return None
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        return num.abs() > 20.0
+
     # ------------------------------------------------------------------
     # Column-level helpers, now used ONLY to decide whether the *derived*
     # re-computation columns further down are safe to rebuild (they need
@@ -1669,56 +1690,62 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
     atr14 = f"{prefix}_ATR_14"
 
     # ------------------------------------------------------------------
-    # FIX (root cause #2): a plain `.diff(1)` here computes "this row's MA
-    # minus whatever row happens to sit immediately above it" — and `df`
-    # at this point is ordered however fetch_table_paginated(order_column
-    # ="id") returned it, i.e. by insertion id, NOT by symbol/date. This
-    # table is one row per (symbol, detection_date) labeled event, not a
-    # continuous daily series for a single ticker, so a raw positional
-    # diff(1) mixes MA values across unrelated symbols and dates. The
-    # result isn't noisy signal, it's pure noise: for row N it's
-    # "AAPL's MA minus whatever ticker got inserted right before AAPL",
-    # which is a different (essentially random) quantity on every run
-    # depending on insertion order/batching.
+    # FIX (root cause #2, revised): the original fix here computed Slope
+    # via `.diff(1)` grouped by symbol over THIS table — the winners/
+    # non-winners label-event table, which is one row per (symbol,
+    # detection_date), not a continuous daily series. That was strictly
+    # better than the original ungrouped diff(1) (which mixed unrelated
+    # symbols), but it introduced a NEW problem: a symbol only has a
+    # valid "previous row" to diff against if it happens to appear twice
+    # in THIS table. Winners occasionally repeat (~57% still got a real
+    # value); non-winners are overwhelmingly one-off "checked and
+    # rejected" events, so ~100% of non-winner rows got NaN. That's
+    # label-correlated missingness — the model can trivially learn
+    # "Slope is NaN => non-winner", which is leakage of a different
+    # flavor than the one we were trying to fix (confirmed empirically:
+    # diagnose_feature_leakage.py's NaN-rate-gap check went from clean to
+    # a ~43pp gap on these exact columns after that change).
     #
-    # The fix: compute the diff within each symbol's own rows, ordered by
-    # detection_date, then map the result back onto df's original index/
-    # order. Rows that are the first (or only) observation for their
-    # symbol in this batch have no valid "previous" row and correctly get
-    # NaN (downstream imputation already handles NaN feature values —
-    # this is not a new failure mode, it's the same one the multiday
-    # collector's own diff-based features have for a symbol's very first
-    # observation).
-    def _grouped_slope(col_name: str) -> "pd.Series | None":
-        """diff(1) of col_name within each symbol, ordered by
-        detection_date, re-indexed back onto df's original row order."""
+    # The actual fix: don't re-derive Slope from THIS table at all. The
+    # intraday collector already computes a genuine slope — diff(1) over
+    # its own continuous per-symbol bar series (see
+    # intraday_data_collector.py: sma20_slope/ema20_slope/atr_pct) — and
+    # that value arrives in `df` pre-populated via rename_t1_columns(),
+    # BEFORE this function even runs. The only thing that can be wrong
+    # with it is units: pre-fix collector rows computed that diff before
+    # normalising the underlying MA, so it's occasionally a raw
+    # dollar-per-bar change instead of a %-point change. So treat it like
+    # every other dollar-diff column (group B: MACD/MOM/AO) — rescale the
+    # raw-looking rows in place, per row, and leave everything else
+    # (including every already-normalised row) untouched. No diff
+    # recomputation, no dependency on a "previous row" existing anywhere,
+    # so no way for this to introduce missingness that didn't already
+    # exist in the source column.
+    def _rescale_slope_col(col_name: str) -> None:
         if col_name not in df.columns:
-            return None
-        if "symbol" not in df.columns or "detection_date" not in df.columns:
+            return
+        raw_mask = _raw_slope_mask(col_name)
+        if raw_mask is None or not raw_mask.any():
+            return
+        if safe_close is None:
             logger.warning(
-                f"  normalise_t1: cannot compute grouped slope for {col_name} — "
-                "'symbol'/'detection_date' column missing; leaving as NaN."
+                f"  normalise_t1: {col_name} appears raw but {close_col} is "
+                "absent — cannot rescale."
             )
-            return pd.Series(np.nan, index=df.index)
-        tmp = pd.DataFrame({
-            "_val": pd.to_numeric(df[col_name], errors="coerce"),
-            "_sym": df["symbol"],
-            "_dt":  pd.to_datetime(df["detection_date"], errors="coerce"),
-        }, index=df.index)
-        tmp = tmp.sort_values(["_sym", "_dt"], kind="mergesort")
-        tmp["_slope"] = tmp.groupby("_sym")["_val"].diff(1)
-        return tmp["_slope"].reindex(df.index)
+            return
+        n_raw = int(raw_mask.sum())
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        df.loc[raw_mask, col_name] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+        logger.debug(
+            f"  normalise_t1: {col_name} → % of close, in place "
+            f"({n_raw} raw row(s), no re-derivation)"
+        )
 
-    # EMA_20_Slope and SMA_20_Slope: diff of normalised MA (%-point per snapshot)
     ema20_slope_col = f"{prefix}_EMA_20_Slope"
-    if ema20 in df.columns and not _is_raw_price_line(ema20):
-        df[ema20_slope_col] = _grouped_slope(ema20)
-        logger.debug(f"  normalise_t1: re-derived {ema20_slope_col} (grouped by symbol)")
+    _rescale_slope_col(ema20_slope_col)
 
     sma20_slope_col = f"{prefix}_SMA_20_Slope"
-    if sma20 in df.columns and not _is_raw_price_line(sma20):
-        df[sma20_slope_col] = _grouped_slope(sma20)
-        logger.debug(f"  normalise_t1: re-derived {sma20_slope_col} (grouped by symbol)")
+    _rescale_slope_col(sma20_slope_col)
 
     # EMA_12_26_Diff and SMA_20_50_Diff: spread of normalised MAs
     ema_diff_col = f"{prefix}_EMA_12_26_Diff"
@@ -1758,11 +1785,11 @@ def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
             df[vs_col] = (1.0 / (1.0 + _norm_ma / 100.0) - 1.0) * 100.0
             logger.debug(f"  normalise_t1: re-derived {vs_col}")
 
-    # ATR_14_Slope: diff of normalised ATR (matches multiday atr_14_slope)
+    # ATR_14_Slope: same treatment as EMA/SMA Slope above — the collector's
+    # own value is already correct, rescale it per row instead of
+    # re-deriving it from this event-level table.
     atr_slope_col = f"{prefix}_ATR_14_Slope"
-    if atr14 in df.columns and not _is_raw_atr(atr14):
-        df[atr_slope_col] = _grouped_slope(atr14)
-        logger.debug(f"  normalise_t1: re-derived {atr_slope_col} (grouped by symbol)")
+    _rescale_slope_col(atr_slope_col)
 
     if normalised_count > 0 or skipped_count > 0:
         logger.info(
