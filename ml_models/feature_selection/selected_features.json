@@ -1,15 +1,15 @@
 {
-  "stage0_count": 317,
-  "stage1_corr_count": 119,
-  "stage2_boruta_count": 12,
+  "stage0_count": 6,
+  "stage1_corr_count": 5,
+  "stage2_boruta_count": 5,
   "stage3_rfecv_count": 4,
   "stage4_ga_count": null,
   "final_count": 4,
   "final_features": [
-    "t1_close_EMA_20_Slope",
-    "t1_open_SMA_20_Slope",
+    "t1_close_ROC_10",
     "t1_open_SMA_50",
-    "t1_open_EMA_20"
+    "t1_open_SMA_20_Slope",
+    "t1_open_MOM_10"
   ],
   "corr_threshold": 0.85,
   "boruta_iterations": 100,
@@ -37,8 +37,8 @@
     "Volume_Ratio"
   ],
   "stability_check_ran": true,
-  "stability_gate_enabled": false,
-  "stability_min_frequency": 0.75,
+  "stability_gate_enabled": true,
+  "stability_min_frequency": 0.5,
   "embargo_days": 70,
   "symbol_purge_enabled": true
 }
