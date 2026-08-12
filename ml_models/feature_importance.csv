@@ -1,4 +1,10 @@
 feature,importance
-t1_open_MOM_10,0.42958
-t1_close_ROC_10,0.337877
-t1_open_SMA_50,0.232543
+t1_close_HV_10,0.203229
+t10_superts_10_3,0.16758
+t3_superts_10_3,0.151446
+t3_kcle_20_2,0.11563
+t5_obv,0.097919
+t3_atr_20,0.095892
+t1_open_VWAP,0.071398
+t1_open_ATR_14_Slope,0.04958
+t5_hv_30,0.047325
