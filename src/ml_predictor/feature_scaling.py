@@ -246,3 +246,604 @@ def scale_with_fitted_scaler(
 
     return X_scaled
 
+
+# ---------------------------------------------------------------------------
+# Unit normalisation (dollar-scale / raw-count -> scale-free t1_ features)
+# ---------------------------------------------------------------------------
+# Moved here from ml_retrain_model.py so explosion_predictor.py (prediction)
+# can call the EXACT same detection/conversion logic training uses, instead
+# of relying purely on the assumption that intraday_data_collector.py always
+# normalises at collection time. Training self-heals legacy raw-dollar rows
+# via this function; prediction previously had no equivalent runtime guard,
+# so a collector regression could silently feed a raw-dollar value into the
+# scaler at inference with no detection. Both callers now share one
+# implementation, same pattern as build_scaler()/scale_with_fitted_scaler().
+
+def normalise_t1_features(df: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """
+    Ensure all T-1 feature columns that carry dollar-scale or cumulative-volume
+    values are expressed in the same scale-free units that multiday_feature_collector
+    writes to the DB (and that the model was trained to expect).
+
+    WHY THIS IS NEEDED
+    ------------------
+    The intraday_data_collector was originally storing raw dollar values for
+    MAs, Bollinger Bands, MACD, etc.  A fix to the collector now normalises
+    those values at collection time, but rows already in the DB are raw.
+    This function detects — per column, per batch — whether each feature is
+    already normalised and skips it if so, making the operation idempotent:
+    running it on already-normalised data is a no-op.
+
+    NORMALISATION CATEGORIES (mirror of multiday_feature_collector.py)
+    -------------------------------------------------------------------
+    A. Price lines  → (value / close - 1) * 100   [% distance from close]
+       SMA_5/10/20/50, EMA_5/10/12/20/26/50, BB lower/middle/upper,
+       Keltner lower/middle/upper, Donchian lower/middle/upper, VWAP.
+
+    B. Dollar diffs → value / close * 100          [% of close]
+       MACD_12_26_9, MACDh_12_26_9, MACDs_12_26_9, MOM_10, AO.
+
+    C. ATR          → value / close * 100          [% of close]
+       ATR_14.  multiday stores ATRr (already %) but intraday's `ta` library
+       returns dollar ATR, so the same normalisation is required.
+
+    D. Volume       → value / Volume_MA20          [ratio]
+       Volume_MA5, Volume_MA10, OBV.
+       Volume_MA20 / Volume_MA20 = 1.0 always (sentinel value; set to 1.0).
+
+    DERIVED RE-COMPUTATION
+    ----------------------
+    Four derived columns depend on the raw MA values and must be re-derived
+    after normalisation so they are consistent with their inputs:
+       EMA_20_Slope   = diff(EMA_20)            after normalisation
+       SMA_20_Slope   = diff(SMA_20)            after normalisation
+       EMA_12_26_Diff = EMA_12 − EMA_26         after normalisation
+       SMA_20_50_Diff = SMA_20 − SMA_50         after normalisation
+       Price_vs_SMA20 = −SMA_20                 (= 0 − normalised_SMA_20)
+       Price_vs_SMA50 = −SMA_50
+       Price_vs_EMA20 = −EMA_20
+       ATR_14_Slope   = diff(ATR_14)            after normalisation
+
+    DETECTION LOGIC
+    ---------------
+    Detection for groups A/B/C/D is PER ROW, not per-column-median. A batch
+    fetched from the DB can contain rows from multiple ingestion runs — some
+    already normalised (post-collector-fix), some still raw (pre-fix /
+    older rows) — mixed together in the same column. A column-median check
+    decides raw-vs-normalised for the WHOLE column at once, so whichever
+    state is in the majority wins and the minority rows are silently left
+    on the wrong scale (this was already identified and fixed for group D;
+    it applied equally to A/B/C and is now fixed the same way there). Each
+    row's own value/close ratio (or, for group D, its own Volume_MA20)
+    decides that row's raw/normalised state, so a column that is 90% clean
+    and 10% raw gets exactly the 10% fixed. The close price column (e.g.
+    t1_close_Close) is used as the per-row anchor for price-relative checks.
+
+    Each group has its own detection rule (now applied per row):
+
+      Price lines: a normalised MA sits within ±50% of close (i.e. in the
+        range −50 to +50).  A raw MA equals the close price itself — so its
+        median absolute value ≈ median(close).  Threshold: if the median
+        absolute value of the column exceeds 50 (which is impossible for a
+        correctly normalised % distance), the column is raw.
+
+      Dollar diffs (MACD/MOM/AO): normalised values are small percentages,
+        typically ±5%.  Raw values are dollar differences whose magnitude
+        scales with close price.  Threshold: if median(|col|) > 20 the column
+        is raw.  (A normalised MACD of 20% of close would be extreme.)
+
+      ATR: normalised ATR is 1–20% for volatile small caps.  Dollar ATR for
+        a $5 stock may be $0.30 (= 6% normalised) — difficult to distinguish
+        just from magnitude.  Use close as anchor: if median(ATR) > 0.5 *
+        median(close) the column must be raw (a 50%+ daily ATR is impossible).
+        Fallback: if median(ATR) > 50 it is certainly raw.
+
+      Volume MAs / OBV: after normalisation Volume_MA20 is exactly 1.0 and
+        Volume_MA5/MA10/OBV are ratios near 1.0. Unlike every other group
+        above, this detection is done PER ROW rather than on the column
+        median: a row is raw iff its own Volume_MA20 value is > 100 (raw
+        share counts are always > 100; normalised Volume_MA20 is always
+        exactly 1.0). This matters because a single DataFrame can contain
+        rows from multiple ingestion batches — some already normalised,
+        some not — and a column-median threshold would normalise-or-skip
+        the *entire* column based on whichever state is in the majority,
+        silently leaving the minority batch's rows on a raw share-count
+        scale in the same column as rows pinned at the 1.0 sentinel.
+
+    Args:
+        df:     DataFrame as returned by rename_t1_columns — column names
+                already carry the full prefix (e.g. 't1_close_SMA_20').
+        prefix: 't1_close' or 't1_open' — used to locate the close-price
+                anchor column and to build the full column names.
+
+    Returns:
+        df with unnormalised columns normalised in-place (copy returned).
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    close_col = f"{prefix}_Close"
+    vol_ma20_col = f"{prefix}_Volume_MA20"
+
+    # --- close anchor (Series of per-row close prices) ----------------------
+    # Used for price-relative normalisation; may be absent for old DB rows.
+    close_s = (
+        pd.to_numeric(df[close_col], errors="coerce")
+        if close_col in df.columns
+        else None
+    )
+    safe_close = close_s.replace(0, np.nan) if close_s is not None else None
+    median_close = float(close_s.median()) if close_s is not None and close_s.notna().any() else None
+
+    # --- volume anchor -------------------------------------------------------
+    vol_ma20_s = (
+        pd.to_numeric(df[vol_ma20_col], errors="coerce")
+        if vol_ma20_col in df.columns
+        else None
+    )
+
+    normalised_count = 0
+    skipped_count    = 0
+
+    def _median_abs(col_name: str) -> float:
+        """Median of the absolute values of a column; NaN if column absent."""
+        if col_name not in df.columns:
+            return float("nan")
+        s = pd.to_numeric(df[col_name], errors="coerce").dropna()
+        return float(s.abs().median()) if len(s) else float("nan")
+
+    # ------------------------------------------------------------------
+    # PER-ROW raw/normalised masks (groups A/B/C)
+    # ------------------------------------------------------------------
+    # FIX (root cause #1): the previous _is_raw_* helpers decided "raw vs
+    # normalised" once per column, from the column's median. That's fine
+    # when a batch is homogeneous, but this table accumulates rows from
+    # multiple ingestion runs — some collected before the intraday
+    # collector's normalisation fix, some after. If most rows in a given
+    # retrain's batch are already normalised, the column median sits in
+    # the normalised range and the whole column is skipped, silently
+    # leaving the raw-dollar minority rows untouched in the same column
+    # (this is exactly the failure mode already documented and fixed for
+    # Volume group D below — vol_needs_norm going False and stranding the
+    # raw share-count rows). That mixed-scale minority is what produced
+    # the blown-out tails in model_metadata.json (median ≈ correct,
+    # min/max in the tens of thousands).
+    #
+    # The fix mirrors group D's approach: every row decides its OWN raw/
+    # normalised state, using the same close-anchored ratio test the old
+    # code applied to the column as a whole. Rows are normalised (or left
+    # alone) individually, so a column that's 90% clean and 10% raw gets
+    # exactly the 10% fixed instead of the whole column being judged by
+    # majority vote.
+    def _raw_price_line_mask(col_name: str) -> "pd.Series | None":
+        """Per-row boolean mask: True where the row's own value looks like a
+        raw dollar price line rather than a % distance from close."""
+        if col_name not in df.columns or safe_close is None:
+            return None
+        num   = pd.to_numeric(df[col_name], errors="coerce")
+        ratio = num / safe_close
+        # Applying the old column-median window (0.3x-3.0x of close) per row
+        # instead of per-column-median turns out to be ambiguous on a
+        # per-row basis: a legitimately normalised, wide "% distance from
+        # close" value (e.g. -20, on a $10 stock) has |value/close| = 2.0,
+        # which lands inside the same 0.3-3.0x window a genuinely raw price
+        # line would. The column median averaged this collision away; a
+        # per-row check needs an extra discriminator to avoid re-corrupting
+        # already-clean rows:
+        #   1) a raw dollar price line is always POSITIVE (MAs/bands are
+        #      never negative); a normalised "% distance from close" value
+        #      is frequently negative. Requiring num > 0 rules out roughly
+        #      half of the collision zone for free.
+        #   2) an MA/band rarely strays more than ~2x above/below its own
+        #      close in practice (that would imply a >100% multi-day move),
+        #      so tightening the window to 0.5x-2.0x (from 0.3x-3.0x)
+        #      shrinks the overlap with genuinely wide normalised values
+        #      (which cluster in the -50..50 range and increasingly rarely
+        #      land at exactly 0.5x-2.0x of that row's own close) without
+        #      giving up real raw-price detection, which sits at ~1.0x by
+        #      construction.
+        return (num > 0) & (ratio.abs().between(0.5, 2.0))
+
+    def _raw_dollar_diff_mask(col_name: str) -> "pd.Series | None":
+        """Per-row boolean mask: True where MACD/MOM/AO looks like a raw
+        dollar difference rather than a % of close."""
+        if col_name not in df.columns:
+            return None
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        return num.abs() > 20.0
+
+    def _raw_atr_mask(col_name: str) -> "pd.Series | None":
+        """Per-row boolean mask: True where ATR looks like raw dollar ATR
+        rather than % of close."""
+        if col_name not in df.columns:
+            return None
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        mask = num.abs() > 50.0
+        if safe_close is not None:
+            mask = mask | (num.abs() > safe_close * 0.5)
+        return mask
+
+    def _raw_slope_mask(col_name: str) -> "pd.Series | None":
+        """Per-row boolean mask for the Slope columns (SMA_20_Slope,
+        EMA_20_Slope, ATR_14_Slope): True where the row's value looks like a
+        raw dollar-scale slope (from a pre-fix collector row) rather than a
+        %-point change already computed on normalised units.
+
+        These three columns arrive in `df` ALREADY POPULATED by
+        rename_t1_columns() — the intraday collector computes them as a
+        genuine diff(1) over its own continuous per-symbol bar series (see
+        `sma20_slope`/`ema20_slope`/`atr_pct` in
+        intraday_data_collector.py) and that value is correct as collected.
+        The only thing that can be wrong with it is units: pre-fix collector
+        rows computed the diff BEFORE normalising the underlying MA/ATR, so
+        their slope is a raw dollar-per-bar change, not a %-point change.
+        Same magnitude heuristic as the other dollar-diff columns (group B).
+        """
+        if col_name not in df.columns:
+            return None
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        return num.abs() > 20.0
+
+    # ------------------------------------------------------------------
+    # Column-level helpers, now used ONLY to decide whether the *derived*
+    # re-computation columns further down are safe to rebuild (they need
+    # to know "is this base column normalised at all, anywhere in this
+    # batch" — a coarser question than the per-row masks above). Kept as
+    # medians deliberately: a single stray raw row shouldn't block
+    # re-deriving the whole Slope/Diff column, since that column is about
+    # to be rebuilt per-row from the (now per-row-normalised) base column
+    # anyway.
+    def _is_raw_price_line(col_name: str) -> bool:
+        if col_name not in df.columns or safe_close is None:
+            return False
+        num   = pd.to_numeric(df[col_name], errors="coerce")
+        ratio = (num / safe_close).dropna()
+        if ratio.empty:
+            return False
+        med_ratio = float(ratio.abs().median())
+        return 0.3 <= med_ratio <= 3.0
+
+    def _is_raw_dollar_diff(col_name: str) -> bool:
+        """True if MACD/MOM/AO column looks like a raw dollar difference."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        return med > 20.0
+
+    def _is_raw_atr(col_name: str) -> bool:
+        """True if ATR column looks like raw dollar ATR rather than % of close."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        if med > 50.0:
+            return True
+        if median_close is not None and median_close > 0:
+            return med > median_close * 0.5
+        return False
+
+    def _is_raw_volume_ma(col_name: str) -> bool:
+        """True if a Volume_MA column is still in raw share counts."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # After normalisation Volume_MA5/10 are ratios near 1.0; Volume_MA20 = 1.0.
+        # Raw share counts are always > 100 (even the most thinly traded stocks).
+        return med > 100.0
+
+    def _is_raw_obv(col_name: str) -> bool:
+        """True if OBV is in raw cumulative share counts rather than ÷ vol_ma20."""
+        med = _median_abs(col_name)
+        if np.isnan(med):
+            return False
+        # Normalised OBV is a ratio to daily avg volume — typically ±200.
+        # Raw OBV for even a thinly traded stock easily hits tens of thousands.
+        return med > 10_000.0
+
+    # ── Outlier guard for close-anchored % conversions ──────────────────────
+    # BUG FIX: safe_close only guards against close == 0, not close ≈ 0. For
+    # sub-penny stocks (close e.g. $0.0002) an ordinary dollar-scale move
+    # divided by that close explodes into a percentage in the tens of
+    # thousands, even though the underlying value was never "raw" in a
+    # meaningful sense. That contaminates X_train_raw fed to build_scaler()
+    # (StandardScaler's mean_/std_ get dragged by a handful of these rows,
+    # compressing genuine signal for every normal-priced stock) and
+    # contaminates the top10_training_stats percentile snapshot saved to
+    # model_metadata.json — which explosion_predictor.py then uses as the
+    # live clip bounds (percentiles[0], percentiles[-1]), so the guard rail
+    # itself becomes [-hundreds_of_thousands, +thousands] and stops guarding
+    # anything. Clip every close-anchored % conversion to a generous but
+    # finite band immediately after computing it, before it can reach the
+    # scaler fit or the metadata snapshot.
+    _PRICE_LINE_CLIP_PCT = 100.0   # % distance from close
+    _DOLLAR_DIFF_CLIP_PCT = 200.0  # % of close (MACD/MOM/AO/slopes)
+    _ATR_CLIP_PCT = 100.0          # % of close
+
+    def _clip_inplace(mask: "pd.Series", col_name: str, bound: float) -> None:
+        vals = pd.to_numeric(df.loc[mask, col_name], errors="coerce")
+        clipped = vals.clip(-bound, bound)
+        n_clipped = int((clipped != vals).sum())
+        df.loc[mask, col_name] = clipped
+        if n_clipped:
+            logger.debug(
+                f"  normalise_t1: {col_name} → clipped {n_clipped} row(s) to "
+                f"±{bound} after % conversion (sub-penny-close outlier guard)"
+            )
+
+    # ── A. Price lines → (value / close − 1) × 100 ──────────────────────────
+    PRICE_LINE_COLS = [
+        f"{prefix}_SMA_5",   f"{prefix}_SMA_10",  f"{prefix}_SMA_20",  f"{prefix}_SMA_50",
+        f"{prefix}_EMA_5",   f"{prefix}_EMA_10",  f"{prefix}_EMA_12",
+        f"{prefix}_EMA_20",  f"{prefix}_EMA_26",  f"{prefix}_EMA_50",
+        f"{prefix}_BBL_20_2.0_2.0", f"{prefix}_BBM_20_2.0_2.0", f"{prefix}_BBU_20_2.0_2.0",
+        f"{prefix}_KCLe_20_2",      f"{prefix}_KCBe_20_2",      f"{prefix}_KCUe_20_2",
+        f"{prefix}_DCL_20_20",      f"{prefix}_DCM_20_20",      f"{prefix}_DCU_20_20",
+        f"{prefix}_VWAP",
+    ]
+
+    for col in PRICE_LINE_COLS:
+        if col not in df.columns:
+            continue
+        raw_mask = _raw_price_line_mask(col)
+        if raw_mask is None or not raw_mask.any():
+            skipped_count += 1
+            continue
+        if safe_close is not None:
+            n_raw = int(raw_mask.sum())
+            num = pd.to_numeric(df[col], errors="coerce")
+            df.loc[raw_mask, col] = (
+                num.loc[raw_mask] / safe_close.loc[raw_mask] - 1
+            ) * 100
+            _clip_inplace(raw_mask, col, _PRICE_LINE_CLIP_PCT)
+            normalised_count += 1
+            logger.debug(
+                f"  normalise_t1: {col} → % dist from close ({n_raw} raw row(s))"
+            )
+        else:
+            logger.warning(
+                f"  normalise_t1: {col} appears raw but {close_col} is absent "
+                "— cannot normalise.  Rows without a close price will have NaN."
+            )
+
+    # ── B. Dollar diffs → value / close × 100 ────────────────────────────────
+    DOLLAR_DIFF_COLS = [
+        f"{prefix}_MACD_12_26_9",
+        f"{prefix}_MACDh_12_26_9",
+        f"{prefix}_MACDs_12_26_9",
+        f"{prefix}_MOM_10",
+        f"{prefix}_AO",
+    ]
+
+    for col in DOLLAR_DIFF_COLS:
+        if col not in df.columns:
+            continue
+        raw_mask = _raw_dollar_diff_mask(col)
+        if raw_mask is None or not raw_mask.any():
+            skipped_count += 1
+            continue
+        if safe_close is not None:
+            n_raw = int(raw_mask.sum())
+            num = pd.to_numeric(df[col], errors="coerce")
+            df.loc[raw_mask, col] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+            _clip_inplace(raw_mask, col, _DOLLAR_DIFF_CLIP_PCT)
+            normalised_count += 1
+            logger.debug(
+                f"  normalise_t1: {col} → % of close ({n_raw} raw row(s))"
+            )
+        else:
+            logger.warning(
+                f"  normalise_t1: {col} appears raw but {close_col} is absent."
+            )
+
+    # ── C. ATR → value / close × 100 ─────────────────────────────────────────
+    atr_col = f"{prefix}_ATR_14"
+    if atr_col in df.columns:
+        raw_mask = _raw_atr_mask(atr_col)
+        if raw_mask is not None and raw_mask.any():
+            if safe_close is not None:
+                n_raw = int(raw_mask.sum())
+                num = pd.to_numeric(df[atr_col], errors="coerce")
+                df.loc[raw_mask, atr_col] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+                _clip_inplace(raw_mask, atr_col, _ATR_CLIP_PCT)
+                normalised_count += 1
+                logger.debug(
+                    f"  normalise_t1: {atr_col} → % of close ({n_raw} raw row(s))"
+                )
+            else:
+                logger.warning(
+                    f"  normalise_t1: {atr_col} appears raw but {close_col} is absent."
+                )
+        else:
+            skipped_count += 1
+
+    # ── D. Volume → value / Volume_MA20 ──────────────────────────────────────
+    #
+    # IMPORTANT: detection here MUST be done PER-ROW, not per-column-median.
+    # A DataFrame passed to this function can contain a mix of rows from
+    # different ingestion batches — some already normalised (post-fix
+    # collector), some still raw (pre-fix collector / old DB rows). A
+    # column-level median check decides "raw vs normalised" for the WHOLE
+    # column at once, so whichever state is in the majority wins and the
+    # minority rows are left untouched. In particular, if most rows are
+    # already normalised, `vol_needs_norm` comes back False and the ~10%
+    # still-raw rows keep their raw share-count values (hundreds of
+    # thousands to millions) sitting in the same column as rows pinned at
+    # the 1.0 sentinel — a mixed-scale column that leaks ingestion-batch
+    # identity into the model instead of carrying real signal. Detecting
+    # and normalising per row (using each row's own Volume_MA20 value as
+    # the raw/normalised signal, since raw Volume_MA20 is always > 100 and
+    # normalised Volume_MA20 is always exactly 1.0) fixes this regardless
+    # of how the batches are mixed.
+    vol_ma5_col  = f"{prefix}_Volume_MA5"
+    vol_ma10_col = f"{prefix}_Volume_MA10"
+    obv_col      = f"{prefix}_OBV"
+
+    if vol_ma20_s is not None:
+        # Per-row raw mask: a row is "raw" iff its OWN Volume_MA20 value is
+        # still a raw share count (> 100). Post-normalisation Volume_MA20
+        # is always exactly 1.0, so this check is self-consistent and
+        # idempotent — already-normalised rows are correctly left alone.
+        raw_row_mask = vol_ma20_s > 100.0
+        n_raw = int(raw_row_mask.sum())
+
+        if n_raw > 0:
+            # Use each raw row's own (pre-overwrite) Volume_MA20 as the
+            # denominator for that row.
+            denom = vol_ma20_s.where(raw_row_mask).replace(0, np.nan)
+
+            for col in [vol_ma5_col, vol_ma10_col, obv_col]:
+                if col in df.columns:
+                    num = pd.to_numeric(df[col], errors="coerce")
+                    df.loc[raw_row_mask, col] = (
+                        num.loc[raw_row_mask] / denom.loc[raw_row_mask]
+                    )
+                    normalised_count += 1
+                    logger.debug(
+                        f"  normalise_t1: {col} → ratio to vol_ma20 "
+                        f"({n_raw} raw rows)"
+                    )
+
+            # Volume_MA20 / itself = 1.0 always (matches multiday behaviour).
+            # Only overwrite the rows that were actually raw — already
+            # normalised rows are already 1.0 and are left untouched.
+            df.loc[raw_row_mask, vol_ma20_col] = 1.0
+            normalised_count += 1
+            logger.debug(
+                f"  normalise_t1: {vol_ma20_col} → 1.0 sentinel "
+                f"({n_raw} raw rows)"
+            )
+        else:
+            skipped_count += 1   # every row already normalised
+    else:
+        logger.warning(
+            f"  normalise_t1: Volume MAs/OBV appear raw but {vol_ma20_col} is "
+            "absent — cannot normalise volume features."
+        )
+
+    # ── Derived re-computation ────────────────────────────────────────────────
+    # These were computed before normalisation in the old collector and are
+    # therefore in raw-dollar units.  Re-derive them from the now-normalised
+    # base columns so they are consistent with multiday behaviour.
+    #
+    # We only re-derive when the base columns exist AND are now normalised
+    # (i.e. median absolute value ≤ 50 after the steps above).
+
+    ema20 = f"{prefix}_EMA_20"
+    sma20 = f"{prefix}_SMA_20"
+    ema12 = f"{prefix}_EMA_12"
+    ema26 = f"{prefix}_EMA_26"
+    sma50 = f"{prefix}_SMA_50"
+    atr14 = f"{prefix}_ATR_14"
+
+    # ------------------------------------------------------------------
+    # FIX (root cause #2, revised): the original fix here computed Slope
+    # via `.diff(1)` grouped by symbol over THIS table — the winners/
+    # non-winners label-event table, which is one row per (symbol,
+    # detection_date), not a continuous daily series. That was strictly
+    # better than the original ungrouped diff(1) (which mixed unrelated
+    # symbols), but it introduced a NEW problem: a symbol only has a
+    # valid "previous row" to diff against if it happens to appear twice
+    # in THIS table. Winners occasionally repeat (~57% still got a real
+    # value); non-winners are overwhelmingly one-off "checked and
+    # rejected" events, so ~100% of non-winner rows got NaN. That's
+    # label-correlated missingness — the model can trivially learn
+    # "Slope is NaN => non-winner", which is leakage of a different
+    # flavor than the one we were trying to fix (confirmed empirically:
+    # diagnose_feature_leakage.py's NaN-rate-gap check went from clean to
+    # a ~43pp gap on these exact columns after that change).
+    #
+    # The actual fix: don't re-derive Slope from THIS table at all. The
+    # intraday collector already computes a genuine slope — diff(1) over
+    # its own continuous per-symbol bar series (see
+    # intraday_data_collector.py: sma20_slope/ema20_slope/atr_pct) — and
+    # that value arrives in `df` pre-populated via rename_t1_columns(),
+    # BEFORE this function even runs. The only thing that can be wrong
+    # with it is units: pre-fix collector rows computed that diff before
+    # normalising the underlying MA, so it's occasionally a raw
+    # dollar-per-bar change instead of a %-point change. So treat it like
+    # every other dollar-diff column (group B: MACD/MOM/AO) — rescale the
+    # raw-looking rows in place, per row, and leave everything else
+    # (including every already-normalised row) untouched. No diff
+    # recomputation, no dependency on a "previous row" existing anywhere,
+    # so no way for this to introduce missingness that didn't already
+    # exist in the source column.
+    def _rescale_slope_col(col_name: str) -> None:
+        if col_name not in df.columns:
+            return
+        raw_mask = _raw_slope_mask(col_name)
+        if raw_mask is None or not raw_mask.any():
+            return
+        if safe_close is None:
+            logger.warning(
+                f"  normalise_t1: {col_name} appears raw but {close_col} is "
+                "absent — cannot rescale."
+            )
+            return
+        n_raw = int(raw_mask.sum())
+        num = pd.to_numeric(df[col_name], errors="coerce")
+        df.loc[raw_mask, col_name] = num.loc[raw_mask] / safe_close.loc[raw_mask] * 100
+        _clip_inplace(raw_mask, col_name, _DOLLAR_DIFF_CLIP_PCT)
+        logger.debug(
+            f"  normalise_t1: {col_name} → % of close, in place "
+            f"({n_raw} raw row(s), no re-derivation)"
+        )
+
+    ema20_slope_col = f"{prefix}_EMA_20_Slope"
+    _rescale_slope_col(ema20_slope_col)
+
+    sma20_slope_col = f"{prefix}_SMA_20_Slope"
+    _rescale_slope_col(sma20_slope_col)
+
+    # EMA_12_26_Diff and SMA_20_50_Diff: spread of normalised MAs
+    ema_diff_col = f"{prefix}_EMA_12_26_Diff"
+    if ema12 in df.columns and ema26 in df.columns:
+        if not _is_raw_price_line(ema12) and not _is_raw_price_line(ema26):
+            df[ema_diff_col] = (
+                pd.to_numeric(df[ema12], errors="coerce") -
+                pd.to_numeric(df[ema26], errors="coerce")
+            )
+            logger.debug(f"  normalise_t1: re-derived {ema_diff_col}")
+
+    sma_diff_col = f"{prefix}_SMA_20_50_Diff"
+    if sma20 in df.columns and sma50 in df.columns:
+        if not _is_raw_price_line(sma20) and not _is_raw_price_line(sma50):
+            df[sma_diff_col] = (
+                pd.to_numeric(df[sma20], errors="coerce") -
+                pd.to_numeric(df[sma50], errors="coerce")
+            )
+            logger.debug(f"  normalise_t1: re-derived {sma_diff_col}")
+
+    # Price_vs_MA: base (multiday_feature_collector.py) defines this as
+    # (close - MA) / MA * 100 = (close/MA - 1) * 100 — i.e. it divides by
+    # the MA, not by close. The stored MA columns here are normalised to
+    # "% distance from close": normalised_MA = (MA/close - 1)*100, so
+    # MA/close = 1 + normalised_MA/100. Negating (−normalised_MA) instead
+    # gives (close-MA)/close*100, which divides by CLOSE — only matching
+    # base when close ~= MA and diverging on large moves. Derive
+    # algebraically instead so both paths divide by MA:
+    #   (close/MA - 1)*100 = (1 / (1 + normalised_MA/100) - 1) * 100
+    for ma_col, vs_col in [
+        (sma20, f"{prefix}_Price_vs_SMA20"),
+        (sma50, f"{prefix}_Price_vs_SMA50"),
+        (ema20, f"{prefix}_Price_vs_EMA20"),
+    ]:
+        if ma_col in df.columns and not _is_raw_price_line(ma_col):
+            _norm_ma = pd.to_numeric(df[ma_col], errors="coerce")
+            df[vs_col] = (1.0 / (1.0 + _norm_ma / 100.0) - 1.0) * 100.0
+            logger.debug(f"  normalise_t1: re-derived {vs_col}")
+
+    # ATR_14_Slope: same treatment as EMA/SMA Slope above — the collector's
+    # own value is already correct, rescale it per row instead of
+    # re-deriving it from this event-level table.
+    atr_slope_col = f"{prefix}_ATR_14_Slope"
+    _rescale_slope_col(atr_slope_col)
+
+    if normalised_count > 0 or skipped_count > 0:
+        logger.info(
+            f"  normalise_t1 [{prefix}]: "
+            f"{normalised_count} column(s) normalised, "
+            f"{skipped_count} already normalised (skipped)."
+        )
+
+    return df
