@@ -1,8 +1,5 @@
 feature,importance
-t1_open_HV_20,0.311332
-t1_close_KCUe_20_2,0.29853
-t1_close_SMA_20_Slope,0.180818
-t1_close_ROC_10,0.062798
-t1_open_BBU_20_2.0_2.0,0.061414
-t1_close_EMA_20_Slope,0.044722
-t1_open_ATR_14,0.040387
+t1_open_SMA_20_Slope,0.404925
+t1_open_SMA_50,0.365808
+t1_open_MOM_10,0.126404
+t1_close_ROC_10,0.102864
