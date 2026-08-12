@@ -1,16 +1,6 @@
 {
   "excluded_features": [],
   "excluded_base_features": [
-    "DCL_20_20",
-    "DCM_20_20",
-    "DCU_20_20",
-    "BBL_20_2.0_2.0",
-    "BBB_20_2.0_2.0",
-    "BBM_20_2.0_2.0",
-    "BBU_20_2.0_2.0",
-    "KCLe_20_2",
-    "KCBe_20_2",
-    "KCUe_20_2",
     "Price_vs_SMA20",
     "Price_vs_SMA50",
     "Price_vs_EMA20",
