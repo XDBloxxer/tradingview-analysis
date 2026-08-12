@@ -899,9 +899,15 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["atr14"] = ind["atr"]   # alias
 
     # ATR slope
+    # Normalise ATR to % of close BEFORE taking the slope, so this is a
+    # change-in-% (matching multiday_feature_collector's atr_14_slope,
+    # computed from ATRr which pandas_ta already returns as % of close) —
+    # not a change-in-dollars, which is what a slope of raw dollar ATR
+    # would give and is a different scale per stock price level.
     atr14_series = tr.rolling(14).mean()
-    if len(atr14_series.dropna()) >= 6:
-        atr_slope = atr14_series.diff(5)
+    atr14_pct_series = atr14_series / c.replace(0, np.nan) * 100
+    if len(atr14_pct_series.dropna()) >= 6:
+        atr_slope = atr14_pct_series.diff(5)
         ind["atr_pct"] = safe(atr_slope, 0.0)
     else:
         ind["atr_pct"] = 0.0
@@ -1130,9 +1136,15 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     rsi14_al     = rsi14_loss.ewm(com=13, min_periods=14).mean()
     rsi14_series = 100 - (100 / (1 + rsi14_ag / rsi14_al.replace(0, np.nan)))
 
-    ind["sma_20_slope"] = _slope(sma20_series)
-    ind["ema_20_slope"] = _slope(ema20_series)
-    ind["rsi_14_slope"] = _slope(rsi14_series)
+    # Normalise the MA series to % distance from close BEFORE computing the
+    # slope (matching multiday/intraday, which diff() the already-normalised
+    # MA columns). A slope of the raw dollar MA is a dollar-per-bar figure
+    # that scales with the stock's price level, not a %-per-bar figure.
+    sma20_norm_series = (sma20_series / c.replace(0, np.nan) - 1) * 100
+    ema20_norm_series = (ema20_series / c.replace(0, np.nan) - 1) * 100
+    ind["sma_20_slope"] = _slope(sma20_norm_series)
+    ind["ema_20_slope"] = _slope(ema20_norm_series)
+    ind["rsi_14_slope"] = _slope(rsi14_series)  # RSI is already 0-100, unitless
 
     # ── Fast MACD (5/13/1) and MACD ROC ─────────────────────────────────
     ema5_f  = c.ewm(span=5,  adjust=False).mean()
@@ -1192,7 +1204,11 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     _obv_sma20_val = safe(obv_sma20_raw, float("nan"))
     if _obv_sma20_val != _obv_sma20_val:  # isnan check without import
         _obv_sma20_val = float(obv_series.mean()) if len(obv_series) > 0 else 0.0
-    ind["obv_sma20"] = _obv_sma20_val
+    # Same ratio-to-volume_sma20 treatment already applied to `obv` itself
+    # above (the 2026-07-24 fix) — obv_sma20 is a moving average OF that same
+    # cumulative-volume series, so it needs the identical scale-free ratio,
+    # not raw absolute share counts.
+    ind["obv_sma20"] = (_obv_sma20_val / _last_vm20) if _last_vm20 else 0.0
 
     # ── ADXR (ADX smoothed) ───────────────────────────────────────────────
     adx_series = dx.rolling(14).mean()
@@ -1258,6 +1274,73 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
         ind["supert_d"] = 1.0
         ind["supert_l"] = close_v
         ind["supert_s"] = close_v
+
+    # ── Normalise every remaining dollar-scale indicator ─────────────────────
+    # This duplicates the normalisation blocks in
+    # src/multiday_feature_collector.py and src/intraday_data_collector.py,
+    # which run at data-collection time on the training data. This function
+    # is a THIRD, independent reimplementation used for live t1_close_*/
+    # t1_open_* scoring, and it never had the equivalent step — so every
+    # dollar-scale indicator below was written straight through in raw
+    # dollar terms while the model was trained on %-of-close / %-distance
+    # versions of the same features. That mismatch (verified against
+    # multiday_feature_collector.py's normalisation list) is what produced
+    # things like t1_open_MOM_10 percentiles in the tens of thousands after
+    # the StandardScaler transform — MOM was only ever fixed at the collector
+    # level, not here.
+    #
+    # Three normalisation strategies (matching the collectors exactly):
+    #   A. Dollar bands/lines → (value / close - 1) * 100  = % distance from close
+    #   B. Signed dollar diffs → value / close * 100        = % of close
+    #   C. ATR (dollar in this `ta`-based implementation, unlike pandas_ta's
+    #      ATRr used at training time, which is already % of close)
+    _safe_close_v = close_v if close_v not in (0, 0.0) else None
+
+    if _safe_close_v:
+        # A. Moving averages / bands / channels / VWAP / Supertrend bands
+        #    → % distance from close
+        for _col in [
+            "sma5", "sma10", "sma20", "sma50",
+            "ema5", "ema10", "ema12", "ema20", "ema26", "ema50",
+            "wma10", "wma20",
+            "hma9", "hma20",
+            "bb.upper", "bb.lower", "bb.middle",
+            "keltner_upper", "keltner_lower", "keltner_middle",
+            "donchian_upper", "donchian_lower", "donchian_middle",
+            "vwap",
+            "supert", "supert_l", "supert_s",   # supert_d (±1 direction) is unitless — left alone
+        ]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = (ind[_col] / _safe_close_v - 1) * 100
+
+        # B. Signed dollar differences (MACD variants, MOM, AO) → % of close
+        for _col in [
+            "macd.macd", "macd.signal", "macd_diff",
+            "macd_fast", "macdh_fast", "macds_fast",
+            "mom", "mom20",
+            "ao",
+        ]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = ind[_col] / _safe_close_v * 100
+
+        # C. ATR variants → % of close
+        for _col in ["atr", "atr7", "atr20"]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = ind[_col] / _safe_close_v * 100
+        if "atr" in ind:
+            ind["atr14"] = ind["atr"]   # re-derive alias from the now-normalised value
+
+    # ── Re-derive MA-spread features from the now-normalised (%-of-close)
+    # values ──────────────────────────────────────────────────────────────
+    # These were originally computed above from the raw dollar MAs, which
+    # gives a dollar-scale spread. multiday_feature_collector.py computes
+    # these AFTER normalising each MA to % of close, so the result is a
+    # %-point spread instead — re-derive here the same way, now that sma20/
+    # sma50/ema12/ema26 have been normalised in place above.
+    if "ema12" in ind and "ema26" in ind:
+        ind["ema_12_26_diff"] = ind["ema12"] - ind["ema26"]
+    if "sma20" in ind and "sma50" in ind:
+        ind["sma_20_50_diff"] = ind["sma20"] - ind["sma50"]
 
     return ind
 
