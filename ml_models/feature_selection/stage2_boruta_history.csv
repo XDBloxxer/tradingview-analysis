@@ -1,8 +1,6 @@
 feature,hits,hit_rate,p_value,status
-t1_open_HV_20,100,1.0,0.0,confirmed
-t1_close_SMA_20_Slope,100,1.0,0.0,confirmed
-t1_close_EMA_20_Slope,100,1.0,0.0,confirmed
-t1_open_BBU_20_2.0_2.0,100,1.0,0.0,confirmed
-t1_close_KCUe_20_2,100,1.0,0.0,confirmed
-t1_open_ATR_14,100,1.0,0.0,confirmed
 t1_close_ROC_10,100,1.0,0.0,confirmed
+t1_close_RSI_14,100,1.0,0.0,confirmed
+t1_open_SMA_50,100,1.0,0.0,confirmed
+t1_open_SMA_20_Slope,100,1.0,0.0,confirmed
+t1_open_MOM_10,100,1.0,0.0,confirmed
