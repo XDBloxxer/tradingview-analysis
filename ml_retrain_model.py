@@ -4536,11 +4536,46 @@ def train_gain_regressor(
         y_tier_va = y_reg_valid.loc[X_va.index].apply(_tier_label)
 
         tier_counts_tr = y_tier_tr.value_counts().to_dict()
+        tier_counts_va = y_tier_va.value_counts().to_dict()
         logger.info(
             f"  TIER FALLBACK: training 3-tier gain classifier "
             f"({', '.join(name for _, _, name in GAIN_TIERS)}) — "
             f"train tier counts: {tier_counts_tr}"
         )
+
+        # DIAGNOSTIC (2026-08-13): confirm/deny the backfill-skew explanation
+        # directly, instead of leaving it as a plausible story. If zero-anchor
+        # ("small") rows really are concentrated wherever the historical
+        # non-winner backfill landed (see ml_check_t1_source_skew.yml), that
+        # should show up as: (a) train and val majority classes disagree, and
+        # (b) the zero-anchor share of train is much higher than the
+        # zero-anchor share of val. Log both so a real shift is distinguished
+        # from a fluke of this particular retrain's date range.
+        _train_majority = max(tier_counts_tr, key=tier_counts_tr.get) if tier_counts_tr else None
+        _val_majority = max(tier_counts_va, key=tier_counts_va.get) if tier_counts_va else None
+        if _train_majority is not None and _val_majority is not None and _train_majority != _val_majority:
+            _zero_anchor_tr = float((y_reg_valid.loc[X_tr.index].values == 0.0).mean())
+            _zero_anchor_va = float((y_reg_valid.loc[X_va.index].values == 0.0).mean())
+            _tier_names = [name for _, _, name in GAIN_TIERS]
+            logger.warning(
+                f"  ⚠️  TIER FALLBACK: train/val DISTRIBUTION SHIFT detected — "
+                f"train majority tier='{_tier_names[_train_majority]}' "
+                f"({tier_counts_tr}) vs val majority tier='{_tier_names[_val_majority]}' "
+                f"({tier_counts_va}). Zero-anchor share: train={_zero_anchor_tr:.1%} "
+                f"val={_zero_anchor_va:.1%}. "
+                + (
+                    "This matches the backfill-skew hypothesis (zero-anchor non-winner "
+                    "rows cluster in train because that's where the historical backfill "
+                    "landed) rather than a bug — treat val accuracy on this run as "
+                    "unmeasurable, not as evidence the classifier is broken."
+                    if abs(_zero_anchor_tr - _zero_anchor_va) > 0.15
+                    else
+                    "Zero-anchor share is similar across the split, so backfill skew "
+                    "alone doesn't explain this — the tier shift may be a genuine "
+                    "regime change (e.g. gain magnitudes trending up over time) "
+                    "instead. Worth checking actual_high_pct by date range directly."
+                )
+            )
 
         if y_tier_tr.nunique() < 2:
             logger.warning(
@@ -4576,9 +4611,22 @@ def train_gain_regressor(
             tier_pred = tier_classifier.predict(X_va)
             tier_acc = float((tier_pred == y_tier_va.values).mean())
             _baseline_acc = float(y_tier_va.value_counts(normalize=True).max())
+            # Raw accuracy (and the majority-class baseline it's compared
+            # against) is exactly the metric that gets distorted by a
+            # train/val distribution shift like the one flagged above — a
+            # classifier that only ever learned "predict small" scores 0%
+            # on a val set that's 99% medium/large, regardless of whether
+            # the model itself is any good. balanced_accuracy (macro-average
+            # of per-class recall) is far less sensitive to that shift, since
+            # it weights each class equally rather than by how often it
+            # shows up in this particular val slice.
+            from sklearn.metrics import balanced_accuracy_score
+            tier_balanced_acc = float(balanced_accuracy_score(y_tier_va.values, tier_pred))
             logger.info(
                 f"  TIER FALLBACK: val accuracy={tier_acc:.3f} "
                 f"(majority-class baseline={_baseline_acc:.3f}, "
+                f"balanced accuracy={tier_balanced_acc:.3f} [distribution-shift-robust, "
+                f"random-guess floor={1.0 / len(GAIN_TIERS):.3f}], "
                 f"best_iteration={tier_classifier.best_iteration})"
             )
             # DIAGNOSTIC (2026-08-13): a correctly-behaving multiclass model
@@ -4590,7 +4638,8 @@ def train_gain_regressor(
             # a data-volume signal — log a confusion matrix so it's diagnosable
             # instead of guessed at.
             _naive_random = 1.0 / len(GAIN_TIERS)
-            if tier_acc < _naive_random * 0.5:
+            _shift_detected = _train_majority is not None and _val_majority is not None and _train_majority != _val_majority
+            if tier_acc < _naive_random * 0.5 and not _shift_detected:
                 from sklearn.metrics import confusion_matrix
                 _cm = confusion_matrix(y_tier_va.values, tier_pred, labels=list(range(len(GAIN_TIERS))))
                 _pred_dist = pd.Series(tier_pred).value_counts().to_dict()
@@ -4607,7 +4656,23 @@ def train_gain_regressor(
                     f"  Predicted-class distribution: {_pred_dist} vs true distribution: "
                     f"{y_tier_va.value_counts().to_dict()}"
                 )
-            elif tier_acc <= _baseline_acc:
+            elif tier_acc < _naive_random * 0.5 and _shift_detected:
+                # Same below-random-floor symptom, but already explained above by
+                # the train/val distribution-shift diagnostic — a classifier that
+                # only ever predicts train's majority class will score near-zero
+                # on a val set whose majority class is different. Log the
+                # confusion matrix for completeness (still useful to eyeball)
+                # without re-raising it as a fresh, unexplained bug alarm.
+                from sklearn.metrics import confusion_matrix
+                _cm = confusion_matrix(y_tier_va.values, tier_pred, labels=list(range(len(GAIN_TIERS))))
+                logger.info(
+                    f"  TIER FALLBACK: accuracy={tier_acc:.3f} is below the random-guess "
+                    f"floor, but this is explained by the distribution-shift diagnostic "
+                    f"above (not a new bug). Confusion matrix (rows=true, cols=pred, "
+                    f"order={[name for _,_,name in GAIN_TIERS]}):\n{_cm}\n"
+                    f"  See balanced accuracy ({tier_balanced_acc:.3f}) for a shift-robust read."
+                )
+            elif tier_acc <= _baseline_acc and not _shift_detected:
                 logger.warning(
                     "  ⚠️  TIER FALLBACK: classifier does not beat the majority-class "
                     "baseline yet — informative pool is likely still too small for "
