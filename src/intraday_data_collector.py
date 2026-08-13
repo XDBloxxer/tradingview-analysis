@@ -985,16 +985,37 @@ class IntradayDataCollector:
         # produce volatility_10d at all — far more history than the ~280
         # trading-day rows the fallback fetches, so these columns came back
         # NaN for every row, every symbol, on every backfilled date.
+        # TRAIN/INFERENCE MISMATCH FIX (2026-08-13):
+        # multiday_feature_collector.py (training source for HV_10/20/30, see
+        # t1_column_map.py: volatility_10d -> HV_10) computes this from DAILY
+        # close-to-close log returns: log_ret.rolling(d).std() * sqrt(252) * 100.
+        # This block previously annualized 5-MINUTE bar log returns instead,
+        # using sqrt(252 * bars_per_day) and a `d * bars_per_day`-bar window.
+        # That's the wrong estimator to compare against a daily-return model:
+        # 5-min bar returns carry microstructure noise/bid-ask bounce that
+        # doesn't average out the way the sqrt(bars_per_day) scaling assumes,
+        # so realized values came back systematically inflated (e.g. 345%,
+        # 635% at inference vs a ~121% ceiling in the training distribution).
+        # Any downstream step keyed to the training scale — winsorization
+        # bounds, the StandardScaler fit on X_train, and the per-symbol HV
+        # demeaning baselines in symbol_demeaning.py — was then fed a value
+        # far outside what it was calibrated on.
+        # Fix: always compute HV from DAILY-resampled closes, same as
+        # training, regardless of the bar granularity of `df`. bars_per_day
+        # is no longer used here at all.
         try:
-            log_returns = np.log(df['Close'] / df['Close'].shift(1))
-            ANNUALISE = np.sqrt(252 * bars_per_day)
+            daily_close = df['Close'].resample('1D').last().dropna()
+            daily_log_returns = np.log(daily_close / daily_close.shift(1))
             for d in [10, 20, 30]:
-                bars = d * bars_per_day
-                result[f'volatility_{d}d'] = (
-                    log_returns
-                    .rolling(window=bars, min_periods=bars // 2)
-                    .std() * ANNUALISE * 100
+                daily_vol = (
+                    daily_log_returns
+                    .rolling(window=d, min_periods=max(d // 2, 1))
+                    .std() * np.sqrt(252) * 100
                 )
+                # Broadcast each completed day's volatility onto every bar of
+                # that day (a no-op reindex when df is already daily, i.e.
+                # bars_per_day == 1).
+                result[f'volatility_{d}d'] = daily_vol.reindex(df.index, method='ffill')
         except:
             pass
 
