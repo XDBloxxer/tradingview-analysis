@@ -650,7 +650,17 @@ XGBOOST_PARAMS = {
     "min_child_weight":   4,       # loosened from 10 → was over-constraining the smaller,
                                     # denser 22-feature/lookback-fixed training set (early
                                     # stopping was firing after only 3 trees)
-    "gamma":              0.3,     # loosened from 2.0 → lower minimum gain needed to split
+    "gamma":              0.15,    # EXPERIMENT (2026-08-13): loosened 0.3→0.15, alone, to test
+                                    # whether the raw-score ceiling (~0.62 max, no STRONG_BUY-
+                                    # range predictions) is a min-gain-to-split constraint choking
+                                    # off separation, vs. an inherent limit of the informative-row
+                                    # count/feature set. Changed in isolation (no other hyperparams
+                                    # touched this run) so the result is attributable. If the raw
+                                    # score max and calibrated spread don't move, revert to 0.3 —
+                                    # the ceiling is data/feature-limited, not this. Watch val AUC
+                                    # too: gamma is a light regularizer, so overfitting risk here is
+                                    # low, but confirm it didn't work early-stopping's iteration
+                                    # count much lower/higher than the ~39 seen at gamma=0.3.
     "reg_alpha":          0.2,     # loosened from 0.5 → less L1 regularisation
     "reg_lambda":         1.5,     # loosened from 2.0 → less L2 regularisation
     "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
@@ -5973,6 +5983,33 @@ def main() -> int:
         if line.strip():
             logger.info(f"  {line}")
 
+    # PRODUCTION-CONSISTENT METRIC (2026-08-13): the classification_report
+    # above uses a fixed raw_proba>=0.5 cutoff, but explosion_predictor.py
+    # never actually applies that cutoff in production — it falls back to
+    # percentile-based ranking (top 20% -> BUY-or-better) whenever raw
+    # probabilities look compressed (LOW-PROB COMPRESSION / NARROW BAND /
+    # etc. in _detect_bimodal), which is the common case for this model.
+    # A 0.5-cutoff recall number is therefore not a reliable signal of how
+    # well the deployed BUY/STRONG BUY picks actually perform — it can look
+    # terrible (or great) for reasons that never reach production. Report
+    # recall/precision at the same top-20%-by-score cut that
+    # RELATIVE_BUY_PCT uses, so this number tracks what's actually shipped.
+    _top20_recall_at_k = None
+    if len(y_val_xgb) > 0 and int(pd.Series(y_val_xgb).sum()) > 0:
+        _k = max(1, int(round(len(val_proba) * 0.20)))
+        _top_idx = np.argsort(-val_proba)[:_k]
+        _y_val_arr = np.asarray(y_val_xgb)
+        _n_pos_total = int(_y_val_arr.sum())
+        _n_pos_captured = int(_y_val_arr[_top_idx].sum())
+        _top20_recall_at_k = _n_pos_captured / _n_pos_total
+        _top20_precision_at_k = _n_pos_captured / _k
+        logger.info(
+            f"  Top-20%-by-score (production BUY-or-better cut, n={_k}): "
+            f"recall={_top20_recall_at_k:.3f} ({_n_pos_captured}/{_n_pos_total} positives captured), "
+            f"precision={_top20_precision_at_k:.3f} — trust this over the 0.5-cutoff "
+            "recall above for judging real-world BUY signal quality."
+        )
+
     # Log probability distribution on val set (early-stop holdout only)
     val_proba_series = pd.Series(val_proba)
     bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
@@ -6014,6 +6051,25 @@ def main() -> int:
         for line in classification_report(y_cal_fit, cal_pred_report).split("\n"):
             if line.strip():
                 logger.info(f"  {line}")
+
+        # Same production-consistent top-20% metric as above, on the blind
+        # holdout — this is the number to actually trust for BUY signal
+        # quality since it was never used for early stopping.
+        if len(y_cal_fit) > 0 and int(pd.Series(y_cal_fit).sum()) > 0:
+            _k_cal = max(1, int(round(len(cal_proba_report) * 0.20)))
+            _top_idx_cal = np.argsort(-cal_proba_report)[:_k_cal]
+            _y_cal_arr = np.asarray(y_cal_fit)
+            _n_pos_total_cal = int(_y_cal_arr.sum())
+            _n_pos_captured_cal = int(_y_cal_arr[_top_idx_cal].sum())
+            _recall_cal = _n_pos_captured_cal / _n_pos_total_cal
+            _precision_cal = _n_pos_captured_cal / _k_cal
+            logger.info(
+                f"  Top-20%-by-score (production BUY-or-better cut, n={_k_cal}, "
+                f"blind holdout): recall={_recall_cal:.3f} "
+                f"({_n_pos_captured_cal}/{_n_pos_total_cal} positives captured), "
+                f"precision={_precision_cal:.3f} — this is the number to trust for "
+                "real-world BUY signal quality."
+            )
 
         cal_proba_report_series = pd.Series(cal_proba_report)
         cal_dist = pd.cut(cal_proba_report_series, bins=bins).value_counts().sort_index()
