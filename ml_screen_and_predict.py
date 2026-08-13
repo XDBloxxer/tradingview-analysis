@@ -1436,6 +1436,19 @@ def _fetch_real_multiday_features(
         )
 
 
+def _most_recent_completed_trading_day(logger):
+    """
+    RC13 (2026-08-13): fallback "yesterday" used when the T-1 5-min intraday
+    fetch fails, so the T-3/T-5/T-10 daily-bar fetch (a completely
+    independent yfinance call) still has a detection_date to anchor on
+    instead of being skipped along with the intraday fetch.
+    """
+    d = datetime.now().date() - timedelta(days=1)
+    while not _is_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
 def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = False) -> dict:
     """
     Fetch T-1 intraday 5-min data and compute technical indicators.
@@ -1446,6 +1459,22 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
            daily-bar snapshots are fetched via _fetch_real_multiday_features() and
            written under t3_/t5_/t10_* columns.  The old approach of copying T-1
            intraday indicators into all three prefix columns has been removed.
+
+    RC13 FIX (2026-08-13): the T-1 5-min intraday fetch and the T-3/T-5/T-10
+    daily-bar fetch used to live inside ONE try block with early `return {}`
+    checks on the intraday side and a blanket `except Exception: return {}`
+    at the bottom. Since 5-min intraday data is far more likely to be thin,
+    delayed, or rate-limited than daily bars — especially for the kind of
+    low-liquidity small caps an explosion screener surfaces — any intraday
+    hiccup silently wiped out the daily-bar features too, even though that's
+    a completely independent yfinance call that usually would have
+    succeeded. On a live batch this showed up as dozens of stocks going
+    100%-NaN across every t1_/t3_/t5_ feature simultaneously (see RC12 log),
+    which XGBoost's missing-value branches then routed to the same leaf —
+    an honest tie, but on essentially no real data for the majority of the
+    batch. The two fetches are now independent: an intraday failure is
+    logged with its actual exception (no more silent swallow) and no longer
+    blocks the daily-bar fetch from running.
     """
     try:
         import yfinance as yf
@@ -1459,114 +1488,135 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
         _rename = None
         _t1_map_available = False
 
+    result = {}
+    yesterday = None
+
+    # ── Phase 1: T-1 5-min intraday fetch (independent — failure here no ──
+    # longer blocks Phase 2 below) ──────────────────────────────────────────
     try:
         ticker      = yf.Ticker(symbol)
         df_intraday = ticker.history(period="5d", interval="5m")
 
         if df_intraday.empty or len(df_intraday) < 50:
-            return {}
-
-        if df_intraday.index.tz is None:
-            df_intraday.index = df_intraday.index.tz_localize("America/New_York")
+            logger.warning(
+                f"{symbol}: T-1 intraday fetch returned "
+                f"{0 if df_intraday.empty else len(df_intraday)} bars (< 50 "
+                "required) — t1_close_*/t1_open_* will be absent for this "
+                "symbol, but the daily-bar t3/t5/t10 fetch will still run."
+            )
         else:
-            df_intraday.index = df_intraday.index.tz_convert("America/New_York")
+            if df_intraday.index.tz is None:
+                df_intraday.index = df_intraday.index.tz_localize("America/New_York")
+            else:
+                df_intraday.index = df_intraday.index.tz_convert("America/New_York")
 
-        available_dates = sorted(df_intraday.index.date, reverse=True)
-        if not available_dates:
-            return {}
+            available_dates = sorted(df_intraday.index.date, reverse=True)
+            if available_dates:
+                yesterday = available_dates[0]
+                day_bars  = df_intraday[df_intraday.index.date == yesterday].copy()
 
-        yesterday = available_dates[0]
-        day_bars  = df_intraday[df_intraday.index.date == yesterday].copy()
+                if len(day_bars) < 20:
+                    logger.warning(
+                        f"{symbol}: only {len(day_bars)} T-1 intraday bars for "
+                        f"{yesterday} (< 20 required) — t1_close_*/t1_open_* "
+                        "will be absent for this symbol."
+                    )
+                else:
+                    day_bars.columns = [c.lower() for c in day_bars.columns]
 
-        if len(day_bars) < 20:
-            return {}
+                    # ── Close-of-day indicators (full session) ──────────────
+                    close_indicators = _compute_indicators(
+                        day_bars["close"], day_bars["high"], day_bars["low"],
+                        day_bars["volume"], day_bars["open"]
+                    )
 
-        day_bars.columns = [c.lower() for c in day_bars.columns]
+                    # ── Open indicators (first ~1 hour of session) ───────────
+                    open_bars = day_bars[day_bars.index.time <= dt_time(10, 30)]
 
-        # ── Close-of-day indicators (full session) ────────────────────────
-        close_indicators = _compute_indicators(
-            day_bars["close"], day_bars["high"], day_bars["low"],
-            day_bars["volume"], day_bars["open"]
+                    open_indicators: dict = {}
+                    if len(open_bars) >= T1_OPEN_MIN_BARS:
+                        open_indicators = _compute_indicators(
+                            open_bars["close"], open_bars["high"], open_bars["low"],
+                            open_bars["volume"], open_bars["open"]
+                        )
+                        logger.debug(f"{symbol}: computed open indicators from {len(open_bars)} bars")
+                    else:
+                        logger.debug(
+                            f"{symbol}: only {len(open_bars)} open bars (< {T1_OPEN_MIN_BARS}), "
+                            "copying close indicators as open fallback"
+                        )
+                        open_indicators = dict(close_indicators)
+
+                    if _t1_map_available:
+                        # ── Rename and write t1_close_* ──────────────────────
+                        close_df      = pd.DataFrame([close_indicators])
+                        close_renamed = _rename(close_df, prefix="t1_close")
+                        for col in close_renamed.columns:
+                            val = close_renamed.iloc[0][col]
+                            if pd.notna(val):
+                                try:
+                                    result[col] = float(val)
+                                except (TypeError, ValueError):
+                                    pass
+
+                        # ── Rename and write t1_open_* ───────────────────────
+                        open_df      = pd.DataFrame([open_indicators])
+                        open_renamed = _rename(open_df, prefix="t1_open")
+                        for col in open_renamed.columns:
+                            val = open_renamed.iloc[0][col]
+                            if pd.notna(val):
+                                try:
+                                    result[col] = float(val)
+                                except (TypeError, ValueError):
+                                    pass
+                    else:
+                        for k, val in close_indicators.items():
+                            result[f"t1_close_{k}"] = val
+                        for k, val in open_indicators.items():
+                            result[f"t1_open_{k}"] = val
+    except Exception as exc:
+        logger.warning(
+            f"{symbol}: T-1 intraday fetch/compute failed ({type(exc).__name__}: "
+            f"{exc}) — t1_close_*/t1_open_* will be absent for this symbol, "
+            "but the daily-bar t3/t5/t10 fetch will still run."
         )
 
-        # ── Open indicators (first ~1 hour of session) ─────────────────────
-        open_bars = day_bars[day_bars.index.time <= dt_time(10, 30)]
+    # ── Phase 2: T-3/T-5/T-10 daily-bar snapshots — a SEPARATE yfinance ──
+    # call from Phase 1, so it runs regardless of whether Phase 1 succeeded.
+    # Uses the intraday-derived `yesterday` as the anchor date when
+    # available (keeps exact parity with the old behavior); falls back to
+    # the most recent completed trading day when Phase 1 didn't produce one.
+    if fill_flat_prefixes:
+        detection_date_for_multiday = datetime.combine(
+            yesterday if yesterday is not None else _most_recent_completed_trading_day(logger),
+            dt_time(0, 0),
+        )
+        _fetch_real_multiday_features(symbol, detection_date_for_multiday, result, logger)
 
-        open_indicators: dict = {}
-        if len(open_bars) >= T1_OPEN_MIN_BARS:
-            open_indicators = _compute_indicators(
-                open_bars["close"], open_bars["high"], open_bars["low"],
-                open_bars["volume"], open_bars["open"]
-            )
-            logger.debug(f"{symbol}: computed open indicators from {len(open_bars)} bars")
-        else:
-            logger.debug(
-                f"{symbol}: only {len(open_bars)} open bars (< {T1_OPEN_MIN_BARS}), "
-                "copying close indicators as open fallback"
-            )
-            open_indicators = dict(close_indicators)
+    t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
+    t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
+    flat_count     = sum(1 for k in result if k.startswith("t3_"))
+    logger.debug(
+        f"{symbol}: t1_close_* = {t1_close_count}, "
+        f"t1_open_* = {t1_open_count}, "
+        f"t3_* = {flat_count} (from real daily bars)"
+    )
 
-        result = {}
-
-        if _t1_map_available:
-            # ── Rename and write t1_close_* ────────────────────────────────
-            close_df      = pd.DataFrame([close_indicators])
-            close_renamed = _rename(close_df, prefix="t1_close")
-            for col in close_renamed.columns:
-                val = close_renamed.iloc[0][col]
-                if pd.notna(val):
-                    try:
-                        result[col] = float(val)
-                    except (TypeError, ValueError):
-                        pass
-
-            # ── Rename and write t1_open_* ─────────────────────────────────
-            open_df      = pd.DataFrame([open_indicators])
-            open_renamed = _rename(open_df, prefix="t1_open")
-            for col in open_renamed.columns:
-                val = open_renamed.iloc[0][col]
-                if pd.notna(val):
-                    try:
-                        result[col] = float(val)
-                    except (TypeError, ValueError):
-                        pass
-
-        else:
-            for k, val in close_indicators.items():
-                result[f"t1_close_{k}"] = val
-            for k, val in open_indicators.items():
-                result[f"t1_open_{k}"] = val
-
-        # ── FIX 9 (revised): Fetch REAL T-3/T-5/T-10 daily-bar snapshots ──
-        # Uses genuine daily bars fetched from yfinance, processed through the
-        # same _compute_indicators + PANDAS_TA_TO_BASE pipeline as training.
-        # This replaces the old approach of copying T-1 intraday indicators
-        # into all three prefix columns, which gave the model identical data
-        # under three different names.
-        if fill_flat_prefixes:
-            # detection_date = the trading day whose T-1 bar we just computed,
-            # i.e. yesterday (the most recent date in df_intraday).
-            detection_date_for_multiday = datetime.combine(yesterday, dt_time(0, 0))
-            _fetch_real_multiday_features(symbol, detection_date_for_multiday, result, logger)
-
-        t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
-        t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
-        flat_count     = sum(1 for k in result if k.startswith("t3_"))
-        logger.debug(
-            f"{symbol}: t1_close_* = {t1_close_count}, "
-            f"t1_open_* = {t1_open_count}, "
-            f"t3_* = {flat_count} (from real daily bars)"
+    if not result:
+        logger.warning(
+            f"{symbol}: BOTH the T-1 intraday and T-3/T-5/T-10 daily-bar "
+            "fetches produced nothing — this symbol will have zero real "
+            "features and will fall back to defaults/imputation for every "
+            "column. Check the warnings above for the actual fetch failure "
+            "reason(s)."
         )
 
-        # Store the accurate t3 count as metadata so the display loop can read
-        # it after predictions are generated (predictions_df doesn't carry raw
-        # feature columns, so counting t3_ there always returns 0).
-        result["_meta_t3_count"] = flat_count
+    # Store the accurate t3 count as metadata so the display loop can read
+    # it after predictions are generated (predictions_df doesn't carry raw
+    # feature columns, so counting t3_ there always returns 0).
+    result["_meta_t3_count"] = flat_count
 
-        return result
-
-    except Exception:
-        return {}
+    return result
 
 
 # ---------------------------------------------------------------------------
