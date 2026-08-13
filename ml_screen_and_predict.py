@@ -924,10 +924,35 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     # intraday_data_collector.py) actually uses. Diverged most during trend
     # reversals / choppy stretches — exactly where it matters. Now calling
     # the same ta library class training uses, so this can't drift again.
-    _adx_ind = ADXIndicator(high=h, low=l, close=c, window=14)
-    ind["adx"]    = safe(_adx_ind.adx(), 20.0)
-    ind["adx+di"] = safe(_adx_ind.adx_pos(), 20.0)
-    ind["adx-di"] = safe(_adx_ind.adx_neg(), 20.0)
+    #
+    # RC13 FIX (2026-08-13): ta.trend.ADXIndicator's internal Wilder
+    # smoothing can raise IndexError ("index 0 is out of bounds for axis 0
+    # with size 0") or ValueError ("negative dimensions are not allowed") on
+    # short/marginal-length series — which 5-min bars for a thin small-cap
+    # routinely produce even after clearing the len(day_bars) >= 20 gate
+    # above (that gate counts raw bars, not the effectively-shorter series
+    # ADXIndicator needs after its own internal smoothing/dropna). Before
+    # this fix, that exception propagated all the way out of
+    # _compute_indicators and discarded every indicator already computed
+    # above (RSI, MACD, moving averages, stochastic, ATR, Bollinger, etc.)
+    # for the entire symbol — turning one marginal indicator's failure into
+    # a total T-1 feature loss. Isolated here so a failure only costs the
+    # 3 ADX/DMI values (which already have safe() defaults elsewhere in
+    # this function), not the whole indicator set.
+    try:
+        _adx_ind = ADXIndicator(high=h, low=l, close=c, window=14)
+        ind["adx"]    = safe(_adx_ind.adx(), 20.0)
+        ind["adx+di"] = safe(_adx_ind.adx_pos(), 20.0)
+        ind["adx-di"] = safe(_adx_ind.adx_neg(), 20.0)
+    except Exception as _adx_exc:
+        ind["adx"]    = 20.0
+        ind["adx+di"] = 20.0
+        ind["adx-di"] = 20.0
+        logging.getLogger(__name__).debug(
+            f"ADXIndicator failed on {len(c)}-bar series "
+            f"({type(_adx_exc).__name__}: {_adx_exc}) — using defaults for "
+            "adx/adx+di/adx-di, rest of indicators unaffected."
+        )
 
     # NOTE: pdm/ndm/dx below are kept (unchanged, still flat-rolling) purely
     # because `dx` is reused by the ADXR calc further down. ADXR has the same
