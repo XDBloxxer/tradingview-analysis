@@ -650,17 +650,17 @@ XGBOOST_PARAMS = {
     "min_child_weight":   4,       # loosened from 10 → was over-constraining the smaller,
                                     # denser 22-feature/lookback-fixed training set (early
                                     # stopping was firing after only 3 trees)
-    "gamma":              0.15,    # EXPERIMENT (2026-08-13): loosened 0.3→0.15, alone, to test
-                                    # whether the raw-score ceiling (~0.62 max, no STRONG_BUY-
-                                    # range predictions) is a min-gain-to-split constraint choking
-                                    # off separation, vs. an inherent limit of the informative-row
-                                    # count/feature set. Changed in isolation (no other hyperparams
-                                    # touched this run) so the result is attributable. If the raw
-                                    # score max and calibrated spread don't move, revert to 0.3 —
-                                    # the ceiling is data/feature-limited, not this. Watch val AUC
-                                    # too: gamma is a light regularizer, so overfitting risk here is
-                                    # low, but confirm it didn't work early-stopping's iteration
-                                    # count much lower/higher than the ~39 seen at gamma=0.3.
+    "gamma":              0.3,     # REVERTED (2026-08-13): the gamma=0.15 experiment moved the
+                                    # raw-score ceiling up slightly (isotonic breakpoints reached
+                                    # ~0.76 vs ~0.62) but produced NO change in calibrated output
+                                    # (cal proba mean 0.171 vs 0.172, still 0% >=0.90, same
+                                    # unreachable 0.583-0.750 calibrated gap) and flat AUC (0.8318
+                                    # vs 0.8309 early-stop). Confirms the STRONG_BUY ceiling is a
+                                    # calibration-data/informative-row-count limit, not tree
+                                    # capacity — the calibrator has no confirmed positives near the
+                                    # high end regardless of how far raw scores reach. Back to 0.3;
+                                    # don't re-try gamma for this specific problem again without new
+                                    # informative rows first.
     "reg_alpha":          0.2,     # loosened from 0.5 → less L1 regularisation
     "reg_lambda":         1.5,     # loosened from 2.0 → less L2 regularisation
     "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
