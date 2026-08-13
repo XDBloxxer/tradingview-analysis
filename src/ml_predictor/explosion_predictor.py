@@ -1102,6 +1102,41 @@ class ExplosionPredictor:
         predictions   = self.model.predict(X_scaled)
         probabilities = self.model.predict_proba(X_scaled)[:, 1]
 
+        # RC11 FIX (2026-08-13): the isotonic calibrator is a step function
+        # with a limited number of breakpoints (see RC6-diag log at training
+        # time) — e.g. any raw score in [0.7398, 0.8418) maps to the exact
+        # same calibrated output. On a small live batch (44 stocks here) it's
+        # common for most stocks' raw scores to land inside one wide plateau,
+        # producing dozens of EXACT ties in `probabilities`. That's not a
+        # miscalibration — it's what a step function does — but ranking on
+        # already-collapsed values then treats every one of those ties as
+        # "tied for the top" (rank(method='max')), turning what should be a
+        # spread-out ranking into "43 STRONG BUY, 1 AVOID" regardless of how
+        # differentiated the underlying model actually was. Fix: rank on the
+        # RAW (pre-calibration) score, which retains full granularity, and
+        # keep the calibrated value only for reporting/absolute-threshold
+        # comparisons (those are supposed to reflect the calibrated bar).
+        raw_scores = probabilities
+        if hasattr(self.model, "calibrated_classifiers_"):
+            try:
+                _raw_estimator = self.model.calibrated_classifiers_[0].estimator
+                raw_scores = _raw_estimator.predict_proba(X_scaled)[:, 1]
+                _n_exact_ties = int(probabilities.size - len(np.unique(probabilities)))
+                if _n_exact_ties > 0:
+                    self.logger.info(
+                        f"RC11: {_n_exact_ties} exact tie(s) in calibrated probabilities "
+                        f"(isotonic plateau collapse) — ranking will use raw pre-calibration "
+                        f"scores instead (spread: min={raw_scores.min():.4f} "
+                        f"max={raw_scores.max():.4f} std={raw_scores.std():.6f})."
+                    )
+            except (AttributeError, IndexError, TypeError) as _unwrap_exc:
+                self.logger.warning(
+                    f"RC11: could not unwrap raw pre-calibration scores ({_unwrap_exc}) "
+                    "— falling back to ranking on calibrated probabilities, which may "
+                    "produce tie-collapsed STRONG BUY clusters if the isotonic step "
+                    "function has wide plateaus."
+                )
+
         self.logger.info(
             f"Probability spread: min={probabilities.min():.4f}  "
             f"max={probabilities.max():.4f}  "
@@ -1121,7 +1156,10 @@ class ExplosionPredictor:
         prob_series = pd.Series(probabilities, index=data_df.index)
         if self._is_bimodal:
             self.logger.info("Using percentile-based (relative) signal classification.")
-            signals = self._classify_signals_relative(prob_series)
+            # RC11: rank on raw scores (full granularity), not the
+            # tie-collapsed calibrated values — see comment above.
+            raw_score_series = pd.Series(raw_scores, index=data_df.index)
+            signals = self._classify_signals_relative(raw_score_series)
         else:
             self.logger.info("Distribution looks healthy — using absolute probability thresholds.")
             signals = prob_series.map(self._classify_signal_absolute)
