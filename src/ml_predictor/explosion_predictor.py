@@ -772,6 +772,28 @@ class ExplosionPredictor:
     # NaN-safe scaling
     # -------------------------------------------------------------------------
 
+    # RC12 FIX (2026-08-13): columns built from a *conditional* forward-fill
+    # (only defined on bearish/bullish days, then ffilled — e.g. SUPERTs_/
+    # SUPERTl_ "resistance while bearish" / "support while bullish" bands)
+    # can have a live-batch NaN rate wildly different from their overall
+    # training-set coverage. Training coverage is measured across many
+    # months of mixed market regimes, so a column can clear the 50%
+    # sparse-threshold overall while still being ~100% NaN for a live batch
+    # that skews toward one regime (e.g. an "explosion candidate" screener
+    # selecting sustained-uptrend stocks with no recent bearish SuperTrend
+    # flip). When that happens the column silently gets mean-imputed to a
+    # single training-time constant for the whole affected group instead of
+    # going through XGBoost's native missing-value branch — collapsing
+    # whatever real information a high-importance feature had for exactly
+    # the highest-conviction stocks (see RC12 diagnostic log). These columns
+    # are always treated as sparse (NaN-preserving) at inference regardless
+    # of what training-set coverage said, on top of whatever
+    # _trained_sparse_cols already flagged.
+    _ALWAYS_SPARSE_AT_INFERENCE = {
+        "t1_superts_10_3", "t3_superts_10_3", "t5_superts_10_3", "t10_superts_10_3",
+        "t1_supertl_10_3", "t3_supertl_10_3", "t5_supertl_10_3", "t10_supertl_10_3",
+    }
+
     def _scale_features(self, X: pd.DataFrame) -> pd.DataFrame:
         expected_n = self.scaler.n_features_in_
         if X.shape[1] != expected_n:
@@ -801,7 +823,16 @@ class ExplosionPredictor:
         # by save_outputs()), not recomputed from this inference batch — see
         # _load_model() above for why recomputing per-batch would be
         # inconsistent with how the model was trained.
-        sparse_cols = getattr(self, "_trained_sparse_cols", None) or None
+        sparse_cols = set(getattr(self, "_trained_sparse_cols", None) or [])
+        _forced = self._ALWAYS_SPARSE_AT_INFERENCE & set(X.columns)
+        _newly_forced = _forced - sparse_cols
+        if _newly_forced:
+            self.logger.info(
+                f"RC12: forcing {len(_newly_forced)} conditionally-defined "
+                f"column(s) to sparse (NaN-preserving) at inference "
+                f"regardless of training-set coverage: {sorted(_newly_forced)}"
+            )
+        sparse_cols = list(sparse_cols | _forced) or None
         winsor_bounds = getattr(self, "_trained_winsor_bounds", None) or None
 
         return scale_with_fitted_scaler(
@@ -1142,6 +1173,85 @@ class ExplosionPredictor:
             f"max={probabilities.max():.4f}  "
             f"std={probabilities.std():.6f}"
         )
+
+        # RC12 DIAGNOSTIC (2026-08-13): RC11 fixed ranking to use raw_scores
+        # instead of the isotonic-collapsed calibrated probabilities — but if
+        # raw_scores ITSELF has exact ties, that fix has nothing left to rank
+        # on. This decomposes any tied raw_scores group and reports which of
+        # the model's actual input features are identical across the group,
+        # so the root cause (e.g. a high-importance feature silently
+        # imputed to the training-mean constant for a subset of live rows)
+        # is visible directly in the log instead of guessed at.
+        _n_raw_ties = int(raw_scores.size - len(np.unique(raw_scores)))
+        if _n_raw_ties > 0:
+            _raw_series = pd.Series(raw_scores, index=X_scaled.index)
+            _tie_value = _raw_series.value_counts().idxmax()
+            _tie_idx = _raw_series[_raw_series == _tie_value].index
+            _tie_size = len(_tie_idx)
+            self.logger.warning(
+                f"RC12: {_n_raw_ties} exact tie(s) found in RAW pre-calibration "
+                f"scores (not just the calibrated output) — the largest tied "
+                f"group has {_tie_size} rows all at raw score {_tie_value:.6f}. "
+                f"This means the underlying model itself, not the calibrator, "
+                f"is failing to discriminate between these rows. Decomposing "
+                f"the tied group's model inputs to find the cause:"
+            )
+            _tie_X = X_scaled.loc[_tie_idx]
+            _feat_std = _tie_X.std().sort_values()
+            _identical_feats = _feat_std[_feat_std < 1e-9].index.tolist()
+            _varying_feats = _feat_std[_feat_std >= 1e-9].index.tolist()
+            self.logger.warning(
+                f"RC12: of {len(self.feature_names)} model features, "
+                f"{len(_identical_feats)} are IDENTICAL across the tied group "
+                f"and {len(_varying_feats)} still vary: "
+                f"identical={_identical_feats}"
+            )
+            if _varying_feats:
+                self.logger.warning(
+                    f"RC12: features that still vary within the tied group "
+                    f"(these are NOT the cause — the model just isn't splitting "
+                    f"on them for this group): {_varying_feats} "
+                    f"(std range {_feat_std[_varying_feats].min():.4f}-"
+                    f"{_feat_std[_varying_feats].max():.4f})"
+                )
+            # Cross-reference identical features against raw (pre-scaling) NaN
+            # rate for this tied group specifically — a feature that's
+            # constant post-scaling AND heavily NaN pre-scaling in this group
+            # is almost certainly being mean-imputed to a training constant.
+            _fi_lookup = {}
+            _fi_path = self.model_dir / "feature_importance.csv"
+            if _fi_path.exists():
+                try:
+                    _fi_lookup = pd.read_csv(_fi_path).set_index("feature")["importance"].to_dict()
+                except Exception:
+                    pass
+            _trained_sparse = set(getattr(self, "_trained_sparse_cols", None) or []) | (
+                self._ALWAYS_SPARSE_AT_INFERENCE & set(X.columns)
+            )
+            for _feat in _identical_feats:
+                if _feat in X.columns:
+                    _raw_vals = X.loc[_tie_idx, _feat]
+                    _nan_rate = float(_raw_vals.isna().mean())
+                    _is_sparse = _feat in _trained_sparse
+                    _imp = _fi_lookup.get(_feat, "n/a")
+                    self.logger.warning(
+                        f"RC12:   {_feat} — pre-scale NaN rate in THIS tied "
+                        f"group: {_nan_rate:.0%} | flagged sparse "
+                        f"(NaN-preserving) at train time: {_is_sparse} | "
+                        f"model importance: {_imp}"
+                    )
+                    if _nan_rate > 0.5 and not _is_sparse:
+                        self.logger.warning(
+                            f"RC12:   ^ {_feat} is majority-NaN for this tied "
+                            f"group but was NOT flagged sparse at training "
+                            f"time (train-set coverage was ≥50% overall). "
+                            f"That means these live rows are being silently "
+                            f"mean-imputed to the training constant for "
+                            f"{_feat}, wiping out whatever real discriminative "
+                            f"value it has for exactly this subset of stocks. "
+                            f"This is very likely your root cause if {_feat} "
+                            f"carries meaningful importance above."
+                        )
 
         # Detect whether the probability distribution is degenerate (compressed,
         # narrow-band, bimodal, or high-probability clustered).  When it is,
