@@ -318,7 +318,25 @@ def _t1_source_propensity_weights(
 #   • Too small  → noisy AUC / unstable early stopping.
 #   • Too large  → less training data, slower to adapt to recent market regimes.
 #   8 weeks (≈ 2 months) is a reasonable starting point.
-VAL_WEEKS = 8
+#
+# RAISED 8 → 12 (2026-08-13): with 8 weeks the val set carried only ~160
+# positives, which RC6 then splits in half (interleaved) between the
+# early-stopping holdout and the isotonic calibration holdout — leaving each
+# with only ~80 positives. That's thin enough that: (1) AUC on the
+# early-stopping half is noisy round-to-round, so XGBoost's patience counter
+# trips after ~16 trees on what is mostly sampling noise rather than genuine
+# non-improvement (see the UNDERTRAINED warning in train_model()); and
+# (2) isotonic regression — a nonparametric, nonsmooth step-function fit —
+# produces hard flat plateaus with that few calibration points, which is why
+# predict_proba() was returning identical values for many different inputs.
+# 12 weeks (~1.5x the val/cal rows) directly targets both symptoms at once
+# without touching early_stopping_rounds or the calibration method. If
+# best_iteration is still <30 after this change, the next lever to pull is
+# CAL_MIN_POS / the cal-vs-stop split ratio in main() (currently a 50/50
+# interleave — could shift toward giving early-stopping more of the val set
+# than calibration, since isotonic degrades more gracefully with fewer points
+# than AUC-based early stopping does).
+VAL_WEEKS = 12
 
 # ---------------------------------------------------------------------------
 # Purge / embargo gap at the train/val boundary
@@ -1659,27 +1677,69 @@ def enrich_mistakes_with_gains(
     # gain target. Tag these explicitly since their denominator may not match
     # the prev_close base used above (the accuracy tracker can fall back to a
     # same-day-close denominator when yfinance data is unavailable).
+    #
+    # FIX2: previously this step filled actual_high_pct from the accuracy
+    # table's raw value (whatever denominator it happened to use), tagged it
+    # '_gain_source' == 'accuracy_table_unverified_base', logged a warning
+    # about it — and then dropped the tag a few lines later, so the warning
+    # was the only trace of the problem and the unverified values were
+    # blended into the gain regressor's training pool anyway. We now only
+    # blend actual_high_pct when the row's actual_high_pct_source confirms a
+    # prev_close base (or the source column isn't present at all yet, for
+    # backward compatibility with un-migrated deployments). Same-day-price
+    # -sourced values are excluded from actual_high_pct (left NaN) rather
+    # than filled — actual_gain_pct is unaffected since it isn't used as the
+    # regressor's primary target.
     n_from_accuracy = 0
+    n_from_accuracy_excluded = 0
     if accuracy_rows:
         acc_df = pd.DataFrame(accuracy_rows).rename(columns={"prediction_date": "detection_date"})
         acc_df = acc_df.dropna(subset=["symbol", "detection_date"])
+        has_source_col = "actual_high_pct_source" in acc_df.columns
+
+        merge_cols = ["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]
+        if has_source_col:
+            merge_cols.append("actual_high_pct_source")
 
         merged = result.merge(
-            acc_df[["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]],
+            acc_df[merge_cols],
             on=["symbol", "detection_date"],
             how="left",
             suffixes=("", "_acc"),
         )
-        for col in ["actual_gain_pct", "actual_high_pct"]:
-            acc_col = f"{col}_acc"
-            if acc_col in merged.columns:
-                fillable = merged[col].isna() & merged[acc_col].notna()
-                merged.loc[fillable, col] = merged.loc[fillable, acc_col]
-                if col == "actual_high_pct":
-                    n_from_accuracy = int(fillable.sum())
-                    merged.loc[fillable, "_gain_source"] = "accuracy_table_unverified_base"
-                merged = merged.drop(columns=[acc_col])
+
+        # actual_gain_pct: fill unconditionally (not the regressor's primary target).
+        acc_col = "actual_gain_pct_acc"
+        if acc_col in merged.columns:
+            fillable = merged["actual_gain_pct"].isna() & merged[acc_col].notna()
+            merged.loc[fillable, "actual_gain_pct"] = merged.loc[fillable, acc_col]
+            merged = merged.drop(columns=[acc_col])
+
+        # actual_high_pct: only fill when the denominator is verified prev_close
+        # (or unknown, for backward compatibility) — never when it's flagged
+        # as the same-day-price fallback.
+        acc_col = "actual_high_pct_acc"
+        if acc_col in merged.columns:
+            if has_source_col:
+                verified = merged["actual_high_pct_source_acc"] != "winners_table_same_day_price"
+            else:
+                verified = pd.Series(True, index=merged.index)  # no tag available — old behaviour
+            fillable = merged["actual_high_pct"].isna() & merged[acc_col].notna() & verified
+            excluded = merged["actual_high_pct"].isna() & merged[acc_col].notna() & ~verified
+            merged.loc[fillable, "actual_high_pct"] = merged.loc[fillable, acc_col]
+            merged.loc[fillable, "_gain_source"] = "accuracy_table_unverified_base"
+            n_from_accuracy = int(fillable.sum())
+            n_from_accuracy_excluded = int(excluded.sum())
+            merged = merged.drop(columns=[acc_col])
+            if has_source_col:
+                merged = merged.drop(columns=["actual_high_pct_source_acc"], errors="ignore")
         result = merged
+        if n_from_accuracy_excluded > 0:
+            logger.info(
+                f"FIX2: Excluded {n_from_accuracy_excluded} mistake rows from actual_high_pct "
+                "fill because their accuracy-table value used the same-day-price "
+                "denominator (left as NaN instead of blending an incompatible base)."
+            )
 
     # Clip to non-negative, matching RC2's treatment, so the two sources can't
     # diverge on sign conventions either.
@@ -3346,19 +3406,40 @@ def train_gain_regressor(
                     f"falling back to LOOKBACK={lookback_days} days from today ({start_date})"
                 )
             logger.info(f"RC1: Querying ml_prediction_accuracy from {start_date}")
-            resp = (
-                client.table("ml_prediction_accuracy")
-                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-                .gte("prediction_date", start_date)
-                .not_.is_("actual_gain_pct", "null")
-                .execute()
-            )
+            # FIX2: also select actual_high_pct_source so we can tell prev_close
+            # -based values apart from the noisier same-day-price fallback (see
+            # ml_track_comprehensive_accuracy.py). The column may not exist yet
+            # on deployments that haven't run the migration — fall back to the
+            # old select() without it so this doesn't hard-fail.
+            try:
+                resp = (
+                    client.table("ml_prediction_accuracy")
+                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct, actual_high_pct_source")
+                    .gte("prediction_date", start_date)
+                    .not_.is_("actual_gain_pct", "null")
+                    .execute()
+                )
+            except Exception as _e_col:
+                logger.info(
+                    f"RC1: actual_high_pct_source column unavailable ({_e_col}); "
+                    "querying without it (denominator will be treated as unverified)."
+                )
+                resp = (
+                    client.table("ml_prediction_accuracy")
+                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+                    .gte("prediction_date", start_date)
+                    .not_.is_("actual_gain_pct", "null")
+                    .execute()
+                )
             if resp.data:
                 for row in resp.data:
                     key = (row["symbol"], row["prediction_date"])
                     accuracy_gain_map[key] = {
                         "actual_gain_pct": row.get("actual_gain_pct"),
                         "actual_high_pct": row.get("actual_high_pct"),
+                        # None = legacy row written before the source column
+                        # existed; treated as unverified (see acc_lookup below).
+                        "actual_high_pct_source": row.get("actual_high_pct_source"),
                     }
                 logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
         except Exception as e:
@@ -3433,10 +3514,28 @@ def train_gain_regressor(
             # (base CSV rows).  A single map() call replaces the per-row loop.
 
             # --- Build acc_lookup: (symbol, date_str) -> best gain value ----------
-            acc_lookup = {
-                k: (v.get("actual_high_pct") or v.get("actual_gain_pct"))
-                for k, v in accuracy_gain_map.items()
-            }
+            # FIX2: exclude rows whose actual_high_pct was computed on the
+            # same-day-price base (winners_table_same_day_price) — that base
+            # compresses gains toward ~0% and mixing it with prev_close-based
+            # values is exactly what produced the FIX2 mean-gain divergence.
+            # Rows with source=None are legacy (written before the source
+            # column existed) and are kept for backward compatibility, but are
+            # NOT the fix — once enough history accumulates with the tag
+            # populated, consider dropping the None case too.
+            _n_acc_excluded_denominator = 0
+            acc_lookup = {}
+            for k, v in accuracy_gain_map.items():
+                _src = v.get("actual_high_pct_source")
+                if _src == "winners_table_same_day_price":
+                    _n_acc_excluded_denominator += 1
+                    continue
+                acc_lookup[k] = v.get("actual_high_pct") or v.get("actual_gain_pct")
+            if _n_acc_excluded_denominator > 0:
+                logger.info(
+                    f"FIX2: Excluded {_n_acc_excluded_denominator} accuracy-table records "
+                    "with same-day-price-denominated actual_high_pct from the gain "
+                    "regressor target pool (incompatible base vs prev_close)."
+                )
 
             null_mask = gain_targets.isna()
             valid_det = pd.array([], dtype=bool)  # pre-init; populated in Path 1 if has_detection
@@ -3552,6 +3651,53 @@ def train_gain_regressor(
             f"Bug3 FIX: Excluded {n_low_gain_excluded} winner rows with "
             f"gain < {GAIN_REGRESSOR_MIN_PCT}% as noisy winner targets. "
             f"Non-winner rows with gain=0.0 are retained as the low-end anchor."
+        )
+
+    # ------------------------------------------------------------------
+    # ZERO-ANCHOR SUBSAMPLING FIX: the CORE FIX zero-fill above routinely
+    # produces ~90% of the regressor's training pool as rows with an
+    # IDENTICAL target (gain=0.0) — e.g. 3837 zero-anchor rows against only
+    # 408 winners + 77 genuine non-zero non-winners in one observed run.
+    # RC8's winner-weight up-weighting (clamped to [REG_WINNER_WEIGHT_MIN,
+    # REG_WINNER_WEIGHT_MAX]) roughly balances total *weight* on each side,
+    # but doesn't fix the underlying problem: half the loss surface is a
+    # single repeated point, so gradient boosting minimizes loss by
+    # collapsing predictions toward ~0 almost everywhere rather than learning
+    # feature-dependent gain structure. That's the direct cause of the
+    # near-flat 0.4%–11.1% predicted-gain range and near-zero/negative R².
+    # Down-sampling (not just down-weighting) the zero-anchor rows to a
+    # bounded multiple of the informative pool (winners + genuine non-zero
+    # non-winners) gives the model room to actually differentiate. The
+    # informative rows are never touched; only the redundant zero-anchor
+    # rows are subsampled, and it's a fixed random_state for reproducibility.
+    # ------------------------------------------------------------------
+    ZERO_ANCHOR_MAX_RATIO = 3.0  # max zero-anchor rows per informative row
+    zero_anchor_valid_mask = valid_gain_mask & zero_fill_mask.reindex(valid_gain_mask.index, fill_value=False)
+    informative_valid_mask = valid_gain_mask & ~zero_anchor_valid_mask
+    n_zero_anchor_valid = int(zero_anchor_valid_mask.sum())
+    n_informative_valid = int(informative_valid_mask.sum())
+    max_zero_anchor_rows = int(n_informative_valid * ZERO_ANCHOR_MAX_RATIO)
+    if n_informative_valid > 0 and n_zero_anchor_valid > max_zero_anchor_rows:
+        _zero_idx = valid_gain_mask.index[zero_anchor_valid_mask]
+        _rng = np.random.RandomState(42)
+        _keep_idx = pd.Index(
+            _rng.choice(_zero_idx.to_numpy(), size=max_zero_anchor_rows, replace=False)
+        )
+        _drop_idx = _zero_idx.difference(_keep_idx)
+        valid_gain_mask = valid_gain_mask.copy()
+        valid_gain_mask.loc[_drop_idx] = False
+        logger.info(
+            f"  ZERO-ANCHOR SUBSAMPLE: {n_zero_anchor_valid} zero-anchor rows vs "
+            f"{n_informative_valid} informative rows (winners + genuine non-zero "
+            f"non-winners) exceeded the {ZERO_ANCHOR_MAX_RATIO:.0f}:1 ratio cap — "
+            f"downsampled zero-anchors to {max_zero_anchor_rows} "
+            f"(dropped {len(_drop_idx)}, kept all informative rows)."
+        )
+    elif n_informative_valid == 0:
+        logger.warning(
+            "  ZERO-ANCHOR SUBSAMPLE: no informative (winner or genuine non-zero "
+            "non-winner) rows available — skipping subsampling, regressor will "
+            "likely underperform regardless."
         )
 
     n_valid = int(valid_gain_mask.sum())
@@ -4845,13 +4991,33 @@ def main() -> int:
                 _min_date.date().isoformat() if pd.notna(_min_date) else None
             )
 
-            _acc_resp = (
-                client.table("ml_prediction_accuracy")
-                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-                .not_.is_("actual_high_pct", "null")
-                .gte("prediction_date", _start_date)
-                .execute()
-            ) if _start_date else None
+            # FIX2: also select actual_high_pct_source (see
+            # ml_track_comprehensive_accuracy.py) so the gain regressor can
+            # tell prev_close-based accuracy-table rows apart from the noisier
+            # same-day-price fallback instead of silently blending both bases
+            # into one target, which is what produced the ~60pp mean-gain
+            # divergence the FIX2 diagnostic below flags. Falls back to the
+            # old select() on deployments that haven't migrated the column yet.
+            try:
+                _acc_resp = (
+                    client.table("ml_prediction_accuracy")
+                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct, actual_high_pct_source")
+                    .not_.is_("actual_high_pct", "null")
+                    .gte("prediction_date", _start_date)
+                    .execute()
+                ) if _start_date else None
+            except Exception as _e_col:
+                logger.info(
+                    f"RC3: actual_high_pct_source column unavailable ({_e_col}); "
+                    "querying without it (denominator will be treated as unverified)."
+                )
+                _acc_resp = (
+                    client.table("ml_prediction_accuracy")
+                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
+                    .not_.is_("actual_high_pct", "null")
+                    .gte("prediction_date", _start_date)
+                    .execute()
+                ) if _start_date else None
 
             if _acc_resp and _acc_resp.data:
                 # ── Build accuracy_gain_map for gain regressor (ISSUE 2 FIX) ──
@@ -4859,6 +5025,7 @@ def main() -> int:
                     _accuracy_gain_map[(_r["symbol"], _r["prediction_date"])] = {
                         "actual_gain_pct": _r.get("actual_gain_pct"),
                         "actual_high_pct": _r.get("actual_high_pct"),
+                        "actual_high_pct_source": _r.get("actual_high_pct_source"),
                     }
                 logger.info(
                     f"RC3: Built accuracy_gain_map with {len(_accuracy_gain_map)} records "
