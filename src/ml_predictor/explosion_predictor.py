@@ -1166,6 +1166,7 @@ class ExplosionPredictor:
 
         result_df = pd.DataFrame({
             "explosion_probability": probabilities,
+            "raw_model_score":       raw_scores,
             "prediction":            predictions,
             "signal":                signals.values,
         }, index=data_df.index)
@@ -1174,8 +1175,17 @@ class ExplosionPredictor:
             if col in features_df.columns:
                 result_df.insert(0, col, features_df[col].values)
 
+        # RC11 FIX (2026-08-13): sort by raw_model_score, not the calibrated
+        # explosion_probability. Sorting by the calibrated value put ties
+        # (see RC11 comment above — isotonic plateaus routinely collapse
+        # dozens of stocks to the exact same calibrated output) in arbitrary
+        # index order, so "Top N Predictions" looked unordered among the tied
+        # majority even after signal classification itself was fixed to use
+        # raw scores. Sorting by raw_model_score keeps the displayed/stored
+        # rank order consistent with what actually decided each stock's
+        # signal.
         result_df = result_df.sort_values(
-            "explosion_probability", ascending=False
+            "raw_model_score", ascending=False
         ).reset_index(drop=True)
 
         result_df["_orig_idx"] = range(len(result_df))
