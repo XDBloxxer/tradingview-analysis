@@ -295,14 +295,19 @@ def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.L
 
     logger.info("")
     logger.info("  Top 10 stocks by probability:")
-    logger.info(f"  {'#':<4} {'Symbol':<8} {'Prob':>8}  {'Signal':<13} {'Gain'}")
+    logger.info(f"  {'#':<4} {'Symbol':<8} {'Prob':>8}  {'Raw':>8}  {'Signal':<13} {'Gain'}")
     logger.info("  " + "-" * 50)
     for rank, (_, row) in enumerate(predictions_df.head(10).iterrows(), 1):
         prob_pct = row['explosion_probability'] * 100
+        # RC11: raw_model_score retains full granularity even when
+        # explosion_probability is tied across many rows (isotonic
+        # calibrator plateau collapse) — show both so it's clear the
+        # ranking isn't arbitrary among calibrated-probability ties.
+        raw_pct  = row.get('raw_model_score', float('nan')) * 100
         signal   = row.get('signal', 'N/A')
         symbol   = row.get('symbol', 'N/A')
         gain     = row.get('target_gain_pct', 0)
-        logger.info(f"  {rank:<4} {symbol:<8} {prob_pct:>7.2f}%  {signal:<13} +{gain:.1f}%")
+        logger.info(f"  {rank:<4} {symbol:<8} {prob_pct:>7.2f}%  {raw_pct:>7.2f}%  {signal:<13} +{gain:.1f}%")
 
     logger.info("")
 
@@ -2160,7 +2165,7 @@ def main():
 
     logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
     logger.info("-" * 100)
-    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'t3_cols'}")
+    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Raw':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'t3_cols'}")
     logger.info("-" * 100)
 
     # Build a symbol → t3 count lookup from the features DataFrame.
@@ -2176,9 +2181,14 @@ def main():
     for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
         current_price = row.get('current_price', 0)
         n_t3 = t3_count_by_symbol.get(row['symbol'], 0)
+        # RC11: show raw_model_score alongside the calibrated probability —
+        # rows tied on 'Prob' (isotonic plateau collapse) are still ranked
+        # correctly via 'Raw', which is what actually drove the order.
+        raw_score = row.get('raw_model_score', float('nan'))
         logger.info(
             f"{rank:<4} {row['symbol']:<8} {row['signal']:<13} "
             f"{row['explosion_probability']*100:>6.2f}%  "
+            f"{raw_score*100:>6.2f}%  "
             f"${current_price:>8.2f}  "
             f"${row.get('target_price', 0):>8.2f}  "
             f"+{row.get('target_gain_pct', 0):>5.1f}%"
