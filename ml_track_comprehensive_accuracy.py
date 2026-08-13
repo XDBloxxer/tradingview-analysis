@@ -734,8 +734,20 @@ class ComprehensiveAccuracyTracker:
 
             # Always prefer yfinance for actual_high_pct (prev_close denominator).
             # Fall back to the daily_winners high column only if yfinance has no data.
+            #
+            # FIX2 (denominator tagging): the two branches below compute
+            # actual_high_pct on DIFFERENT bases — yfinance uses prev_close,
+            # the daily_winners fallback uses actual_price (same-day price).
+            # Previously this distinction was computed and then discarded, so
+            # nothing downstream (ml_retrain_model.py's gain regressor) could
+            # tell a prev_close-based value apart from a same-day-price one.
+            # That silent mixing is exactly what produced the ~60pp mean-gain
+            # divergence flagged by the FIX2 diagnostic in ml_retrain_model.py.
+            # We now record which base was used in actual_high_pct_source so
+            # downstream consumers can filter/weight accordingly.
             if yf_data.get("actual_high_pct") is not None:
                 actual_high_pct = yf_data["actual_high_pct"]
+                actual_high_pct_source = "yfinance_prev_close"
             elif in_winners_table and not winners_df.empty:
                 winner_row  = winners_df[winners_df["symbol"] == symbol].iloc[0]
                 w_high      = winner_row.get("high", actual_price)
@@ -743,8 +755,14 @@ class ComprehensiveAccuracyTracker:
                     ((float(w_high) / actual_price) - 1) * 100
                     if actual_price and actual_price > 0 else None
                 )
+                # NOTE: this base is same-day actual_price, NOT prev_close — it
+                # is the fallback flagged as noisy in the module docstring (FIX2).
+                actual_high_pct_source = (
+                    "winners_table_same_day_price" if actual_high_pct is not None else None
+                )
             else:
                 actual_high_pct = None
+                actual_high_pct_source = None
 
             # ── Winner definition ────────────────────────────────────────────
             # A stock is a winner if its intraday high on prediction date reached
@@ -795,6 +813,17 @@ class ComprehensiveAccuracyTracker:
                 "became_winner":          became_winner,
                 "actual_gain_pct":        actual_gain,
                 "actual_high_pct":        actual_high_pct,
+                # FIX2: tags which denominator actual_high_pct was computed with
+                # ("yfinance_prev_close" or "winners_table_same_day_price"), so
+                # ml_retrain_model.py can exclude/downweight the noisier
+                # same-day-price fallback instead of silently blending both
+                # bases into one gain-regressor target. Requires a matching
+                # `actual_high_pct_source text` column on ml_prediction_accuracy;
+                # if that column doesn't exist yet in Supabase, add it via
+                # migration before this starts populating (upsert will otherwise
+                # either error or silently drop the field depending on client
+                # config — check before relying on it downstream).
+                "actual_high_pct_source": actual_high_pct_source,
                 "actual_price":           actual_price,
                 "prediction_correct":     prediction_correct,
                 "gain_error_pct":         gain_error,
