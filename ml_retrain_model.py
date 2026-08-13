@@ -2661,6 +2661,8 @@ def train_model(
     y_val: pd.Series,
     X_cal: pd.DataFrame = None,
     y_cal: pd.Series = None,
+    X_val_full: pd.DataFrame = None,
+    y_val_full: pd.Series = None,
 ) -> object:
     """Train XGBClassifier from scratch with early stopping.
 
@@ -2784,6 +2786,39 @@ def train_model(
             calibrated_model = CalibratedClassifierCV(
                 model, method="isotonic", cv="prefit"
             )
+
+            # TAIL-GUARANTEE FIX (2026-08-13): the cal/early-stop split assigns
+            # rows by time-position, independent of raw score. With very few
+            # extreme-score rows in the whole val set, whichever side of the
+            # split they land on is close to a coin flip — and if they land in
+            # the early-stop half instead of cal, the isotonic calibrator's
+            # highest achievable output step drops (it can only output y-values
+            # it saw evidence for), silently capping predicted probabilities
+            # well below 1.0 (e.g. losing the 0.8-1.0 output range entirely)
+            # even though nothing about the underlying model changed.
+            # Fix: after the split is fixed, explicitly check whether the most
+            # extreme-scoring val rows (by raw model score) are present in the
+            # calibration set, and if not, add them in (union, not swap — cal
+            # set only grows, early-stopping is already done by this point so
+            # there's no leakage concern in adding more rows to X_cal here).
+            if X_val_full is not None and y_val_full is not None and len(X_val_full) > len(X_cal):
+                _raw_full = model.predict_proba(X_val_full)[:, 1]
+                _TAIL_GUARANTEE_N = max(5, int(0.01 * len(X_val_full)))  # top/bottom 1%, min 5
+                _order = np.argsort(_raw_full)
+                _tail_positions = np.concatenate([_order[:_TAIL_GUARANTEE_N], _order[-_TAIL_GUARANTEE_N:]])
+                _tail_idx = X_val_full.index[_tail_positions]
+                _missing_tail_idx = _tail_idx.difference(X_cal.index)
+                if len(_missing_tail_idx) > 0:
+                    X_cal = pd.concat([X_cal, X_val_full.loc[_missing_tail_idx]])
+                    y_cal = pd.concat([y_cal, y_val_full.loc[_missing_tail_idx]])
+                    logger.info(
+                        f"  RC6-tailfix: added {len(_missing_tail_idx)} extreme-raw-score "
+                        f"val row(s) (top/bottom {_TAIL_GUARANTEE_N} by raw score) into the "
+                        "calibration set that weren't already there — prevents the "
+                        "calibrated output range from silently shrinking based on which "
+                        "side of the time-position split they happened to land on."
+                    )
+
             calibrated_model.fit(X_cal, y_cal)
 
             # Sanity-check: log how calibration shifted the distribution
@@ -4378,6 +4413,49 @@ def train_gain_regressor(
     # R² in log-space (what the model was actually trained on) is more meaningful
     r2_log = r2_score(y_va.values if hasattr(y_va, "values") else y_va, val_pred_log) if len(y_va) > 1 else float("nan")
     pred_std_pct = float(val_pred_pct.std())
+
+    # DIAGNOSTIC (2026-08-13): the MAE/R² above are UNWEIGHTED, so with ~75%
+    # of val rows being zero-anchors, they mostly measure how well the model
+    # predicts "0" — not how well it predicts actual gain magnitude on the
+    # ~25% of rows (winners + genuine non-winners) that carry the real
+    # signal. Log a weighted version (matching what training actually
+    # optimises) and an informative-rows-only version, so a bad unweighted
+    # R² can be told apart from a model that's actually fine on the rows
+    # that matter.
+    w_va_arr = w_va.values if hasattr(w_va, "values") else np.array(w_va)
+    r2_weighted = r2_score(
+        y_va.values if hasattr(y_va, "values") else y_va, val_pred_log,
+        sample_weight=w_va_arr
+    ) if len(y_va) > 1 else float("nan")
+    mae_weighted = mean_absolute_error(y_va_raw_arr, val_pred_pct, sample_weight=w_va_arr)
+
+    _informative_va_mask = y_va_raw_arr > 0.0   # zero-anchor rows are exactly 0.0
+    n_informative_va = int(_informative_va_mask.sum())
+    if n_informative_va >= 5:
+        r2_informative = r2_score(
+            (y_va.values if hasattr(y_va, "values") else y_va)[_informative_va_mask],
+            val_pred_log[_informative_va_mask]
+        )
+        mae_informative = mean_absolute_error(
+            y_va_raw_arr[_informative_va_mask], val_pred_pct[_informative_va_mask]
+        )
+        pred_vs_actual_corr = float(np.corrcoef(
+            y_va_raw_arr[_informative_va_mask], val_pred_pct[_informative_va_mask]
+        )[0, 1]) if n_informative_va >= 3 else float("nan")
+        logger.info(
+            f"  Gain regressor — INFORMATIVE-ROWS-ONLY (n={n_informative_va}, excludes "
+            f"zero-anchors): MAE={mae_informative:.2f}%  R²={r2_informative:.3f}  "
+            f"pred-vs-actual corr={pred_vs_actual_corr:.3f}"
+        )
+        logger.info(
+            f"  Gain regressor — weighted (matches training objective): "
+            f"MAE={mae_weighted:.2f}%  R²(log)={r2_weighted:.3f}"
+        )
+    else:
+        logger.warning(
+            f"  Gain regressor — only {n_informative_va} informative rows in val; "
+            "too few to compute a meaningful informative-only metric."
+        )
     logger.info(
         f"  Gain regressor — val MAE (% space): {mae:.2f}%  "
         f"R² (log space): {r2_log:.3f}  "
@@ -4503,7 +4581,33 @@ def train_gain_regressor(
                 f"(majority-class baseline={_baseline_acc:.3f}, "
                 f"best_iteration={tier_classifier.best_iteration})"
             )
-            if tier_acc <= _baseline_acc:
+            # DIAGNOSTIC (2026-08-13): a correctly-behaving multiclass model
+            # under this exact class imbalance should never score meaningfully
+            # BELOW the majority-class baseline — worst case (zero signal) it
+            # converges to always predicting the majority class, matching the
+            # baseline exactly. If accuracy is well below both the baseline
+            # AND naive random-guess (1/n_classes), that's a bug signal, not
+            # a data-volume signal — log a confusion matrix so it's diagnosable
+            # instead of guessed at.
+            _naive_random = 1.0 / len(GAIN_TIERS)
+            if tier_acc < _naive_random * 0.5:
+                from sklearn.metrics import confusion_matrix
+                _cm = confusion_matrix(y_tier_va.values, tier_pred, labels=list(range(len(GAIN_TIERS))))
+                _pred_dist = pd.Series(tier_pred).value_counts().to_dict()
+                logger.warning(
+                    f"  ⚠️  TIER FALLBACK: accuracy={tier_acc:.3f} is BELOW the naive "
+                    f"random-guess floor ({_naive_random:.3f}) for {len(GAIN_TIERS)} classes "
+                    "— this is NOT explained by small/imbalanced data (a correctly-behaving "
+                    "model under this imbalance converges to the majority-class baseline "
+                    f"({_baseline_acc:.3f}) in the worst case, not below random). Likely an "
+                    "implementation bug (index/label misalignment, or an XGBoost "
+                    "best_iteration/iteration_range mismatch on .predict() after early "
+                    "stopping) rather than a data problem. Confusion matrix (rows=true, "
+                    f"cols=pred, order={[name for _,_,name in GAIN_TIERS]}):\n{_cm}\n"
+                    f"  Predicted-class distribution: {_pred_dist} vs true distribution: "
+                    f"{y_tier_va.value_counts().to_dict()}"
+                )
+            elif tier_acc <= _baseline_acc:
                 logger.warning(
                     "  ⚠️  TIER FALLBACK: classifier does not beat the majority-class "
                     "baseline yet — informative pool is likely still too small for "
@@ -5572,19 +5676,20 @@ def main() -> int:
     # Minimum requirements: ≥10 positives in each half after the split.
     CAL_MIN_POS = 10
 
-    # CAL_SPLIT_FRACTION (2026-08-13): fraction of the val set given to the
-    # calibration holdout, with the remainder going to early-stopping.  This
-    # was a hardcoded 50/50 split; per the earlier analysis, isotonic
-    # regression degrades more gracefully with fewer points than AUC-based
-    # early stopping does, and the 50/50 split was starving the calibrator
-    # (1526 cal rows here) enough to produce hard flat plateaus in the
-    # calibrated-probability distribution. Shifting the split to 60/40 in
-    # favor of calibration gives the isotonic fit more points to define finer
-    # steps, while early-stopping still keeps a reasonable pool (AUC is a
-    # fairly stable signal even with somewhat fewer points, per the same
-    # reasoning that justified eval_metric="auc" in the first place).
-    # Re-tune if best_iteration starts coming in noisy/low again.
-    CAL_SPLIT_FRACTION = 0.6
+    # CAL_SPLIT_FRACTION (2026-08-13, revised 2026-08-13b): fraction of the
+    # val set given to the calibration holdout, with the remainder going to
+    # early-stopping. Originally 50/50; first tried 60/40 in favor of
+    # calibration to fix flat isotonic plateaus (worked — the 0.5-0.7 gap
+    # closed), but 60/40 shrank the early-stopping set enough (1525→1220
+    # rows) that best_iteration dropped 79→38 and winner recall on the blind
+    # holdout fell 0.40→0.27 — early-stopping's AUC signal got noisier and
+    # triggered sooner at a worse point. Settling on 55/45 as a smaller step:
+    # still gives the calibrator meaningfully more than the original 50%,
+    # while giving back some of what early-stopping lost. Re-tune based on
+    # what the next run's best_iteration/recall/calibration-gap numbers show
+    # — this is a real trade-off between the two objectives, not a value
+    # with one obviously-correct setting.
+    CAL_SPLIT_FRACTION = 0.55
 
     X_cal_fit, y_cal_fit = None, None
     X_val_xgb, y_val_xgb = X_val, y_val
@@ -5643,7 +5748,8 @@ def main() -> int:
 
     # ── Train ─────────────────────────────────────────────────────────────────
     model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val_xgb, y_val_xgb,
-                        X_cal=X_cal_fit, y_cal=y_cal_fit)
+                        X_cal=X_cal_fit, y_cal=y_cal_fit,
+                        X_val_full=X_val, y_val_full=y_val)
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
