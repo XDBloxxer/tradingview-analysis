@@ -634,7 +634,16 @@ SCREENER_POSITIVE_RATE: float | None = None
 
 XGBOOST_PARAMS = {
     "n_estimators":       500,
-    "max_depth":          3,       # reduced from 6 → less overfitting
+    "max_depth":          4,       # raised 3→4 (2026-08-13): depth=3 was shown to over-discretize
+                                    # raw predict_proba into a small number of distinct leaf-score
+                                    # combinations, which — combined with eval_metric="auc" not
+                                    # rewarding a spread-out probability surface — fed the isotonic
+                                    # calibrator too few distinct raw-score clusters, producing hard
+                                    # flat plateaus (empty 0.5-0.7 / 0.8-0.9 calibrated-probability
+                                    # bins). depth=4 gives the calibrator more granularity to work
+                                    # with while still well short of the original depth=6 that was
+                                    # overfitting. Re-check val AUC / early-stopping iteration after
+                                    # this change in case it needs to come back down.
     "learning_rate":      0.05,
     "subsample":          0.8,
     "colsample_bytree":   0.8,
@@ -2791,6 +2800,59 @@ def train_model(
                 f"pct>=0.90: {(cal_proba>=0.90).mean():.1%}"
             )
 
+            # DIAGNOSTIC (2026-08-13): log the isotonic calibrator's step
+            # breakpoints so any gaps in the calibrated-probability histogram
+            # can be attributed correctly. Isotonic regression is a step
+            # function — cal_proba can only take the distinct y_thresholds_
+            # values below. If a gap (e.g. 0.5-0.7) in the calibrated-output
+            # histogram corresponds to a jump between two consecutive
+            # thresholds here, that's expected PAVA-pooling behaviour, not a
+            # bug. If instead the *raw* scores themselves show a similar gap
+            # (checked below), that indicates the underlying model is
+            # separating rows into distinct clusters rather than a smooth
+            # probability surface — worth understanding but still not
+            # necessarily a bug (e.g. a dominant regime-flag feature).
+            try:
+                _iso = calibrated_model.calibrated_classifiers_[0].calibrators[0]
+                _x_thresh = getattr(_iso, "X_thresholds_", None)
+                _y_thresh = getattr(_iso, "y_thresholds_", None)
+                if _x_thresh is not None and _y_thresh is not None:
+                    _steps = list(zip(np.round(_x_thresh, 4), np.round(_y_thresh, 4)))
+                    logger.info(
+                        f"  RC6-diag: isotonic calibrator has {len(_steps)} step "
+                        f"breakpoint(s). raw_score→prob steps: {_steps}"
+                    )
+                    _y_sorted = np.sort(_y_thresh)
+                    _y_gaps = np.diff(_y_sorted)
+                    if len(_y_gaps) > 0 and _y_gaps.max() > 0.15:
+                        _gap_idx = int(np.argmax(_y_gaps))
+                        logger.info(
+                            f"  RC6-diag: largest calibrated-probability gap is "
+                            f"{_y_sorted[_gap_idx]:.3f}–{_y_sorted[_gap_idx+1]:.3f} "
+                            f"(width {_y_gaps[_gap_idx]:.3f}) — no calibrator output "
+                            "will ever land inside this range, by construction."
+                        )
+            except (AttributeError, IndexError, TypeError) as _e:
+                logger.debug(f"  RC6-diag: could not introspect isotonic thresholds ({_e}).")
+
+            # Bimodal check on the RAW (pre-calibration) scores — a real gap
+            # here (as opposed to just the calibrated output above) would
+            # suggest the model itself is splitting rows into distinct
+            # clusters rather than a smooth score surface.
+            _raw_sorted = np.sort(raw_proba)
+            if len(_raw_sorted) > 1:
+                _raw_gaps = np.diff(_raw_sorted)
+                _raw_gap_max = float(_raw_gaps.max())
+                if _raw_gap_max > 0.15:
+                    _rg_idx = int(np.argmax(_raw_gaps))
+                    logger.info(
+                        f"  RC6-diag: raw (pre-calibration) scores also show a gap "
+                        f"of {_raw_gap_max:.3f} between {_raw_sorted[_rg_idx]:.3f} and "
+                        f"{_raw_sorted[_rg_idx+1]:.3f} — the model may be separating "
+                        "rows into distinct clusters (e.g. a dominant discrete "
+                        "regime-flag feature) rather than producing a smooth score."
+                    )
+
             # Step 2: Prior-probability correction for base-rate mismatch.
             p_inf = SCREENER_POSITIVE_RATE
             if p_inf is not None and 0.0 < p_inf < 1.0 and 0.0 < p_cal < 1.0:
@@ -3708,7 +3770,13 @@ def train_gain_regressor(
 
     # Exclude winner rows with NaN-filled or unreliably low gain only.
     # Non-winner rows with gain=0.0 are KEPT — they are the true low-end anchor.
-    GAIN_REGRESSOR_MIN_PCT = 5.0
+    GAIN_REGRESSOR_MIN_PCT = 3.0  # loosened 5.0→3.0 (2026-08-13): the informative
+    # pool (239 winners + ~26 genuine non-winners) is the hard ceiling on
+    # regressor training signal (see ZERO-ANCHOR SUBSAMPLE diagnostic above),
+    # so excluding winner rows as "noisy" below 5% was giving away scarce
+    # informative rows for comparatively little noise-reduction benefit.
+    # 3% still excludes true data-error-scale rows while keeping more of the
+    # low-end winner signal.
     low_gain_winner_mask = valid_gain_mask & winner_rows & (gain_targets < GAIN_REGRESSOR_MIN_PCT)
     n_low_gain_excluded = int(low_gain_winner_mask.sum())
     if n_low_gain_excluded > 0:
@@ -3765,6 +3833,20 @@ def train_gain_regressor(
             "non-winner) rows available — skipping subsampling, regressor will "
             "likely underperform regardless."
         )
+
+    # DIAGNOSTIC (2026-08-13): ZERO_ANCHOR_MAX_RATIO controls the *uninformative*
+    # zero-anchor pool, not the informative pool — n_informative_valid is the
+    # real ceiling on what the regressor can learn from, and this ratio cap
+    # cannot raise it. Surfacing it explicitly here so it's obvious in the
+    # logs (rather than implied) that growing regressor performance requires
+    # more winner/genuine-non-winner rows accumulating over time (or loosening
+    # GAIN_REGRESSOR_MIN_PCT below), not further tuning of this ratio.
+    logger.info(
+        f"  Informative-row ceiling: {n_informative_valid} rows (winners + genuine "
+        f"non-zero non-winners). This is the hard cap on regressor training signal "
+        f"regardless of ZERO_ANCHOR_MAX_RATIO={ZERO_ANCHOR_MAX_RATIO:.0f} — the ratio "
+        f"only controls how many redundant zero-anchor rows are kept alongside it."
+    )
 
     n_valid = int(valid_gain_mask.sum())
     n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
@@ -4230,16 +4312,28 @@ def train_gain_regressor(
     # training set.  Using the same depth/regularisation as the classifier
     # forces the regressor to find more specific gain-relevant patterns.
     # ------------------------------------------------------------------
+    # CAPACITY REDUCTION (2026-08-13): the RC7 fix above matched regressor
+    # capacity to the classifier's depth=5/n_estimators=300, on the theory
+    # that shallow/loose was over-generalising toward the mean. But the
+    # informative training pool here is ~239 winners + ~26 genuine
+    # non-winners (see ZERO-ANCHOR SUBSAMPLE diagnostic) — an order of
+    # magnitude smaller than what the classifier trains on. depth=5 over
+    # ~200 truly-informative rows overfits almost immediately, which is
+    # consistent with best_iteration=1 and near-zero prediction variance
+    # observed in practice (the weighted-eval-set fix below rules out the
+    # other explanation for that symptom). Reducing depth and estimator count
+    # gives the regressor a hypothesis space actually sized to the data it
+    # has, rather than the classifier's much larger training pool.
     regressor = XGBRegressor(
-        n_estimators=300,
-        max_depth=5,
+        n_estimators=120,      # reduced from 300
+        max_depth=3,            # reduced from 5, back in line with informative-row count
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
-        min_child_weight=4,   # loosened from 10, matching classifier fix
-        gamma=0.3,             # loosened from 1.0
-        reg_alpha=0.2,         # loosened from 0.5
-        reg_lambda=1.5,        # loosened from 2.0
+        min_child_weight=4,
+        gamma=0.3,
+        reg_alpha=0.3,          # slightly higher than classifier — fewer rows, more regularisation
+        reg_lambda=2.0,         # slightly higher than classifier — fewer rows, more regularisation
         objective="reg:squarederror",
         eval_metric="rmse",
         random_state=42,
@@ -4294,6 +4388,27 @@ def train_gain_regressor(
     )
     logger.info(f"  Best iteration: {regressor.best_iteration}")
 
+    # VERIFICATION (2026-08-13): sample_weight_eval_set was confirmed already
+    # wired correctly above (2026-08-12 EVAL-SET WEIGHT FIX) — early stopping
+    # is monitoring weighted RMSE, not the trivially-minimised unweighted
+    # version. So best_iteration landing at 1 is NOT a sign that fix
+    # regressed; it's the capacity/data-volume problem the fixes above target
+    # directly. This check exists so a *future* regression of the eval-set
+    # weighting wiring surfaces immediately instead of being misdiagnosed as
+    # a data problem again.
+    if regressor.best_iteration is not None and regressor.best_iteration <= 1:
+        logger.warning(
+            f"  ⚠️  Gain regressor best_iteration={regressor.best_iteration} — stopped "
+            "almost immediately. sample_weight_eval_set IS being passed (verified "
+            "2026-08-13), so this is most likely the informative-row ceiling "
+            "(see ZERO-ANCHOR SUBSAMPLE diagnostic) combined with model capacity, "
+            "not a reversion of the eval-set weighting fix. If sample_weight_eval_set "
+            "is ever removed from the fit() call above, this same symptom will "
+            "reappear for the OLD reason (unweighted RMSE trivially favouring a "
+            "flat near-zero prediction) — check the fit() call first if this "
+            "warning appears alongside a sudden pred_std collapse."
+        )
+
     if pred_std_pct < 0.5:
         logger.warning(
             f"  ⚠️  Regressor prediction std={pred_std_pct:.3f}% is very flat even after RC7 fixes. "
@@ -4309,6 +4424,99 @@ def train_gain_regressor(
     # (leak-free) or the full train+val fallback pool (see guard above).
     # main() reads this to log/record it in model_metadata.json.
     regressor._trained_leak_free = not _is_fallback_retry  # type: ignore[attr-defined]
+
+    # ------------------------------------------------------------------
+    # TIER FALLBACK (2026-08-13): with ~239 winners + ~26 genuine non-winners
+    # as the hard informative-row ceiling, a continuous log-space regression
+    # target (winsorized up to 328%) demands more dynamic range than that
+    # sample size can reliably support — hence R² staying deeply negative
+    # across attempts. A coarse 3-tier classification of the same rows needs
+    # far less data per "bucket" to beat a naive baseline, and gives
+    # downstream consumers a usable signal (small/medium/large winner)
+    # while the informative pool grows over future retrain cycles.
+    # This is trained alongside — not instead of — the regressor above, and
+    # saved as a separate artifact; nothing currently reads it, it exists so
+    # callers can migrate to it once its accuracy is validated over a few
+    # retrain cycles.
+    # ------------------------------------------------------------------
+    GAIN_TIERS = [
+        (0.0, 15.0, "small"),     # anchors + sub-threshold winners
+        (15.0, 50.0, "medium"),
+        (50.0, float("inf"), "large"),
+    ]
+
+    def _tier_label(pct: float) -> int:
+        for i, (lo, hi, _name) in enumerate(GAIN_TIERS):
+            if lo <= pct < hi:
+                return i
+        return len(GAIN_TIERS) - 1
+
+    try:
+        from xgboost import XGBClassifier as _XGBClassifierForTiers
+
+        y_tier_tr = y_reg_valid.loc[X_tr.index].apply(_tier_label)
+        y_tier_va = y_reg_valid.loc[X_va.index].apply(_tier_label)
+
+        tier_counts_tr = y_tier_tr.value_counts().to_dict()
+        logger.info(
+            f"  TIER FALLBACK: training 3-tier gain classifier "
+            f"({', '.join(name for _, _, name in GAIN_TIERS)}) — "
+            f"train tier counts: {tier_counts_tr}"
+        )
+
+        if y_tier_tr.nunique() < 2:
+            logger.warning(
+                "  TIER FALLBACK: fewer than 2 distinct tiers present in train "
+                "split — skipping tier classifier this run."
+            )
+            gain_tier_classifier = None
+        else:
+            tier_classifier = _XGBClassifierForTiers(
+                n_estimators=100,
+                max_depth=3,
+                learning_rate=0.05,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                min_child_weight=4,
+                gamma=0.3,
+                reg_alpha=0.3,
+                reg_lambda=2.0,
+                objective="multi:softprob",
+                num_class=len(GAIN_TIERS),
+                eval_metric="mlogloss",
+                random_state=42,
+                n_jobs=-1,
+                early_stopping_rounds=30,
+            )
+            tier_classifier.fit(
+                X_tr, y_tier_tr,
+                sample_weight=w_tr.values,
+                eval_set=[(X_va, y_tier_va)],
+                sample_weight_eval_set=[w_va.values],
+                verbose=False,
+            )
+            tier_pred = tier_classifier.predict(X_va)
+            tier_acc = float((tier_pred == y_tier_va.values).mean())
+            _baseline_acc = float(y_tier_va.value_counts(normalize=True).max())
+            logger.info(
+                f"  TIER FALLBACK: val accuracy={tier_acc:.3f} "
+                f"(majority-class baseline={_baseline_acc:.3f}, "
+                f"best_iteration={tier_classifier.best_iteration})"
+            )
+            if tier_acc <= _baseline_acc:
+                logger.warning(
+                    "  ⚠️  TIER FALLBACK: classifier does not beat the majority-class "
+                    "baseline yet — informative pool is likely still too small for "
+                    "even this coarse a target. Not necessarily a bug; re-check after "
+                    "the informative-row pool grows."
+                )
+            tier_classifier._tier_boundaries = GAIN_TIERS  # type: ignore[attr-defined]
+            gain_tier_classifier = tier_classifier
+    except Exception as _tier_exc:  # noqa: BLE001 - this is a best-effort bonus artifact
+        logger.warning(f"  TIER FALLBACK: skipped due to error: {_tier_exc}")
+        gain_tier_classifier = None
+
+    regressor._gain_tier_classifier = gain_tier_classifier  # type: ignore[attr-defined]
 
     return regressor
 
@@ -5363,24 +5571,51 @@ def main() -> int:
     #
     # Minimum requirements: ≥10 positives in each half after the split.
     CAL_MIN_POS = 10
+
+    # CAL_SPLIT_FRACTION (2026-08-13): fraction of the val set given to the
+    # calibration holdout, with the remainder going to early-stopping.  This
+    # was a hardcoded 50/50 split; per the earlier analysis, isotonic
+    # regression degrades more gracefully with fewer points than AUC-based
+    # early stopping does, and the 50/50 split was starving the calibrator
+    # (1526 cal rows here) enough to produce hard flat plateaus in the
+    # calibrated-probability distribution. Shifting the split to 60/40 in
+    # favor of calibration gives the isotonic fit more points to define finer
+    # steps, while early-stopping still keeps a reasonable pool (AUC is a
+    # fairly stable signal even with somewhat fewer points, per the same
+    # reasoning that justified eval_metric="auc" in the first place).
+    # Re-tune if best_iteration starts coming in noisy/low again.
+    CAL_SPLIT_FRACTION = 0.6
+
     X_cal_fit, y_cal_fit = None, None
     X_val_xgb, y_val_xgb = X_val, y_val
 
     _val_pos_idx  = y_val[y_val == 1].index.tolist()
     _val_neg_idx  = y_val[y_val == 0].index.tolist()
-    _n_cal_pos    = len(_val_pos_idx) // 2
-    _n_cal_neg    = len(_val_neg_idx) // 2
+
+    def _fractional_interleave_split(idx_list: list, cal_fraction: float) -> tuple[list, list]:
+        """Split idx_list into (cal_idx, stop_idx) at roughly cal_fraction,
+        selecting cal positions evenly spaced across the list so both halves
+        still span the full time window (same regime-mix goal as the
+        original interleave, generalised from a fixed 50/50 to any ratio)."""
+        n = len(idx_list)
+        n_cal = round(n * cal_fraction)
+        if n_cal <= 0:
+            return [], list(idx_list)
+        if n_cal >= n:
+            return list(idx_list), []
+        cal_positions = set(np.linspace(0, n - 1, n_cal).round().astype(int).tolist())
+        cal_idx  = [idx_list[i] for i in range(n) if i in cal_positions]
+        stop_idx = [idx_list[i] for i in range(n) if i not in cal_positions]
+        return cal_idx, stop_idx
+
+    _cal_pos_idx, _stop_pos_idx = _fractional_interleave_split(_val_pos_idx, CAL_SPLIT_FRACTION)
+    _cal_neg_idx, _stop_neg_idx = _fractional_interleave_split(_val_neg_idx, CAL_SPLIT_FRACTION)
+    _n_cal_pos = len(_cal_pos_idx)
+    _n_cal_neg = len(_cal_neg_idx)
 
     if _n_cal_pos >= CAL_MIN_POS and _n_cal_neg >= CAL_MIN_POS:
-        # ISSUE 1 FIX: interleave by position instead of taking first/second halves.
-        # y_val is time-ordered ascending, so a first/second-half split gives the
-        # calibrator the OLDEST val rows and early-stopping the NEWEST — two different
-        # market sub-periods.  Interleaving (even positions → cal, odd → early-stop)
-        # ensures both sets span the full val time window with the same regime mix,
-        # making the isotonic calibrator representative of the same period the
-        # early-stopping signal comes from.
-        _cal_idx  = _val_pos_idx[0::2] + _val_neg_idx[0::2]   # even positions → cal
-        _stop_idx = _val_pos_idx[1::2] + _val_neg_idx[1::2]   # odd positions  → early-stop
+        _cal_idx  = _cal_pos_idx + _cal_neg_idx
+        _stop_idx = _stop_pos_idx + _stop_neg_idx
 
         X_cal_fit    = X_val.loc[_cal_idx]
         y_cal_fit    = y_val.loc[_cal_idx]
@@ -5390,7 +5625,8 @@ def main() -> int:
         cal_pos = int((y_cal_fit == 1).sum())
         cal_neg = int((y_cal_fit == 0).sum())
         logger.info(
-            f"RC6: Calibration set carved from val (same T-1 regime as inference). "
+            f"RC6: Calibration set carved from val (same T-1 regime as inference), "
+            f"{CAL_SPLIT_FRACTION:.0%}/{1-CAL_SPLIT_FRACTION:.0%} cal/early-stop split. "
             f"Cal: {len(X_cal_fit)} rows ({cal_pos} pos / {cal_neg} neg, "
             f"rate={cal_pos/max(1,len(X_cal_fit)):.1%}). "
             f"Early-stop val: {len(X_val_xgb)} rows "
@@ -5399,7 +5635,7 @@ def main() -> int:
     else:
         logger.info(
             f"RC6: Val set too small to split for calibration "
-            f"({_n_cal_pos} pos / {_n_cal_neg} neg per half, need ≥{CAL_MIN_POS} each). "
+            f"({_n_cal_pos} pos / {_n_cal_neg} neg in cal share, need ≥{CAL_MIN_POS} each). "
             "Training without isotonic calibration."
         )
 
