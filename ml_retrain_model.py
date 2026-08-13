@@ -336,6 +336,15 @@ def _t1_source_propensity_weights(
 # interleave — could shift toward giving early-stopping more of the val set
 # than calibration, since isotonic degrades more gracefully with fewer points
 # than AUC-based early stopping does).
+#
+# CAUTION observed in practice: because row volume is NOT uniform over time
+# (recent weeks can carry far more rows than older ones), an 8→12 week bump
+# was observed to nearly triple val size (1.1k→3.3k rows) while train
+# collapsed by ~2/3 (4.9k→1.6k) — badly starving the gain regressor, which
+# only trains on the classifier's train split. See the MAX_VAL_FRACTION
+# guard in train_val_split(), which now caps val at a fraction of total
+# dated rows regardless of what VAL_WEEKS resolves to, so raising VAL_WEEKS
+# further should no longer have this runaway effect.
 VAL_WEEKS = 12
 
 # ---------------------------------------------------------------------------
@@ -2924,6 +2933,63 @@ def train_val_split(
     VAL_CUTOFF_DATE = "unknown"  # default; overwritten below when date_col is present
     if date_col is not None:
         cutoff = _compute_val_cutoff(df_work)
+
+        # ── MAX_VAL_FRACTION guard ───────────────────────────────────────
+        # A fixed calendar window (VAL_WEEKS) assumes roughly steady row
+        # volume over time. That assumption breaks when data collection
+        # volume itself is non-stationary — e.g. the screener started
+        # covering far more symbols/day in recent weeks than it did months
+        # ago. In that case widening VAL_WEEKS to fix a too-small val set
+        # can backfire: going 8→12 weeks was observed to take val from
+        # ~1.1k rows to ~3.3k rows (a ~3x jump for a 1.5x window increase),
+        # while train collapsed from ~4.9k rows to ~1.6k — starving the
+        # classifier's train split and, worse, the gain regressor (which
+        # only sees the classifier's train split) of the majority of
+        # available data. That is very likely why gain-regressor R² got
+        # dramatically worse (-14.6) even though the classifier's own AUC
+        # looked fine.
+        #
+        # Cap val at MAX_VAL_FRACTION of all dated rows: if the VAL_WEEKS
+        # cutoff would take more than that, shrink the window (move cutoff
+        # later/more recent) until val is back under the cap, using a
+        # per-row date quantile so the cap tracks actual row density
+        # instead of calendar time. Never shrink below what's needed for
+        # MIN_VAL_POSITIVES — if the fraction cap and the positive-count
+        # floor conflict, the floor wins and a warning is logged so the
+        # tension is visible instead of silently picking one.
+        MAX_VAL_FRACTION = 0.30
+        _dated = pd.to_datetime(df_work[date_col], errors="coerce")
+        _dated = _dated[_dated.notna()]
+        if len(_dated) > 0:
+            _val_frac_at_cutoff = (_dated >= cutoff).mean()
+            if _val_frac_at_cutoff > MAX_VAL_FRACTION:
+                _capped_cutoff = _dated.quantile(1.0 - MAX_VAL_FRACTION)
+                # Check the capped cutoff still leaves enough positives in val.
+                _cand_val_mask = _dated.index.isin(
+                    _dated[_dated >= _capped_cutoff].index
+                )
+                _cand_val_pos = int(y.reindex(_dated.index).fillna(0)[_cand_val_mask].sum()) \
+                    if hasattr(y, "reindex") else None
+                if _cand_val_pos is None or _cand_val_pos >= MIN_VAL_POSITIVES:
+                    logger.info(
+                        f"MAX_VAL_FRACTION guard: {VAL_WEEKS}-week cutoff would put "
+                        f"{_val_frac_at_cutoff:.1%} of dated rows in val (row volume is "
+                        f"not uniform over time) — capping to {MAX_VAL_FRACTION:.0%} by "
+                        f"moving cutoff {cutoff.date()} → {pd.Timestamp(_capped_cutoff).date()}."
+                    )
+                    cutoff = pd.Timestamp(_capped_cutoff)
+                else:
+                    logger.warning(
+                        f"MAX_VAL_FRACTION guard: {VAL_WEEKS}-week cutoff puts "
+                        f"{_val_frac_at_cutoff:.1%} of dated rows in val, above the "
+                        f"{MAX_VAL_FRACTION:.0%} cap, but shrinking to the cap would drop "
+                        f"val positives to ~{_cand_val_pos} (< MIN_VAL_POSITIVES="
+                        f"{MIN_VAL_POSITIVES}). Keeping the wider {VAL_WEEKS}-week window "
+                        "— train set will be smaller than ideal this run. Consider "
+                        "lowering VAL_WEEKS or investigating why recent weeks are so much "
+                        "denser than older ones."
+                    )
+
         VAL_CUTOFF_DATE = cutoff.date()  # stored for metadata/logging
         dates  = pd.to_datetime(df_work[date_col], errors="coerce")
 
