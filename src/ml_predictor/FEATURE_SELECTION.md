@@ -57,6 +57,25 @@ or a dict with an `excluded_features` key (so you can leave yourself a note):
 {"excluded_features": ["some_leaky_feature"], "note": "why"}
 ```
 
+`excluded_features` can also mix general and specific entries with
+`excluded_base_features`:
+
+```json
+{
+  "excluded_features": ["some_leaky_feature", "t1_close_DCL_20_20"],
+  "excluded_base_features": ["BBL_20_2.0_2.0"],
+  "note": "why"
+}
+```
+
+- `excluded_features: ["t1_close_DCL_20_20"]` — specific: blocks only that
+  one exact T-1 close-side column, leaving `t1_open_DCL_20_20` /
+  `t3_dcl_20_20` / etc. live.
+- `excluded_base_features: ["BBL_20_2.0_2.0"]` — general: blocks every
+  lag/side **and** open/close variant of that indicator at once
+  (`t1_open_BBL_...`, `t1_close_BBL_...`, `t3_bbl_...`, `t5_bbl_...`,
+  `t10_bbl_...`).
+
 A missing file is treated as an empty blocklist (no error). Flags:
 
 - `--exclude-features-file PATH` — point at a different blocklist (default
