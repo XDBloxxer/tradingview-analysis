@@ -76,6 +76,12 @@ or a dict with an `excluded_features` key (so you can leave yourself a note):
   (`t1_open_BBL_...`, `t1_close_BBL_...`, `t3_bbl_...`, `t5_bbl_...`,
   `t10_bbl_...`).
 
+If a lag/side-prefixed name (e.g. `"t1_close_HV_10"`) ends up in
+`excluded_base_features` by mistake, it's still honored — it's matched as
+an exact single-column exclusion rather than silently dropping nothing —
+but the recommended place for it is `excluded_features`, so the intent
+(one specific column vs. every variant) is unambiguous from the file.
+
 A missing file is treated as an empty blocklist (no error). Flags:
 
 - `--exclude-features-file PATH` — point at a different blocklist (default
