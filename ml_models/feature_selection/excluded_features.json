@@ -9,7 +9,13 @@
     "Volume_MA10",
     "Volume_MA20",
     "Volume_Ratio",
-    "SMA_20_50_Diff"
+    "SMA_20_50_Diff",
+    "t1_open_HV_10",
+    "t1_close_HV_10",
+    "t1_open_HV_20",
+    "t1_close_HV_20",
+    "t1_open_HV_30",
+    "t1_close_HV_30"
   ],
   "note": "excluded_base_features entries block EVERY lag/side variant of that indicator (t1_open_*, t1_close_*, t3_*, t5_*, t10_*), matched case-insensitively after stripping the prefix -- see apply_feature_exclusions() in feature_selection.py. DCL_20_20 and BBL_20_2.0_2.0 originally blocked 2026-07-28 (as exact names, one lag/side each) after RFECV collapsed to 15 features with these two alone carrying ~60% importance and val AUC hit 1.0000 with a fully bimodal probability distribution; live predictions were degenerate (near-zero confidence, gain regressor flat at ~4.1%). Only t1_open_DCL_20_20 and t1_close_BBL_20_2.0_2.0 were listed, leaving t1_close_DCL_20_20 (univariate AUC 1.000000) and t1_open_BBL_20_2.0_2.0 (univariate AUC 0.955) unblocked and fully exploitable -- confirmed via diagnose_feature_leakage.py on 2026-08-09 with symbol-purge + embargo leak guards active, so this is leakage baked into the feature/label construction itself, not time- or symbol-boundary leakage. Root cause not yet identified -- check whether DCL_20_20/BBL_20_2.0_2.0 construction overlaps with the winner/non-winner label definition or detector-selection criteria before re-testing with these unblocked. 2026-08-11: extended the block to the rest of the Donchian/Bollinger/Keltner band families (DCU_20_20, BBM_20_2.0_2.0, BBU_20_2.0_2.0, KCBe_20_2, KCUe_20_2) after BBU_20_2.0_2.0 and KCUe_20_2 showed up as top features in the next selection run and DCU_20_20 was a near-miss (0.625 stability frequency) -- same construction as the already-confirmed-leaky lower bands, root cause for the family as a whole still not identified. KCLe_20_2 was already blocked 2026-07-28 alongside DCL_20_20/BBL_20_2.0_2.0 but its BBU/KCUe siblings were missed at the time; this closes that gap."
 }
