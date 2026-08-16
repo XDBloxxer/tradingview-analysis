@@ -79,7 +79,9 @@ def load_excluded_features(path: str | Path) -> tuple[list[str], list[str]]:
 
       exact_names: matched literally against column names — use for one-off
         columns that don't follow the lag/side-prefix convention (e.g.
-        "has_t1_features").
+        "has_t1_features"), or to block one specific lag/side variant of an
+        indicator (e.g. "t1_close_HV_10" blocks only the T-1 close-side
+        column, leaving t1_open_HV_10 / t3_hv_10 / etc. live).
 
       base_names: matched against the BASE indicator name after stripping
         the lag/side prefix (t1_open_/t1_close_/t3_/t5_/t10_), case-
@@ -95,7 +97,7 @@ def load_excluded_features(path: str | Path) -> tuple[list[str], list[str]]:
     Expected JSON shape:
 
         {
-          "excluded_features": ["some_one_off_column"],
+          "excluded_features": ["some_one_off_column", "t1_close_HV_10"],
           "excluded_base_features": ["DCL_20_20", "BBL_20_2.0_2.0"],
           "note": "why"
         }
