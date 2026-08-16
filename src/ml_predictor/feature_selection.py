@@ -94,6 +94,17 @@ def load_excluded_features(path: str | Path) -> tuple[list[str], list[str]]:
         t1_open_DCL_20_20 while t1_close_DCL_20_20 stayed live and scored a
         1.000 univariate AUC) leaves the leak fully exploitable.
 
+        If an entry here already carries a lag/side prefix itself (e.g.
+        "t1_close_HV_10" instead of the bare "HV_10"), it's treated as an
+        exact single-column exclusion — matching only that one literal
+        column — rather than a base-indicator exclusion, since a prefixed
+        entry can never match anything once the prefix is stripped from
+        the column side for comparison. This is a safety net for a
+        misfiled entry, not the recommended way to write one: if you want
+        every variant blocked, use the bare base name; if you want only
+        one specific variant blocked, put the prefixed name in
+        `excluded_features` instead so the intent is unambiguous.
+
     Expected JSON shape:
 
         {
@@ -157,6 +168,13 @@ def apply_feature_exclusions(
     case-insensitively — see load_excluded_features docstring) from X
     before any selection stage sees them.
 
+    An `excluded_base_features` entry that already carries a lag/side
+    prefix (e.g. "t1_close_HV_10") is matched as an exact single column
+    instead — it can never match via base-name comparison, since the
+    prefix is stripped from the column side but not from a target that
+    already has one baked in, and that would otherwise silently exclude
+    nothing (see the base_names section of load_excluded_features).
+
     Names in the blocklist that aren't actually present in X are logged and
     ignored (not an error) — the pipeline's feature set changes over time,
     so a stale entry shouldn't break the run.
@@ -168,7 +186,14 @@ def apply_feature_exclusions(
     if missing:
         logger.info(f"[exclude] {len(missing)} blocklisted exact name(s) not present in X (ignored): {missing}")
 
-    base_targets = {b.lower() for b in excluded_base_features}
+    # Split excluded_base_features into genuinely-bare entries (matched
+    # against the stripped base name, blocking every variant) and entries
+    # that already carry a recognized lag/side prefix (matched exactly,
+    # case-insensitively, against one literal column) — see docstring.
+    bare_bases = [b for b in excluded_base_features if not _LAG_SIDE_PREFIX_RE.match(b)]
+    prefixed_bases = [b for b in excluded_base_features if _LAG_SIDE_PREFIX_RE.match(b)]
+
+    base_targets = {b.lower() for b in bare_bases}
     base_matches = [c for c in X.columns if _base_feature_name(c) in base_targets]
     matched_bases = {_base_feature_name(c) for c in base_matches}
     unmatched_bases = base_targets - matched_bases
@@ -178,7 +203,23 @@ def apply_feature_exclusions(
             f"matched no column in X (ignored): {sorted(unmatched_bases)}"
         )
 
-    to_drop = sorted(set(present) | set(base_matches))
+    prefixed_targets = {b.lower() for b in prefixed_bases}
+    prefixed_matches = [c for c in X.columns if c.lower() in prefixed_targets]
+    matched_prefixed = {c.lower() for c in prefixed_matches}
+    unmatched_prefixed = prefixed_targets - matched_prefixed
+    if prefixed_bases:
+        logger.info(
+            f"[exclude] {len(prefixed_bases)} entr(y/ies) in excluded_base_features "
+            f"already carry a lag/side prefix — matched as exact single-column "
+            f"exclusions instead of base-indicator exclusions: {sorted(prefixed_targets)}"
+        )
+    if unmatched_prefixed:
+        logger.info(
+            f"[exclude] {len(unmatched_prefixed)} prefixed base-indicator exclusion(s) "
+            f"matched no column in X (ignored): {sorted(unmatched_prefixed)}"
+        )
+
+    to_drop = sorted(set(present) | set(base_matches) | set(prefixed_matches))
     if to_drop:
         logger.info(f"[exclude] dropping {len(to_drop)} blocklisted feature(s): {to_drop}")
     return X.drop(columns=to_drop) if to_drop else X
