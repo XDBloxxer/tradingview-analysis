@@ -1798,6 +1798,7 @@ def enrich_mistakes_with_gains(
 
 def _compute_correct_actual_high_pct(
     winners_df: pd.DataFrame,
+    source_label: str = "winners",
 ) -> pd.DataFrame:
     """
     RC2 FIX: Compute actual_high_pct using the PREVIOUS day's close as the
@@ -1836,7 +1837,7 @@ def _compute_correct_actual_high_pct(
     required = {"symbol", "detection_date", "high"}
     if not required.issubset(winners_df.columns):
         logger.warning(
-            f"RC2: daily_winners missing required columns {required - set(winners_df.columns)} "
+            f"RC2: {source_label} missing required columns {required - set(winners_df.columns)} "
             "— cannot compute corrected actual_high_pct"
         )
         return winners_df
@@ -1857,7 +1858,7 @@ def _compute_correct_actual_high_pct(
         df.loc[mask_db, "prev_close"] = db_vals[mask_db]
         df.loc[mask_db, "_prev_close_source"] = "db"
         n_db = int(mask_db.sum())
-        logger.info(f"RC2: prev_close_db column supplied {n_db}/{n_total} rows")
+        logger.info(f"RC2: prev_close_db column supplied {n_db}/{n_total} rows ({source_label})")
     else:
         n_db = 0
 
@@ -1884,7 +1885,7 @@ def _compute_correct_actual_high_pct(
         if n_shift_nan_oneoff > 0:
             logger.info(
                 f"RC2: shift(1) produced NaN for {n_shift_nan_oneoff}/{n_total} rows "
-                f"(symbols appear only once in daily_winners — open fallback will be used)"
+                f"(symbols appear only once in {source_label} — open fallback will be used)"
             )
     else:
         n_shift = 0
@@ -1904,7 +1905,7 @@ def _compute_correct_actual_high_pct(
     n_none = int((df["_prev_close_source"] == "none").sum())
 
     logger.info(
-        f"RC2: prev_close sources — db:{n_db}  shift:{n_shift}  "
+        f"RC2: prev_close sources ({source_label}) — db:{n_db}  shift:{n_shift}  "
         f"open_fallback:{n_open}  missing:{n_none}  total:{n_total}"
     )
 
@@ -1913,12 +1914,12 @@ def _compute_correct_actual_high_pct(
     n_non_db = n_total - n_db  # rows that couldn't use the reliable db source
     if n_non_db > 0 and n_open / n_total > OPEN_FALLBACK_WARN_PCT:
         logger.warning(
-            f"RC2 WARNING: {n_open}/{n_total} rows ({n_open / n_total:.1%}) are using "
-            f"same-day open as prev_close proxy. This is a noisy fallback. "
-            f"Consider storing prev_close_db in the daily_winners table at insertion "
+            f"RC2 WARNING: {n_open}/{n_total} rows ({n_open / n_total:.1%}) of {source_label} "
+            f"are using same-day open as prev_close proxy. This is a noisy fallback. "
+            f"Consider storing prev_close_db in the {source_label} table at insertion "
             f"time (e.g. from the yfinance previous-day close) to improve accuracy. "
             f"shift(1) only helps when the same symbol appears on consecutive days in "
-            f"daily_winners, which is rare for one-off small-cap winners."
+            f"{source_label}, which is rare for one-off small-cap rows."
         )
 
     # ── Compute corrected actual_high_pct ────────────────────────────────────
@@ -1944,13 +1945,14 @@ def _compute_correct_actual_high_pct(
         # Break down corrected rows by source for transparency
         src_counts = df.loc[valid_mask, "_prev_close_source"].value_counts().to_dict()
         logger.info(
-            f"RC2: Corrected actual_high_pct for {n_corrected}/{n_total} winner rows "
+            f"RC2: Corrected actual_high_pct for {n_corrected}/{n_total} {source_label} rows "
             f"(range: {pct_range.min():.1f}%–{pct_range.max():.1f}%, "
             f"mean: {pct_range.mean():.1f}%) | sources: {src_counts}"
         )
     else:
         logger.warning(
-            "RC2: Could not compute corrected actual_high_pct — no prev_close data available"
+            f"RC2: Could not compute corrected actual_high_pct for {source_label} — "
+            "no prev_close data available"
         )
 
     # Drop diagnostic column before returning
@@ -1959,6 +1961,125 @@ def _compute_correct_actual_high_pct(
     # Restore string dates
     df["detection_date"] = df["detection_date"].dt.strftime("%Y-%m-%d")
     return df
+
+
+# ---------------------------------------------------------------------------
+# DAILY-OUTCOME GAIN TARGET FIX: build the gain-regressor training label the
+# SAME WAY the classifier gets its label — straight from the daily_winners /
+# daily_non_winners tables, joined onto the classifier's existing feature-row
+# pool by (symbol, detection_date), with NO second snapshot table required to
+# "agree" before a row counts.
+#
+# WHY THIS EXISTS (root cause of the regressor's tiny informative pool):
+#   The classifier's label is nearly free — it's just "which table did this
+#   row's FEATURES come from" (winners_day_prior_* vs non_winners_day_prior_*),
+#   assigned at ingestion. Every T-1 row that has features gets a label.
+#
+#   The regressor's previous primary target ('true_gain_pct', built by
+#   fetch_market_snapshot_gain_targets() below) instead required an INNER JOIN
+#   between two independently-populated snapshot tables
+#   (winners_market_close x winners_day_prior_close). If either collector
+#   missed a day, or the dates didn't line up, the row silently vanished from
+#   the training pool entirely — with no warning. That inner join, not a lack
+#   of underlying data, is what collapsed the informative pool to ~239
+#   winners + ~26 non-winners even though daily_winners alone has ~1990 rows.
+#
+#   daily_winners / daily_non_winners already store the actual measured
+#   outcome (open/high/close, and — via _compute_correct_actual_high_pct — a
+#   correctly prev_close-denominated actual_high_pct) for every scanned
+#   symbol, with no second table needed to corroborate it. Left-joining that
+#   directly onto the SAME feature-row pool the classifier already trains on
+#   (winners_day_prior_*/non_winners_day_prior_* + t3_/t5_/t10_ multiday,
+#   built in load_t1_data()) gives the regressor access to essentially the
+#   same row count as the classifier, just with a continuous target instead
+#   of a binary one — exactly mirroring how the classifier is trained.
+# ---------------------------------------------------------------------------
+
+def fetch_daily_outcomes_gain_targets(client: Client) -> pd.DataFrame:
+    """
+    Build (symbol, detection_date) -> gain-outcome directly from daily_winners
+    and daily_non_winners — the same tables that already hold ~1990+ real,
+    directly-measured outcomes — instead of requiring a second snapshot table
+    to independently corroborate the row (see module comment above).
+
+    Returns:
+        DataFrame with columns: symbol, detection_date, daily_outcome_gain_pct,
+        label (1 for daily_winners rows, 0 for daily_non_winners rows). Empty
+        DataFrame (same columns, zero rows) if neither source table is usable.
+    """
+    SOURCE_TABLES = [
+        ("daily_winners",     1),
+        ("daily_non_winners", 0),
+    ]
+
+    frames = []
+    for table_name, label in SOURCE_TABLES:
+        try:
+            raw_df = fetch_table_paginated(client, table_name)
+        except Exception as e:
+            logger.warning(f"daily_outcome_gain_pct: could not fetch '{table_name}': {e}")
+            continue
+        if raw_df.empty:
+            logger.warning(f"daily_outcome_gain_pct: '{table_name}' is empty — skipping")
+            continue
+        if not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
+            logger.warning(
+                f"daily_outcome_gain_pct: '{table_name}' missing required columns "
+                f"{{'symbol', 'detection_date', 'high'}} - "
+                f"{set(raw_df.columns)} — skipping"
+            )
+            continue
+
+        # Reuse the same prev_close-correction logic already used for
+        # daily_winners (RC2) — it only needs symbol/detection_date/high plus
+        # optional prev_close_db/close/open, which daily_non_winners also has.
+        corrected = _compute_correct_actual_high_pct(raw_df, source_label=table_name)
+        if "actual_high_pct" not in corrected.columns:
+            logger.warning(
+                f"daily_outcome_gain_pct: '{table_name}' correction produced no "
+                "actual_high_pct column — skipping"
+            )
+            continue
+
+        out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
+        out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
+        out["detection_date"] = pd.to_datetime(
+            out["detection_date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+        out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
+        out["label"] = label
+        # Keep the most recently-computed row per (symbol, detection_date) if
+        # the table happens to contain duplicates.
+        out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+
+        if not out.empty:
+            logger.info(
+                f"daily_outcome_gain_pct: {table_name} -> {len(out)} rows with a "
+                f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
+                f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
+                f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
+            )
+            frames.append(out)
+        else:
+            logger.warning(
+                f"daily_outcome_gain_pct: '{table_name}' produced 0 rows with a valid "
+                "corrected gain outcome — skipping"
+            )
+
+    if not frames:
+        logger.warning(
+            "daily_outcome_gain_pct: no usable rows from daily_winners/daily_non_winners — "
+            "gain regressor will fall back to the market-snapshot / legacy target sources."
+        )
+        return pd.DataFrame(columns=["symbol", "detection_date", "daily_outcome_gain_pct", "label"])
+
+    result = pd.concat(frames, ignore_index=True)
+    result = result.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+    logger.info(
+        f"daily_outcome_gain_pct: {len(result)} total rows with a directly-measured "
+        "daily_winners/daily_non_winners gain outcome (no second-table join required)"
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2089,30 +2210,79 @@ def fetch_market_snapshot_gain_targets(client: Client) -> pd.DataFrame:
     return result
 
 
-def attach_true_gain_targets(combined_df: pd.DataFrame, market_gain_df: pd.DataFrame) -> pd.DataFrame:
+def attach_true_gain_targets(
+    combined_df: pd.DataFrame,
+    market_gain_df: pd.DataFrame,
+    daily_outcome_df: "Optional[pd.DataFrame]" = None,
+) -> pd.DataFrame:
     """
-    Merge true_gain_pct (from fetch_market_snapshot_gain_targets) onto
-    combined_df by (symbol, detection_date), and build a single unified gain
-    target column '_unified_gain_target' that the gain regressor reads first:
+    Merge gain-outcome sources onto combined_df by (symbol, detection_date),
+    and build a single unified gain target column '_unified_gain_target' that
+    the gain regressor reads first. Priority (highest first):
 
-        1. true_gain_pct           — market-snapshot-derived (T-1 rows; see above)
-        2. gain_pct                — ml_training_base's own pre-computed gain
+        1. daily_outcome_gain_pct  — DIRECTLY from daily_winners /
+                                      daily_non_winners (see
+                                      fetch_daily_outcomes_gain_targets()
+                                      above). Simple left-join onto the SAME
+                                      feature-row pool the classifier trains
+                                      on (winners_day_prior_*/
+                                      non_winners_day_prior_* + t3_/t5_/t10_
+                                      multiday) — no second snapshot table
+                                      has to independently corroborate the
+                                      row for it to count. This is the
+                                      regressor's equivalent of "does this
+                                      row's features exist" for the
+                                      classifier, and should cover close to
+                                      the full daily_winners/daily_non_winners
+                                      population.
+        2. true_gain_pct           — market-snapshot-derived (T-1 rows).
+                                      Requires winners_market_close AND
+                                      winners_day_prior_close to BOTH have a
+                                      matching row (inner join) — kept only
+                                      as a secondary fallback for rows that
+                                      daily_outcome_gain_pct didn't reach.
+        3. gain_pct                — ml_training_base's own pre-computed gain
                                       column, previously collected but never
                                       used as a regression target (only
                                       excluded from the feature matrix to
                                       avoid classifier leakage). Covers the
-                                      base-CSV rows that true_gain_pct can't
-                                      reach (they have no detection_date).
+                                      base-CSV rows that neither of the above
+                                      can reach (they have no detection_date).
 
-    Rows with neither source populated are left NaN in '_unified_gain_target'
-    and train_gain_regressor() falls back to its legacy
-    actual_high_pct / actual_gain_pct / accuracy-table logic for them.
+    Rows with none of these sources populated are left NaN in
+    '_unified_gain_target' and train_gain_regressor() falls back to its
+    legacy actual_high_pct / actual_gain_pct / accuracy-table logic for them.
     """
     combined_df = combined_df.copy()
 
     symbol_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
-    if symbol_col and "detection_date" in combined_df.columns and not market_gain_df.empty:
-        _key = pd.to_datetime(combined_df["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    has_join_keys = symbol_col and "detection_date" in combined_df.columns
+    _key = (
+        pd.to_datetime(combined_df["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+        if has_join_keys else None
+    )
+
+    # ── Source 1 (highest priority): daily_winners / daily_non_winners ──────
+    if has_join_keys and daily_outcome_df is not None and not daily_outcome_df.empty:
+        _lookup_daily = daily_outcome_df.set_index(
+            ["symbol", "detection_date"]
+        )["daily_outcome_gain_pct"]
+        keys = list(zip(combined_df[symbol_col], _key))
+        combined_df["daily_outcome_gain_pct"] = [_lookup_daily.get(k, np.nan) for k in keys]
+        n_matched_daily = combined_df["daily_outcome_gain_pct"].notna().sum()
+        logger.info(
+            f"daily_outcome_gain_pct: matched onto {n_matched_daily}/{len(combined_df)} "
+            "combined_df rows (direct daily_winners/daily_non_winners join)"
+        )
+    else:
+        combined_df["daily_outcome_gain_pct"] = np.nan
+        logger.info(
+            "daily_outcome_gain_pct: nothing to merge (no daily_outcome_df data or "
+            "no symbol/detection_date columns)"
+        )
+
+    # ── Source 2: market-snapshot true_gain_pct (secondary fallback) ────────
+    if has_join_keys and not market_gain_df.empty:
         _lookup = market_gain_df.set_index(["symbol", "detection_date"])["true_gain_pct"]
         keys = list(zip(combined_df[symbol_col], _key))
         combined_df["true_gain_pct"] = [_lookup.get(k, np.nan) for k in keys]
@@ -2122,13 +2292,21 @@ def attach_true_gain_targets(combined_df: pd.DataFrame, market_gain_df: pd.DataF
         combined_df["true_gain_pct"] = np.nan
         logger.info("true_gain_pct: nothing to merge (no market_gain_df data or no detection_date column)")
 
-    unified = combined_df["true_gain_pct"].copy()
+    unified = combined_df["daily_outcome_gain_pct"].copy()
+    n_filled_from_snapshot = int((unified.isna() & combined_df["true_gain_pct"].notna()).sum())
+    unified = unified.fillna(combined_df["true_gain_pct"])
+    if n_filled_from_snapshot:
+        logger.info(
+            f"_unified_gain_target: filled {n_filled_from_snapshot} additional rows from "
+            "true_gain_pct (market-snapshot fallback, used where daily_outcome_gain_pct was NaN)"
+        )
+
     if "gain_pct" in combined_df.columns:
         gain_pct_numeric = pd.to_numeric(combined_df["gain_pct"], errors="coerce")
         n_filled_from_base = int((unified.isna() & gain_pct_numeric.notna()).sum())
         unified = unified.fillna(gain_pct_numeric)
         logger.info(
-            f"true_gain_pct: filled {n_filled_from_base} additional rows from "
+            f"_unified_gain_target: filled {n_filled_from_base} additional rows from "
             "ml_training_base.gain_pct (previously unused as a regression target)"
         )
 
@@ -2136,7 +2314,7 @@ def attach_true_gain_targets(combined_df: pd.DataFrame, market_gain_df: pd.DataF
     n_total_unified = int(combined_df["_unified_gain_target"].notna().sum())
     logger.info(
         f"_unified_gain_target populated for {n_total_unified}/{len(combined_df)} rows "
-        "(true_gain_pct + ml_training_base.gain_pct combined)"
+        "(daily_outcome_gain_pct > true_gain_pct > ml_training_base.gain_pct, in priority order)"
     )
     return combined_df
 
@@ -3625,13 +3803,16 @@ def train_gain_regressor(
     # that accuracy-table data can count toward the ≥30 threshold.
     # ------------------------------------------------------------------
     gain_col = None
-    # TRUE GAIN TARGET FIX: '_unified_gain_target' (built in attach_true_gain_targets()
-    # from true_gain_pct — the market_close/day_prior_close snapshot join — and
-    # ml_training_base.gain_pct) is checked FIRST. It is a directly-measured,
-    # pipeline-native label with no yfinance/ml_prediction_accuracy dependency,
-    # and it covers both T-1 rows (via true_gain_pct) and base-CSV rows (via
-    # gain_pct, previously discarded entirely). The legacy columns below remain
-    # as a fallback for any deployment that hasn't backfilled the new tables yet.
+    # DAILY-OUTCOME GAIN TARGET FIX: '_unified_gain_target' (built in
+    # attach_true_gain_targets()) is checked FIRST. Priority inside that
+    # column: daily_outcome_gain_pct (direct daily_winners/daily_non_winners
+    # join — the SAME row-matching approach the classifier's label already
+    # uses, no second table has to independently corroborate the row) >
+    # true_gain_pct (market_close/day_prior_close inner-join fallback) >
+    # ml_training_base.gain_pct (base-CSV rows with no detection_date). It is
+    # a directly-measured, pipeline-native label with no yfinance/
+    # ml_prediction_accuracy dependency. The legacy columns below remain as a
+    # fallback for any deployment that hasn't backfilled the new tables yet.
     for candidate in ("_unified_gain_target", "actual_high_pct", "actual_gain_pct", "change_pct"):
         if candidate in combined_df.columns:
             col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
@@ -5582,9 +5763,11 @@ def main() -> int:
     # for base rows) instead of ml_prediction_accuracy. See the docstrings on
     # fetch_market_snapshot_gain_targets() / attach_true_gain_targets() above
     # for why this replaces the old actual_high_pct-via-accuracy-table path.
-    logger.info("Fetching market-snapshot gain targets (true_gain_pct)...")
+    logger.info("Fetching daily-outcome gain targets (daily_winners / daily_non_winners)...")
+    daily_outcome_df = fetch_daily_outcomes_gain_targets(client)
+    logger.info("Fetching market-snapshot gain targets (true_gain_pct, fallback)...")
     market_gain_df = fetch_market_snapshot_gain_targets(client)
-    combined_df = attach_true_gain_targets(combined_df, market_gain_df)
+    combined_df = attach_true_gain_targets(combined_df, market_gain_df, daily_outcome_df)
 
     # ── Mistake learning step — DISABLED ─────────────────────────────────────
     # Reason: with only ~18 mistakes in the corpus, the 3x/2x sample weights
