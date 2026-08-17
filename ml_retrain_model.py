@@ -2963,6 +2963,7 @@ def train_model(
     X_val_full: pd.DataFrame = None,
     y_val_full: pd.Series = None,
     n_estimators_ceiling: Optional[int] = None,
+    hyperparams_override: Optional[dict] = None,
 ) -> object:
     """Train XGBClassifier from scratch with early stopping.
 
@@ -2974,6 +2975,16 @@ def train_model(
     calibration and the tail-guarantee logic below are unaffected) — the
     ceiling only prevents a single noisy val cut from growing the model far
     past what several independent folds agree generalises.
+
+    HYPERPARAMETER SEARCH FIX: hyperparams_override, when provided, is
+    search_hyperparameters()'s best_params for {max_depth, min_child_weight,
+    gamma, reg_alpha, reg_lambda, subsample, colsample_bytree} — the winner
+    of a real search scored on the walk-forward CV folds, replacing the
+    corresponding hand-tuned values in XGBOOST_PARAMS for this run only
+    (XGBOOST_PARAMS itself is left untouched as the documented fallback/
+    baseline). Every other XGBOOST_PARAMS entry (learning_rate, objective,
+    eval_metric, n_estimators, scale_pos_weight, early_stopping_rounds) is
+    unaffected.
 
     RC6: If X_cal/y_cal are supplied (a held-out calibration set),
     the raw XGBoost model is wrapped with CalibratedClassifierCV
@@ -2988,6 +2999,20 @@ def train_model(
     training data leaks into the calibration fit.
     """
     params = XGBOOST_PARAMS.copy()
+
+    if hyperparams_override:
+        _changed = {
+            k: (params.get(k), v) for k, v in hyperparams_override.items()
+            if params.get(k) != v
+        }
+        params.update(hyperparams_override)
+        if _changed:
+            logger.info(
+                "  Using search_hyperparameters() results in place of hand-tuned "
+                "XGBOOST_PARAMS for this run:"
+            )
+            for k, (old, new) in _changed.items():
+                logger.info(f"    {k}: {old} -> {new}")
 
     if n_estimators_ceiling is not None and n_estimators_ceiling > 0:
         _original_n_estimators = params["n_estimators"]
@@ -3306,6 +3331,123 @@ def _cv_sort_date_and_symbols(df_work: pd.DataFrame) -> tuple:
     return sort_date, symbols
 
 
+def _prep_cv_xy(X: pd.DataFrame, y: pd.Series, w: pd.Series) -> tuple:
+    """Numeric-coerce X and pull y/w to plain arrays, shared by
+    cv_walk_forward_evaluate() and search_hyperparameters() so both fit
+    against an identical feature matrix."""
+    Xc = X.copy()
+    for c in Xc.columns:
+        Xc[c] = pd.to_numeric(Xc[c], errors="coerce")
+    Xc = Xc.replace([np.inf, -np.inf], np.nan)
+    return Xc, y.astype(int).values, w.values
+
+
+def _build_cv_splits(
+    X: pd.DataFrame,
+    combined_df: pd.DataFrame,
+    n_splits: int = CV_N_SPLITS,
+    min_train_frac: float = CV_MIN_TRAIN_FRAC,
+):
+    """Build the walk-forward fold list shared by cv_walk_forward_evaluate()
+    and search_hyperparameters(), so a hyperparameter search and the CV
+    report it feeds are always scored against the IDENTICAL folds (same
+    embargo + symbol purge as train_val_split()'s FIX 4/5).
+
+    Returns (splits, EMBARGO_DAYS) on success, or (None, reason_str) if
+    there isn't enough dated data for n_splits folds, or time_aware_splits()
+    itself raises (e.g. min_train_frac leaves too few rows).
+    """
+    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
+    sort_date, symbols = _cv_sort_date_and_symbols(combined_df)
+
+    n_dated = int(sort_date.notna().sum())
+    if n_dated < (n_splits + 1) * 2:
+        return None, f"insufficient_dated_rows:{n_dated}"
+
+    try:
+        splits = time_aware_splits(
+            sort_date,
+            n_splits=n_splits,
+            min_train_frac=min_train_frac,
+            symbols=symbols,
+            embargo_days=EMBARGO_DAYS,
+            symbol_purge_window_days=EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER,
+        )
+    except ValueError as e:
+        return None, str(e)
+
+    return splits, EMBARGO_DAYS
+
+
+def _fit_and_score_cv_folds(
+    Xc: pd.DataFrame,
+    yv: np.ndarray,
+    wv: np.ndarray,
+    splits: list,
+    params: dict,
+    random_state: int = 42,
+) -> dict:
+    """Fit one XGBOOST_PARAMS-shaped `params` dict across every
+    (train_pos, test_pos) fold in `splits`, scoring each fold with its own
+    early-stopping AUC. Shared by cv_walk_forward_evaluate() (reports the
+    active params' CV performance) and search_hyperparameters() (scores
+    each trial's candidate params) so both use identical fold-fitting logic
+    — a hyperparameter search is only a fair comparison against the
+    legitimacy report if they share the exact same fitting code path.
+
+    Folds with a degenerate class split (all-one-class train or test) are
+    skipped and excluded from the aggregates but still recorded.
+
+    Returns {"fold_aucs", "fold_best_iters", "fold_rows", "n_used"}.
+    """
+    fold_rows, fold_aucs, fold_best_iters = [], [], []
+
+    for i, (train_pos, test_pos) in enumerate(splits):
+        y_tr, y_te = yv[train_pos], yv[test_pos]
+        n_tr_pos, n_tr_neg = int((y_tr == 1).sum()), int((y_tr == 0).sum())
+        n_te_pos, n_te_neg = int((y_te == 1).sum()), int((y_te == 0).sum())
+
+        if n_tr_pos == 0 or n_tr_neg == 0 or n_te_pos == 0 or n_te_neg == 0:
+            fold_rows.append({
+                "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
+                "n_test_pos": n_te_pos, "auc": None, "best_iteration": None, "skipped": True,
+            })
+            continue
+
+        fold_params = params.copy()
+        raw_spw = n_tr_neg / n_tr_pos
+        fold_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, raw_spw)), 3)
+        # random_state may already be a key in `params` (XGBOOST_PARAMS carries
+        # one) — overwrite rather than also passing it as a separate kwarg
+        # below, which would otherwise raise "multiple values for keyword
+        # argument 'random_state'".
+        fold_params["random_state"] = random_state
+        early_stopping = fold_params.pop("early_stopping_rounds", 30)
+        fold_model = XGBClassifier(**fold_params, early_stopping_rounds=early_stopping)
+        fold_model.fit(
+            Xc.iloc[train_pos], y_tr,
+            sample_weight=wv[train_pos],
+            eval_set=[(Xc.iloc[test_pos], y_te)],
+            verbose=False,
+        )
+        fold_auc = float(fold_model.best_score)
+        fold_iter = int(fold_model.best_iteration)
+        fold_aucs.append(fold_auc)
+        fold_best_iters.append(fold_iter)
+        fold_rows.append({
+            "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
+            "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
+            "best_iteration": fold_iter, "skipped": False,
+        })
+
+    return {
+        "fold_aucs": fold_aucs,
+        "fold_best_iters": fold_best_iters,
+        "fold_rows": fold_rows,
+        "n_used": len(fold_aucs),
+    }
+
+
 def cv_walk_forward_evaluate(
     X: pd.DataFrame,
     y: pd.Series,
@@ -3314,6 +3456,7 @@ def cv_walk_forward_evaluate(
     n_splits: int = CV_N_SPLITS,
     min_train_frac: float = CV_MIN_TRAIN_FRAC,
     random_state: int = 42,
+    params_override: Optional[dict] = None,
 ) -> dict:
     """
     Walk-forward CV for the classifier itself, reusing the SAME leak-guarded
@@ -3331,10 +3474,10 @@ def cv_walk_forward_evaluate(
     best_iteration (how many trees the final model uses) reflects real
     signal or that run's particular val slice.
 
-    This fits the SAME XGBOOST_PARAMS / scale_pos_weight recipe as
-    train_model() across n_splits rolling walk-forward folds (each fold's
-    train is every dated row before its test window, honoring the embargo +
-    symbol purge) and reports:
+    This fits the SAME scale_pos_weight recipe as train_model() — using
+    XGBOOST_PARAMS by default, or `params_override` (e.g. the winner of
+    search_hyperparameters()) when given — across n_splits rolling
+    walk-forward folds and reports:
       - fold_results: per-fold (n_train, n_test, n_test_pos, auc, best_iteration)
       - mean_auc / std_auc: the CV estimate to read alongside (not instead
         of) train_val_split()'s point estimate.
@@ -3352,101 +3495,44 @@ def cv_walk_forward_evaluate(
         logger.info("cv_walk_forward_evaluate: disabled via CV_EVALUATION_ENABLED=0 — skipping.")
         return {"skipped": True, "reason": "disabled"}
 
-    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
-    sort_date, symbols = _cv_sort_date_and_symbols(combined_df)
+    splits, embargo_or_reason = _build_cv_splits(X, combined_df, n_splits, min_train_frac)
+    if splits is None:
+        logger.warning(f"cv_walk_forward_evaluate: {embargo_or_reason} — skipping CV evaluation.")
+        return {"skipped": True, "reason": embargo_or_reason}
+    EMBARGO_DAYS = embargo_or_reason
 
-    n_dated = int(sort_date.notna().sum())
-    if n_dated < (n_splits + 1) * 2:
-        logger.warning(
-            f"cv_walk_forward_evaluate: only {n_dated} dated rows — too few for "
-            f"{n_splits} walk-forward folds. Skipping CV evaluation (the final "
-            "model still trains normally on the single train_val_split() cut)."
-        )
-        return {"skipped": True, "reason": "insufficient_dated_rows", "n_dated_rows": n_dated}
-
-    try:
-        splits = time_aware_splits(
-            sort_date,
-            n_splits=n_splits,
-            min_train_frac=min_train_frac,
-            symbols=symbols,
-            embargo_days=EMBARGO_DAYS,
-            symbol_purge_window_days=EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER,
-        )
-    except ValueError as e:
-        logger.warning(f"cv_walk_forward_evaluate: {e} — skipping CV evaluation.")
-        return {"skipped": True, "reason": str(e)}
-
-    Xc = X.copy()
-    for c in Xc.columns:
-        Xc[c] = pd.to_numeric(Xc[c], errors="coerce")
-    Xc = Xc.replace([np.inf, -np.inf], np.nan)
-    yv = y.astype(int).values
-    wv = w.values
+    Xc, yv, wv = _prep_cv_xy(X, y, w)
+    params = (params_override if params_override is not None else XGBOOST_PARAMS).copy()
 
     logger.info(
         f"CV walk-forward evaluation: {n_splits} folds requested, "
         f"embargo={EMBARGO_DAYS}d, symbol_purge_window="
         f"{EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER:.0f}d "
-        f"(mirrors train_val_split()'s FIX 4/5)."
+        f"(mirrors train_val_split()'s FIX 4/5), "
+        f"params={'searched (search_hyperparameters)' if params_override is not None else 'hand-tuned XGBOOST_PARAMS'}."
     )
 
-    fold_rows = []
-    fold_aucs = []
-    fold_best_iters = []
-
-    for i, (train_pos, test_pos) in enumerate(splits):
-        y_tr, y_te = yv[train_pos], yv[test_pos]
-        n_tr_pos, n_tr_neg = int((y_tr == 1).sum()), int((y_tr == 0).sum())
-        n_te_pos, n_te_neg = int((y_te == 1).sum()), int((y_te == 0).sum())
-
-        if n_tr_pos == 0 or n_tr_neg == 0 or n_te_pos == 0 or n_te_neg == 0:
+    result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
+    for i, row in enumerate(result["fold_rows"]):
+        if row["skipped"]:
             logger.info(
                 f"[cv fold {i}] skipped — degenerate class split "
-                f"(train pos={n_tr_pos}/neg={n_tr_neg}, test pos={n_te_pos}/neg={n_te_neg})"
+                f"(train n={row['n_train']}, test n={row['n_test']}, test_pos={row['n_test_pos']})"
             )
-            fold_rows.append({
-                "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
-                "n_test_pos": n_te_pos, "auc": None, "best_iteration": None, "skipped": True,
-            })
-            continue
+        else:
+            logger.info(
+                f"[cv fold {i}] train={row['n_train']}  test={row['n_test']} "
+                f"(pos={row['n_test_pos']})  auc={row['auc']:.4f}  "
+                f"best_iteration={row['best_iteration']}"
+            )
 
-        params = XGBOOST_PARAMS.copy()
-        raw_spw = n_tr_neg / n_tr_pos
-        params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, raw_spw)), 3)
-        early_stopping = params.pop("early_stopping_rounds", 30)
-        fold_model = XGBClassifier(
-            **params, early_stopping_rounds=early_stopping, random_state=random_state,
-        )
-        fold_model.fit(
-            Xc.iloc[train_pos], y_tr,
-            sample_weight=wv[train_pos],
-            eval_set=[(Xc.iloc[test_pos], y_te)],
-            verbose=False,
-        )
-        fold_auc = float(fold_model.best_score)
-        fold_iter = int(fold_model.best_iteration)
-        fold_aucs.append(fold_auc)
-        fold_best_iters.append(fold_iter)
-
-        logger.info(
-            f"[cv fold {i}] train={len(train_pos)} (pos={n_tr_pos})  "
-            f"test={len(test_pos)} (pos={n_te_pos})  "
-            f"auc={fold_auc:.4f}  best_iteration={fold_iter}"
-        )
-        fold_rows.append({
-            "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
-            "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
-            "best_iteration": fold_iter, "skipped": False,
-        })
-
-    n_used = len(fold_aucs)
+    fold_aucs, fold_best_iters, n_used = result["fold_aucs"], result["fold_best_iters"], result["n_used"]
     if n_used == 0:
         logger.warning(
             "cv_walk_forward_evaluate: every fold had a degenerate class split — "
             "no CV estimate available this run."
         )
-        return {"skipped": True, "reason": "all_folds_degenerate", "fold_results": fold_rows}
+        return {"skipped": True, "reason": "all_folds_degenerate", "fold_results": result["fold_rows"]}
 
     mean_auc = float(np.mean(fold_aucs))
     std_auc = float(np.std(fold_aucs))
@@ -3455,10 +3541,10 @@ def cv_walk_forward_evaluate(
     # folds only see rows before their own test window, while the final fit
     # sees everything before the val cutoff), so the final fit can typically
     # support at least as many trees as any individual fold needed. +15%
-    # headroom on the CV-averaged iteration count, clamped to XGBOOST_PARAMS'
-    # own ceiling and a sane floor, rather than trusting either extreme.
+    # headroom on the CV-averaged iteration count, clamped to this run's own
+    # n_estimators ceiling and a sane floor, rather than trusting either extreme.
     recommended_n_estimators = int(
-        np.clip(round(mean_best_iter * 1.15), 30, XGBOOST_PARAMS["n_estimators"])
+        np.clip(round(mean_best_iter * 1.15), 30, params.get("n_estimators", XGBOOST_PARAMS["n_estimators"]))
     )
 
     logger.info(
@@ -3480,11 +3566,236 @@ def cv_walk_forward_evaluate(
         "n_splits_requested": n_splits,
         "n_folds_used": n_used,
         "embargo_days": EMBARGO_DAYS,
-        "fold_results": fold_rows,
+        "used_searched_params": params_override is not None,
+        "fold_results": result["fold_rows"],
         "mean_auc": round(mean_auc, 4),
         "std_auc": round(std_auc, 4),
         "mean_best_iteration": round(mean_best_iter, 1),
         "recommended_n_estimators": recommended_n_estimators,
+    }
+
+
+# ── HYPERPARAMETER SEARCH FIX ───────────────────────────────────────────────
+# XGBOOST_PARAMS above carries a long comment history of one-parameter-at-a-
+# time manual edits ("loosened from 10→4", "raised 3→4", "gamma REVERTED")
+# tuned against a single train/val cut. search_hyperparameters() replaces
+# that with a real search over the regularisation/complexity parameters,
+# scored against the walk-forward folds from cv_walk_forward_evaluate()
+# above instead of one split's quirks.
+HPARAM_SEARCH_ENABLED = os.environ.get("HPARAM_SEARCH_ENABLED", "1").lower() in ("1", "true", "yes")
+HPARAM_SEARCH_N_TRIALS = int(os.environ.get("HPARAM_SEARCH_N_TRIALS", "40"))
+# Safety valve so a slow environment can't turn "minutes" into "hours" —
+# optuna's study.optimize() stops issuing new trials once this elapses (the
+# in-flight trial still finishes).
+HPARAM_SEARCH_TIMEOUT_SECONDS = int(os.environ.get("HPARAM_SEARCH_TIMEOUT_SECONDS", "600"))
+HPARAM_SEARCH_RANDOM_STATE = 42
+
+# Exactly the parameters called out as hand-tuned by trial-and-error above:
+# max_depth, min_child_weight, gamma, reg_alpha, reg_lambda, subsample,
+# colsample_bytree. (kind, low, high, log_scale) — log_scale=True samples
+# log-uniformly, standard practice for regularisation-strength parameters
+# that matter on a multiplicative rather than additive scale.
+HPARAM_SEARCH_SPACE = {
+    "max_depth":        ("int",   3,    8,   False),
+    "min_child_weight": ("int",   1,    20,  False),
+    "gamma":            ("float", 0.01, 5.0, True),
+    "reg_alpha":        ("float", 0.01, 3.0, True),
+    "reg_lambda":       ("float", 0.1,  5.0, True),
+    "subsample":        ("float", 0.5,  1.0, False),
+    "colsample_bytree": ("float", 0.5,  1.0, False),
+}
+
+
+def search_hyperparameters(
+    X: pd.DataFrame,
+    y: pd.Series,
+    w: pd.Series,
+    combined_df: pd.DataFrame,
+    n_splits: int = CV_N_SPLITS,
+    min_train_frac: float = CV_MIN_TRAIN_FRAC,
+    n_trials: int = HPARAM_SEARCH_N_TRIALS,
+    timeout_seconds: int = HPARAM_SEARCH_TIMEOUT_SECONDS,
+    random_state: int = HPARAM_SEARCH_RANDOM_STATE,
+) -> dict:
+    """
+    Systematic hyperparameter search over max_depth, min_child_weight, gamma,
+    reg_alpha, reg_lambda, subsample, colsample_bytree — scored against the
+    SAME leak-guarded walk-forward folds cv_walk_forward_evaluate() uses
+    (time_aware_splits() with FIX 4/5's embargo + symbol purge), instead of
+    the single train_val_split() cut every value in XGBOOST_PARAMS was
+    hand-tuned against one parameter at a time.
+
+    Uses Optuna (TPE sampler + median pruning) when installed; falls back to
+    plain random search over the same distributions otherwise, so this
+    module carries no hard Optuna dependency. Either way this is a real
+    search — tens of trials x several folds each, not one-parameter-at-a-
+    time — but bounded to "minutes, not hours" via n_trials/timeout_seconds.
+    Every parameter NOT in HPARAM_SEARCH_SPACE (learning_rate, objective,
+    eval_metric, n_estimators, scale_pos_weight, early_stopping_rounds) is
+    taken unchanged from XGBOOST_PARAMS.
+
+    Returns a dict: {skipped, method, n_trials_run, best_params,
+    best_mean_auc, best_std_auc, baseline_mean_auc (XGBOOST_PARAMS' own CV
+    score on the identical folds, for a direct before/after comparison),
+    delta_vs_baseline, top_trials (best 10, for transparency in metadata)}.
+    """
+    if not HPARAM_SEARCH_ENABLED:
+        logger.info("search_hyperparameters: disabled via HPARAM_SEARCH_ENABLED=0 — skipping.")
+        return {"skipped": True, "reason": "disabled"}
+
+    splits, embargo_or_reason = _build_cv_splits(X, combined_df, n_splits, min_train_frac)
+    if splits is None:
+        logger.warning(f"search_hyperparameters: {embargo_or_reason} — skipping search.")
+        return {"skipped": True, "reason": embargo_or_reason}
+    EMBARGO_DAYS = embargo_or_reason
+
+    Xc, yv, wv = _prep_cv_xy(X, y, w)
+    searched_keys = list(HPARAM_SEARCH_SPACE.keys())
+
+    def _build_params(sampled: dict) -> dict:
+        params = XGBOOST_PARAMS.copy()
+        params.update(sampled)
+        return params
+
+    def _score(params: dict) -> tuple:
+        result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
+        if result["n_used"] == 0:
+            return float("-inf"), float("nan"), 0
+        return float(np.mean(result["fold_aucs"])), float(np.std(result["fold_aucs"])), result["n_used"]
+
+    # Baseline: current hand-tuned XGBOOST_PARAMS, scored on the exact same
+    # folds, so the search result reads as "beat / didn't beat the hand-tuned
+    # defaults" instead of a number in a vacuum.
+    baseline_mean_auc, baseline_std_auc, baseline_n_used = _score(XGBOOST_PARAMS.copy())
+    logger.info(
+        f"search_hyperparameters: baseline (current hand-tuned XGBOOST_PARAMS) "
+        f"CV AUC = {baseline_mean_auc:.4f} \u00b1 {baseline_std_auc:.4f} "
+        f"({baseline_n_used}/{len(splits)} folds)"
+    )
+
+    trials_log = []
+    best_params, best_mean_auc, best_std_auc = None, float("-inf"), float("nan")
+    method = "unknown"
+    n_trials_run = 0
+
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        method = "optuna_tpe"
+
+        def objective(trial):
+            sampled = {}
+            for name, (kind, low, high, log) in HPARAM_SEARCH_SPACE.items():
+                if kind == "int":
+                    sampled[name] = trial.suggest_int(name, low, high)
+                else:
+                    sampled[name] = trial.suggest_float(name, low, high, log=log)
+            params = _build_params(sampled)
+            mean_auc, std_auc, n_used = _score(params)
+            trials_log.append({
+                "params": sampled,
+                "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
+                "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
+                "n_folds_used": n_used,
+            })
+            return mean_auc
+
+        sampler = optuna.samplers.TPESampler(seed=random_state)
+        pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
+        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+        study.optimize(objective, n_trials=n_trials, timeout=timeout_seconds, show_progress_bar=False)
+
+        n_trials_run = len(study.trials)
+        if study.best_value != float("-inf"):
+            best_params = _build_params(study.best_params)
+            best_mean_auc = float(study.best_value)
+            _match = next((t for t in trials_log if t["params"] == study.best_params), None)
+            best_std_auc = _match["std_auc"] if _match and _match["std_auc"] is not None else float("nan")
+
+    except ImportError:
+        logger.info(
+            "search_hyperparameters: optuna not installed — falling back to plain "
+            "random search over the same distributions (pip install optuna for "
+            "TPE + pruning; sample-efficiency differs, the search space and "
+            "scoring are otherwise identical)."
+        )
+        method = "random_search"
+        rng = np.random.default_rng(random_state)
+        for _ in range(n_trials):
+            sampled = {}
+            for name, (kind, low, high, log) in HPARAM_SEARCH_SPACE.items():
+                if kind == "int":
+                    sampled[name] = int(rng.integers(low, high + 1))
+                elif log:
+                    sampled[name] = float(np.exp(rng.uniform(np.log(low), np.log(high))))
+                else:
+                    sampled[name] = float(rng.uniform(low, high))
+            params = _build_params(sampled)
+            mean_auc, std_auc, n_used = _score(params)
+            n_trials_run += 1
+            trials_log.append({
+                "params": sampled,
+                "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
+                "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
+                "n_folds_used": n_used,
+            })
+            if mean_auc > best_mean_auc:
+                best_params, best_mean_auc, best_std_auc = params, mean_auc, std_auc
+
+    if best_params is None or best_mean_auc == float("-inf"):
+        logger.warning(
+            "search_hyperparameters: no trial produced a usable CV score — "
+            "keeping hand-tuned XGBOOST_PARAMS unchanged."
+        )
+        return {
+            "skipped": True, "reason": "no_usable_trial", "method": method,
+            "n_trials_run": n_trials_run,
+            "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
+        }
+
+    delta = (best_mean_auc - baseline_mean_auc) if baseline_mean_auc != float("-inf") else None
+    if delta is not None:
+        logger.info(
+            f"search_hyperparameters ({method}, {n_trials_run} trials): "
+            f"best CV AUC = {best_mean_auc:.4f} \u00b1 {best_std_auc:.4f} "
+            f"(baseline {baseline_mean_auc:.4f}, delta {delta:+.4f})"
+        )
+    else:
+        logger.info(
+            f"search_hyperparameters ({method}, {n_trials_run} trials): "
+            f"best CV AUC = {best_mean_auc:.4f} \u00b1 {best_std_auc:.4f}"
+        )
+    for k in searched_keys:
+        logger.info(f"  {k}: hand-tuned={XGBOOST_PARAMS[k]}  -> searched={best_params[k]}")
+
+    if delta is not None and delta < 0.002:
+        logger.info(
+            "  search_hyperparameters: the best searched config is within +0.002 "
+            "AUC of the hand-tuned baseline on these folds — read this as "
+            "confirming the hand-tuned values rather than a real improvement; "
+            "either config is defensible, and the hand-tuned one keeps its "
+            "existing comment-trail rationale."
+        )
+
+    top_trials = sorted(
+        (t for t in trials_log if t["mean_auc"] is not None),
+        key=lambda t: t["mean_auc"], reverse=True,
+    )[:10]
+
+    return {
+        "skipped": False,
+        "method": method,
+        "n_trials_run": n_trials_run,
+        "n_splits": len(splits),
+        "embargo_days": EMBARGO_DAYS,
+        "searched_params": searched_keys,
+        "best_params": {k: best_params[k] for k in searched_keys},
+        "best_mean_auc": round(best_mean_auc, 4),
+        "best_std_auc": round(best_std_auc, 4) if best_std_auc == best_std_auc else None,
+        "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
+        "baseline_std_auc": round(baseline_std_auc, 4) if baseline_std_auc == baseline_std_auc else None,
+        "delta_vs_baseline": round(delta, 4) if delta is not None else None,
+        "top_trials": top_trials,
     }
 
 
@@ -6253,17 +6564,34 @@ def main() -> int:
         except Exception as e:
             logger.warning(f"[symbol-demean] failed to compute/save baselines (non-fatal): {e}")
 
+    # ── HYPERPARAMETER SEARCH ────────────────────────────────────────────────
+    # Runs BEFORE the CV legitimacy report below, so that report reflects
+    # whichever params this run actually uses (searched, if a usable result
+    # came back; hand-tuned XGBOOST_PARAMS otherwise). Scored against the
+    # same walk-forward folds as cv_walk_forward_evaluate() -- see
+    # search_hyperparameters()'s docstring.
+    logger.info("\n" + "=" * 60)
+    logger.info("HYPERPARAMETER SEARCH (pre-flight, scored on walk-forward CV folds)")
+    logger.info("=" * 60)
+    hparam_search_results = search_hyperparameters(X, y, w, combined_df)
+    _searched_params = (
+        hparam_search_results.get("best_params")
+        if not hparam_search_results.get("skipped") else None
+    )
+
     # ── CV WALK-FORWARD EVALUATION ───────────────────────────────────────────
     # Runs BEFORE the single train_val_split() cut, over the same X/y/w/
     # combined_df, reusing time_aware_splits() (the leak-guarded splitter
     # feature_selection.py's RFECV/GA stages already depend on) to give the
     # classifier itself a multi-fold walk-forward AUC estimate + a CV-averaged
     # n_estimators recommendation, instead of relying solely on one train/val
-    # cut's point estimate. See cv_walk_forward_evaluate()'s docstring.
+    # cut's point estimate. Scored with the searched hyperparameters (if any)
+    # so the reported CV numbers match what train_model() will actually use.
+    # See cv_walk_forward_evaluate()'s docstring.
     logger.info("\n" + "=" * 60)
     logger.info("CV WALK-FORWARD EVALUATION (pre-flight, before single train/val split)")
     logger.info("=" * 60)
-    cv_results = cv_walk_forward_evaluate(X, y, w, combined_df)
+    cv_results = cv_walk_forward_evaluate(X, y, w, combined_df, params_override=_searched_params)
 
     # ── Scale ─────────────────────────────────────────────────────────────────
     # ── FIX 1: Time-based train/val split (on RAW features, before scaling) ───────
@@ -6442,7 +6770,8 @@ def main() -> int:
                         n_estimators_ceiling=(
                             cv_results.get("recommended_n_estimators")
                             if not cv_results.get("skipped") else None
-                        ))
+                        ),
+                        hyperparams_override=_searched_params)
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
@@ -6802,6 +7131,12 @@ def main() -> int:
         # AUC", with val_auc_roc/blind_cal_auc kept for early-stopping/
         # calibration diagnostics.
         "cv_walk_forward":         cv_results,
+        # HYPERPARAMETER SEARCH FIX: full search_hyperparameters() result --
+        # method used (optuna_tpe / random_search), best_params actually fed
+        # into train_model() above (see hyperparams_override), and how they
+        # compared to the hand-tuned XGBOOST_PARAMS baseline on the same
+        # folds cv_walk_forward is reporting on.
+        "hyperparameter_search":  hparam_search_results,
         "base_sample_weight":      BASE_CSV_WEIGHT,
         "t1_sample_weight":        T1_WEIGHT,
         "intraday_win_threshold":  INTRADAY_WIN_THRESHOLD,
