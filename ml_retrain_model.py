@@ -128,6 +128,13 @@ from src.ml_predictor.symbol_demeaning import (
     save_symbol_baselines,
     DEFAULT_BASELINE_PATH as SYMBOL_DEMEAN_BASELINE_PATH,
 )
+# CV WALK-FORWARD FIX: reuse the SAME leak-guarded walk-forward splitter
+# (with FIX 4/5's embargo + symbol purge) that Stage 3/4 feature selection
+# (rfecv_time_aware / genetic_algorithm_selection) already relies on, so the
+# classifier itself gets a multi-fold CV estimate instead of only ever being
+# fit/evaluated against feature_selection.py's single train/val cut. See
+# cv_walk_forward_evaluate() below.
+from src.ml_predictor.feature_selection import time_aware_splits
 from supabase import create_client, Client
 from xgboost import XGBClassifier
 
@@ -535,6 +542,17 @@ def _compute_val_cutoff(df_with_dates: "pd.DataFrame") -> "pd.Timestamp":
 # training proceeds. If the cutoff date produces fewer than this many winners,
 # training aborts with a clear message rather than producing a junk model.
 MIN_VAL_POSITIVES = 50
+
+# ── CV WALK-FORWARD FIX ────────────────────────────────────────────────────
+# train_val_split()'s reported best_val_auc / blind_cal_auc are point
+# estimates off a single ~VAL_WEEKS-wide cut. cv_walk_forward_evaluate()
+# (below) reuses time_aware_splits() to add a multi-fold walk-forward
+# estimate of the SAME classifier recipe, run before the final single-split
+# fit. Configurable via env vars so a run can disable it (e.g. CI smoke
+# tests on tiny fixture data) without touching code.
+CV_N_SPLITS = int(os.environ.get("CV_N_SPLITS", "5"))
+CV_MIN_TRAIN_FRAC = float(os.environ.get("CV_MIN_TRAIN_FRAC", "0.4"))
+CV_EVALUATION_ENABLED = os.environ.get("CV_EVALUATION_ENABLED", "1").lower() in ("1", "true", "yes")
 
 # Train-set size guards — abort if the training split is too thin to generalise.
 # These fire when the Supabase tables are sparse (new deployment, data gaps, or
@@ -2944,8 +2962,18 @@ def train_model(
     y_cal: pd.Series = None,
     X_val_full: pd.DataFrame = None,
     y_val_full: pd.Series = None,
+    n_estimators_ceiling: Optional[int] = None,
 ) -> object:
     """Train XGBClassifier from scratch with early stopping.
+
+    CV WALK-FORWARD FIX: n_estimators_ceiling, when provided, is the
+    recommended_n_estimators from cv_walk_forward_evaluate() — the mean
+    early-stopping best_iteration across several walk-forward folds (plus
+    headroom), rather than XGBOOST_PARAMS' fixed default. This run's actual
+    tree count is still chosen by early stopping against X_val/y_val (so
+    calibration and the tail-guarantee logic below are unaffected) — the
+    ceiling only prevents a single noisy val cut from growing the model far
+    past what several independent folds agree generalises.
 
     RC6: If X_cal/y_cal are supplied (a held-out calibration set),
     the raw XGBoost model is wrapped with CalibratedClassifierCV
@@ -2960,6 +2988,16 @@ def train_model(
     training data leaks into the calibration fit.
     """
     params = XGBOOST_PARAMS.copy()
+
+    if n_estimators_ceiling is not None and n_estimators_ceiling > 0:
+        _original_n_estimators = params["n_estimators"]
+        params["n_estimators"] = min(params["n_estimators"], max(30, int(n_estimators_ceiling)))
+        if params["n_estimators"] != _original_n_estimators:
+            logger.info(
+                f"  n_estimators capped {_original_n_estimators} -> {params['n_estimators']} "
+                "(CV walk-forward recommendation: mean early-stopping best_iteration "
+                "across folds, see cv_walk_forward_evaluate())."
+            )
 
     n_pos = int((y_train == 1).sum())
     n_neg = int((y_train == 0).sum())
@@ -3230,6 +3268,224 @@ def train_model(
         )
 
     return model
+
+
+def _cv_sort_date_and_symbols(df_work: pd.DataFrame) -> tuple:
+    """Build the same detection_date/event_date unified sort-date column that
+    train_val_split()'s FIX 1 uses, for cv_walk_forward_evaluate() below.
+
+    Deliberately duplicated rather than factored into a shared helper: this
+    ~10-line date-unification rule is simple and stable, while train_val_split
+    is a large, already-hardened function (FIX 1-5) that a shared-helper
+    refactor risks perturbing for no real benefit. Keep both in sync by hand
+    if the date-column convention ever changes.
+
+    Returns (sort_date, symbols) where symbols is None if df_work has no
+    'symbol' column. Both are aligned 1:1 by position with df_work's rows —
+    callers must pass X/y/w/combined_df sharing that same row order (true for
+    every caller in this file, since prepare_features() never reorders rows).
+    """
+    has_detection = "detection_date" in df_work.columns
+    has_event = "event_date" in df_work.columns
+
+    if has_detection or has_event:
+        sort_date = pd.Series(pd.NaT, index=df_work.index)
+        if has_detection:
+            sort_date = pd.to_datetime(df_work["detection_date"], errors="coerce")
+        if has_event:
+            event_parsed = pd.to_datetime(df_work["event_date"], errors="coerce")
+            sort_date = sort_date.fillna(event_parsed)
+    else:
+        date_col = next((c for c in ["date"] if c in df_work.columns), None)
+        sort_date = (
+            pd.to_datetime(df_work[date_col], errors="coerce")
+            if date_col else pd.Series(pd.NaT, index=df_work.index)
+        )
+
+    symbols = df_work["symbol"] if "symbol" in df_work.columns else None
+    return sort_date, symbols
+
+
+def cv_walk_forward_evaluate(
+    X: pd.DataFrame,
+    y: pd.Series,
+    w: pd.Series,
+    combined_df: pd.DataFrame,
+    n_splits: int = CV_N_SPLITS,
+    min_train_frac: float = CV_MIN_TRAIN_FRAC,
+    random_state: int = 42,
+) -> dict:
+    """
+    Walk-forward CV for the classifier itself, reusing the SAME leak-guarded
+    splitter (time_aware_splits(), with FIX 4's embargo + FIX 5-equivalent
+    symbol purge) that Stage 3/4 feature selection already relies on — see
+    rfecv_time_aware() / genetic_algorithm_selection() in
+    src/ml_predictor/feature_selection.py.
+
+    WHY THIS EXISTS:
+    train_val_split() produces exactly one train/val cut. The reported
+    best_val_auc / blind_cal_auc are therefore point estimates off
+    ~1700-2100 val rows with only ~250-300 positives — noisy enough that a
+    different VAL_WEEKS cutoff date could plausibly move the number by
+    several points, and a single run gives no way to tell whether
+    best_iteration (how many trees the final model uses) reflects real
+    signal or that run's particular val slice.
+
+    This fits the SAME XGBOOST_PARAMS / scale_pos_weight recipe as
+    train_model() across n_splits rolling walk-forward folds (each fold's
+    train is every dated row before its test window, honoring the embargo +
+    symbol purge) and reports:
+      - fold_results: per-fold (n_train, n_test, n_test_pos, auc, best_iteration)
+      - mean_auc / std_auc: the CV estimate to read alongside (not instead
+        of) train_val_split()'s point estimate.
+      - mean_best_iteration / recommended_n_estimators: the boosting-round
+        hyperparameter, averaged across folds instead of trusted from one
+        run's early stopping.
+
+    This does NOT replace train_val_split() / train_model() — the final
+    model is still fit on the full FIX 1-5 train/val split, so calibration
+    and the gain regressor are unaffected. It's a pre-flight legitimacy
+    check whose recommended_n_estimators is fed back into train_model() as
+    an upper bound on tree count (see n_estimators_ceiling there).
+    """
+    if not CV_EVALUATION_ENABLED:
+        logger.info("cv_walk_forward_evaluate: disabled via CV_EVALUATION_ENABLED=0 — skipping.")
+        return {"skipped": True, "reason": "disabled"}
+
+    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
+    sort_date, symbols = _cv_sort_date_and_symbols(combined_df)
+
+    n_dated = int(sort_date.notna().sum())
+    if n_dated < (n_splits + 1) * 2:
+        logger.warning(
+            f"cv_walk_forward_evaluate: only {n_dated} dated rows — too few for "
+            f"{n_splits} walk-forward folds. Skipping CV evaluation (the final "
+            "model still trains normally on the single train_val_split() cut)."
+        )
+        return {"skipped": True, "reason": "insufficient_dated_rows", "n_dated_rows": n_dated}
+
+    try:
+        splits = time_aware_splits(
+            sort_date,
+            n_splits=n_splits,
+            min_train_frac=min_train_frac,
+            symbols=symbols,
+            embargo_days=EMBARGO_DAYS,
+            symbol_purge_window_days=EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER,
+        )
+    except ValueError as e:
+        logger.warning(f"cv_walk_forward_evaluate: {e} — skipping CV evaluation.")
+        return {"skipped": True, "reason": str(e)}
+
+    Xc = X.copy()
+    for c in Xc.columns:
+        Xc[c] = pd.to_numeric(Xc[c], errors="coerce")
+    Xc = Xc.replace([np.inf, -np.inf], np.nan)
+    yv = y.astype(int).values
+    wv = w.values
+
+    logger.info(
+        f"CV walk-forward evaluation: {n_splits} folds requested, "
+        f"embargo={EMBARGO_DAYS}d, symbol_purge_window="
+        f"{EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER:.0f}d "
+        f"(mirrors train_val_split()'s FIX 4/5)."
+    )
+
+    fold_rows = []
+    fold_aucs = []
+    fold_best_iters = []
+
+    for i, (train_pos, test_pos) in enumerate(splits):
+        y_tr, y_te = yv[train_pos], yv[test_pos]
+        n_tr_pos, n_tr_neg = int((y_tr == 1).sum()), int((y_tr == 0).sum())
+        n_te_pos, n_te_neg = int((y_te == 1).sum()), int((y_te == 0).sum())
+
+        if n_tr_pos == 0 or n_tr_neg == 0 or n_te_pos == 0 or n_te_neg == 0:
+            logger.info(
+                f"[cv fold {i}] skipped — degenerate class split "
+                f"(train pos={n_tr_pos}/neg={n_tr_neg}, test pos={n_te_pos}/neg={n_te_neg})"
+            )
+            fold_rows.append({
+                "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
+                "n_test_pos": n_te_pos, "auc": None, "best_iteration": None, "skipped": True,
+            })
+            continue
+
+        params = XGBOOST_PARAMS.copy()
+        raw_spw = n_tr_neg / n_tr_pos
+        params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, raw_spw)), 3)
+        early_stopping = params.pop("early_stopping_rounds", 30)
+        fold_model = XGBClassifier(
+            **params, early_stopping_rounds=early_stopping, random_state=random_state,
+        )
+        fold_model.fit(
+            Xc.iloc[train_pos], y_tr,
+            sample_weight=wv[train_pos],
+            eval_set=[(Xc.iloc[test_pos], y_te)],
+            verbose=False,
+        )
+        fold_auc = float(fold_model.best_score)
+        fold_iter = int(fold_model.best_iteration)
+        fold_aucs.append(fold_auc)
+        fold_best_iters.append(fold_iter)
+
+        logger.info(
+            f"[cv fold {i}] train={len(train_pos)} (pos={n_tr_pos})  "
+            f"test={len(test_pos)} (pos={n_te_pos})  "
+            f"auc={fold_auc:.4f}  best_iteration={fold_iter}"
+        )
+        fold_rows.append({
+            "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
+            "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
+            "best_iteration": fold_iter, "skipped": False,
+        })
+
+    n_used = len(fold_aucs)
+    if n_used == 0:
+        logger.warning(
+            "cv_walk_forward_evaluate: every fold had a degenerate class split — "
+            "no CV estimate available this run."
+        )
+        return {"skipped": True, "reason": "all_folds_degenerate", "fold_results": fold_rows}
+
+    mean_auc = float(np.mean(fold_aucs))
+    std_auc = float(np.std(fold_aucs))
+    mean_best_iter = float(np.mean(fold_best_iters))
+    # Folds train on LESS data than the final single-split fit (walk-forward
+    # folds only see rows before their own test window, while the final fit
+    # sees everything before the val cutoff), so the final fit can typically
+    # support at least as many trees as any individual fold needed. +15%
+    # headroom on the CV-averaged iteration count, clamped to XGBOOST_PARAMS'
+    # own ceiling and a sane floor, rather than trusting either extreme.
+    recommended_n_estimators = int(
+        np.clip(round(mean_best_iter * 1.15), 30, XGBOOST_PARAMS["n_estimators"])
+    )
+
+    logger.info(
+        f"CV walk-forward evaluation ({n_used}/{n_splits} usable folds): "
+        f"AUC = {mean_auc:.4f} \u00b1 {std_auc:.4f}  "
+        f"(fold AUCs: {[round(a, 4) for a in fold_aucs]})  "
+        f"mean_best_iteration={mean_best_iter:.1f} -> "
+        f"recommended_n_estimators={recommended_n_estimators}"
+    )
+    if std_auc > 0.03:
+        logger.warning(
+            f"  \u26a0\ufe0f  CV fold AUC std={std_auc:.4f} is high — the single-cut "
+            "point estimate from train_val_split() (best_val_auc / blind_cal_auc) "
+            "should be read as this CV range, not as precise to a couple points."
+        )
+
+    return {
+        "skipped": False,
+        "n_splits_requested": n_splits,
+        "n_folds_used": n_used,
+        "embargo_days": EMBARGO_DAYS,
+        "fold_results": fold_rows,
+        "mean_auc": round(mean_auc, 4),
+        "std_auc": round(std_auc, 4),
+        "mean_best_iteration": round(mean_best_iter, 1),
+        "recommended_n_estimators": recommended_n_estimators,
+    }
 
 
 def train_val_split(
@@ -5997,6 +6253,18 @@ def main() -> int:
         except Exception as e:
             logger.warning(f"[symbol-demean] failed to compute/save baselines (non-fatal): {e}")
 
+    # ── CV WALK-FORWARD EVALUATION ───────────────────────────────────────────
+    # Runs BEFORE the single train_val_split() cut, over the same X/y/w/
+    # combined_df, reusing time_aware_splits() (the leak-guarded splitter
+    # feature_selection.py's RFECV/GA stages already depend on) to give the
+    # classifier itself a multi-fold walk-forward AUC estimate + a CV-averaged
+    # n_estimators recommendation, instead of relying solely on one train/val
+    # cut's point estimate. See cv_walk_forward_evaluate()'s docstring.
+    logger.info("\n" + "=" * 60)
+    logger.info("CV WALK-FORWARD EVALUATION (pre-flight, before single train/val split)")
+    logger.info("=" * 60)
+    cv_results = cv_walk_forward_evaluate(X, y, w, combined_df)
+
     # ── Scale ─────────────────────────────────────────────────────────────────
     # ── FIX 1: Time-based train/val split (on RAW features, before scaling) ───────
     # Split first so the scaler is fit on train rows only (no val leakage).
@@ -6170,7 +6438,11 @@ def main() -> int:
     # ── Train ─────────────────────────────────────────────────────────────────
     model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val_xgb, y_val_xgb,
                         X_cal=X_cal_fit, y_cal=y_cal_fit,
-                        X_val_full=X_val, y_val_full=y_val)
+                        X_val_full=X_val, y_val_full=y_val,
+                        n_estimators_ceiling=(
+                            cv_results.get("recommended_n_estimators")
+                            if not cv_results.get("skipped") else None
+                        ))
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
@@ -6523,6 +6795,13 @@ def main() -> int:
         "blind_cal_auc": (
             float(cal_auc) if cal_auc is not None and cal_auc == cal_auc else None
         ),
+        # CV WALK-FORWARD FIX: multi-fold walk-forward estimate (see
+        # cv_walk_forward_evaluate()) to read alongside the single-cut
+        # val_auc_roc/blind_cal_auc point estimates above -- mean_auc/std_auc
+        # here is the number that should actually be quoted as "the model's
+        # AUC", with val_auc_roc/blind_cal_auc kept for early-stopping/
+        # calibration diagnostics.
+        "cv_walk_forward":         cv_results,
         "base_sample_weight":      BASE_CSV_WEIGHT,
         "t1_sample_weight":        T1_WEIGHT,
         "intraday_win_threshold":  INTRADAY_WIN_THRESHOLD,
