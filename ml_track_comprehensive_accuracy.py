@@ -99,6 +99,17 @@ SCREENER_FEATURE_MAP = {
 HARD_CAPS = {
     "min_price":           0.50,
     "max_price":           50.0,
+    # FIX 6: max_price previously had a ceiling (50.0) but no floor. Because
+    # daily_winners_detector.py feeds this same learned max_price BACK IN as
+    # the price ceiling for tomorrow's winner-candidate screen (see its
+    # _load_learned_filters), a narrow/unlucky winner sample can pull
+    # max_price down to a few dollars — which then makes it structurally
+    # impossible for the screener to ever find a winner above that price
+    # again, ratcheting max_price down further on each subsequent run with
+    # no way to recover. min_max_price stops that ratchet: no matter how low
+    # the derived p90*1.2 comes out, max_price is never clamped below this
+    # floor, so the screener always keeps looking above it.
+    "min_max_price":       15.0,
     "min_volume":          100_000,
     "min_relative_volume": 1.0,
     "max_min_hv10":        30.0,
@@ -433,11 +444,24 @@ def compute_model_driven_filters(
             p10 = float(prices.quantile(LOWER_PCT / 100))
             p90 = float(prices.quantile(UPPER_PCT / 100))
             filters["min_price"] = max(HARD_CAPS["min_price"], round(p10 * 0.8, 2))
-            filters["max_price"] = min(HARD_CAPS["max_price"], round(p90 * 1.2, 2))
+            # FIX 6: floor max_price at HARD_CAPS["min_max_price"] so a
+            # narrow/low-priced winner sample can't ratchet the ceiling down
+            # below a sane floor (see HARD_CAPS comment — this value feeds
+            # back into tomorrow's winner screen, so under-flooring here
+            # permanently blinds the screener to higher-priced winners).
+            filters["max_price"] = min(
+                HARD_CAPS["max_price"],
+                max(HARD_CAPS["min_max_price"], round(p90 * 1.2, 2)),
+            )
             logger.info(
                 f"  Price range from winners: ${prices.min():.2f}–${prices.max():.2f} | "
                 f"10th–90th: ${p10:.2f}–${p90:.2f} → "
                 f"filters: ${filters['min_price']}–${filters['max_price']}"
+                + (
+                    f" (max_price floored at ${HARD_CAPS['min_max_price']})"
+                    if round(p90 * 1.2, 2) < HARD_CAPS["min_max_price"]
+                    else ""
+                )
             )
 
     # ── Volume ───────────────────────────────────────────────────────────────
