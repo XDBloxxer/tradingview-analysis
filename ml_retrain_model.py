@@ -122,6 +122,14 @@ from sklearn.preprocessing import StandardScaler
 # __main__ at load time.  Import it here so the name is available in this
 # module's namespace (used below when wrapping the calibrated model).
 from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
+
+# BaggedXGBClassifier / BaggedXGBRegressor live in the same kind of stable,
+# importable module for the same joblib/__main__ reason — see
+# bagged_models.py's docstring. They implement seed-variance bagging: N
+# models identical except for random_state, averaged together, since
+# subsample=0.8/colsample_bytree=0.8 make each model's tree-building a random
+# draw even with XGBOOST_PARAMS' random_state held fixed.
+from src.ml_predictor.bagged_models import BaggedXGBClassifier, BaggedXGBRegressor  # noqa: F401
 from src.ml_predictor.symbol_demeaning import (
     demean_training_features,
     compute_symbol_baselines,
@@ -672,6 +680,20 @@ SCREENER_POSITIVE_RATE: float | None = None
 # save time, then failed to find it when __main__ was ml_screen_and_predict.py
 # at load time.  The class now lives in src/ml_predictor/prior_corrected_model.py
 # and is imported at the top of this file; call-sites below are unchanged.
+
+# SEED-VARIANCE BAGGING: with subsample=0.8/colsample_bytree=0.8 and a small
+# dataset, part of a single run's val AUC / val R² is just which random draw
+# XGBoost made for row & feature sampling at a fixed random_state. Training
+# BAGGING_N_SEEDS models that differ only in random_state and averaging their
+# predictions cancels that seed-dependent component while keeping the signal
+# (common across seeds) intact. Applied to both the classifier (train_model)
+# and the gain regressor (train_gain_regressor) — not the tier-fallback
+# multiclass classifier, which is a minor auxiliary path.
+# Cost scales linearly with BAGGING_N_SEEDS (each seed refits from scratch
+# with its own early stopping); 5-10 seeds is the recommended range.
+BAGGING_N_SEEDS  = 7
+BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
+                         # so BAGGING_N_SEEDS=1 reproduces the pre-bagging behaviour
 
 XGBOOST_PARAMS = {
     "n_estimators":       500,
@@ -3044,22 +3066,40 @@ def train_model(
 
     early_stopping = params.pop("early_stopping_rounds", 30)
 
-    model = XGBClassifier(**params, early_stopping_rounds=early_stopping)
-
-    logger.info("Training XGBoost model from scratch...")
+    logger.info(f"Training {BAGGING_N_SEEDS} XGBoost model(s) from scratch (seed bagging)...")
     logger.info(f"  Train: {len(X_train)} rows")
     logger.info(f"  Val:   {len(X_val)} rows")
 
-    model.fit(
-        X_train,
-        y_train,
-        sample_weight=w_train.values,
-        eval_set=[(X_val, y_val)],
-        verbose=False,
-    )
+    _seed_models = []
+    for _i in range(BAGGING_N_SEEDS):
+        _seed = BAGGING_SEED_BASE + _i
+        _seed_params = {**params, "random_state": _seed}
+        _seed_model = XGBClassifier(**_seed_params, early_stopping_rounds=early_stopping)
+        _seed_model.fit(
+            X_train,
+            y_train,
+            sample_weight=w_train.values,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+        logger.info(
+            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}): "
+            f"best_iteration={_seed_model.best_iteration}  best_val_auc={_seed_model.best_score:.4f}"
+        )
+        _seed_models.append(_seed_model)
 
-    logger.info(f"  Best iteration: {model.best_iteration}")
-    logger.info(f"  Best val AUC: {model.best_score:.4f}")
+    # BAGGING: average predict_proba across the seeds below (BaggedXGBClassifier)
+    # instead of picking a single seed's model. This is the same bagging
+    # principle feature_selection.py already uses for *stability* (selecting
+    # features that repeatedly survive across resampled runs) — here it's
+    # applied to the trained model's output instead of to feature selection.
+    model = BaggedXGBClassifier(_seed_models)
+
+    logger.info(
+        f"  Bagged across {model.n_seeds_} seeds — "
+        f"mean best_iteration={model.best_iteration} (std={model.best_iteration_std_:.1f})  "
+        f"mean best_val_auc={model.best_score:.4f} (std={model.best_score_std_:.4f})"
+    )
     # Warn if early stopping fired suspiciously early — indicates the val set
     # is too small, too imbalanced, or temporally non-representative.
     if model.best_iteration < 30:
@@ -4273,13 +4313,21 @@ def compute_feature_importance(
     RC6: model may be a CalibratedClassifierCV wrapping an XGBClassifier.
     We unwrap it to access the underlying booster for feature importances.
     """
-    # RC6: unwrap CalibratedClassifierCV to get the raw XGBClassifier
+    # RC6: unwrap CalibratedClassifierCV to get the raw XGBClassifier (or,
+    # with seed bagging, the BaggedXGBClassifier wrapping several of them).
     xgb_model = model
     if hasattr(model, "calibrated_classifiers_"):
         # CalibratedClassifierCV stores list of (estimator, calibrator) pairs
         xgb_model = model.calibrated_classifiers_[0].estimator
-    booster = xgb_model.get_booster()
-    scores  = booster.get_score(importance_type="gain")
+
+    # BAGGING: BaggedXGBClassifier/BaggedXGBRegressor expose
+    # get_feature_importance() which averages gain-importance across seeds,
+    # instead of a single get_booster() call.
+    if hasattr(xgb_model, "get_feature_importance"):
+        scores = xgb_model.get_feature_importance()
+    else:
+        booster = xgb_model.get_booster()
+        scores  = booster.get_score(importance_type="gain")
 
     importance_list = []
     for feat, score in scores.items():
@@ -5270,7 +5318,7 @@ def train_gain_regressor(
     # other explanation for that symptom). Reducing depth and estimator count
     # gives the regressor a hypothesis space actually sized to the data it
     # has, rather than the classifier's much larger training pool.
-    regressor = XGBRegressor(
+    _regressor_base_params = dict(
         n_estimators=120,      # reduced from 300
         max_depth=3,            # reduced from 5, back in line with informative-row count
         learning_rate=0.05,
@@ -5282,7 +5330,6 @@ def train_gain_regressor(
         reg_lambda=2.0,         # slightly higher than classifier — fewer rows, more regularisation
         objective="reg:squarederror",
         eval_metric="rmse",
-        random_state=42,
         n_jobs=-1,
         early_stopping_rounds=30,
     )
@@ -5306,12 +5353,37 @@ def train_gain_regressor(
     # early stopping now selects the iteration that's genuinely best at
     # predicting winner gains, not the iteration that best predicts the
     # anchor rows' constant zero.
-    regressor.fit(
-        X_tr, y_tr,
-        sample_weight=w_tr.values,
-        eval_set=[(X_va, y_va)],
-        sample_weight_eval_set=[w_va.values],
-        verbose=False,
+    # SEED-VARIANCE BAGGING (same rationale as train_model()'s classifier —
+    # see BAGGING_N_SEEDS comment near XGBOOST_PARAMS): train BAGGING_N_SEEDS
+    # regressors identical except for random_state and average their
+    # predictions, instead of trusting one seed's subsample/colsample_bytree
+    # draw. Particularly relevant here since the gain regressor's informative
+    # training pool is already small (~200 rows per the CAPACITY REDUCTION
+    # note above), so a single seed's draw is a larger share of its variance
+    # than for the classifier.
+    logger.info(f"Training {BAGGING_N_SEEDS} gain-regressor model(s) from scratch (seed bagging)...")
+    _seed_regressors = []
+    for _i in range(BAGGING_N_SEEDS):
+        _seed = BAGGING_SEED_BASE + _i
+        _seed_regressor = XGBRegressor(**_regressor_base_params, random_state=_seed)
+        _seed_regressor.fit(
+            X_tr, y_tr,
+            sample_weight=w_tr.values,
+            eval_set=[(X_va, y_va)],
+            sample_weight_eval_set=[w_va.values],
+            verbose=False,
+        )
+        logger.info(
+            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}): "
+            f"best_iteration={_seed_regressor.best_iteration}  "
+            f"best_val_rmse={_seed_regressor.best_score}"
+        )
+        _seed_regressors.append(_seed_regressor)
+
+    regressor = BaggedXGBRegressor(_seed_regressors)
+    logger.info(
+        f"  Bagged across {regressor.n_seeds_} seeds — "
+        f"mean best_iteration={regressor.best_iteration} (std={regressor.best_iteration_std_:.1f})"
     )
 
     # Evaluate in original % space for interpretability
