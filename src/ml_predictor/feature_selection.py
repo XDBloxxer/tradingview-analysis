@@ -236,6 +236,7 @@ def time_aware_splits(
     gap: int = 0,
     symbols: Optional[pd.Series] = None,
     embargo_days: int = 0,
+    symbol_purge_window_days: Optional[float] = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     Walk-forward CV splits ordered by `dates` (ties broken by index order).
@@ -264,15 +265,32 @@ def time_aware_splits(
         0 (default) disables this, preserving old behaviour for any existing
         caller that doesn't pass it.
 
-      symbols: if provided (same length/order as `dates`), any symbol present
-        in a fold's test window is purged from that fold's TRAIN split
-        entirely. hv_20/30/cci/dmn-style rolling-window indicators stay close
-        to a stock's own baseline level for weeks/months, so without this,
-        a model can partially re-identify a symbol from a *different* time
-        window instead of learning a genuinely predictive pattern — this is
-        exactly what synthetic_leak_test.py demonstrates against this
-        function. None (default) disables this, preserving old behaviour for
-        any existing caller that doesn't pass it.
+      symbols: if provided (same length/order as `dates`), a train row is
+        purged from a fold's TRAIN split when its symbol also appears in
+        that fold's test window AND the row falls within
+        `symbol_purge_window_days` of that symbol's nearest test-window
+        occurrence (see `symbol_purge_window_days` below). hv_20/30/cci/dmn-
+        style rolling-window indicators stay close to a stock's own baseline
+        level for weeks/months, so without this, a model can partially
+        re-identify a symbol from a *nearby* time window instead of learning
+        a genuinely predictive pattern — this is exactly what
+        synthetic_leak_test.py demonstrates against this function. None
+        (default) disables this, preserving old behaviour for any existing
+        caller that doesn't pass it.
+
+      symbol_purge_window_days: how far (in calendar days) from a symbol's
+        nearest test-window occurrence a same-symbol train row must be to
+        be spared by the `symbols` purge above. None (default) reuses
+        `embargo_days`, since that value already represents the calendar-day
+        span over which a rolling-window feature stays autocorrelated with
+        the row that produced it — the same mechanism that makes symbol-
+        level memorization possible. Only relevant when `symbols` is given.
+        Previously this purge was NOT time-scoped at all: any train row
+        for a symbol was dropped if that symbol appeared ANYWHERE in a
+        fold's test window, regardless of how far apart in time the two
+        rows were. For a universe with recurring small-cap movers, one
+        test-window appearance could purge months of that ticker's train
+        history for no leakage-relevant reason.
 
     Returns a list of (train_idx, test_idx) pairs of *positional* indices
     into `dates.reset_index(drop=True)`. Each successive fold's test window
@@ -331,10 +349,34 @@ def time_aware_splits(
         if sym is not None and len(test_pos) > 0:
             test_symbols = set(sym.iloc[test_pos].dropna().unique())
             if test_symbols:
-                overlap_mask = sym.iloc[train_pos].isin(test_symbols).values
-                if overlap_mask.any():
-                    n_purged = int(overlap_mask.sum())
-                    train_pos = train_pos[~overlap_mask]
+                purge_window = (
+                    embargo_days if symbol_purge_window_days is None
+                    else symbol_purge_window_days
+                )
+                # Earliest test-window occurrence per symbol. train_pos here
+                # is entirely pre-test (walk-forward), so the earliest test
+                # occurrence is always the nearest one for gap purposes.
+                test_symbol_min_date = (
+                    d.iloc[test_pos]
+                    .groupby(sym.iloc[test_pos].values)
+                    .min()
+                )
+                train_sym_vals = sym.iloc[train_pos]
+                candidate_mask = train_sym_vals.isin(test_symbols).values
+                n_candidates = int(candidate_mask.sum())
+                if n_candidates > 0:
+                    candidate_pos = train_pos[candidate_mask]
+                    candidate_syms = sym.iloc[candidate_pos]
+                    candidate_dates = d.iloc[candidate_pos]
+                    nearest_test_date = candidate_syms.map(test_symbol_min_date)
+                    gap_days = (nearest_test_date - candidate_dates).dt.days
+                    purge_within_window = (
+                        gap_days.isna() | (gap_days <= purge_window)
+                    ).values
+                    overlap_mask = np.isin(train_pos, candidate_pos[purge_within_window])
+                    if overlap_mask.any():
+                        n_purged = int(overlap_mask.sum())
+                        train_pos = train_pos[~overlap_mask]
 
         if n_embargoed or n_purged:
             logger.debug(
