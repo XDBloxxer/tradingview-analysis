@@ -43,6 +43,10 @@ xgboost>=2.0.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
 scipy>=1.10.0  # used by src/ml_predictor/feature_selection.py (hierarchical clustering)
+optuna>=3.6.0  # optional: ml_retrain_model.py's search_hyperparameters() uses
+               # optuna's TPE sampler + median pruning when installed, and
+               # falls back to plain random search over the same distributions
+               # if it's absent -- not a hard requirement.
 
 # Stock data fetching
 yfinance>=0.2.40
