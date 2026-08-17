@@ -369,6 +369,29 @@ VAL_WEEKS = 12
 EMBARGO_DAYS_FLOOR = 5
 EMBARGO_DAYS_CAP   = 90
 
+# FIX 5's symbol purge (below, in train_val_split) drops train rows that
+# share a symbol with a val row. Originally this was a flat, all-time
+# set-membership check: ANY train row for a symbol was dropped if that
+# symbol appeared ANYWHERE in val, regardless of how far apart the two
+# rows were in time. For a universe with recurring small-cap movers, that
+# meant a single val appearance could purge months of that ticker's train
+# history -- and widening --lookback-days made this *worse*, not better,
+# since it just handed the purge more old rows of the same recurring
+# symbols to delete.
+#
+# SYMBOL_PURGE_WINDOW_MULTIPLIER scopes the purge to time instead: a train
+# row is only purged if it falls within
+# (EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER) calendar days of THAT
+# SYMBOL's nearest val occurrence. Default 1.0 reuses EMBARGO_DAYS itself,
+# since EMBARGO_DAYS already represents the calendar-day span over which a
+# rolling-window feature's value stays autocorrelated with the row that
+# produced it -- the same mechanism that makes symbol-level memorization
+# possible in the first place. Override via the SYMBOL_PURGE_WINDOW_MULTIPLIER
+# env var if a wider or narrower margin is wanted.
+SYMBOL_PURGE_WINDOW_MULTIPLIER = float(
+    os.environ.get("SYMBOL_PURGE_WINDOW_MULTIPLIER", "1.0")
+)
+
 # Rolling-window feature lengths (SMA_50, hv_30, t10_*, ...) are counted in
 # TRADING days, but the embargo gap itself is subtracted from a CALENDAR-day
 # cutoff (pd.Timedelta(days=EMBARGO_DAYS)). A straight day-for-day mapping
@@ -3420,7 +3443,7 @@ def train_val_split(
             f"embargoed={n_embargoed}"
         )
 
-        # ── FIX 5: Symbol-level purge ──────────────────────────────────────
+        # ── FIX 5: Symbol-level purge (time-window-scoped) ──────────────────
         # The date embargo above only guarantees train/val rows aren't
         # temporally adjacent. It does NOT stop the same symbol appearing on
         # both sides of the split. Several top features (hv_20/30, atr_14,
@@ -3435,25 +3458,85 @@ def train_val_split(
         # this exact effect with pure-noise labels and a symbol-autocorrelated
         # feature under a clean time-only split.
         #
-        # Fix: any symbol present in val is purged entirely from train
-        # (not moved to val — just dropped), the same way the date embargo
-        # drops rows rather than reassigning them.
+        # Fix: only purge a train row for symbol X if X's val occurrence is
+        # actually near enough in time for that autocorrelation to matter —
+        # i.e. the train row falls within symbol_purge_window_days of X's
+        # nearest val appearance. A train row for X from months before X's
+        # val appearance is not near the boundary and is not memorization
+        # risk in the same way; keeping it is what the date embargo above
+        # already relies on for every other symbol, and there's nothing
+        # symbol-overlap-specific that should change that logic.
+        #
+        # NOTE: this used to be a flat all-time set-membership purge (any
+        # train row for a symbol dropped if that symbol appeared ANYWHERE in
+        # val). That over-purges hard for a universe with recurring
+        # small-cap movers: one val appearance could wipe out months of a
+        # ticker's train history, and a wider --lookback-days made it worse
+        # by handing the purge more old rows of the same recurring symbols
+        # to delete (which is why purge fraction was rising, not falling,
+        # as lookback grew).
         if "symbol" in df_work.columns:
             val_symbols = set(df_work.loc[val_idx, "symbol"].dropna().unique())
             if val_symbols:
+                symbol_purge_window_days = EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER
+
+                # Earliest val occurrence per symbol. Train always precedes
+                # val here (train_idx is drawn from dates < embargo_start),
+                # so "nearest val occurrence" for gap purposes is always the
+                # earliest one — a later val occurrence of the same symbol
+                # can only be farther from any given train row, never closer.
+                val_symbol_min_date = (
+                    dates.loc[val_idx]
+                    .groupby(df_work.loc[val_idx, "symbol"])
+                    .min()
+                )
+
                 train_symbols = df_work.loc[train_idx, "symbol"]
-                symbol_overlap_mask = train_symbols.isin(val_symbols)
-                n_overlap = int(symbol_overlap_mask.sum())
-                if n_overlap > 0:
-                    overlap_frac = n_overlap / max(1, len(train_idx))
-                    logger.warning(
-                        f"FIX 5 — Symbol purge: {n_overlap} train rows "
-                        f"({overlap_frac:.1%} of train) share a symbol with "
-                        f"a val row ({len(val_symbols)} distinct val symbols). "
-                        "Dropping these from train to prevent symbol-level "
-                        "leakage (see synthetic_leak_test.py)."
-                    )
-                    train_idx = train_symbols.index[~symbol_overlap_mask]
+                train_dates_for_purge = dates.loc[train_idx]
+
+                overlap_candidate_mask = train_symbols.isin(val_symbols)
+                n_candidates = int(overlap_candidate_mask.sum())
+
+                if n_candidates > 0:
+                    candidate_idx = train_symbols.index[overlap_candidate_mask]
+                    candidate_symbols = train_symbols.loc[candidate_idx]
+                    candidate_dates = train_dates_for_purge.loc[candidate_idx]
+                    nearest_val_date = candidate_symbols.map(val_symbol_min_date)
+
+                    gap_days = (nearest_val_date - candidate_dates).dt.days
+                    # NaT on either side (shouldn't happen given the
+                    # val_symbols/isin filters above, but a missing/odd date
+                    # is possible) is treated as "can't prove it's safe" and
+                    # purged conservatively — same fail-safe stance FIX 2
+                    # takes on undated rows elsewhere in this function.
+                    purge_within_window = gap_days.isna() | (gap_days <= symbol_purge_window_days)
+                    symbol_purge_idx = candidate_idx[purge_within_window.to_numpy()]
+
+                    n_overlap = len(symbol_purge_idx)
+                    n_spared = n_candidates - n_overlap
+
+                    if n_overlap > 0:
+                        overlap_frac = n_overlap / max(1, len(train_idx))
+                        logger.warning(
+                            f"FIX 5 — Symbol purge (time-scoped, window="
+                            f"{symbol_purge_window_days:.0f}d): {n_overlap} "
+                            f"train rows ({overlap_frac:.1%} of train) fall "
+                            f"within {symbol_purge_window_days:.0f}d of their "
+                            f"symbol's nearest val appearance "
+                            f"({len(val_symbols)} distinct val symbols). "
+                            "Dropping these from train to prevent symbol-level "
+                            f"leakage (see synthetic_leak_test.py). {n_spared} "
+                            "additional same-symbol train row(s) fell outside "
+                            "the window and were kept."
+                        )
+                        train_idx = train_idx.difference(symbol_purge_idx)
+                    else:
+                        logger.info(
+                            "FIX 5 — Symbol purge: train/val share "
+                            f"{len(val_symbols)} symbol(s) but no train rows "
+                            f"fall within the {symbol_purge_window_days:.0f}d "
+                            "window — nothing purged."
+                        )
                 else:
                     logger.info(
                         "FIX 5 — Symbol purge: no train/val symbol overlap found."
