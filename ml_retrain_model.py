@@ -1995,76 +1995,146 @@ def _compute_correct_actual_high_pct(
 #   of a binary one — exactly mirroring how the classifier is trained.
 # ---------------------------------------------------------------------------
 
-def fetch_daily_outcomes_gain_targets(client: Client) -> pd.DataFrame:
+def fetch_daily_outcomes_gain_targets(
+    client: Client,
+    winners_corrected_df: "Optional[pd.DataFrame]" = None,
+) -> pd.DataFrame:
     """
     Build (symbol, detection_date) -> gain-outcome directly from daily_winners
     and daily_non_winners — the same tables that already hold ~1990+ real,
     directly-measured outcomes — instead of requiring a second snapshot table
     to independently corroborate the row (see module comment above).
 
+    Args:
+        winners_corrected_df: optional pre-fetched, pre-corrected daily_winners
+            DataFrame (output of _compute_correct_actual_high_pct on the raw
+            daily_winners table), already computed by the RC2 enrichment step
+            in main() for combined_df.actual_high_pct. When supplied, this
+            function reuses it instead of re-fetching + re-correcting
+            daily_winners from scratch — daily_winners was previously being
+            fetched and corrected twice per retrain run (once here, once in
+            the RC2 block), doubling the network/compute cost and duplicating
+            every RC2 log line. Pass None to have this function fetch and
+            correct daily_winners itself (e.g. when called standalone).
+
     Returns:
         DataFrame with columns: symbol, detection_date, daily_outcome_gain_pct,
         label (1 for daily_winners rows, 0 for daily_non_winners rows). Empty
         DataFrame (same columns, zero rows) if neither source table is usable.
     """
-    SOURCE_TABLES = [
-        ("daily_winners",     1),
-        ("daily_non_winners", 0),
-    ]
-
     frames = []
-    for table_name, label in SOURCE_TABLES:
-        try:
-            raw_df = fetch_table_paginated(client, table_name)
-        except Exception as e:
-            logger.warning(f"daily_outcome_gain_pct: could not fetch '{table_name}': {e}")
-            continue
-        if raw_df.empty:
-            logger.warning(f"daily_outcome_gain_pct: '{table_name}' is empty — skipping")
-            continue
-        if not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
-            logger.warning(
-                f"daily_outcome_gain_pct: '{table_name}' missing required columns "
-                f"{{'symbol', 'detection_date', 'high'}} - "
-                f"{set(raw_df.columns)} — skipping"
-            )
-            continue
 
-        # Reuse the same prev_close-correction logic already used for
-        # daily_winners (RC2) — it only needs symbol/detection_date/high plus
-        # optional prev_close_db/close/open, which daily_non_winners also has.
-        corrected = _compute_correct_actual_high_pct(raw_df, source_label=table_name)
-        if "actual_high_pct" not in corrected.columns:
-            logger.warning(
-                f"daily_outcome_gain_pct: '{table_name}' correction produced no "
-                "actual_high_pct column — skipping"
-            )
-            continue
-
-        out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
+    # ── Winners: reuse the caller's already-corrected daily_winners if given ──
+    if winners_corrected_df is not None and not winners_corrected_df.empty and "actual_high_pct" in winners_corrected_df.columns:
+        out = winners_corrected_df[["symbol", "detection_date", "actual_high_pct"]].copy()
         out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
         out["detection_date"] = pd.to_datetime(
             out["detection_date"], errors="coerce"
         ).dt.strftime("%Y-%m-%d")
         out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
-        out["label"] = label
-        # Keep the most recently-computed row per (symbol, detection_date) if
-        # the table happens to contain duplicates.
+        out["label"] = 1
         out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-
         if not out.empty:
             logger.info(
-                f"daily_outcome_gain_pct: {table_name} -> {len(out)} rows with a "
-                f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
+                f"daily_outcome_gain_pct: daily_winners (reused from RC2 fetch, no "
+                f"duplicate query) -> {len(out)} rows with a corrected gain outcome "
+                f"(range {out['daily_outcome_gain_pct'].min():.1f}%"
                 f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
                 f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
             )
             frames.append(out)
-        else:
+    else:
+        # No pre-corrected frame supplied (e.g. standalone call, or the RC2
+        # fetch above failed/returned empty) — fetch and correct it here.
+        SOURCE_TABLES = [("daily_winners", 1)]
+        for table_name, label in SOURCE_TABLES:
+            try:
+                raw_df = fetch_table_paginated(client, table_name)
+            except Exception as e:
+                logger.warning(f"daily_outcome_gain_pct: could not fetch '{table_name}': {e}")
+                continue
+            if raw_df.empty:
+                logger.warning(f"daily_outcome_gain_pct: '{table_name}' is empty — skipping")
+                continue
+            if not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
+                logger.warning(
+                    f"daily_outcome_gain_pct: '{table_name}' missing required columns "
+                    f"{{'symbol', 'detection_date', 'high'}} - "
+                    f"{set(raw_df.columns)} — skipping"
+                )
+                continue
+            corrected = _compute_correct_actual_high_pct(raw_df, source_label=table_name)
+            if "actual_high_pct" not in corrected.columns:
+                logger.warning(
+                    f"daily_outcome_gain_pct: '{table_name}' correction produced no "
+                    "actual_high_pct column — skipping"
+                )
+                continue
+            out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
+            out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
+            out["detection_date"] = pd.to_datetime(
+                out["detection_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
+            out["label"] = label
+            out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+            if not out.empty:
+                logger.info(
+                    f"daily_outcome_gain_pct: {table_name} -> {len(out)} rows with a "
+                    f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
+                    f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
+                    f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
+                )
+                frames.append(out)
+            else:
+                logger.warning(
+                    f"daily_outcome_gain_pct: '{table_name}' produced 0 rows with a valid "
+                    "corrected gain outcome — skipping"
+                )
+
+    # ── Non-winners: always fetched fresh here — no earlier step in main() ──
+    # already fetches/corrects daily_non_winners, so there's nothing to reuse.
+    try:
+        raw_df = fetch_table_paginated(client, "daily_non_winners")
+    except Exception as e:
+        logger.warning(f"daily_outcome_gain_pct: could not fetch 'daily_non_winners': {e}")
+        raw_df = pd.DataFrame()
+    if raw_df.empty:
+        logger.warning("daily_outcome_gain_pct: 'daily_non_winners' is empty — skipping")
+    elif not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
+        logger.warning(
+            "daily_outcome_gain_pct: 'daily_non_winners' missing required columns "
+            f"{{'symbol', 'detection_date', 'high'}} - {set(raw_df.columns)} — skipping"
+        )
+    else:
+        corrected = _compute_correct_actual_high_pct(raw_df, source_label="daily_non_winners")
+        if "actual_high_pct" not in corrected.columns:
             logger.warning(
-                f"daily_outcome_gain_pct: '{table_name}' produced 0 rows with a valid "
-                "corrected gain outcome — skipping"
+                "daily_outcome_gain_pct: 'daily_non_winners' correction produced no "
+                "actual_high_pct column — skipping"
             )
+        else:
+            out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
+            out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
+            out["detection_date"] = pd.to_datetime(
+                out["detection_date"], errors="coerce"
+            ).dt.strftime("%Y-%m-%d")
+            out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
+            out["label"] = 0
+            out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
+            if not out.empty:
+                logger.info(
+                    f"daily_outcome_gain_pct: daily_non_winners -> {len(out)} rows with a "
+                    f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
+                    f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
+                    f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
+                )
+                frames.append(out)
+            else:
+                logger.warning(
+                    "daily_outcome_gain_pct: 'daily_non_winners' produced 0 rows with a "
+                    "valid corrected gain outcome — skipping"
+                )
 
     if not frames:
         logger.warning(
@@ -5481,7 +5551,17 @@ def main() -> int:
 
     # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
     # Use prev_close as denominator instead of same-day close
+    #
+    # SINGLE-FETCH FIX (2026-08-17): daily_winners used to be fetched and
+    # corrected TWICE — once here (feeds combined_df.actual_high_pct, which
+    # apply_intraday_high_labels() below needs) and again inside
+    # fetch_daily_outcomes_gain_targets() (feeds the gain regressor's
+    # daily_outcome_gain_pct). Same table, same correction function, same
+    # result — just duplicated network + compute + log noise. winners_corrected
+    # is now captured here and threaded into fetch_daily_outcomes_gain_targets()
+    # below so daily_winners is only ever fetched/corrected once per run.
     logger.info("RC2: Fetching daily_winners data for corrected actual_high_pct computation...")
+    winners_corrected: "Optional[pd.DataFrame]" = None
     try:
         winners_response = fetch_table_paginated(client, "daily_winners")
         if not winners_response.empty:
@@ -5764,7 +5844,7 @@ def main() -> int:
     # fetch_market_snapshot_gain_targets() / attach_true_gain_targets() above
     # for why this replaces the old actual_high_pct-via-accuracy-table path.
     logger.info("Fetching daily-outcome gain targets (daily_winners / daily_non_winners)...")
-    daily_outcome_df = fetch_daily_outcomes_gain_targets(client)
+    daily_outcome_df = fetch_daily_outcomes_gain_targets(client, winners_corrected_df=winners_corrected)
     logger.info("Fetching market-snapshot gain targets (true_gain_pct, fallback)...")
     market_gain_df = fetch_market_snapshot_gain_targets(client)
     combined_df = attach_true_gain_targets(combined_df, market_gain_df, daily_outcome_df)
