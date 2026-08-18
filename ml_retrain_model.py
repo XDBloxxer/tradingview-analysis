@@ -3747,6 +3747,14 @@ HPARAM_SEARCH_N_TRIALS = int(os.environ.get("HPARAM_SEARCH_N_TRIALS", "40"))
 # in-flight trial still finishes).
 HPARAM_SEARCH_TIMEOUT_SECONDS = int(os.environ.get("HPARAM_SEARCH_TIMEOUT_SECONDS", "600"))
 HPARAM_SEARCH_RANDOM_STATE = 42
+# Minimum CV AUC improvement over the hand-tuned baseline required before a
+# searched config is actually used (see ACCEPTANCE-GATE FIX below). Folds
+# this small/imbalanced routinely produce AUC deltas of a few thousandths
+# from pure noise; without a gate, a trial that "wins" on noise can carry
+# far heavier regularisation (min_child_weight up to 20, gamma up to 5.0)
+# than the hand-tuned defaults and cause the final fit to converge in a
+# handful of trees regardless of the n_estimators ceiling.
+HPARAM_SEARCH_MIN_DELTA = float(os.environ.get("HPARAM_SEARCH_MIN_DELTA", "0.002"))
 
 # Exactly the parameters called out as hand-tuned by trial-and-error above:
 # max_depth, min_child_weight, gamma, reg_alpha, reg_lambda, subsample,
@@ -3926,13 +3934,39 @@ def search_hyperparameters(
     for k in searched_keys:
         logger.info(f"  {k}: hand-tuned={XGBOOST_PARAMS[k]}  -> searched={best_params[k]}")
 
-    if delta is not None and delta < 0.002:
+    # ── ACCEPTANCE-GATE FIX ──────────────────────────────────────────────────
+    # Previously this branch only LOGGED "read this as confirming the
+    # hand-tuned values rather than a real improvement" but still returned
+    # `best_params` unconditionally — the caller (train_model(), via
+    # `_searched_params` in the retrain entrypoint) used the searched config
+    # regardless of whether it actually beat the baseline.
+    #
+    # With CV fold AUCs this noisy (this run: 0.3732-0.5104, i.e. barely
+    # distinguishable from chance on a ~1600-row fold with ~210 positives),
+    # a delta of a few thousandths of an AUC point is well within fold-to-
+    # fold noise — the "winning" trial isn't meaningfully better, it just
+    # got lucky on this particular embargoed split. But HPARAM_SEARCH_SPACE
+    # allows min_child_weight up to 20 and gamma up to 5.0 — an order of
+    # magnitude heavier than the hand-tuned defaults (4 / 0.3) — so a trial
+    # that wins on pure noise can easily land on very heavy regularisation.
+    # That, independent of any n_estimators ceiling, makes the final
+    # seed-bagged fit's early stopping converge in single-digit-to-teens
+    # trees (this run: seed best_iterations of 34,4,5,16,41,5,10 -> mean 16),
+    # which is genuine early stopping against noisy val AUC, not a starved
+    # tree budget — raising n_estimators_ceiling alone cannot fix this.
+    #
+    # Fix: only accept the searched config when it beats the baseline by
+    # more than HPARAM_SEARCH_MIN_DELTA. Otherwise fall back to the
+    # hand-tuned XGBOOST_PARAMS values (best_params=None), and record why.
+    accepted = delta is not None and delta >= HPARAM_SEARCH_MIN_DELTA
+    if not accepted:
         logger.info(
-            "  search_hyperparameters: the best searched config is within +0.002 "
-            "AUC of the hand-tuned baseline on these folds — read this as "
-            "confirming the hand-tuned values rather than a real improvement; "
-            "either config is defensible, and the hand-tuned one keeps its "
-            "existing comment-trail rationale."
+            f"  search_hyperparameters: best searched config beats baseline by only "
+            f"{('%.4f' % delta) if delta is not None else 'n/a'} AUC "
+            f"(< {HPARAM_SEARCH_MIN_DELTA} threshold) — not a real improvement over "
+            "this noisy a CV estimate. Falling back to hand-tuned XGBOOST_PARAMS "
+            "for this run instead of using the searched (possibly over-regularised) "
+            "config."
         )
 
     top_trials = sorted(
@@ -3948,6 +3982,8 @@ def search_hyperparameters(
         "embargo_days": EMBARGO_DAYS,
         "searched_params": searched_keys,
         "best_params": {k: best_params[k] for k in searched_keys},
+        "accepted": accepted,
+        "min_delta_threshold": HPARAM_SEARCH_MIN_DELTA,
         "best_mean_auc": round(best_mean_auc, 4),
         "best_std_auc": round(best_std_auc, 4) if best_std_auc == best_std_auc else None,
         "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
@@ -6764,9 +6800,17 @@ def main() -> int:
     logger.info("HYPERPARAMETER SEARCH (pre-flight, scored on walk-forward CV folds)")
     logger.info("=" * 60)
     hparam_search_results = search_hyperparameters(X, y, w, combined_df)
+    # ACCEPTANCE-GATE FIX: only use the searched params when
+    # search_hyperparameters() actually marked them as a real improvement
+    # over the hand-tuned baseline (accepted=True). A non-skipped result
+    # whose best config didn't clear HPARAM_SEARCH_MIN_DELTA still comes
+    # back with skipped=False (it's a valid result, just not adopted), so
+    # this must check `accepted`, not just `skipped`, or the un-accepted —
+    # potentially over-regularised — config gets used anyway.
     _searched_params = (
         hparam_search_results.get("best_params")
-        if not hparam_search_results.get("skipped") else None
+        if not hparam_search_results.get("skipped") and hparam_search_results.get("accepted")
+        else None
     )
 
     # ── CV WALK-FORWARD EVALUATION ───────────────────────────────────────────
