@@ -114,14 +114,16 @@ except ImportError:
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.preprocessing import StandardScaler
 
 # _PriorCorrectedModel lives in a stable shared module so that joblib can
 # always resolve it by fully-qualified name regardless of which script is
 # __main__ at load time.  Import it here so the name is available in this
 # module's namespace (used below when wrapping the calibrated model).
-from src.ml_predictor.prior_corrected_model import _PriorCorrectedModel  # noqa: F401
+from src.ml_predictor.prior_corrected_model import (  # noqa: F401
+    _PriorCorrectedModel,
+    fit_cross_fitted_blended_calibrator,
+)
 
 # BaggedXGBClassifier / BaggedXGBRegressor live in the same kind of stable,
 # importable module for the same joblib/__main__ reason — see
@@ -671,6 +673,22 @@ SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
 #   probabilities. The RC7/RC8/RC9 safety nets in explosion_predictor.py will
 #   catch any residual clustering if calibration drifts.
 SCREENER_POSITIVE_RATE: float | None = None
+
+# CALIBRATION_N_SPLITS / CALIBRATION_BLEND_WEIGHT: knobs for the cross-fitted,
+# isotonic/sigmoid-blended calibrator (see fit_cross_fitted_blended_calibrator
+# in src/ml_predictor/prior_corrected_model.py). A single isotonic fit on a
+# small calibration set is a jumpy, nonparametric step function that can show
+# large unreachable gaps in the calibrated-probability range as an artifact
+# of the fixed split rather than a real property of the model. Cross-fitting
+# (K isotonic + K sigmoid calibrators averaged across folds) smooths that out
+# without needing more calibration data.
+#   CALIBRATION_N_SPLITS: requested number of folds; auto-reduced if the cal
+#     set doesn't have enough positives/negatives to support it.
+#   CALIBRATION_BLEND_WEIGHT: weight given to the isotonic ensemble output;
+#     the sigmoid ensemble gets (1 - this). 0.7 keeps isotonic as the
+#     dominant signal while sigmoid fills in any remaining plateaus.
+CALIBRATION_N_SPLITS: int = 5
+CALIBRATION_BLEND_WEIGHT: float = 0.7
 
 
 
@@ -3008,15 +3026,22 @@ def train_model(
     eval_metric, n_estimators, scale_pos_weight, early_stopping_rounds) is
     unaffected.
 
-    RC6: If X_cal/y_cal are supplied (a held-out calibration set),
-    the raw XGBoost model is wrapped with CalibratedClassifierCV
-    (method='isotonic', cv='prefit') before being returned.  Isotonic
-    regression fits a rank-preserving monotone step function to the
+    RC6: If X_cal/y_cal are supplied (a held-out calibration set), the raw
+    XGBoost model is wrapped with a cross-fitted, isotonic/sigmoid-blended
+    calibrator (see fit_cross_fitted_blended_calibrator() in
+    src/ml_predictor/prior_corrected_model.py) before being returned.
+    Isotonic regression fits a rank-preserving monotone step function to the
     calibration data and does NOT anchor to the calibration set's base
     rate — making it robust to the mismatch between the val-set positive
     rate (~10–25%) and the screened inference universe's higher positive
-    rate.  Sigmoid (Platt scaling) anchors to the cal-set base rate and
-    was suppressing all inference probabilities to 0.50–0.68.
+    rate. Pure sigmoid (Platt scaling) anchors to the cal-set base rate and
+    was suppressing all inference probabilities to 0.50–0.68, which is why
+    isotonic remains the dominant component of the blend; sigmoid is only
+    blended in (weight = 1 - CALIBRATION_BLEND_WEIGHT) to smooth over the
+    unreachable-probability gaps a single small-sample isotonic fit can show.
+    Both components are cross-fitted (K folds averaged) rather than fit once
+    on the whole calibration set, so the result isn't sensitive to exactly
+    which rows land in a single fixed split.
     The calibrator is fitted on X_cal/y_cal (not X_train) so that no
     training data leaks into the calibration fit.
     """
@@ -3163,12 +3188,9 @@ def train_model(
         if n_cal_pos >= 10 and n_cal_neg >= 10:
             p_cal = n_cal_pos / max(1, n_cal_pos + n_cal_neg)
             logger.info(
-                f"RC6: Fitting isotonic probability calibrator on "
-                f"{len(y_cal)} calibration samples "
+                f"RC6: Fitting cross-fitted isotonic/sigmoid-blended probability "
+                f"calibrator on {len(y_cal)} calibration samples "
                 f"({n_cal_pos} pos / {n_cal_neg} neg, rate={p_cal:.1%})."
-            )
-            calibrated_model = CalibratedClassifierCV(
-                model, method="isotonic", cv="prefit"
             )
 
             # TAIL-GUARANTEE FIX (2026-08-13): the cal/early-stop split assigns
@@ -3203,7 +3225,24 @@ def train_model(
                         "side of the time-position split they happened to land on."
                     )
 
-            calibrated_model.fit(X_cal, y_cal)
+            calibrated_model, _n_splits_used = fit_cross_fitted_blended_calibrator(
+                model,
+                X_cal,
+                y_cal,
+                n_splits=CALIBRATION_N_SPLITS,
+                blend_weight=CALIBRATION_BLEND_WEIGHT,
+            )
+            if _n_splits_used != CALIBRATION_N_SPLITS:
+                logger.info(
+                    f"  RC6: calibration set too small for {CALIBRATION_N_SPLITS} "
+                    f"folds — used {_n_splits_used} fold(s) instead."
+                )
+            logger.info(
+                f"  RC6: calibrator = {_n_splits_used}-fold cross-fitted isotonic "
+                f"blended with {_n_splits_used}-fold cross-fitted sigmoid "
+                f"(blend_weight={CALIBRATION_BLEND_WEIGHT:.2f} isotonic / "
+                f"{1.0 - CALIBRATION_BLEND_WEIGHT:.2f} sigmoid)."
+            )
 
             # Sanity-check: log how calibration shifted the distribution
             raw_proba = model.predict_proba(X_cal)[:, 1]
@@ -3232,24 +3271,38 @@ def train_model(
             # probability surface — worth understanding but still not
             # necessarily a bug (e.g. a dominant regime-flag feature).
             try:
-                _iso = calibrated_model.calibrated_classifiers_[0].calibrators[0]
-                _x_thresh = getattr(_iso, "X_thresholds_", None)
-                _y_thresh = getattr(_iso, "y_thresholds_", None)
-                if _x_thresh is not None and _y_thresh is not None:
-                    _steps = list(zip(np.round(_x_thresh, 4), np.round(_y_thresh, 4)))
-                    logger.info(
-                        f"  RC6-diag: isotonic calibrator has {len(_steps)} step "
-                        f"breakpoint(s). raw_score→prob steps: {_steps}"
-                    )
-                    _y_sorted = np.sort(_y_thresh)
+                # RC6-diag (revised for cross-fitted blended calibrator): log
+                # each fold's isotonic step breakpoints, then check whether the
+                # UNION of all folds' y-thresholds still shows a gap. Because
+                # the final output is the blend of the isotonic-fold average
+                # with the smooth sigmoid-fold average, a gap in any single
+                # fold's steps (or even in their union) doesn't necessarily
+                # produce a gap in the actual blended output — but it's still
+                # useful to see whether the underlying isotonic fits are jumpy.
+                _all_y_thresh = []
+                for _fold_i, _iso in enumerate(calibrated_model._iso_models):
+                    _x_thresh = getattr(_iso, "X_thresholds_", None)
+                    _y_thresh = getattr(_iso, "y_thresholds_", None)
+                    if _x_thresh is not None and _y_thresh is not None:
+                        _steps = list(zip(np.round(_x_thresh, 4), np.round(_y_thresh, 4)))
+                        logger.info(
+                            f"  RC6-diag: isotonic fold {_fold_i} has {len(_steps)} "
+                            f"step breakpoint(s). raw_score→prob steps: {_steps}"
+                        )
+                        _all_y_thresh.extend(_y_thresh.tolist())
+                if _all_y_thresh:
+                    _y_sorted = np.sort(np.unique(np.round(_all_y_thresh, 4)))
                     _y_gaps = np.diff(_y_sorted)
                     if len(_y_gaps) > 0 and _y_gaps.max() > 0.15:
                         _gap_idx = int(np.argmax(_y_gaps))
                         logger.info(
-                            f"  RC6-diag: largest calibrated-probability gap is "
+                            f"  RC6-diag: largest gap across the union of all "
+                            f"isotonic folds' output thresholds is "
                             f"{_y_sorted[_gap_idx]:.3f}–{_y_sorted[_gap_idx+1]:.3f} "
-                            f"(width {_y_gaps[_gap_idx]:.3f}) — no calibrator output "
-                            "will ever land inside this range, by construction."
+                            f"(width {_y_gaps[_gap_idx]:.3f}). The sigmoid blend "
+                            "component fills in this range in the final output; "
+                            "only the raw per-fold isotonic step function has "
+                            "this hard restriction."
                         )
             except (AttributeError, IndexError, TypeError) as _e:
                 logger.debug(f"  RC6-diag: could not introspect isotonic thresholds ({_e}).")
