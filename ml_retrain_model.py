@@ -3755,6 +3755,13 @@ HPARAM_SEARCH_RANDOM_STATE = 42
 # than the hand-tuned defaults and cause the final fit to converge in a
 # handful of trees regardless of the n_estimators ceiling.
 HPARAM_SEARCH_MIN_DELTA = float(os.environ.get("HPARAM_SEARCH_MIN_DELTA", "0.002"))
+# A delta clearing HPARAM_SEARCH_MIN_DELTA can still be pure noise when the
+# folds themselves are volatile (e.g. baseline_std_auc=0.0795 with only
+# ~1600 rows / ~210 positives per fold). Require the delta to also clear a
+# multiple of that run's own baseline fold std before accepting the search
+# result, so acceptance scales with how noisy this particular run's CV
+# estimate actually is instead of a single fixed number.
+HPARAM_SEARCH_NOISE_MULTIPLIER = float(os.environ.get("HPARAM_SEARCH_NOISE_MULTIPLIER", "1.0"))
 
 # Exactly the parameters called out as hand-tuned by trial-and-error above:
 # max_depth, min_child_weight, gamma, reg_alpha, reg_lambda, subsample,
@@ -3941,34 +3948,43 @@ def search_hyperparameters(
     # `_searched_params` in the retrain entrypoint) used the searched config
     # regardless of whether it actually beat the baseline.
     #
-    # With CV fold AUCs this noisy (this run: 0.3732-0.5104, i.e. barely
-    # distinguishable from chance on a ~1600-row fold with ~210 positives),
-    # a delta of a few thousandths of an AUC point is well within fold-to-
-    # fold noise — the "winning" trial isn't meaningfully better, it just
-    # got lucky on this particular embargoed split. But HPARAM_SEARCH_SPACE
-    # allows min_child_weight up to 20 and gamma up to 5.0 — an order of
-    # magnitude heavier than the hand-tuned defaults (4 / 0.3) — so a trial
-    # that wins on pure noise can easily land on very heavy regularisation.
-    # That, independent of any n_estimators ceiling, makes the final
-    # seed-bagged fit's early stopping converge in single-digit-to-teens
-    # trees (this run: seed best_iterations of 34,4,5,16,41,5,10 -> mean 16),
-    # which is genuine early stopping against noisy val AUC, not a starved
-    # tree budget — raising n_estimators_ceiling alone cannot fix this.
+    # A first attempt gated acceptance on a flat `delta >= 0.002`. That's
+    # still not sufficient: on a run with baseline_std_auc=0.0795 (this run),
+    # a delta of +0.0088 cleared the flat threshold while being barely 11%
+    # of a single fold-to-fold standard deviation — i.e. indistinguishable
+    # from noise despite "passing". HPARAM_SEARCH_SPACE allows
+    # min_child_weight up to 20 and gamma up to 5.0 — an order of magnitude
+    # heavier than the hand-tuned defaults (4 / 0.3) — so a trial that wins
+    # on pure noise can easily land on very heavy regularisation. That,
+    # independent of any n_estimators ceiling, makes the final seed-bagged
+    # fit's early stopping converge in single-digit-to-teens trees (this
+    # run: seed best_iterations of 34,4,5,16,41,5,10 -> mean 16), which is
+    # genuine early stopping against noisy val AUC, not a starved tree
+    # budget — raising n_estimators_ceiling alone cannot fix this, and
+    # neither can a threshold that ignores how noisy this run's folds were.
     #
-    # Fix: only accept the searched config when it beats the baseline by
-    # more than HPARAM_SEARCH_MIN_DELTA. Otherwise fall back to the
-    # hand-tuned XGBOOST_PARAMS values (best_params=None), and record why.
-    accepted = delta is not None and delta >= HPARAM_SEARCH_MIN_DELTA
+    # Fix: require delta to clear BOTH a small absolute floor
+    # (HPARAM_SEARCH_MIN_DELTA, guards against near-zero deltas even when
+    # folds happen to be very stable) AND a multiple of the baseline fold
+    # noise (HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc, guards
+    # against "passing" a threshold that's tiny relative to how much these
+    # folds already disagree with each other). Otherwise fall back to the
+    # hand-tuned XGBOOST_PARAMS values (best_params effectively unused) and
+    # record why.
+    _noise_bar = HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc if baseline_std_auc == baseline_std_auc else 0.0
+    _required_delta = max(HPARAM_SEARCH_MIN_DELTA, _noise_bar)
+    accepted = delta is not None and delta >= _required_delta
     if not accepted:
         logger.info(
             f"  search_hyperparameters: best searched config beats baseline by only "
-            f"{('%.4f' % delta) if delta is not None else 'n/a'} AUC "
-            f"(< {HPARAM_SEARCH_MIN_DELTA} threshold) — not a real improvement over "
-            "this noisy a CV estimate. Falling back to hand-tuned XGBOOST_PARAMS "
-            "for this run instead of using the searched (possibly over-regularised) "
-            "config."
+            f"{('%.4f' % delta) if delta is not None else 'n/a'} AUC, which doesn't "
+            f"clear the required bar of {_required_delta:.4f} "
+            f"(= max(min_delta={HPARAM_SEARCH_MIN_DELTA}, "
+            f"{HPARAM_SEARCH_NOISE_MULTIPLIER}\u00d7baseline_std={baseline_std_auc:.4f})) "
+            "— not a real improvement over this noisy a CV estimate. Falling back to "
+            "hand-tuned XGBOOST_PARAMS for this run instead of using the searched "
+            "(possibly over-regularised) config."
         )
-
     top_trials = sorted(
         (t for t in trials_log if t["mean_auc"] is not None),
         key=lambda t: t["mean_auc"], reverse=True,
@@ -3984,6 +4000,7 @@ def search_hyperparameters(
         "best_params": {k: best_params[k] for k in searched_keys},
         "accepted": accepted,
         "min_delta_threshold": HPARAM_SEARCH_MIN_DELTA,
+        "required_delta": round(_required_delta, 4),
         "best_mean_auc": round(best_mean_auc, 4),
         "best_std_auc": round(best_std_auc, 4) if best_std_auc == best_std_auc else None,
         "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
