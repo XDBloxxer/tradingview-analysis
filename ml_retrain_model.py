@@ -3641,28 +3641,80 @@ def cv_walk_forward_evaluate(
     mean_auc = float(np.mean(fold_aucs))
     std_auc = float(np.std(fold_aucs))
     mean_best_iter = float(np.mean(fold_best_iters))
-    # Folds train on LESS data than the final single-split fit (walk-forward
-    # folds only see rows before their own test window, while the final fit
-    # sees everything before the val cutoff), so the final fit can typically
-    # support at least as many trees as any individual fold needed. +15%
-    # headroom on the CV-averaged iteration count, clamped to this run's own
-    # n_estimators ceiling and a sane floor, rather than trusting either extreme.
+    median_best_iter = float(np.median(fold_best_iters))
+    min_best_iter, max_best_iter = int(np.min(fold_best_iters)), int(np.max(fold_best_iters))
+
+    # ── TREE-BUDGET FIX (undertrained-classifier root cause) ────────────────
+    # Previously this used the raw MEAN of fold best_iterations with a flat
+    # +15% headroom and a flat floor of 30. Two problems with that, confirmed
+    # against a run whose 5 folds gave best_iterations [43, 43, 88, 10, 6]:
+    #
+    #   1. The mean (38) is not robust to fold-to-fold noise that spans more
+    #      than an order of magnitude (6 -> 88). A couple of low-iteration
+    #      folds (small/hard test windows) can drag the mean down and that
+    #      noise propagates straight into a hard ceiling on the PRODUCTION
+    #      fit's tree budget. The median (43 here) is far less sensitive to
+    #      one or two outlier folds and is a better summary of "how many
+    #      trees do folds typically need" than the mean is.
+    #   2. A floor of 30 is meaningless in the presence of
+    #      early_stopping_rounds=50 (or whatever XGBOOST_PARAMS/
+    #      params_override actually set): if the ceiling comes out below
+    #      early_stopping_rounds, early stopping's patience window can never
+    #      fully play out — the final fit just trains up to the ceiling and
+    #      best_iteration becomes whichever round happened to look best on a
+    #      still fairly small val set, not "training converged". The floor
+    #      must be comfortably above early_stopping_rounds so patience can
+    #      actually apply before the ceiling is hit.
+    #
+    # Fix: base the estimate on the median (fall back to the mean only when
+    # they're already close, i.e. folds agree), keep the +15% headroom, and
+    # raise the floor to early_stopping_rounds + a margin instead of a flat
+    # 30. Still clamped above by this run's own configured n_estimators.
+    _es_rounds = params.get("early_stopping_rounds", 50)
+    _min_floor = max(30, _es_rounds + 20)
+    _center = median_best_iter
     recommended_n_estimators = int(
-        np.clip(round(mean_best_iter * 1.15), 30, params.get("n_estimators", XGBOOST_PARAMS["n_estimators"]))
+        np.clip(
+            round(_center * 1.15),
+            _min_floor,
+            params.get("n_estimators", XGBOOST_PARAMS["n_estimators"]),
+        )
     )
+
+    fold_spread_ratio = (max_best_iter / max(1, min_best_iter))
 
     logger.info(
         f"CV walk-forward evaluation ({n_used}/{n_splits} usable folds): "
         f"AUC = {mean_auc:.4f} \u00b1 {std_auc:.4f}  "
         f"(fold AUCs: {[round(a, 4) for a in fold_aucs]})  "
-        f"mean_best_iteration={mean_best_iter:.1f} -> "
-        f"recommended_n_estimators={recommended_n_estimators}"
+        f"best_iteration per fold: {fold_best_iters}  "
+        f"mean={mean_best_iter:.1f} median={median_best_iter:.1f} -> "
+        f"recommended_n_estimators={recommended_n_estimators} "
+        f"(floor={_min_floor}, early_stopping_rounds={_es_rounds})"
     )
     if std_auc > 0.03:
         logger.warning(
             f"  \u26a0\ufe0f  CV fold AUC std={std_auc:.4f} is high — the single-cut "
             "point estimate from train_val_split() (best_val_auc / blind_cal_auc) "
             "should be read as this CV range, not as precise to a couple points."
+        )
+    if fold_spread_ratio >= 5:
+        logger.warning(
+            f"  \u26a0\ufe0f  CV fold best_iteration spread is wide: min={min_best_iter} "
+            f"max={max_best_iter} (ratio={fold_spread_ratio:.1f}x). Using the median "
+            f"({median_best_iter:.1f}) instead of the mean ({mean_best_iter:.1f}) to "
+            "keep one or two noisy folds from dominating the production tree-budget "
+            "estimate, but treat recommended_n_estimators as a rough range, not a "
+            "precise number, when the folds disagree this much."
+        )
+    if recommended_n_estimators <= _es_rounds:
+        logger.warning(
+            f"  \u26a0\ufe0f  recommended_n_estimators={recommended_n_estimators} <= "
+            f"early_stopping_rounds={_es_rounds}: early stopping's patience window "
+            "cannot fully play out inside this tree budget — the final fit will just "
+            "train to the ceiling and best_iteration will reflect whichever round "
+            "looked best on that budget, not genuine convergence. Consider raising "
+            "the floor further or lowering early_stopping_rounds for this run."
         )
 
     return {
@@ -3675,6 +3727,8 @@ def cv_walk_forward_evaluate(
         "mean_auc": round(mean_auc, 4),
         "std_auc": round(std_auc, 4),
         "mean_best_iteration": round(mean_best_iter, 1),
+        "median_best_iteration": round(median_best_iter, 1),
+        "fold_best_iteration_range": [min_best_iter, max_best_iter],
         "recommended_n_estimators": recommended_n_estimators,
     }
 
