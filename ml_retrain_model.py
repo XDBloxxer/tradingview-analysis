@@ -746,7 +746,7 @@ XGBOOST_PARAMS = {
     "reg_lambda":         1.5,     # loosened from 2.0 → less L2 regularisation
     "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
     "objective":          "binary:logistic",
-    # eval_metric changed from "logloss" to "auc":
+    # eval_metric changed from "logloss" to "auc", then "auc" to "aucpr":
     # logloss is sensitive to predicted probability calibration.  When the val
     # set has a very different positive rate from the train set (e.g. val has
     # 27% positives vs train 9.5%), scale_pos_weight causes logloss on the val
@@ -754,7 +754,18 @@ XGBOOST_PARAMS = {
     # AUC is rank-based and immune to this calibration skew — it only cares
     # whether the model separates positives from negatives, not the absolute
     # probability level, so it gives a stable and meaningful early-stopping signal.
-    "eval_metric":        "auc",
+    #
+    # However, ROC-AUC weighs the whole ranking equally, including the easy
+    # majority-negative tail that we never act on. What we actually use in
+    # production is top-20%-by-score precision/recall (a precision-at-K
+    # objective), not the full ranking. At the screened universe's ~15%
+    # positive rate, PR-AUC (average precision) is far more sensitive to
+    # ranking quality in the high-score region than ROC-AUC is — it's still
+    # rank-based (so it keeps the calibration-skew immunity above) but it
+    # concentrates on precision/recall trade-offs the way our downstream
+    # top-K selection does, so early stopping now tracks the metric we
+    # actually make decisions on instead of a more generic ranking score.
+    "eval_metric":        "aucpr",
     "use_label_encoder":  False,
     "random_state":       42,
     "n_jobs":             -1,
@@ -5788,7 +5799,7 @@ def save_outputs(
         "features":              feature_names,
         "feature_names_sample":  feature_names[:20],
         "best_iteration":        int(_raw_model.best_iteration),
-        "best_val_auc":          float(_raw_model.best_score),  # renamed from best_val_logloss; metric is AUC (eval_metric="auc")
+        "best_val_auc":          float(_raw_model.best_score),  # NOTE: key name is legacy; metric is now PR-AUC (eval_metric="aucpr"), not ROC-AUC
         "gain_regressor_trained": gain_regressor is not None,
         "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
                                   "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
