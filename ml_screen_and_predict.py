@@ -440,10 +440,13 @@ def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
             while not _is_trading_day(prediction_day):
                 prediction_day += timedelta(days=1)
 
-            # Clamp: if the calculated day is in the future but today is
-            # already a valid trading day, use today instead.
-            # This happens when a holiday sat between last_date and today.
-            if prediction_day > today and _is_trading_day(today):
+            # Clamp: only kicks in for a genuine backfill lag (e.g. a holiday
+            # or an outage left daily_winners more than one trading day behind
+            # today). A gap of exactly one day is the normal, expected case
+            # (yesterday's winners -> predicting today's session) and must
+            # NOT be clamped, or the script will perpetually predict for the
+            # day that already closed instead of the upcoming session.
+            if (prediction_day - today).days > 1 and _is_trading_day(today):
                 logger.info(
                     f"Prediction date derived from daily_winners: "
                     f"last={last_date}  →  next trading day={prediction_day} "
