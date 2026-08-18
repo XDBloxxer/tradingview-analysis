@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-08-18T20:08:53.677966+00:00",
+  "trained_at": "2026-08-18T20:19:25.495066+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
   "n_features": 13,
@@ -195,6 +195,8 @@
       "subsample": 0.5779972601681014,
       "colsample_bytree": 0.5290418060840998
     },
+    "accepted": true,
+    "min_delta_threshold": 0.002,
     "best_mean_auc": 0.4178,
     "best_std_auc": 0.0765,
     "baseline_mean_auc": 0.4089,
