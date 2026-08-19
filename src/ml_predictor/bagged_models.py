@@ -82,6 +82,27 @@ class BaggedXGBClassifier:
     def predict(self, X):
         return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
 
+    # FEATURE-METADATA PROXY FIX: every seed is trained on the same params,
+    # data, and columns (only random_state differs — see class docstring),
+    # so estimators_[0] is representative of them all. Without these,
+    # getattr(self, "feature_names_in_", ...) / "n_features_in_" on the
+    # wrapper silently fall back to their default (missing/None) instead of
+    # raising OR returning the real values, which lets callers that build
+    # extra regressor-only columns based on these attributes (see
+    # BaggedXGBRegressor below, and explosion_predictor.py's
+    # predict_with_targets()) silently skip columns the underlying model
+    # actually needs.
+    @property
+    def feature_names_in_(self):
+        return self.estimators_[0].feature_names_in_
+
+    @property
+    def n_features_in_(self):
+        return self.estimators_[0].n_features_in_
+
+    def get_booster(self):
+        return self.estimators_[0].get_booster()
+
     def get_feature_importance(self, feature_names=None):
         """Average each seed's gain-importance scores (raw XGBoost 'fN' keys,
         or feature_names[N] if provided). Used by compute_feature_importance()
@@ -151,6 +172,23 @@ class BaggedXGBRegressor:
                 totals[feat] = totals.get(feat, 0.0) + score
                 counts[feat] = counts.get(feat, 0) + 1
         return {feat: totals[feat] / counts[feat] for feat in totals}
+
+    # FEATURE-METADATA PROXY FIX: see BaggedXGBClassifier.feature_names_in_
+    # above — same rationale. Without this, explosion_predictor.py can't
+    # detect that this regressor was trained with the extra 'log_price' /
+    # 'clf_proba' columns (ml_retrain_model.py's "REGRESSOR-ONLY ... FEATURE"
+    # blocks), and silently predicts on an incomplete feature row instead of
+    # appending them — the root cause of the collapsed/garbage gain outputs.
+    @property
+    def feature_names_in_(self):
+        return self.estimators_[0].feature_names_in_
+
+    @property
+    def n_features_in_(self):
+        return self.estimators_[0].n_features_in_
+
+    def get_booster(self):
+        return self.estimators_[0].get_booster()
 
     def __getstate__(self):
         return self.__dict__
