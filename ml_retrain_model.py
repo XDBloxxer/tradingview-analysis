@@ -842,7 +842,7 @@ BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
 #      initialization variance. Applied only inside train_model()'s seed
 #      loop — the val/cal split, calibration, and CV walk-forward evaluation
 #      report the CV are unaffected.
-RECENCY_WEIGHTING_ENABLED = True
+RECENCY_WEIGHTING_ENABLED = False
 RECENCY_HALF_LIFE_DAYS    = 90   # sample weight halves every 90 calendar days
                                   # back from the most recent training row;
                                   # undated (mistake-sample) rows are left at
