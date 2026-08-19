@@ -81,7 +81,12 @@ YFINANCE_MAX_WORKERS = 10
 
 # A stock is considered a winner if its intraday high on prediction date
 # reached this threshold above the prior close — regardless of where it closed.
-INTRADAY_WIN_THRESHOLD = 20.0
+# CLAUDE FIX (2026-08-19): kept in sync with ml_retrain_model.py's
+# INTRADAY_WIN_THRESHOLD (20.0 -> 15.0). These two constants must match —
+# otherwise this tracker would grade the model against a "winner" bar
+# different from what it was actually trained to hit, silently mis-scoring
+# performance again in the other direction.
+INTRADAY_WIN_THRESHOLD = 15.0
 
 # FIX 1: Keys are now lowercase to match what load_feature_importance() produces
 # after stripping the t3_/t5_/t10_ prefix from lowercase model feature names.
