@@ -100,6 +100,50 @@ RC9 FIX — Mode D threshold tightened from 0.50 → 0.40 (2026-06-03):
   relative ranking but the method='average' tie bug masked the effect). With
   RC7's method='max' fix in place, the two changes together ensure both the
   detection and the classification are correct.
+
+RC13 FIX — Percentile ranking made the PRIMARY classification method,
+absolute SIGNAL_THRESHOLDS demoted to diagnostic-only (2026-08-19):
+  The RC6 docstring above assumed "the screener raises the effective
+  positive rate to ~30-50%". That number was never measured — it was a
+  hardcoded fallback constant (SCREENER_POSITIVE_RATE_FALLBACK=0.35 in
+  ml_retrain_model.py). Once SCREENER_POSITIVE_RATE started being measured
+  against real trailing-90-day outcomes, the actual screened positive rate
+  came back at ~14.9% — essentially identical to the training calibration
+  set's own base rate (odds_ratio≈1.02, i.e. no gap for the prior-correction
+  step to close; the isotonic ceiling on the best fold topped out at ~0.50).
+
+  That means SIGNAL_THRESHOLDS (0.90/0.70/0.50) were never reachable by an
+  honestly calibrated model at this base rate, and no amount of correcting
+  the calibration step can change that: a calibrated probability cannot
+  climb higher than the actual observed hit-rate in that score bin. The RC6
+  Mode D/E "high-probability clustering" safety net was catching the
+  symptom (probabilities saturating near the *low* achievable ceiling
+  relative to a threshold set for a *much higher* one) without addressing
+  that absolute thresholds are structurally the wrong tool whenever the real
+  base rate is far from whatever was assumed when the constants were chosen.
+
+  FIX: _classify_signals() now calls _classify_signals_relative() directly
+  as the primary path on every run, not gated behind _detect_bimodal().
+  Relative ranking has three rounds of hardening (RC7 tie-break fix, RC8
+  percentile tuning, RC9 detection-threshold tightening) that the absolute
+  path never received, and — being scale-invariant — it stays meaningful
+  regardless of where the measured base rate drifts to in the future.
+  SIGNAL_THRESHOLDS and _classify_signal_absolute() are retained only for
+  (a) the single-probability _classify_signal() compatibility shim used by
+  external callers that don't have a full batch to rank against, and (b) a
+  non-gating diagnostic log comparing what the absolute path would have
+  produced, so future drift between SIGNAL_THRESHOLDS and the achievable
+  calibrated-probability range is visible instead of silently producing an
+  empty or saturated STRONG BUY bucket again. See
+  get_dynamic_absolute_thresholds() for deriving absolute reference values
+  from the live distribution instead of hand-picking new constants.
+
+  The prior-correction code in prior_corrected_model.py / ml_retrain_model.py
+  is NOT the fix and is NOT broken — odds_ratio≈1.0 is the mathematically
+  correct output when p_inf≈p_cal, i.e. when there's no base-rate gap to
+  correct. It's kept because it's harmless and will do real work automatically
+  if/when the measured screener rate ever does diverge from the calibration
+  set's rate again.
 """
 
 import json
@@ -131,11 +175,46 @@ from src.ml_predictor.feature_scaling import (
 
 _META_COLS = {"symbol", "exchange"}
 
+# RC13: Retained only as a diagnostic reference point (see _classify_signals()
+# dispatch below), NOT as the classification method. These specific numbers
+# are still hand-picked and will still drift out of reach of an honestly
+# calibrated model whenever the real screener base rate is far from the
+# "30-50%" assumption baked into them — do not rescale these to "fix" a base
+# -rate mismatch; that just re-encodes today's distribution as tomorrow's
+# stale constant. If an absolute reference is ever needed again, derive it
+# from percentiles of the calibrated-probability distribution at runtime
+# (see get_dynamic_absolute_thresholds() below) rather than hardcoding it.
 SIGNAL_THRESHOLDS = {
     "STRONG BUY": 0.90,
     "BUY":        0.70,
     "HOLD":       0.50,
 }
+
+
+def get_dynamic_absolute_thresholds(
+    probabilities: np.ndarray,
+    strong_buy_pct: float = 95.0,
+    buy_pct: float = 85.0,
+    hold_pct: float = 60.0,
+) -> Dict[str, float]:
+    """Derive absolute-probability reference cutoffs from THIS run's actual
+    calibrated-probability distribution, instead of hand-picked constants.
+
+    This exists purely as a diagnostic/logging aid (e.g. to compare against
+    SIGNAL_THRESHOLDS and flag drift). The live classification path uses
+    _classify_signals_relative() directly on ranks, which makes this
+    computation unnecessary for correctness — percentile rank thresholds are
+    scale-invariant, so there's no need to translate them back into absolute
+    probability values to classify anything. Use this only when an absolute
+    number is genuinely needed for a report or external comparison.
+    """
+    if len(probabilities) == 0:
+        return {"STRONG BUY": float("nan"), "BUY": float("nan"), "HOLD": float("nan")}
+    return {
+        "STRONG BUY": float(np.percentile(probabilities, strong_buy_pct)),
+        "BUY":        float(np.percentile(probabilities, buy_pct)),
+        "HOLD":       float(np.percentile(probabilities, hold_pct)),
+    }
 
 # Relative-ranking percentile thresholds (used when _is_bimodal = True)
 # RC8 FIX: Lowered RELATIVE_STRONG_BUY_PCT from 0.95 → 0.90.
@@ -1264,15 +1343,60 @@ class ExplosionPredictor:
         self._is_bimodal = self._detect_bimodal(probabilities)
 
         prob_series = pd.Series(probabilities, index=data_df.index)
+
+        # RC13 FIX (2026-08-19): Percentile-based ranking is now the PRIMARY
+        # classification method, not a fallback gated behind _detect_bimodal.
+        #
+        # Why: SIGNAL_THRESHOLDS (0.90/0.70/0.50) were set assuming a screened
+        # inference universe with a ~30-50% positive rate (see old RC6 docstring
+        # above). Measuring SCREENER_POSITIVE_RATE against real trailing data
+        # showed the actual rate is ~14.9%, essentially identical to the
+        # training calibration set's base rate (odds_ratio≈1.0 — there was
+        # never a gap for the prior-correction step to close). With a true
+        # ~15% base rate, a properly calibrated model structurally cannot
+        # produce 70-95%+ probabilities on most days, regardless of how good
+        # the features/model are — so absolute thresholds calibrated to
+        # "confidence language" are the wrong tool for this base rate, not
+        # just miscalibrated. _detect_bimodal's Modes A-E were only ever a
+        # symptom detector for this; they can miss cases (e.g. a "healthy"-
+        # looking but still base-rate-capped distribution) where absolute
+        # thresholds are quietly under-triggering rather than over-triggering.
+        #
+        # Relative ranking has three rounds of hardening (RC7 tie-break fix,
+        # RC8 percentile tuning, RC9 detection-threshold tightening) that the
+        # absolute path never received, and it stays meaningful regardless of
+        # where the measured base rate drifts to over time. Absolute
+        # thresholds are retained only as a non-gating diagnostic (logged
+        # below) to make future recalibration decisions easier to sanity-check.
+        raw_score_series = pd.Series(raw_scores, index=data_df.index)
+        signals = self._classify_signals_relative(raw_score_series)
+
         if self._is_bimodal:
-            self.logger.info("Using percentile-based (relative) signal classification.")
-            # RC11: rank on raw scores (full granularity), not the
-            # tie-collapsed calibrated values — see comment above.
-            raw_score_series = pd.Series(raw_scores, index=data_df.index)
-            signals = self._classify_signals_relative(raw_score_series)
+            self.logger.info(
+                "Using percentile-based (relative) signal classification "
+                "[primary method; _detect_bimodal also flagged this batch as degenerate]."
+            )
         else:
-            self.logger.info("Distribution looks healthy — using absolute probability thresholds.")
-            signals = prob_series.map(self._classify_signal_absolute)
+            self.logger.info(
+                "Using percentile-based (relative) signal classification [primary method]."
+            )
+
+        # Diagnostic-only comparison against the legacy absolute thresholds —
+        # never used to gate the returned signal, just logged so drift in
+        # SIGNAL_THRESHOLDS vs. the achievable calibrated-probability range is
+        # visible over time instead of silently producing a saturated/empty
+        # STRONG BUY bucket the way it did before this fix.
+        absolute_signals = prob_series.map(self._classify_signal_absolute)
+        abs_strong_buy_n = int((absolute_signals == "STRONG BUY").sum())
+        rel_strong_buy_n = int((signals == "STRONG BUY").sum())
+        if abs_strong_buy_n != rel_strong_buy_n:
+            self.logger.info(
+                f"[diagnostic] Absolute-threshold STRONG BUY count would have been "
+                f"{abs_strong_buy_n} vs. {rel_strong_buy_n} from relative ranking "
+                f"(n={len(probabilities)}, mean_prob={float(np.mean(probabilities)):.3f}). "
+                f"Large/persistent gaps here mean SIGNAL_THRESHOLDS no longer reflects "
+                f"the achievable calibrated-probability range and should be revisited."
+            )
 
         result_df = pd.DataFrame({
             "explosion_probability": probabilities,
