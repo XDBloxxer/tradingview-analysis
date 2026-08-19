@@ -672,7 +672,103 @@ SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
 #   With SCREENER_POSITIVE_RATE=None the model returns raw isotonic-calibrated
 #   probabilities. The RC7/RC8/RC9 safety nets in explosion_predictor.py will
 #   catch any residual clustering if calibration drifts.
-SCREENER_POSITIVE_RATE: float | None = None
+#
+#   FIX (2026-08-19): Re-enabled, but as a MEASURED trailing value instead of
+#   a hand-picked constant. The 2026-06-03 disable traded one failure mode
+#   for another: instead of the pre-RC6 saturation bug (probabilities
+#   over-corrected to 0.90+), the classifier now systematically caps out
+#   below 0.50 even for true winners on held-out validation data (see the
+#   2026-08-19 retrain log — 0 validation rows scored above 0.5, class-1
+#   recall at the 0.5 cutoff was 0.00). Isotonic calibration alone doesn't
+#   fix a base-rate mismatch this large (13.8% training positive rate vs. a
+#   screened inference universe that's meaningfully higher); SPW/weight
+#   tuning wasn't closing that gap either. estimate_screener_positive_rate()
+#   below replaces the old static guess with a trailing measurement from
+#   ml_prediction_accuracy, recomputed every retrain so it tracks the
+#   screener's actual observed win rate as filters change over time, rather
+#   than going stale like a hardcoded constant would.
+SCREENER_POSITIVE_RATE: float | None = None  # overwritten by main() at runtime — see below
+
+SCREENER_POSITIVE_RATE_FALLBACK = 0.35
+SCREENER_POSITIVE_RATE_LOOKBACK_DAYS = 90
+# Sanity bounds — if the measured rate falls outside this range, something is
+# probably wrong with the query/table rather than a genuine base-rate shift
+# (e.g. a schema change, an empty table, or a became_winner column that's
+# briefly all-False/all-True after a migration). Fall back rather than trust
+# an implausible number and risk recreating the old saturation bug.
+SCREENER_POSITIVE_RATE_MIN = 0.05
+SCREENER_POSITIVE_RATE_MAX = 0.80
+
+
+def estimate_screener_positive_rate(
+    client,
+    lookback_days: int = SCREENER_POSITIVE_RATE_LOOKBACK_DAYS,
+    fallback: float = SCREENER_POSITIVE_RATE_FALLBACK,
+) -> float:
+    """
+    Trailing realized win rate of the screened inference universe, measured
+    directly from ml_prediction_accuracy rather than hand-picked.
+
+    Replaces the old approach of hardcoding SCREENER_POSITIVE_RATE as a
+    module constant. A fixed guess goes stale as the screener's filters
+    change (learned_filters.json has already been retightened several times
+    — min_price/max_price/min_hv10 etc. all shift the true positive rate of
+    whatever passes the screener), and an over-aggressive guess is exactly
+    what caused the pre-RC6 saturation bug. Recomputing this every retrain
+    from actual outcomes keeps the correction anchored to reality instead of
+    to whatever value someone typed in on a given day.
+
+    Uses became_winner (aligned with INTRADAY_WIN_THRESHOLD — see that
+    constant's definition above) over the trailing `lookback_days` window.
+    Falls back to `fallback` if the table is unreachable, empty, or the
+    measured rate is outside [SCREENER_POSITIVE_RATE_MIN,
+    SCREENER_POSITIVE_RATE_MAX] — an implausible value is more likely a data
+    problem than a genuine base-rate shift, and silently trusting it risks
+    recreating the old over/under-correction bugs.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
+
+    try:
+        resp = (
+            client.table("ml_prediction_accuracy")
+            .select("became_winner")
+            .gte("prediction_date", cutoff)
+            .execute()
+        )
+        rows = resp.data or []
+    except Exception as e:
+        logger.warning(
+            f"[SCREENER_POSITIVE_RATE] Query against ml_prediction_accuracy failed "
+            f"({e}) — using fallback={fallback}."
+        )
+        return fallback
+
+    n_total = len(rows)
+    if n_total == 0:
+        logger.warning(
+            f"[SCREENER_POSITIVE_RATE] No ml_prediction_accuracy rows in the trailing "
+            f"{lookback_days} days — using fallback={fallback}."
+        )
+        return fallback
+
+    n_winners = sum(1 for r in rows if r.get("became_winner"))
+    rate = n_winners / n_total
+
+    if not (SCREENER_POSITIVE_RATE_MIN <= rate <= SCREENER_POSITIVE_RATE_MAX):
+        logger.warning(
+            f"[SCREENER_POSITIVE_RATE] Measured rate {rate:.3f} ({n_winners}/{n_total} "
+            f"over {lookback_days}d) is outside the plausible range "
+            f"[{SCREENER_POSITIVE_RATE_MIN}, {SCREENER_POSITIVE_RATE_MAX}] — "
+            f"using fallback={fallback} instead. Investigate before trusting this "
+            f"table's became_winner values."
+        )
+        return fallback
+
+    logger.info(
+        f"[SCREENER_POSITIVE_RATE] Measured {rate:.3f} ({n_winners}/{n_total} winners "
+        f"over trailing {lookback_days}d) — using this as the prior-correction anchor."
+    )
+    return rate
 
 # CALIBRATION_N_SPLITS / CALIBRATION_BLEND_WEIGHT: knobs for the cross-fitted,
 # isotonic/sigmoid-blended calibrator (see fit_cross_fitted_blended_calibrator
@@ -3015,6 +3111,7 @@ def train_model(
     y_val_full: pd.Series = None,
     n_estimators_ceiling: Optional[int] = None,
     hyperparams_override: Optional[dict] = None,
+    screener_positive_rate: Optional[float] = None,
 ) -> object:
     """Train XGBClassifier from scratch with early stopping.
 
@@ -3337,7 +3434,11 @@ def train_model(
                     )
 
             # Step 2: Prior-probability correction for base-rate mismatch.
-            p_inf = SCREENER_POSITIVE_RATE
+            # screener_positive_rate (passed in from main(), measured via
+            # estimate_screener_positive_rate()) takes priority; falls back
+            # to the module-level SCREENER_POSITIVE_RATE for any caller that
+            # still invokes train_model() directly without it (e.g. tests).
+            p_inf = screener_positive_rate if screener_positive_rate is not None else SCREENER_POSITIVE_RATE
             if p_inf is not None and 0.0 < p_inf < 1.0 and 0.0 < p_cal < 1.0:
                 # Bayes odds-ratio correction factor
                 odds_ratio = (p_inf / (1.0 - p_inf)) / (p_cal / (1.0 - p_cal))
@@ -7014,6 +7115,12 @@ def main() -> int:
 
     X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
 
+    # ── Prior-correction anchor for isotonic calibration ────────────────────
+    # Measured trailing win rate of the screened universe (see
+    # estimate_screener_positive_rate()'s docstring above for why this
+    # replaces the old hardcoded SCREENER_POSITIVE_RATE constant).
+    _screener_positive_rate = estimate_screener_positive_rate(client)
+
     # ── Train ─────────────────────────────────────────────────────────────────
     model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val_xgb, y_val_xgb,
                         X_cal=X_cal_fit, y_cal=y_cal_fit,
@@ -7022,7 +7129,8 @@ def main() -> int:
                             cv_results.get("recommended_n_estimators")
                             if not cv_results.get("skipped") else None
                         ),
-                        hyperparams_override=_searched_params)
+                        hyperparams_override=_searched_params,
+                        screener_positive_rate=_screener_positive_rate)
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
@@ -7391,6 +7499,7 @@ def main() -> int:
         "base_sample_weight":      BASE_CSV_WEIGHT,
         "t1_sample_weight":        T1_WEIGHT,
         "intraday_win_threshold":  INTRADAY_WIN_THRESHOLD,
+        "screener_positive_rate_used": _screener_positive_rate,
         "equal_weight_applied": (
             len(t1_df) >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
             if not t1_df.empty else False
