@@ -27,6 +27,23 @@ explosion_predictor.py).  joblib will then always find it via
 NOTE: Existing .pkl files saved with the old ``__main__`` path will still
 fail until the model is retrained (or re-saved) with this module in place.
 To migrate without retraining see the one-liner in the project README.
+
+RC13 NOTE (2026-08-19) — scope of what this file does and doesn't fix:
+The odds-ratio correction implemented here (see _PriorCorrectedModel below
+and the use of SCREENER_POSITIVE_RATE in ml_retrain_model.py) corrects for
+a *gap* between the calibration set's positive rate (p_cal) and the
+screened inference universe's positive rate (p_inf). Measured against real
+trailing data, that gap turned out to be ~0 (p_cal≈0.147, p_inf≈0.149,
+odds_ratio≈1.02) — so this code is doing its job correctly by doing
+nothing. It was never the source of the STRONG BUY / price-target
+regression; the actual issue was SIGNAL_THRESHOLDS in
+explosion_predictor.py being set for a ~30-50% base rate that was assumed,
+not measured, and unreachable at the real ~15% rate. That's fixed
+separately (see explosion_predictor.py's RC13 note) by making
+percentile-based relative ranking the primary classification method
+instead of rescaling absolute thresholds. This file should stay as-is — it
+will do real corrective work automatically if the measured screener rate
+ever genuinely diverges from the calibration set's rate again.
 """
 
 from types import SimpleNamespace
