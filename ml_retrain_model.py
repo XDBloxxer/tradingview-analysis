@@ -3340,10 +3340,22 @@ def train_model(
                 n_splits=CALIBRATION_N_SPLITS,
                 blend_weight=CALIBRATION_BLEND_WEIGHT,
             )
+            _n_cal_pos = int((y_cal == 1).sum())
+            _n_cal_neg = int((y_cal == 0).sum())
             if _n_splits_used != CALIBRATION_N_SPLITS:
                 logger.info(
                     f"  RC6: calibration set too small for {CALIBRATION_N_SPLITS} "
-                    f"folds — used {_n_splits_used} fold(s) instead."
+                    f"folds — used {_n_splits_used} fold(s) instead "
+                    f"({_n_cal_pos} pos / {_n_cal_neg} neg in calibration set, "
+                    f"~{min(_n_cal_pos, _n_cal_neg) // max(1, _n_splits_used)} of "
+                    f"the rarer class per fold)."
+                )
+            else:
+                logger.info(
+                    f"  RC6: calibration set supports full {_n_splits_used}-fold "
+                    f"split ({_n_cal_pos} pos / {_n_cal_neg} neg, "
+                    f"~{min(_n_cal_pos, _n_cal_neg) // max(1, _n_splits_used)} of "
+                    f"the rarer class per fold)."
                 )
             logger.info(
                 f"  RC6: calibrator = {_n_splits_used}-fold cross-fitted isotonic "
