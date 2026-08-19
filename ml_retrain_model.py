@@ -579,9 +579,22 @@ MIN_TRAIN_ROWS      = 200
 
 # FIX 4: Intraday high threshold — a stock is considered a "winner" even if
 # it didn't close at the top, as long as it hit this intraday gain.
-INTRADAY_WIN_THRESHOLD = 20.0  # %
-# Aligned with ml_track_comprehensive_accuracy.py and the tracker's became_winner
-# definition.  A stock that hits ≥20% intraday is a winner regardless of close price.
+#
+# CLAUDE FIX (2026-08-19): lowered from 20.0 -> 15.0. The 20.0 value was set
+# "to be unambiguous," but apply_intraday_high_labels()'s own docstring cites
+# the actual evidence: 476 rows with actual_high_pct >= 15% were sitting in
+# training as label=0 (i.e. real 15-19% intraday winners were still being
+# taught to the model as "not a winner" at the 20.0 cutoff). Since relabelling
+# is now sourced from all T-1 tables (not just winners_day_prior_*), the
+# selection-bias concern that originally justified a conservative/high
+# threshold no longer applies at 15% either — see the docstring below.
+# This directly targets "AVOID/HOLD stocks outperforming BUY/STRONG BUY in
+# production," which is still happening at 20.0, just less often than before.
+INTRADAY_WIN_THRESHOLD = 15.0  # %
+# NOTE: ml_track_comprehensive_accuracy.py's became_winner definition should
+# be updated to match this threshold — see that file's WIN_THRESHOLD-equivalent
+# constant — or accuracy reporting and training labels will disagree on what
+# counts as a "winner."
 
 # scale_pos_weight caps — prevent extreme corrections while still respecting
 # the actual class imbalance. scale_pos_weight is always computed live from
@@ -2645,20 +2658,23 @@ def apply_intraday_high_labels(
     they passed the screener, so relabelling them could teach the model "screener
     passer with high volatility → winner" rather than a genuine signal.
 
-    That concern was valid at a LOW threshold (e.g. 15%) where borderline moves
-    could plausibly be screener-pass noise.  But the threshold is now 20%, and the
-    data directly refutes the concern:
+    That concern was originally used to justify a conservative 20% threshold.  But
+    the data directly refutes the concern even at 15%:
 
         476 rows in ml_prediction_accuracy have actual_high_pct >= 15% with
         became_winner = false — meaning nearly 500 REAL explosive moves were sitting
         in non_winners_day_prior as label=0 training samples.  The model was being
-        trained that "stock hits +20% intraday = not a winner".  This is the primary
-        cause of AVOID/HOLD stocks outperforming BUY/STRONG BUY in production.
+        trained that "stock hits +15-20% intraday = not a winner".  This is the
+        primary cause of AVOID/HOLD stocks outperforming BUY/STRONG BUY in
+        production.
 
-    At 20% the move is unambiguous — a stock cannot hit +20% intraday by luck of
-    passing a screener filter.  The circular-bias argument does not apply when the
-    outcome is this large.  Restricting to winners_day_prior was silently poisoning
-    the negative class with hundreds of genuine winners.
+    CLAUDE FIX (2026-08-19): threshold lowered 20% -> 15% (see
+    INTRADAY_WIN_THRESHOLD above). At 15% the move is still unambiguous — a stock
+    does not hit +15% intraday by luck of passing a screener filter. The
+    circular-bias argument does not apply at this size. Restricting to
+    winners_day_prior (or leaving the bar at 20%) was silently poisoning the
+    negative class with genuine winners in the 15-19% range on top of the ones
+    already addressed at 20%.
 
     The selection-bias guard is retained for base_csv rows only, because those rows
     do not have reliable actual_high_pct values sourced from the same pipeline.
@@ -2712,8 +2728,16 @@ def apply_intraday_high_labels(
                 logger.info(f"  → {n_src} upgrades from {src_label}")
 
     combined_df.loc[mask, "label"] = 1
-    # Bump sample weight — these are high-signal corrective examples
-    combined_df.loc[mask, "sample_weight"] = combined_df.loc[mask, "sample_weight"] * 1.5
+    # Bump sample weight — these are high-signal corrective examples.
+    # CLAUDE FIX (2026-08-19): raised 1.5x -> 2.5x. These rows are directly
+    # correcting the exact contamination that was training the model to
+    # associate big up-moves with "not a winner" (see docstring above) — at
+    # only 1.5x they were outnumbered by the much larger pool of genuinely-
+    # negative rows they were mixed in with, so the correction was real but
+    # weak. 2.5x keeps them well inside the SPW_MIN/SPW_MAX clamp on the
+    # overall positive class while giving these specific corrective examples
+    # more influence than an average winner row.
+    combined_df.loc[mask, "sample_weight"] = combined_df.loc[mask, "sample_weight"] * 2.5
 
     after = int((combined_df["label"] == 1).sum())
     if after > before:
