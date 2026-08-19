@@ -148,6 +148,7 @@ absolute SIGNAL_THRESHOLDS demoted to diagnostic-only (2026-08-19):
 
 import json
 import logging
+import os
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -225,6 +226,23 @@ def get_dynamic_absolute_thresholds(
 RELATIVE_STRONG_BUY_PCT = 0.90   # top 10% (~4-5 stocks per 44-stock batch)
 RELATIVE_BUY_PCT        = 0.80   # top 10-20% (~4-5 stocks per 44-stock batch)
 RELATIVE_HOLD_PCT       = 0.60   # top 20-40%
+
+# CLAUDE FIX (2026-08-19): raw-score separation guard.
+# RC11/RC13 already fixed *ranking* on compressed/tied scores (rank on
+# raw pre-calibration score, percentile-based classification as primary).
+# But percentile ranking always produces a top 10% and a bottom 20-40%,
+# even on a day where the raw scores barely differ between stocks at all —
+# i.e. the model had essentially no real opinion, and "STRONG BUY" vs.
+# "AVOID" that day is just which side of a coin-flip-sized gap a stock fell
+# on. That's a second, independent way for a real winner to land in
+# HOLD/AVOID that isn't about label quality (see ml_retrain_model.py's
+# INTRADAY_WIN_THRESHOLD fix) — it's the model having nothing meaningful to
+# rank on that particular day. If raw_scores.std() falls below this floor,
+# the batch is treated as "no real separation" and STRONG BUY is withheld
+# for that batch (capped at BUY) rather than manufactured from noise.
+RAW_SCORE_MIN_STD_FOR_STRONG_BUY = float(
+    os.environ.get("RAW_SCORE_MIN_STD_FOR_STRONG_BUY", "0.01")
+)
 
 # Compression detection thresholds
 COMPRESSION_THRESHOLD      = 0.85   # >85% below 0.50 → use relative ranking
@@ -1026,13 +1044,34 @@ class ExplosionPredictor:
         signals[(ranks >= RELATIVE_BUY_PCT) & (ranks < RELATIVE_STRONG_BUY_PCT)] = "BUY"
         signals[(ranks >= RELATIVE_HOLD_PCT) & (ranks < RELATIVE_BUY_PCT)] = "HOLD"
 
+        # CLAUDE FIX (2026-08-19): raw-score separation guard. Percentile
+        # ranking always manufactures a top 10% / bottom 20-40% split, even
+        # when the underlying scores barely differ between stocks (i.e. the
+        # model had no real opinion this batch). When that's the case, the
+        # STRONG BUY / BUY vs. HOLD / AVOID split is effectively arbitrary —
+        # so withhold STRONG BUY (cap at BUY) rather than presenting a
+        # noise-driven split with STRONG BUY-level confidence.
+        score_std = float(probabilities.std())
+        if score_std < RAW_SCORE_MIN_STD_FOR_STRONG_BUY:
+            n_downgraded = int((signals == "STRONG BUY").sum())
+            if n_downgraded:
+                signals[signals == "STRONG BUY"] = "BUY"
+                self.logger.warning(
+                    f"Raw score std={score_std:.6f} is below RAW_SCORE_MIN_STD_FOR_STRONG_BUY="
+                    f"{RAW_SCORE_MIN_STD_FOR_STRONG_BUY} — the model isn't meaningfully "
+                    f"separating stocks in this batch. Downgraded {n_downgraded} STRONG BUY "
+                    "signal(s) to BUY rather than manufacture top-decile confidence from "
+                    "noise-level rank differences."
+                )
+
         strong_buy_n = (signals == "STRONG BUY").sum()
         buy_n        = (signals == "BUY").sum()
         hold_n       = (signals == "HOLD").sum()
 
         self.logger.info(
             f"Relative signals (percentile-based, method=max): STRONG BUY={strong_buy_n}, BUY={buy_n}, "
-            f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n}"
+            f"HOLD={hold_n}, AVOID={n - strong_buy_n - buy_n - hold_n} "
+            f"(raw score std={score_std:.6f})"
         )
 
         return signals
