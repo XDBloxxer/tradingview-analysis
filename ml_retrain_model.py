@@ -809,6 +809,56 @@ BAGGING_N_SEEDS  = 7
 BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
                          # so BAGGING_N_SEEDS=1 reproduces the pre-bagging behaviour
 
+# RC14: RECENCY WEIGHTING + WINDOW-ENSEMBLING (2026-08-19)
+# ─────────────────────────────────────────────────────────────────────────
+# Motivation: CV walk-forward evaluation showed AUC below 0.5 in most folds
+# despite clean feature-leakage / symbol-fingerprint / stability-gate
+# diagnostics — i.e. the features carry real univariate signal (see
+# diagnose_feature_leakage.py output, top AUC 0.72) but the fitted model's
+# out-of-sample rank ordering doesn't reliably generalise across time. This
+# is consistent with regime instability in a small-cap momentum screener
+# (the pattern that predicts a winner in one calendar window can partially
+# invert in the next), not a code bug — every existing leakage/stability
+# check came back clean. Two independent, additive mitigations:
+#
+#   1. RECENCY WEIGHTING — up-weight rows closer to "now" (smooth
+#      exponential decay by calendar age) so the SAME training window used
+#      today already leans toward whatever regime the model is about to be
+#      deployed into, without shrinking the window the way widening
+#      VAL_WEEKS did (that starved the gain regressor — see the comment
+#      above MAX_VAL_FRACTION in train_val_split()). Applied once to
+#      combined_df["sample_weight"] before prepare_features() runs, so it
+#      flows through to every downstream consumer of sample_weight
+#      (classifier train, CV walk-forward evaluation, gain regressor).
+#
+#   2. WINDOW-ENSEMBLING — BAGGING_N_SEEDS already bags across random seeds
+#      on the SAME training window to cancel seed-dependent variance. This
+#      extends that same principle to REGIME variance: each bagged seed is
+#      now also fit on a different lookback window (e.g. full history / last
+#      12mo / last 6mo), so no single seed's model can anchor entirely on
+#      whichever regime happens to dominate the full window. Averaging
+#      predict_proba across seeds-times-windows hedges against regime
+#      dominance the same way seed-bagging already hedges against
+#      initialization variance. Applied only inside train_model()'s seed
+#      loop — the val/cal split, calibration, and CV walk-forward evaluation
+#      report the CV are unaffected.
+RECENCY_WEIGHTING_ENABLED = True
+RECENCY_HALF_LIFE_DAYS    = 90   # sample weight halves every 90 calendar days
+                                  # back from the most recent training row;
+                                  # undated (mistake-sample) rows are left at
+                                  # their existing weight, never decayed.
+
+WINDOW_ENSEMBLE_ENABLED       = True
+# None = no truncation (full train window). Cycled across BAGGING_N_SEEDS
+# seeds in order (index i % len(list)) so with the default 7 seeds each
+# window gets used at least twice and the ensemble always includes at least
+# one full-history seed as a floor against a too-aggressive window guess.
+WINDOW_ENSEMBLE_LOOKBACK_DAYS = [None, 365, 180]
+WINDOW_ENSEMBLE_MIN_POS       = 20   # a truncated window with fewer than
+WINDOW_ENSEMBLE_MIN_NEG       = 20   # this many pos/neg falls back to the
+                                      # full train window for that seed
+                                      # instead of fitting on too little data
+
 XGBOOST_PARAMS = {
     "n_estimators":       500,
     "max_depth":          4,       # raised 3→4 (2026-08-13): depth=3 was shown to over-discretize
@@ -2964,6 +3014,74 @@ def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame
     return combined
 
 
+def apply_recency_weights(combined_df: pd.DataFrame, logger_: logging.Logger) -> pd.DataFrame:
+    """RC14: Multiply combined_df['sample_weight'] by a smooth exponential
+    recency decay, so rows closer to "now" count more during training.
+
+    weight_multiplier = 0.5 ** (days_before_most_recent_row / RECENCY_HALF_LIFE_DAYS)
+
+    The most recent dated row gets multiplier 1.0; a row RECENCY_HALF_LIFE_DAYS
+    old gets 0.5; a row 2x that old gets 0.25; etc. Undated rows (mistake
+    samples forced into train — see train_val_split() FIX 2) are left at
+    multiplier 1.0 since they have no age to decay by and already receive
+    their own weighting elsewhere.
+
+    Uses the same detection_date/event_date unification rule as
+    _cv_sort_date_and_symbols() / train_val_split() FIX 1, kept independent
+    for the same reason those two are independent of each other: this is a
+    small, stable rule that isn't worth risking a shared-helper refactor on.
+
+    No-op (logs and returns combined_df unchanged) if RECENCY_WEIGHTING_ENABLED
+    is False or no usable date column is found.
+    """
+    if not RECENCY_WEIGHTING_ENABLED:
+        logger_.info("RC14: recency weighting disabled (RECENCY_WEIGHTING_ENABLED=False) — skipping.")
+        return combined_df
+
+    has_detection = "detection_date" in combined_df.columns
+    has_event = "event_date" in combined_df.columns
+    if not (has_detection or has_event):
+        logger_.warning(
+            "RC14: no detection_date/event_date column found — skipping recency weighting."
+        )
+        return combined_df
+
+    sort_date = pd.Series(pd.NaT, index=combined_df.index)
+    if has_detection:
+        sort_date = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+    if has_event:
+        event_parsed = pd.to_datetime(combined_df["event_date"], errors="coerce")
+        sort_date = sort_date.fillna(event_parsed)
+
+    dated_mask = sort_date.notna()
+    n_dated = int(dated_mask.sum())
+    if n_dated == 0:
+        logger_.warning("RC14: no dated rows found — skipping recency weighting.")
+        return combined_df
+
+    most_recent = sort_date[dated_mask].max()
+    days_before = (most_recent - sort_date[dated_mask]).dt.total_seconds() / 86400.0
+    decay = np.power(0.5, days_before / RECENCY_HALF_LIFE_DAYS)
+
+    if "sample_weight" not in combined_df.columns:
+        combined_df["sample_weight"] = 1.0
+
+    combined_df.loc[dated_mask, "sample_weight"] = (
+        combined_df.loc[dated_mask, "sample_weight"].astype(float) * decay
+    )
+
+    oldest = sort_date[dated_mask].min()
+    span_days = (most_recent - oldest).days
+    logger_.info(
+        f"RC14: recency weighting applied to {n_dated} dated row(s) "
+        f"(half_life={RECENCY_HALF_LIFE_DAYS}d, date span={span_days}d, "
+        f"most_recent={most_recent.date()}, oldest={oldest.date()}). "
+        f"Weight multiplier range: [{decay.min():.4f}, {decay.max():.4f}]. "
+        f"{int((~dated_mask).sum())} undated row(s) left unmodified."
+    )
+    return combined_df
+
+
 def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     """
     Extract feature matrix X, labels y, and sample weights w.
@@ -3112,6 +3230,7 @@ def train_model(
     n_estimators_ceiling: Optional[int] = None,
     hyperparams_override: Optional[dict] = None,
     screener_positive_rate: Optional[float] = None,
+    train_dates: Optional[pd.Series] = None,
 ) -> object:
     """Train XGBClassifier from scratch with early stopping.
 
@@ -3152,6 +3271,17 @@ def train_model(
     which rows land in a single fixed split.
     The calibrator is fitted on X_cal/y_cal (not X_train) so that no
     training data leaks into the calibration fit.
+
+    RC14: If train_dates is supplied (same index as X_train/y_train/w_train),
+    each bagged seed is fit on a lookback-window-truncated slice of the
+    training set — cycling through WINDOW_ENSEMBLE_LOOKBACK_DAYS — instead of
+    every seed seeing the identical full window. This extends the existing
+    seed-bagging (which cancels random-init variance) to also cancel some of
+    the regime-dependence a single training window can bake in. A window that
+    would leave fewer than WINDOW_ENSEMBLE_MIN_POS/MIN_NEG examples falls back
+    to the full window for that seed. No-op if train_dates is None or
+    WINDOW_ENSEMBLE_ENABLED is False — every seed then sees the full window,
+    identical to pre-RC14 behaviour.
     """
     params = XGBOOST_PARAMS.copy()
 
@@ -3203,23 +3333,90 @@ def train_model(
     logger.info(f"  Train: {len(X_train)} rows")
     logger.info(f"  Val:   {len(X_val)} rows")
 
+    # ── RC14: resolve per-seed lookback window (window-ensembling) ──────────
+    use_window_ensemble = (
+        WINDOW_ENSEMBLE_ENABLED
+        and train_dates is not None
+        and train_dates.notna().any()
+    )
+    if WINDOW_ENSEMBLE_ENABLED and train_dates is None:
+        logger.info(
+            "RC14: window-ensembling enabled but no train_dates supplied to "
+            "train_model() — every seed will see the full window (unchanged)."
+        )
+    _most_recent_train_date = None
+    if use_window_ensemble:
+        _most_recent_train_date = train_dates.max()
+        logger.info(
+            f"RC14: window-ensembling ON — cycling seeds through "
+            f"{WINDOW_ENSEMBLE_LOOKBACK_DAYS} day lookback(s) "
+            f"(None = full window), most_recent_train_date="
+            f"{_most_recent_train_date.date() if pd.notna(_most_recent_train_date) else 'n/a'}."
+        )
+
     _seed_models = []
+    _seed_windows_used = []
     for _i in range(BAGGING_N_SEEDS):
         _seed = BAGGING_SEED_BASE + _i
         _seed_params = {**params, "random_state": _seed}
+
+        # ── Resolve this seed's training subset ─────────────────────────
+        _window_days = None
+        _X_tr_seed, _y_tr_seed, _w_tr_seed = X_train, y_train, w_train
+        if use_window_ensemble:
+            _window_days = WINDOW_ENSEMBLE_LOOKBACK_DAYS[_i % len(WINDOW_ENSEMBLE_LOOKBACK_DAYS)]
+            if _window_days is not None:
+                _cutoff = _most_recent_train_date - pd.Timedelta(days=_window_days)
+                # Undated rows (mistake samples) are always kept — mirrors
+                # train_val_split() FIX 2's "undated rows never get purged".
+                _mask = (train_dates >= _cutoff) | train_dates.isna()
+                _mask = _mask.reindex(X_train.index, fill_value=True)
+                _cand_X, _cand_y, _cand_w = X_train[_mask], y_train[_mask], w_train[_mask]
+                _n_pos_win = int((_cand_y == 1).sum())
+                _n_neg_win = int((_cand_y == 0).sum())
+                if _n_pos_win >= WINDOW_ENSEMBLE_MIN_POS and _n_neg_win >= WINDOW_ENSEMBLE_MIN_NEG:
+                    _X_tr_seed, _y_tr_seed, _w_tr_seed = _cand_X, _cand_y, _cand_w
+                else:
+                    logger.info(
+                        f"  Seed {_seed}: {_window_days}d window would leave only "
+                        f"{_n_pos_win} pos / {_n_neg_win} neg (need ≥"
+                        f"{WINDOW_ENSEMBLE_MIN_POS}/{WINDOW_ENSEMBLE_MIN_NEG}) — "
+                        "falling back to the full train window for this seed."
+                    )
+                    _window_days = None  # record what was actually used, not what was requested
+        _seed_windows_used.append(_window_days)
+
+        # scale_pos_weight is base-rate-dependent, so it must be recomputed
+        # per seed whenever the window truncation changes that seed's train
+        # subset's class balance (matches _fit_and_score_cv_folds()'s
+        # per-fold recomputation for the same reason).
+        _n_pos_seed = int((_y_tr_seed == 1).sum())
+        _n_neg_seed = int((_y_tr_seed == 0).sum())
+        if _n_pos_seed > 0 and _n_neg_seed > 0:
+            _raw_spw_seed = _n_neg_seed / _n_pos_seed
+            _seed_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, _raw_spw_seed)), 3)
+
         _seed_model = XGBClassifier(**_seed_params, early_stopping_rounds=early_stopping)
         _seed_model.fit(
-            X_train,
-            y_train,
-            sample_weight=w_train.values,
+            _X_tr_seed,
+            _y_tr_seed,
+            sample_weight=_w_tr_seed.values,
             eval_set=[(X_val, y_val)],
             verbose=False,
         )
         logger.info(
-            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}): "
+            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}) "
+            f"[window={_window_days if _window_days is not None else 'full'}, "
+            f"train_rows={len(_X_tr_seed)}, pos={_n_pos_seed}, neg={_n_neg_seed}]: "
             f"best_iteration={_seed_model.best_iteration}  best_val_auc={_seed_model.best_score:.4f}"
         )
         _seed_models.append(_seed_model)
+
+    if use_window_ensemble:
+        _window_counts = pd.Series(
+            [w if w is not None else "full" for w in _seed_windows_used]
+        ).value_counts().to_dict()
+        logger.info(f"RC14: window-ensemble seed distribution actually used: {_window_counts}")
 
     # BAGGING: average predict_proba across the seeds below (BaggedXGBClassifier)
     # instead of picking a single seed's model. This is the same bagging
@@ -6899,6 +7096,13 @@ def main() -> int:
     logger.info("Mistake learning step skipped (corpus too small — see MISTAKE_LEARNER_AVAILABLE).")
     mistake_df = pd.DataFrame()  # Placeholder; keeps downstream code compatible
 
+    # ── RC14: recency-weight rows before feature prep ─────────────────────
+    # Must run AFTER every other sample_weight contributor (T1_WEIGHT,
+    # BASE_CSV_WEIGHT, t1_data_source propensity reweighting) so recency
+    # decay multiplies the final combined weight rather than being
+    # overwritten by a later assignment.
+    combined_df = apply_recency_weights(combined_df, logger)
+
     # ── Prepare features ──────────────────────────────────────────────────────
     X, y, w = prepare_features(combined_df)
     feature_names = list(X.columns)
@@ -7127,6 +7331,21 @@ def main() -> int:
 
     X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
 
+    # ── RC14: build train_dates aligned to X_train's index for window-ensembling ──
+    # Reuses the same detection_date/event_date unification rule as
+    # _cv_sort_date_and_symbols() / train_val_split() FIX 1 (kept independently
+    # duplicated for the same reason those two already are — see that
+    # function's docstring).
+    _train_dates_for_windows = None
+    if "detection_date" in combined_df.columns or "event_date" in combined_df.columns:
+        _sort_date_full = pd.Series(pd.NaT, index=combined_df.index)
+        if "detection_date" in combined_df.columns:
+            _sort_date_full = pd.to_datetime(combined_df["detection_date"], errors="coerce")
+        if "event_date" in combined_df.columns:
+            _event_parsed_full = pd.to_datetime(combined_df["event_date"], errors="coerce")
+            _sort_date_full = _sort_date_full.fillna(_event_parsed_full)
+        _train_dates_for_windows = _sort_date_full.reindex(X_train.index)
+
     # ── Prior-correction anchor for isotonic calibration ────────────────────
     # Measured trailing win rate of the screened universe (see
     # estimate_screener_positive_rate()'s docstring above for why this
@@ -7142,7 +7361,8 @@ def main() -> int:
                             if not cv_results.get("skipped") else None
                         ),
                         hyperparams_override=_searched_params,
-                        screener_positive_rate=_screener_positive_rate)
+                        screener_positive_rate=_screener_positive_rate,
+                        train_dates=_train_dates_for_windows)
 
     # ── Feature importance ────────────────────────────────────────────────────
     fi_df = compute_feature_importance(model, feature_names)
