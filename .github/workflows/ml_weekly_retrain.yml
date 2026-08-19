@@ -117,6 +117,7 @@ jobs:
           git add ml_models/model_metadata.json || true
           git add ml_models/feature_importance.csv || true
           git add ml_models/learned_filters.json   || true
+          git add ml_models/feature_selection/symbol_hv_baselines.json || true
 
           # Commit if there are changes
           git diff --staged --quiet || git commit -m "🤖 Auto-retrain: $(date +'%Y-%m-%d %H:%M:%S UTC')"
