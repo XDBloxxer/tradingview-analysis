@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-08-19T07:05:23.608171+00:00",
+  "trained_at": "2026-08-19T07:15:56.547157+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
   "n_features": 13,
@@ -190,9 +190,9 @@
       "max_depth": 3,
       "min_child_weight": 13,
       "gamma": 0.05256170059288601,
-      "reg_alpha": 0.6434214723777957,
+      "reg_alpha": 0.6434214723777958,
       "reg_lambda": 0.14490862666144408,
-      "subsample": 0.8792981857663649,
+      "subsample": 0.8792981857663648,
       "colsample_bytree": 0.5346211656120853
     },
     "accepted": false,
@@ -209,9 +209,9 @@
           "max_depth": 3,
           "min_child_weight": 13,
           "gamma": 0.05256170059288601,
-          "reg_alpha": 0.6434214723777957,
+          "reg_alpha": 0.6434214723777958,
           "reg_lambda": 0.14490862666144408,
-          "subsample": 0.8792981857663649,
+          "subsample": 0.8792981857663648,
           "colsample_bytree": 0.5346211656120853
         },
         "mean_auc": 0.4074,
@@ -239,7 +239,7 @@
           "gamma": 0.195561862119445,
           "reg_alpha": 0.28075100002472475,
           "reg_lambda": 0.6022756992599614,
-          "subsample": 0.954194840371701,
+          "subsample": 0.9541948403717009,
           "colsample_bytree": 0.6158660828559684
         },
         "mean_auc": 0.4027,
@@ -264,10 +264,10 @@
         "params": {
           "max_depth": 3,
           "min_child_weight": 14,
-          "gamma": 1.2714805817675867,
+          "gamma": 1.2714805817675907,
           "reg_alpha": 0.9327294129352018,
           "reg_lambda": 0.634462439130468,
-          "subsample": 0.9736265364972648,
+          "subsample": 0.9736265364972647,
           "colsample_bytree": 0.6152988955245096
         },
         "mean_auc": 0.3998,
@@ -281,7 +281,7 @@
           "gamma": 0.04720309417247796,
           "reg_alpha": 0.2952997811318574,
           "reg_lambda": 0.1439990149546142,
-          "subsample": 0.8978437815292071,
+          "subsample": 0.897843781529207,
           "colsample_bytree": 0.5534439092633042
         },
         "mean_auc": 0.3997,
@@ -295,7 +295,7 @@
           "gamma": 0.05523925397894172,
           "reg_alpha": 0.36906443159512037,
           "reg_lambda": 0.15187194337556661,
-          "subsample": 0.9059845016523322,
+          "subsample": 0.9059845016523321,
           "colsample_bytree": 0.6983258013899591
         },
         "mean_auc": 0.3993,
@@ -306,10 +306,10 @@
         "params": {
           "max_depth": 3,
           "min_child_weight": 17,
-          "gamma": 0.07226287423799171,
+          "gamma": 0.07226287423799173,
           "reg_alpha": 0.7718454439454153,
           "reg_lambda": 0.2486577628877248,
-          "subsample": 0.8420108828932014,
+          "subsample": 0.8420108828932013,
           "colsample_bytree": 0.7120009584158151
         },
         "mean_auc": 0.3991,
@@ -323,7 +323,7 @@
           "gamma": 0.11746658897034754,
           "reg_alpha": 0.6019541362109077,
           "reg_lambda": 0.13183190636779002,
-          "subsample": 0.7849527378148703,
+          "subsample": 0.7849527378148702,
           "colsample_bytree": 0.5821718262630846
         },
         "mean_auc": 0.3983,
@@ -349,6 +349,7 @@
   "base_sample_weight": 1.0,
   "t1_sample_weight": 1.0,
   "intraday_win_threshold": 20.0,
+  "screener_positive_rate_used": 0.14928123848138591,
   "equal_weight_applied": true,
   "gain_regressor_leak_free": true,
   "gain_regressor_rc_fixes": [
