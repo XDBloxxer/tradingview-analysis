@@ -825,12 +825,26 @@ class IntradayDataCollector:
             pass
         
         try:
-            aroon = AroonIndicator(close=df['Close'], window=25)
+            # FIX: ta==0.11.0 (the version this project is actually pinned
+            # to and running) changed AroonIndicator's signature to
+            # (high, low, window) — it no longer accepts a `close` kwarg at
+            # all. The previous call, AroonIndicator(close=df['Close'],
+            # window=25), raised TypeError on every single T-1 row, which
+            # this bare `except: pass` silently swallowed — meaning
+            # aroon_up/aroon_down/aroon_indicator were NEVER populated in
+            # any stored T-1 snapshot, ever. Not currently a live/train
+            # skew issue (the model's 13 selected features don't include
+            # Aroon, and it never survived feature selection precisely
+            # because it was always-NaN), but it was silently discarding
+            # real signal that could have been considered. Fixed so new
+            # snapshots collected from now on carry real values; existing
+            # historical rows are not backfilled.
+            aroon = AroonIndicator(high=df['High'], low=df['Low'], window=25)
             result['aroon_up'] = aroon.aroon_up()
             result['aroon_down'] = aroon.aroon_down()
             result['aroon_indicator'] = aroon.aroon_indicator()
-        except:
-            pass
+        except Exception as _aroon_exc:
+            self.logger.debug(f"AroonIndicator failed: {type(_aroon_exc).__name__}: {_aroon_exc}")
         
         try:
             psar = PSARIndicator(high=df['High'], low=df['Low'], close=df['Close'])
