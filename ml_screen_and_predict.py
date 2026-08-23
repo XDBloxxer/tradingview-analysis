@@ -834,14 +834,40 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     close_v = ind["close"]
 
     # ── RSI (multiple periods) ──────────────────────────────────────────────
+    # FIX: previously ewm(com=period-1, min_periods=period) with default
+    # adjust=True. ta.momentum.RSIIndicator (the real training-time source
+    # for "rsi"/RSI_14) uses ewm(alpha=1/period, adjust=False) — same decay
+    # rate (com=period-1 <=> alpha=1/period), but adjust=True vs False is a
+    # different recursion (adjust=True re-weights every historical bar every
+    # step; adjust=False is the pure recursive/Wilder-style update). They
+    # converge only asymptotically, and T-1 series here are short (~78 bars
+    # for a full day, ~12 for the open window), so this mismatch was live
+    # for effectively the whole window, not just a negligible warm-up period.
+    # Also: ta sets RSI=100 outright when the down-average is exactly 0
+    # (pure uptrend, no losses in the window) instead of leaving it
+    # undefined; the previous rs = ag/al.replace(0, nan) produced NaN in
+    # that case, which safe() then quietly replaced with 50 (neutral) —
+    # the opposite signal from what training would have produced (100,
+    # maximally overbought).
+    # A second, subtler mismatch: gain/loss were previously built with
+    # .clip(lower=0)/.clip(upper=0), which leaves the leading NaN from
+    # c.diff() as NaN. ta builds them with .where(delta > 0, 0.0), which
+    # turns that same leading NaN into 0.0. That one-bar difference shifts
+    # where the ewm's min_periods warm-up threshold is first satisfied,
+    # producing a materially wrong value for the first several bars after
+    # warm-up (verified: 43.12 vs 32.08 at the boundary bar) even with the
+    # smoothing method itself fixed — now using .where() to match exactly.
     delta = c.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta.clip(upper=0))
+    gain  = delta.where(delta > 0, 0.0)
+    loss  = -delta.where(delta < 0, 0.0)
     for period, col_name in [(7, "rsi7"), (14, "rsi"), (21, "rsi21"), (28, "rsi28")]:
-        ag = gain.ewm(com=period - 1, min_periods=period).mean()
-        al = loss.ewm(com=period - 1, min_periods=period).mean()
-        rs = ag / al.replace(0, np.nan)
-        ind[col_name] = safe(100 - (100 / (1 + rs)), 50.0)
+        ag = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        al = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        rs = ag / al
+        rsi_series = pd.Series(
+            np.where(al == 0, 100.0, 100 - (100 / (1 + rs))), index=c.index
+        )
+        ind[col_name] = safe(rsi_series, 50.0)
     ind["rsi[1]"] = ind["rsi"]
     ind["rsi14"]  = ind["rsi"]   # alias for column-map dedup
 
@@ -886,11 +912,20 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
 
     # ── Stochastic ─────────────────────────────────────────────────────────
+    # FIX: previously smoothed raw %K with rolling(3).mean() and called that
+    # "stoch.k", then smoothed AGAIN with another rolling(3).mean() for
+    # "stoch.d" — a double-smoothing pass that doesn't exist in training.
+    # ta.momentum.StochasticOscillator (the real training-time source for
+    # "stoch.k"/"stoch.d") defines stoch() as the RAW, unsmoothed %K and
+    # stoch_signal() as a single rolling(smooth_window).mean() over that raw
+    # %K. So "stoch.k" should be the raw %K itself, and "stoch.d" should be
+    # one rolling(3).mean() pass over it — not two.
     lo14  = l.rolling(14).min()
     hi14  = h.rolling(14).max()
     rng14 = (hi14 - lo14).replace(0, np.nan)
-    stk   = (100 * (c - lo14) / rng14).rolling(3).mean()
-    std   = stk.rolling(3).mean()
+    raw_k = 100 * (c - lo14) / rng14
+    stk   = raw_k
+    std   = raw_k.rolling(3).mean()
     ind["stoch.k"]    = safe(stk, 50.0)
     ind["stoch.d"]    = safe(std, 50.0)
     ind["stoch.k[1]"] = ind["stoch.k"]
@@ -1107,14 +1142,27 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["volume_sma20"] = 1.0
 
     # ── CMF ────────────────────────────────────────────────────────────────
+    # FIX: this was missing the rolling .sum() on the numerator entirely.
+    # ta.volume.ChaikinMoneyFlowIndicator (the real training-time source for
+    # "cmf"/CMF_20) is sum(money_flow_volume, window) / sum(volume, window).
+    # The previous code computed mf_mult * v (a single bar's money-flow
+    # volume, via safe()'s .iloc[-1]) divided by the rolling SUM of volume —
+    # mixing a one-bar numerator with a 20-bar-summed denominator, which
+    # isn't CMF at all, just a differently-scaled and differently-behaved
+    # quantity that happens to share its name. Also matches ta's mfv.fillna(0)
+    # step (rather than dropping/propagating NaN from a zero-range bar into
+    # the window sum) so a single zero-range bar doesn't NaN out the whole
+    # rolling sum it falls inside.
     # With <20 bars v.rolling(20).sum() is all-NaN, causing safe() to return
-    # 0.0 (instead of a real Chaikin Money Flow value).  Use the full
-    # available window (v.sum()) as the denominator when fewer than 20 bars
-    # are present so the feature carries a real signal.
+    # 0.0 (instead of a real Chaikin Money Flow value). Use the full
+    # available window when fewer than 20 bars are present so the feature
+    # carries a real signal.
     mf_mult = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    mfv = (mf_mult * v).fillna(0.0)
     _cmf_win = min(20, len(v))
+    _mfv_roll_sum = mfv.rolling(_cmf_win).sum()
     _v_roll_sum = v.rolling(_cmf_win).sum().replace(0, np.nan)
-    ind["cmf"] = safe(mf_mult * v / _v_roll_sum, 0.0)
+    ind["cmf"] = safe(_mfv_roll_sum / _v_roll_sum, 0.0)
 
     # ── CCI ────────────────────────────────────────────────────────────────
     tp    = (h + l + c) / 3
