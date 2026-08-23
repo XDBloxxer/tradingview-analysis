@@ -73,6 +73,7 @@ import pandas as pd
 import json
 import numpy as np
 from ta.trend import ADXIndicator
+from ta.volatility import AverageTrueRange, KeltnerChannel, BollingerBands, DonchianChannel
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -897,26 +898,54 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["w.r"]        = safe(-100 * (hi14 - c) / rng14, -50.0)
 
     # ── ATR ────────────────────────────────────────────────────────────────
+    # FIX: previously hand-rolled with a flat tr.rolling(period).mean(),
+    # which is the same bug class already found and fixed for ADX below —
+    # ta.volatility.AverageTrueRange (the real training-time source, used
+    # directly in intraday_data_collector.py) uses Wilder's recursive
+    # smoothing instead, which decays a volatility spike gradually rather
+    # than dropping it off a cliff after exactly `window` bars. A flat mean
+    # and Wilder's smoothing diverge most right after a volatility spike —
+    # exactly the regime a "strong buy" candidate is likely to be in.
+    # Still build `tr` (true range) here too: it's reused below by the
+    # DMI/ADXR fallback and by CCI/Ultimate-Oscillator-style calcs elsewhere
+    # in this function that don't have a `ta` equivalent.
     tr = pd.concat([
         h - l,
         (h - c.shift()).abs(),
         (l - c.shift()).abs(),
     ], axis=1).max(axis=1)
+
+    _atr_dollar = {}
     for period, col_name in [(7, "atr7"), (14, "atr"), (20, "atr20")]:
-        ind[col_name] = safe(tr.rolling(period).mean(), 0.5)
+        try:
+            _atr_dollar[period] = AverageTrueRange(
+                high=h, low=l, close=c, window=period
+            ).average_true_range()
+            ind[col_name] = safe(_atr_dollar[period], 0.5)
+        except Exception:
+            _atr_dollar[period] = tr.rolling(period).mean()
+            ind[col_name] = safe(_atr_dollar[period], 0.5)
     ind["atr14"] = ind["atr"]   # alias
 
+    # Normalise ATR_14 to % of close, matching intraday_data_collector.py
+    # (training's T-1 source), which converts the `ta` library's dollar ATR
+    # to %-of-close so it lines up with multiday_feature_collector's
+    # pandas_ta-derived ATRr (already % of close). Do this AFTER computing
+    # the raw dollar ind["atr"]/["atr14"] above (those stay in dollars —
+    # only the slope input is normalised) to match training exactly.
+    _close_safe = c.replace(0, np.nan)
+    atr14_pct_series = _atr_dollar[14] / _close_safe * 100
+
     # ATR slope
-    # Normalise ATR to % of close BEFORE taking the slope, so this is a
-    # change-in-% (matching multiday_feature_collector's atr_14_slope,
-    # computed from ATRr which pandas_ta already returns as % of close) —
-    # not a change-in-dollars, which is what a slope of raw dollar ATR
-    # would give and is a different scale per stock price level.
-    atr14_series = tr.rolling(14).mean()
-    atr14_pct_series = atr14_series / c.replace(0, np.nan) * 100
-    if len(atr14_pct_series.dropna()) >= 6:
-        atr_slope = atr14_pct_series.diff(5)
-        ind["atr_pct"] = safe(atr_slope, 0.0)
+    # FIX: previously diff(5) — but training's atr_14_slope (both
+    # intraday_data_collector.py and multiday_feature_collector.py) is
+    # diff(1) of the normalised (%-of-close) ATR series, not diff(5). Using
+    # the wrong lag here would still have produced a systematically wrong
+    # value for t1_open_ATR_14_Slope even after fixing the ATR smoothing
+    # itself, since a 5-bar delta and a 1-bar delta are simply different
+    # quantities.
+    if len(atr14_pct_series.dropna()) >= 2:
+        ind["atr_pct"] = safe(atr14_pct_series.diff(1), 0.0)
     else:
         ind["atr_pct"] = 0.0
 
@@ -965,16 +994,30 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     dn_move = -l.diff()
     pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
     ndm = pd.Series(np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0), index=c.index)
-    atr14 = tr.rolling(14).mean().replace(0, np.nan)
+    atr14 = _atr_dollar[14].replace(0, np.nan)
     pdi   = 100 * pdm.rolling(14).mean() / atr14
     ndi   = 100 * ndm.rolling(14).mean() / atr14
     dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
 
     # ── Bollinger Bands ────────────────────────────────────────────────────
-    bb_mid = c.rolling(20).mean()
-    bb_std = c.rolling(20).std()
-    bb_up  = bb_mid + 2 * bb_std
-    bb_lo  = bb_mid - 2 * bb_std
+    # FIX: previously hand-rolled with c.rolling(20).std(), which is pandas'
+    # sample std (ddof=1). ta.volatility.BollingerBands (the real
+    # training-time source) uses population std (ddof=0) internally — a
+    # ~2.6% systematic width difference that shows up directly in
+    # t1_open_BBB_20_2.0_2.0 (bb_width), the second-most-important of the
+    # 13 production features. Same bug class as ATR/Keltner: two independent
+    # formula implementations that can drift, replaced with the one library
+    # call training already uses.
+    try:
+        _bb = BollingerBands(close=c, window=20, window_dev=2)
+        bb_up  = _bb.bollinger_hband()
+        bb_lo  = _bb.bollinger_lband()
+        bb_mid = _bb.bollinger_mavg()
+    except Exception:
+        bb_mid = c.rolling(20).mean()
+        bb_std = c.rolling(20).std(ddof=0)
+        bb_up  = bb_mid + 2 * bb_std
+        bb_lo  = bb_mid - 2 * bb_std
     ind["bb.upper"]  = safe(bb_up,  close_v)
     ind["bb.lower"]  = safe(bb_lo,  close_v)
     ind["bb.middle"] = safe(bb_mid, close_v)
@@ -982,17 +1025,44 @@ def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
     ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
 
     # Keltner Channel
-    kc_mid  = c.ewm(span=20, adjust=False).mean()
-    kc_atr  = tr.rolling(10).mean()
-    kc_mult = 2.0
-    ind["keltner_upper"]  = safe(kc_mid + kc_mult * kc_atr, close_v)
-    ind["keltner_lower"]  = safe(kc_mid - kc_mult * kc_atr, close_v)
+    # FIX: previously hand-rolled as EMA(close,20) ± 2×flat-mean-ATR(10).
+    # ta.volatility.KeltnerChannel (the real training-time source) doesn't
+    # just do that — it has its own basis/band construction internally, so
+    # the hand-rolled version was both smoothing-mismatched (flat mean vs
+    # Wilder's) and structurally different from what training actually
+    # computes. t3_kcle_20_2/t10_kcle_20_2/t10_kcue_20_2 are production
+    # features, though for those specific ones the live pipeline already
+    # routes through the (consistent) multiday code path — this fixes the
+    # keltner_* values ml_screen_and_predict.py computes directly for any
+    # other T-1-sourced consumer.
+    try:
+        _kc = KeltnerChannel(high=h, low=l, close=c, window=20)
+        kc_up  = _kc.keltner_channel_hband()
+        kc_lo  = _kc.keltner_channel_lband()
+        kc_mid = _kc.keltner_channel_mband()
+    except Exception:
+        kc_mid = c.ewm(span=20, adjust=False).mean()
+        kc_atr = tr.rolling(10).mean()
+        kc_up  = kc_mid + 2.0 * kc_atr
+        kc_lo  = kc_mid - 2.0 * kc_atr
+    ind["keltner_upper"]  = safe(kc_up,  close_v)
+    ind["keltner_lower"]  = safe(kc_lo,  close_v)
     ind["keltner_middle"] = safe(kc_mid, close_v)
 
     # Donchian Channel (20-period)
-    dc_up  = h.rolling(20).max()
-    dc_lo  = l.rolling(20).min()
-    dc_mid = (dc_up + dc_lo) / 2
+    # The hand-rolled version already matched ta's DonchianChannel formula
+    # closely (min/max/midpoint have no alternate smoothing to diverge on),
+    # but switching to the library call here too removes any chance of a
+    # future silent drift and keeps this section consistent with the rest.
+    try:
+        _dc = DonchianChannel(high=h, low=l, close=c, window=20)
+        dc_up  = _dc.donchian_channel_hband()
+        dc_lo  = _dc.donchian_channel_lband()
+        dc_mid = _dc.donchian_channel_mband()
+    except Exception:
+        dc_up  = h.rolling(20).max()
+        dc_lo  = l.rolling(20).min()
+        dc_mid = (dc_up + dc_lo) / 2
     ind["donchian_upper"]  = safe(dc_up,  close_v)
     ind["donchian_lower"]  = safe(dc_lo,  close_v)
     ind["donchian_middle"] = safe(dc_mid, close_v)
