@@ -54,7 +54,38 @@ class BaggedXGBClassifier:
     pickle it via its fully-qualified name.
     """
 
-    def __init__(self, estimators):
+    def __init__(self, estimators, consensus_iteration=None, per_seed_peaks=None,
+                 consensus_score=None):
+        """
+        Args:
+            estimators: fitted XGBClassifier seeds (see class docstring).
+            consensus_iteration: optional int. When each seed is independently
+                early-stopped, its "best round" is picked off that seed's own
+                noisy per-round validation curve — on a val set with only a
+                few hundred positives, that curve can swing wildly from one
+                random_state to the next even with identical train/val data
+                (observed in practice: best_iteration ranging ~6-33 across 7
+                otherwise-identical seeds). Averaging those noisy per-seed
+                *picks* just averages the noise.
+                Callers that instead capture each seed's FULL per-round eval
+                curve (no early stopping), average the curves themselves
+                across seeds first, and THEN pick the argmax of that smoothed
+                curve, should pass the resulting round here. It overrides the
+                per-seed-average fallback below as self.best_iteration, and
+                every predict_proba() call is truncated to it via
+                iteration_range so inference actually uses the consensus
+                number of trees from every seed, not each seed's own (noisy)
+                stopping point.
+            per_seed_peaks: optional list[int], each seed's own curve-argmax
+                (for logging/diagnostics only — shows how much noisier the
+                un-averaged per-seed picks were than the consensus).
+            consensus_score: optional float, the averaged eval-metric curve's
+                value AT consensus_iteration (i.e. mean_curve[consensus_iteration
+                - 1]). Overrides self.best_score the same way consensus_iteration
+                overrides self.best_iteration. Pass the metric you actually
+                want reported (e.g. true ROC-AUC, not aucpr) — see
+                ml_retrain_model.py's seed-training loop.
+        """
         if not estimators:
             raise ValueError("BaggedXGBClassifier needs at least one fitted estimator")
         self.estimators_ = list(estimators)
@@ -75,8 +106,31 @@ class BaggedXGBClassifier:
         self.best_iteration_std_ = float(np.std(_iters)) if _iters else None
         self.best_score_std_ = float(np.std(_scores)) if _scores else None
 
+        # CONSENSUS STOPPING FIX: prefer the curve-averaged round when the
+        # caller supplies one — it directly replaces the noisy
+        # average-of-independent-early-stops number above.
+        self.per_seed_peaks_ = list(per_seed_peaks) if per_seed_peaks else None
+        self.consensus_iteration_ = int(consensus_iteration) if consensus_iteration is not None else None
+        if self.consensus_iteration_ is not None:
+            self.best_iteration = self.consensus_iteration_
+        if consensus_score is not None:
+            self.best_score = float(consensus_score)
+        # predict_proba() below truncates every seed to this many trees
+        # (1-indexed tree count) via iteration_range=(0, N). None means "use
+        # each estimator's own full/early-stopped tree count" (old behaviour).
+        self._iteration_range = (
+            (0, self.consensus_iteration_) if self.consensus_iteration_ is not None else None
+        )
+
     def predict_proba(self, X):
-        probs = np.mean([e.predict_proba(X) for e in self.estimators_], axis=0)
+        if self._iteration_range is not None:
+            probs = np.mean(
+                [e.predict_proba(X, iteration_range=self._iteration_range)
+                 for e in self.estimators_],
+                axis=0,
+            )
+        else:
+            probs = np.mean([e.predict_proba(X) for e in self.estimators_], axis=0)
         return probs
 
     def predict(self, X):
