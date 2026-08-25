@@ -823,6 +823,24 @@ BAGGING_N_SEEDS  = 7
 BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
                          # so BAGGING_N_SEEDS=1 reproduces the pre-bagging behaviour
 
+# DIAGNOSTIC (2026-08-26): one-off check of whether the gain regressor's
+# per-seed early-stopping picks are as unstable as the classifier's were
+# before the consensus-stopping fix (see BaggedXGBClassifier). The classifier
+# showed per-seed spread ~108% of its mean (6-34 around ~26); if the
+# regressor's spread is proportionally similar, it likely needs the same
+# consensus-curve treatment. If it stays tight even with more seeds, the
+# regressor's current per-seed early stopping is fine as-is.
+# Overridable via env var so this can be bumped for a single diagnostic run
+# without permanently changing BAGGING_N_SEEDS (and therefore classifier cost
+# too, since that constant is shared). Defaults to BAGGING_N_SEEDS, i.e. no
+# behavior change unless explicitly set.
+_gain_regressor_diagnostic_n_seeds_raw = os.environ.get("GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS", "").strip()
+GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS = (
+    int(_gain_regressor_diagnostic_n_seeds_raw)
+    if _gain_regressor_diagnostic_n_seeds_raw
+    else BAGGING_N_SEEDS
+)
+
 # RC14: RECENCY WEIGHTING + WINDOW-ENSEMBLING (2026-08-19)
 # ─────────────────────────────────────────────────────────────────────────
 # Motivation: CV walk-forward evaluation showed AUC below 0.5 in most folds
@@ -5959,9 +5977,11 @@ def train_gain_regressor(
     # training pool is already small (~200 rows per the CAPACITY REDUCTION
     # note above), so a single seed's draw is a larger share of its variance
     # than for the classifier.
-    logger.info(f"Training {BAGGING_N_SEEDS} gain-regressor model(s) from scratch (seed bagging)...")
+    _n_seeds_this_run = GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS
+    logger.info(f"Training {_n_seeds_this_run} gain-regressor model(s) from scratch (seed bagging)...")
     _seed_regressors = []
-    for _i in range(BAGGING_N_SEEDS):
+    _seed_best_iterations = []
+    for _i in range(_n_seeds_this_run):
         _seed = BAGGING_SEED_BASE + _i
         _seed_regressor = XGBRegressor(**_regressor_base_params, random_state=_seed)
         _seed_regressor.fit(
@@ -5972,16 +5992,34 @@ def train_gain_regressor(
             verbose=False,
         )
         logger.info(
-            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}): "
+            f"  Seed {_seed} ({_i + 1}/{_n_seeds_this_run}): "
             f"best_iteration={_seed_regressor.best_iteration}  "
             f"best_val_rmse={_seed_regressor.best_score}"
         )
+        _seed_best_iterations.append(_seed_regressor.best_iteration)
         _seed_regressors.append(_seed_regressor)
 
     regressor = BaggedXGBRegressor(_seed_regressors)
     logger.info(
         f"  Bagged across {regressor.n_seeds_} seeds — "
         f"mean best_iteration={regressor.best_iteration} (std={regressor.best_iteration_std_:.1f})"
+    )
+
+    # DIAGNOSTIC: same spread stat we use to judge the classifier's per-seed
+    # stability, so this can be compared apples-to-apples against the
+    # classifier's pre-fix [6, 28, 6, 28, 33, 34, 6]-style spread.
+    _bi_min, _bi_max = min(_seed_best_iterations), max(_seed_best_iterations)
+    _bi_mean = float(np.mean(_seed_best_iterations))
+    _bi_spread = _bi_max - _bi_min
+    _bi_spread_pct = (_bi_spread / _bi_mean * 100.0) if _bi_mean > 0 else float("nan")
+    logger.info(
+        f"  DIAGNOSTIC — per-seed best_iteration spread: {_seed_best_iterations} "
+        f"(min={_bi_min} max={_bi_max} spread={_bi_spread} spread_pct_of_mean={_bi_spread_pct:.0f}%). "
+        f"For reference, the classifier's pre-consensus-fix spread was ~108% of its mean "
+        f"(range 6-34 around ~26) — a spread_pct_of_mean well below that suggests the "
+        f"regressor's per-seed early stopping is stable enough as-is; a comparably large "
+        f"spread_pct_of_mean would argue for the same consensus-curve treatment used in "
+        f"BaggedXGBClassifier."
     )
 
     # Evaluate in original % space for interpretability
@@ -6792,6 +6830,11 @@ def main() -> int:
     logger.info(f"  use_learned_filters : {os.environ.get('USE_LEARNED_FILTERS', '').lower() in ('1', 'true', 'yes')}")
     logger.info(f"  use_base_training_data : {os.environ.get('USE_BASE_TRAINING_DATA', '').lower() in ('1', 'true', 'yes')}")
     logger.info(f"  verbose             : {args.verbose}")
+    logger.info(
+        f"  gain_regressor_diagnostic_n_seeds : {GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS} "
+        f"(env GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS={os.environ.get('GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS', '<unset>')!r}) "
+        f"[PATCH_MARKER: gain_regressor_seed_spread_diagnostic_v1 present]"
+    )
     logger.info("=" * 60)
 
     # ── Sanity check: is lookback_days wide enough for the embargo? ───────────
