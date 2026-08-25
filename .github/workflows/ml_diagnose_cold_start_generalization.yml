@@ -1,0 +1,111 @@
+name: ML Diagnose Cold-Start Generalization
+
+# Follow-up to "ML Diagnose Symbol-Fingerprint Leak": for features that test
+# as LIKELY FINGERPRINT LEAK there (high between_symbol_auc, low
+# within_symbol_auc) -- default is the upper-band/channel family (DCU_20_20,
+# BBU_20_2.0_2.0, KCUe_20_2) -- splits train-only rows into cold-start (a
+# symbol's first-ever appearance) vs repeat, and compares raw AUC in each
+# group. This tells apart two very different explanations for a high
+# between_symbol_auc:
+#
+#   (a) symbol-identity memorization -- won't hold up on a ticker the model
+#       has never scored before (cold-start AUC collapses toward 0.5)
+#   (b) a real, slow-moving trait computed fresh from that ticker's own
+#       price data -- available on cold-start rows too, because there's
+#       nothing to "memorize"
+#
+# Run this manually after diagnose_symbol_fingerprint_leak.py flags a
+# feature family, to decide whether it's a real transferable signal (keep
+# it) or an artifact of the screener's own sampling (demean/exclude it via
+# DEFAULT_DEMEAN_BASES).
+#
+# Read-only: does not write or commit anything, just prints a report and
+# uploads it as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Days of T-1/base history to fetch (0 = unbounded)'
+        required: false
+        default: '365'
+        type: string
+      features:
+        description: >-
+          Space-separated exact column names to test (e.g.
+          "t1_close_DCU_20_20 t3_bbu_20_2_0_2_0"). Leave blank to use the
+          default upper-band/channel family, or set fingerprint_report
+          below instead. Takes priority over fingerprint_report if both
+          are set.
+        required: false
+        default: ''
+        type: string
+      fingerprint_report:
+        description: >-
+          Path (within this checkout) to a saved symbol-fingerprint report
+          artifact to test every feature it flagged as LIKELY FINGERPRINT
+          LEAK, instead of the hardcoded default family. Download a prior
+          "symbol-fingerprint-report" artifact and commit/upload it first,
+          or leave blank to use the default feature family. Ignored if
+          'features' above is set.
+        required: false
+        default: ''
+        type: string
+      min_group_rows:
+        description: >-
+          Skip a feature if either the cold-start or repeat group has
+          fewer than this many non-NaN rows in the train-only slice
+        required: false
+        default: '30'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-cold-start-generalization:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run cold-start generalization diagnostic
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+          LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '365' }}
+        run: |
+          FEATURES="${{ github.event.inputs.features }}"
+          FINGERPRINT_REPORT="${{ github.event.inputs.fingerprint_report }}"
+          MIN_GROUP_ROWS="${{ github.event.inputs.min_group_rows || '30' }}"
+          if [ -n "$FEATURES" ]; then
+            python diagnose_cold_start_generalization.py --features $FEATURES --min-group-rows "$MIN_GROUP_ROWS" | tee cold_start_generalization_report.txt
+          elif [ -n "$FINGERPRINT_REPORT" ]; then
+            python diagnose_cold_start_generalization.py --fingerprint-report "$FINGERPRINT_REPORT" --min-group-rows "$MIN_GROUP_ROWS" | tee cold_start_generalization_report.txt
+          else
+            python diagnose_cold_start_generalization.py --min-group-rows "$MIN_GROUP_ROWS" | tee cold_start_generalization_report.txt
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cold-start-generalization-report
+          path: cold_start_generalization_report.txt
+          retention-days: 30
