@@ -48,11 +48,20 @@ Usage (from repo root, same env as diagnose_feature_leakage.py):
     python diagnose_symbol_fingerprint_leak.py
     python diagnose_symbol_fingerprint_leak.py --features t1_close_HV_10 t1_close_HV_20 t1_close_HV_30
     python diagnose_symbol_fingerprint_leak.py --min-symbol-rows 3
+    python diagnose_symbol_fingerprint_leak.py --model-features
+    python diagnose_symbol_fingerprint_leak.py --all-features
 
 By default this scans every t1_*/t3_/t5_/t10_ HV_10/HV_20/HV_30 variant
 (open+close, every lag) plus BBB_20_2.0_2.0 (bandwidth), matching the
 family flagged in the latest diagnose_feature_leakage.py run. Pass
---features to scan a different set instead.
+--features to scan a different set instead, --model-features to test
+exactly the live model's current selected-feature set (read from
+model_metadata.json's "features" key -- see --model-metadata-file to
+point at a different metadata file), or --all-features to exhaustively
+scan every column in the prepared feature matrix (the full pre-selection
+pool, typically ~300-400 columns -- slow, but useful for a full audit).
+Precedence when more than one is given: --features > --model-features >
+--all-features > the HV/BBB-only default.
 
 Applies the same manual feature blocklist as diagnose_feature_leakage.py
 by default, for consistency -- but since the whole point here is to
@@ -78,6 +87,26 @@ from src.ml_predictor.feature_selection import (  # noqa: E402
 
 DEFAULT_TARGET_BASES = ("HV_10", "HV_20", "HV_30", "BBB_20_2.0_2.0")
 LAG_PREFIXES = ("t1_close_", "t1_open_", "t3_", "t5_", "t10_")
+DEFAULT_MODEL_METADATA_PATH = "ml_models/model_metadata.json"
+
+
+def _load_model_features(metadata_path: str) -> list[str]:
+    """Read the live model's selected feature list straight out of
+    model_metadata.json ("features" key), so this script can be pointed at
+    exactly what production is using instead of only the HV/BBB family."""
+    import json
+    path = Path(metadata_path)
+    if not path.exists():
+        print(f"ERROR: {metadata_path} not found -- cannot load model feature "
+              "list. Pass --features explicitly instead.", file=sys.stderr)
+        sys.exit(1)
+    with open(path) as f:
+        meta = json.load(f)
+    feats = meta.get("features")
+    if not feats:
+        print(f"ERROR: no 'features' key found in {metadata_path}.", file=sys.stderr)
+        sys.exit(1)
+    return feats
 
 
 def _parse_args():
@@ -88,6 +117,24 @@ def _parse_args():
         "--features", nargs="+", default=None,
         help="Exact column name(s) to test. Default: every lag/side variant "
              f"of {DEFAULT_TARGET_BASES}.",
+    )
+    p.add_argument(
+        "--model-features", action="store_true",
+        help="Test exactly the live model's current feature set (read from "
+             "--model-metadata-file's 'features' key) instead of the "
+             "HV/BBB-only default. Overridden by --features if both are given.",
+    )
+    p.add_argument(
+        "--model-metadata-file", default=DEFAULT_MODEL_METADATA_PATH,
+        help=f"Path to model_metadata.json, used with --model-features. "
+             f"Default: {DEFAULT_MODEL_METADATA_PATH}",
+    )
+    p.add_argument(
+        "--all-features", action="store_true",
+        help="Test every column in the prepared feature matrix X (the full "
+             "pre-selection pool, typically ~300-400 columns), not just the "
+             "HV/BBB family or the live model's subset. Slow but exhaustive. "
+             "Overridden by --features/--model-features if given.",
     )
     p.add_argument(
         "--exclude-features-file",
@@ -168,12 +215,28 @@ def main():
               f"({symbol.nunique() - len(keep_symbols)} symbol(s) affected)\n")
     X, y, symbol = X.loc[row_mask].reset_index(drop=True), y.loc[row_mask].reset_index(drop=True), symbol.loc[row_mask].reset_index(drop=True)
 
-    # Resolve which columns to test.
+    # Resolve which columns to test. Priority: --features > --model-features
+    # > --all-features > the original HV/BBB-only default.
     if args.features:
         target_cols = [c for c in args.features if c in X.columns]
         missing = [c for c in args.features if c not in X.columns]
         if missing:
             print(f"[warn] not present in feature matrix, skipping: {missing}\n")
+    elif args.model_features:
+        model_feats = _load_model_features(args.model_metadata_file)
+        target_cols = [c for c in model_feats if c in X.columns]
+        missing = [c for c in model_feats if c not in X.columns]
+        print(f"[model-features] loaded {len(model_feats)} feature(s) from "
+              f"{args.model_metadata_file}")
+        if missing:
+            print(f"[warn] not present in feature matrix, skipping: {missing}\n")
+    elif args.all_features:
+        if args.no_exclude_features:
+            scan_X = X
+        else:
+            exclude_features, exclude_base_features = load_excluded_features(args.exclude_features_file)
+            scan_X = apply_feature_exclusions(X, exclude_features, exclude_base_features)
+        target_cols = list(scan_X.columns)
     else:
         if args.no_exclude_features:
             scan_X = X
