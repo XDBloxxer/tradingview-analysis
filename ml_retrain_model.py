@@ -3381,6 +3381,8 @@ def train_model(
 
     _seed_models = []
     _seed_windows_used = []
+    _seed_curves = []
+    _seed_peaks = []
     for _i in range(BAGGING_N_SEEDS):
         _seed = BAGGING_SEED_BASE + _i
         _seed_params = {**params, "random_state": _seed}
@@ -3421,7 +3423,31 @@ def train_model(
             _raw_spw_seed = _n_neg_seed / _n_pos_seed
             _seed_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, _raw_spw_seed)), 3)
 
-        _seed_model = XGBClassifier(**_seed_params, early_stopping_rounds=early_stopping)
+        # CONSENSUS STOPPING FIX (undertrained-classifier root cause #2):
+        # Fitting each seed with its OWN early_stopping_rounds picks that
+        # seed's round off its own per-round validation curve. On this val
+        # set (a few hundred positives), that curve is noisy enough that
+        # otherwise-identical seeds (same train/val data, only random_state
+        # differs) can pick wildly different rounds — observed in practice:
+        # best_iteration ranging ~6-33 across 7 seeds. Averaging those noisy
+        # PICKS (the old behaviour) just averages the noise; it doesn't
+        # remove it. It also inherited the aucpr/ROC-AUC metric-name mix-up
+        # fixed in _fit_and_score_cv_folds() above — "best_val_auc" here was
+        # actually PR-AUC (XGBOOST_PARAMS sets eval_metric="aucpr").
+        #
+        # Fix: don't early-stop each seed individually. Instead fit every
+        # seed to the SAME full tree budget (params["n_estimators"], already
+        # capped by cv_walk_forward_evaluate's recommendation) while asking
+        # XGBoost to also track true ROC-AUC per round (eval_metric=["aucpr",
+        # "auc"]) via evals_result(). AFTER all seeds are fit, average their
+        # per-round auc curves together — THIS is the noise-cancelling step,
+        # the same seed-bagging principle this whole class exists for,
+        # applied to curve selection instead of to final predictions — and
+        # pick the argmax of the smoothed, averaged curve as one shared
+        # stopping point for every seed (applied at inference via
+        # iteration_range in BaggedXGBClassifier).
+        _seed_params_curve = {**_seed_params, "eval_metric": ["aucpr", "auc"]}
+        _seed_model = XGBClassifier(**_seed_params_curve)
         _seed_model.fit(
             _X_tr_seed,
             _y_tr_seed,
@@ -3429,11 +3455,17 @@ def train_model(
             eval_set=[(X_val, y_val)],
             verbose=False,
         )
+        _seed_curve = _seed_model.evals_result()["validation_0"]["auc"]
+        _seed_peak_iter = int(np.argmax(_seed_curve)) + 1
+        _seed_curves.append(_seed_curve)
+        _seed_peaks.append(_seed_peak_iter)
         logger.info(
             f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}) "
             f"[window={_window_days if _window_days is not None else 'full'}, "
             f"train_rows={len(_X_tr_seed)}, pos={_n_pos_seed}, neg={_n_neg_seed}]: "
-            f"best_iteration={_seed_model.best_iteration}  best_val_auc={_seed_model.best_score:.4f}"
+            f"own-curve peak={_seed_peak_iter}/{len(_seed_curve)} "
+            f"auc_at_peak={_seed_curve[_seed_peak_iter - 1]:.4f}  "
+            f"auc_at_final={_seed_curve[-1]:.4f}"
         )
         _seed_models.append(_seed_model)
 
@@ -3443,32 +3475,61 @@ def train_model(
         ).value_counts().to_dict()
         logger.info(f"RC14: window-ensemble seed distribution actually used: {_window_counts}")
 
+    # Average the per-seed curves round-by-round (all seeds trained to the
+    # identical tree budget above, so lengths match without padding), then
+    # pick the argmax of the SMOOTHED curve — the noise-cancelling step.
+    _curve_arr = np.array(_seed_curves)  # shape (n_seeds, n_estimators)
+    _mean_curve = _curve_arr.mean(axis=0)
+    _consensus_iter = int(np.argmax(_mean_curve)) + 1
+    _consensus_score = float(_mean_curve[_consensus_iter - 1])
+    logger.info(
+        f"  Per-seed curve peaks (noisy, own val curve each): {_seed_peaks} "
+        f"— spread {min(_seed_peaks)}-{max(_seed_peaks)} illustrates why picking "
+        "each seed's own peak independently is unstable."
+    )
+    logger.info(
+        f"  Consensus stopping point (argmax of the seed-AVERAGED auc curve): "
+        f"iteration={_consensus_iter}/{len(_mean_curve)}  auc={_consensus_score:.4f} "
+        "— this is what every seed is truncated to at inference."
+    )
+
     # BAGGING: average predict_proba across the seeds below (BaggedXGBClassifier)
     # instead of picking a single seed's model. This is the same bagging
     # principle feature_selection.py already uses for *stability* (selecting
     # features that repeatedly survive across resampled runs) — here it's
     # applied to the trained model's output instead of to feature selection.
-    model = BaggedXGBClassifier(_seed_models)
+    model = BaggedXGBClassifier(
+        _seed_models,
+        consensus_iteration=_consensus_iter,
+        per_seed_peaks=_seed_peaks,
+        consensus_score=_consensus_score,
+    )
 
     logger.info(
         f"  Bagged across {model.n_seeds_} seeds — "
-        f"mean best_iteration={model.best_iteration} (std={model.best_iteration_std_:.1f})  "
-        f"mean best_val_auc={model.best_score:.4f} (std={model.best_score_std_:.4f})"
+        f"consensus best_iteration={model.best_iteration}  "
+        f"consensus val AUC={model.best_score:.4f}"
     )
-    # Warn if early stopping fired suspiciously early — indicates the val set
-    # is too small, too imbalanced, or temporally non-representative.
+    # Warn if the consensus stopping point is suspiciously early — indicates
+    # the val set is too small, too imbalanced, or temporally
+    # non-representative. Unlike the old per-seed-average check, this is now
+    # measured off the smoothed curve, so a low value here is much less
+    # likely to just be seed noise.
     if model.best_iteration < 30:
         val_pos  = int((y_val == 1).sum())
         val_neg  = int((y_val == 0).sum())
         val_rate = val_pos / max(1, val_pos + val_neg)
         logger.warning(
-            f"  ⚠️  UNDERTRAINED: best_iteration={model.best_iteration} "
-            f"(early_stopping fired after only {model.best_iteration} trees). "
-            f"Val set: {val_pos} pos / {val_neg} neg ({val_rate:.1%} positive rate). "
-            "Possible causes: (1) val set has too few positives (<20), causing "
-            "noisy AUC that prematurely triggers early stopping; "
-            "(2) val period has a very different class distribution from train; "
-            "(3) heavy regularisation params (gamma/min_child_weight) need loosening."
+            f"  ⚠️  UNDERTRAINED: consensus best_iteration={model.best_iteration} "
+            f"(the seed-averaged val AUC curve peaks after only {model.best_iteration} "
+            f"trees). Val set: {val_pos} pos / {val_neg} neg ({val_rate:.1%} positive "
+            "rate). Because this is now the argmax of a curve averaged across "
+            f"{model.n_seeds_} seeds (not one seed's own noisy pick), a low number "
+            "here is more likely a genuine early plateau than random-seed noise — "
+            "possible causes: (1) val set still has too few positives (<20) for a "
+            "stable curve even after averaging; (2) val period has a very different "
+            "class distribution from train; (3) heavy regularisation params "
+            "(gamma/min_child_weight) need loosening."
         )
 
     # Warn if val AUC is suspiciously perfect — sign of data leakage
