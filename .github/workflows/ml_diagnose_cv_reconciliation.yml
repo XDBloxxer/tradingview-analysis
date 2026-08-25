@@ -1,0 +1,135 @@
+name: ML Diagnose CV Reconciliation
+
+# Follow-up to the 2026-08-23 retrain: the production model's own
+# cv_walk_forward_evaluate() reported mean_auc=0.373 with every fold below
+# 0.5 (see ml_models/model_metadata.json's "cv_walk_forward"), while
+# feature selection's RFECV stage reported mean_auc=0.751 on the exact
+# same 13-feature final set (see
+# ml_models/feature_selection/stage3_rfecv_curve.csv). Two guarded CV runs
+# on the same features giving 0.75 vs 0.37 means something differs in
+# SETUP between the two evaluations -- most likely lookback_days
+# (feature selection defaults to 365, weekly retrain defaults to 200).
+#
+# This workflow runs diagnose_cv_reconciliation.py in one of two modes:
+#   reconcile: sweeps cv_walk_forward_evaluate() across lookback_days
+#     values to see whether the gap closes -- same function, same
+#     features, only the data window changes.
+#   calendar: at one lookback_days value, prints each fold's test-window
+#     date range next to its AUC, to check whether the worst folds cluster
+#     in a specific calendar stretch (regime dependence) vs scattered
+#     evenly (more likely noise).
+#
+# Read-only: does not write or commit anything, just prints a report and
+# uploads it as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Which check to run'
+        required: false
+        default: 'reconcile'
+        type: choice
+        options:
+          - 'reconcile'
+          - 'calendar'
+      lookback_days_list:
+        description: >-
+          Reconcile mode only: space-separated lookback windows to sweep
+          (0 = unbounded). Default matches the two values that actually
+          produced the conflicting numbers (feature-selection's 365 vs
+          weekly-retrain's 200).
+        required: false
+        default: '200 365'
+        type: string
+      lookback_days:
+        description: 'Calendar mode only: single lookback window (0 = unbounded)'
+        required: false
+        default: '365'
+        type: string
+      n_splits:
+        description: 'Number of walk-forward CV folds'
+        required: false
+        default: '5'
+        type: string
+      min_train_frac:
+        description: 'Minimum fraction of dated rows reserved for the first fold train split'
+        required: false
+        default: '0.4'
+        type: string
+      features:
+        description: >-
+          Space-separated exact column names to test. Leave blank to use
+          the current production model's feature list from
+          ml_models/model_metadata.json.
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose-cv-reconciliation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run CV reconciliation diagnostic
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TZ: 'America/New_York'
+        run: |
+          MODE="${{ github.event.inputs.mode || 'reconcile' }}"
+          LOOKBACK_LIST="${{ github.event.inputs.lookback_days_list || '200 365' }}"
+          LOOKBACK_DAYS="${{ github.event.inputs.lookback_days || '365' }}"
+          N_SPLITS="${{ github.event.inputs.n_splits || '5' }}"
+          MIN_TRAIN_FRAC="${{ github.event.inputs.min_train_frac || '0.4' }}"
+          FEATURES="${{ github.event.inputs.features }}"
+
+          FEATURES_ARGS=""
+          if [ -n "$FEATURES" ]; then
+            FEATURES_ARGS="--features $FEATURES"
+          fi
+
+          if [ "$MODE" = "calendar" ]; then
+            python diagnose_cv_reconciliation.py \
+              --lookback-days "$LOOKBACK_DAYS" \
+              --n-splits "$N_SPLITS" \
+              --min-train-frac "$MIN_TRAIN_FRAC" \
+              $FEATURES_ARGS \
+              | tee cv_reconciliation_report.txt
+          else
+            python diagnose_cv_reconciliation.py \
+              --reconcile \
+              --lookback-days-list $LOOKBACK_LIST \
+              --n-splits "$N_SPLITS" \
+              --min-train-frac "$MIN_TRAIN_FRAC" \
+              $FEATURES_ARGS \
+              | tee cv_reconciliation_report.txt
+          fi
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cv-reconciliation-report
+          path: cv_reconciliation_report.txt
+          retention-days: 30
