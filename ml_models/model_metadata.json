@@ -1,5 +1,5 @@
 {
-  "trained_at": "2026-08-25T23:26:43.782456+00:00",
+  "trained_at": "2026-08-25T23:39:16.305025+00:00",
   "source": "ml_retrain_model.py",
   "training_approach": "full_retrain_from_scratch",
   "n_features": 13,
@@ -229,7 +229,7 @@
           "min_child_weight": 13,
           "gamma": 4.92186159245214,
           "reg_alpha": 0.010511586988130508,
-          "reg_lambda": 1.2604557515382908,
+          "reg_lambda": 1.260455751538291,
           "subsample": 0.983276824082136,
           "colsample_bytree": 0.5143014831175484
         },
@@ -271,7 +271,7 @@
           "min_child_weight": 13,
           "gamma": 4.137629314336304,
           "reg_alpha": 0.01107882605884161,
-          "reg_lambda": 1.1725077116798641,
+          "reg_lambda": 1.1725077116798643,
           "subsample": 0.9538323976412588,
           "colsample_bytree": 0.507797399829228
         },
@@ -283,9 +283,9 @@
         "params": {
           "max_depth": 7,
           "min_child_weight": 15,
-          "gamma": 1.3414708283822483,
+          "gamma": 1.3414708283822478,
           "reg_alpha": 0.04547566705197086,
-          "reg_lambda": 0.7327168104812045,
+          "reg_lambda": 0.7327168104812046,
           "subsample": 0.8525984191941941,
           "colsample_bytree": 0.5764954906203786
         },
@@ -299,7 +299,7 @@
           "min_child_weight": 12,
           "gamma": 1.452190276091561,
           "reg_alpha": 0.01470751319736521,
-          "reg_lambda": 1.6200304091837203,
+          "reg_lambda": 1.6200304091837205,
           "subsample": 0.9560303667787335,
           "colsample_bytree": 0.5841423558926677
         },
@@ -341,7 +341,7 @@
           "min_child_weight": 16,
           "gamma": 0.5866726461162177,
           "reg_alpha": 0.018489702430426518,
-          "reg_lambda": 1.694470025985912,
+          "reg_lambda": 1.6944700259859122,
           "subsample": 0.7109036842919474,
           "colsample_bytree": 0.5749430894239488
         },
