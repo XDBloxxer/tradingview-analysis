@@ -834,8 +834,11 @@ BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
 # without permanently changing BAGGING_N_SEEDS (and therefore classifier cost
 # too, since that constant is shared). Defaults to BAGGING_N_SEEDS, i.e. no
 # behavior change unless explicitly set.
-GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS = int(
-    os.environ.get("GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS", BAGGING_N_SEEDS)
+_gain_regressor_diagnostic_n_seeds_raw = os.environ.get("GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS", "").strip()
+GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS = (
+    int(_gain_regressor_diagnostic_n_seeds_raw)
+    if _gain_regressor_diagnostic_n_seeds_raw
+    else BAGGING_N_SEEDS
 )
 
 # RC14: RECENCY WEIGHTING + WINDOW-ENSEMBLING (2026-08-19)
