@@ -32,6 +32,11 @@ on:
         required: false
         default: false
         type: boolean
+      gain_regressor_diagnostic_n_seeds:
+        description: 'One-off diagnostic: number of seeds for the gain regressor seed-bagging loop (leave blank for default BAGGING_N_SEEDS=7, no behavior change). Bump to e.g. 15 to check whether per-seed best_iteration spread is proportionally as unstable as the classifier was pre-consensus-fix.'
+        required: false
+        default: ''
+        type: string
 
 # CRITICAL: Grant write permissions to push model updates
 permissions:
@@ -79,6 +84,11 @@ jobs:
           # Disabled by default — training uses T-1 data only. Opt in via
           # workflow_dispatch if bootstrapping a brand-new database.
           USE_BASE_TRAINING_DATA: ${{ github.event.inputs.use_base_training_data || 'false' }}
+          # One-off diagnostic override (see ml_retrain_model.py comment near
+          # GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS). Blank on the scheduled run and
+          # by default here, so this only ever fires when explicitly set via
+          # workflow_dispatch — never silently inflates weekly retrain cost.
+          GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS: ${{ github.event.inputs.gain_regressor_diagnostic_n_seeds }}
         run: |
           LOOKBACK="${{ github.event.inputs.lookback_days }}"
           USE_ALL="${{ github.event.inputs.use_all_timepoints }}"
