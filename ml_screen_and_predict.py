@@ -1,7972 +1,2463 @@
 #!/usr/bin/env python3
 """
-ml_retrain_model.py  —  Weekly Full Retrain From Scratch
+ML Stock Screener & Predictor
 
-Replaces the previous fine-tuning approach with a complete retrain every week.
+FIXES IN THIS VERSION (2026-03-12 v9):
 
-DATA SOURCES (combined into one training dataset):
-  1. ml_training_base    — original CSV data pivoted to wide format, both classes
-                           Feature prefixes: t3_, t5_, t10_ only
-  2. winners_day_prior_close / winners_day_prior_open
-                         — accumulating T-1 winner samples from daily runs (label=1)
-  3. non_winners_day_prior_close / non_winners_day_prior_open
-                         — accumulating T-1 non-winner samples from daily runs (label=0)
-  4. ml_mistake_learner  — high-weight samples from the model's own past errors
-                           (false positives: weight 3x, false negatives: weight 2x)
+FIX 1 — fetch_t1_data_for_symbol now computes real indicators from 5-min bars.
 
-FIXES IN THIS VERSION:
-  1. Time-based train/val split (not random) — prevents data leakage where the model
-     validates on stocks from the same week it trained on. With a random split, the
-     model sees the market regime in both train and val, producing fake 0.9999 AUC.
-     A time-based split forces the model to generalise across time periods.
+FIX 2 — build_features_from_tv_data lowercases keys for t3/t5/t10 prefix models.
 
-     IMPORTANT: Uses a unified sort_date column (detection_date ?? event_date) so
-     that base CSV rows (which have event_date but no detection_date) sort correctly
-     alongside T-1 rows (which have detection_date). Without this, base CSV rows
-     sort to the END as NaT (na_position='last') and the val set ends up being
-     entirely T-1 non-winners → 0 positives in val → degenerate model.
+FIX 3 — write_predictions_upsert instead of insert-skip-on-duplicate.
 
-  2. Stronger regularisation — min_child_weight raised from 3→10, max_depth 6→5,
-     gamma 0.1→1.0, reg_alpha 0.1→0.5. These prevent the model from memorising
-     individual stocks.
+FIX 4 — SmartScreener._load_learned_filters clamps aggressive HV/vol-ratio minimums.
 
-  3. scale_pos_weight capped at [0.5, 5.0] — avoids extreme corrections when the
-     training set happens to be very imbalanced in either direction.
-     SPW_MAX is intentionally kept at 5.0 even though the raw imbalance can run
-     well above that (e.g. ~13x at a 7% positive rate, higher than the ~8.7x
-     seen when this cap was first set — the cap matters more as the imbalance
-     grows, not less): combining a higher SPW with eval_metric="auc" pushes raw
-     probabilities so high that STRONG_BUY thresholds become meaningless.
-     Base-rate mismatch between the val calibration set and the screened
-     inference universe is corrected via prior-probability correction in
-     train_model() instead of via a higher SPW.
+FIX 5 — Pre-flight and post-prediction variance diagnostics.
 
-  4. Intraday-high label support — if actual_high_pct is available and exceeds
-     INTRADAY_WIN_THRESHOLD, those rows are also treated as winners (label=1).
-     This fixes the JDZG/RIME problem where the model was RIGHT (stock moved big)
-     but the close-based label called it a false positive.
+FIX 6 — Hybrid model prefix handling: TV screener data mapped to t1_close_*
+         only.  t3_/t5_/t10_* are NOT populated from the TV screener row.
+         (Reverted the old fill_flat_prefixes=True path in
+         build_features_from_tv_data which was writing identical TV-screener
+         values into all three flat prefixes, corrupting 2/3 of the hybrid
+         model's flat-prefix features.  See FIX 9 for the correct source.)
 
-  5. Duplicate-date deduplication — the same (symbol, date) can appear in both the
-     base CSV and T-1 tables, causing the model to overfit to repeated examples. We
-     now deduplicate after combine_datasets() so the model doesn't overfit to
-     repeated rows.
+FIX 7 — t1_open_* features now reliably populated (lowered min bar threshold,
+         extended open window, fallback to close indicators).
 
-GAIN REGRESSOR FIXES (2026 update):
-  RC2. Correct gain target: actual_high_pct now uses prev_close as denominator
-       (fetched from daily_winners prev-day row or ml_prediction_accuracy), NOT the
-       same-day close. This was severely compressing the target range.
-  RC3. Scale alignment: regressor is trained on X_scaled (StandardScaler output),
-       exactly matching what explosion_predictor.py passes at inference time.
-  RC1. Broader training set: regressor now also trains on non-winner rows that have
-       actual_gain_pct from ml_prediction_accuracy (yfinance data), giving far more
-       training samples and a wider gain distribution.
-  RC6. Mistake row enrichment: mistake samples (false positives/negatives) are
-       enriched with actual_gain_pct from ml_prediction_accuracy before being added
-       to combined_df, so they contribute to regressor training.
+FIX 8 — Added missing indicators to _compute_indicators:
+  TSI, Keltner Channel, Donchian Channel, VWAP, ATR slope.
 
-LABEL FIX (2026):
-  RC3-label. Non-winner label correction via ml_prediction_accuracy: the RC2
-       join only matches daily_winners rows, so non_winners_day_prior rows exit
-       RC2 with actual_high_pct = NULL.  The previous implementation backfilled
-       actual_high_pct from ml_prediction_accuracy into combined_df before
-       apply_intraday_high_labels() ran — this was lookahead leakage because
-       actual_high_pct is a same-day post-close outcome that does not exist at
-       prediction time.  The fix separates the two pipelines: ml_prediction_accuracy
-       is fetched to build _accuracy_gain_map (for the gain regressor) and to
-       apply label corrections directly (label=0 → 1 where actual_high_pct >=
-       threshold), but actual_high_pct is NOT written back into the feature
-       matrix (combined_df).  apply_intraday_high_labels() now only operates on
-       actual_high_pct values that originated from prior-day data (RC2/daily_winners).
+FIX 9 (revised) — t3_/t5_/t10_* columns now populated from REAL daily-bar
+  snapshots at the correct calendar offsets, not from T-1 intraday data.
 
-NOTE ON CLASS BALANCE:
-  ml_training_base contains both winners (label=1) and non-winners (label=0) from
-  the original CSV, all with t3_/t5_/t10_ features from daily bars.
+  ROOT CAUSE: The model was trained with t3_*/t5_*/t10_* features representing
+  indicator snapshots taken 3, 5, and 10 calendar days before detection_date,
+  computed from daily OHLCV bars via multiday_feature_collector.py.  The
+  original FIX 9 implementation paperd over a feature-pipeline gap by copying
+  yesterday's intraday bar indicators into all three prefix columns, causing
+  the model to receive identical data under three different names and degrading
+  any signal that depends on how conditions differed at T-3 vs T-5 vs T-10.
 
-WHY FULL RETRAIN (not fine-tuning):
-  - Only ~3,600 base rows — trivially fast to retrain (seconds, not minutes)
-  - Fine-tuning with dummy-default T-3/T-7/T-14 values was corrupting new trees
-  - NaN for genuinely missing columns is correct; XGBoost handles it natively
-  - feature_importance.csv is regenerated each run — always accurate and current
+  The revised fix calls _fetch_real_multiday_features(), which:
+    1. Fetches daily OHLCV bars from yfinance (same as training time).
+    2. Calls _snapshot_for_offset() from multiday_feature_collector for each
+       offset (3, 5, 10 calendar days before detection_date).
+    3. Uses the same _compute_indicators + PANDAS_TA_TO_BASE pipeline as the
+       training data pipeline, so feature names and scaling match exactly.
+  The result is that prediction-time t3_*/t5_*/t10_* values are structurally
+  identical to what the model saw during training.
 
-OUTPUTS (same paths as before, drop-in compatible with ml_weekly_retrain.yml):
-  ml_models/best_model.pkl
-  ml_models/scaler.pkl
-  ml_models/model_metadata.json
-  ml_models/feature_importance.csv
+FIX 10 — get_next_trading_day now queries the daily_winners table for the most
+  recent detection_date and returns the next weekday after it, rather than
+  deriving the date from wall-clock time. This prevents mis-dating when GitHub
+  Actions runs late or on the wrong side of midnight. Falls back to the
+  original time-based logic if no winners data exists yet.
+
+FIX 11 — The stored `prediction` integer is now derived from `signal` rather
+  than from the raw XGBoost binary output.  With scale_pos_weight up to 10x,
+  the 0.5 decision boundary was satisfied by nearly every post-screener stock,
+  so `int(row['prediction'])` was 1 for almost all rows — making the column
+  useless as a BUY/AVOID discriminator in the accuracy tracker and in any
+  downstream query.  The field now stores 1 iff signal ∈ {BUY, STRONG BUY},
+  consistent with what the tracker (and the human reader) expects.
 """
 
-import json
+import argparse
 import logging
-import math
-import os
-import re
-import sys
-from datetime import datetime, timezone, timedelta
+import pytz
+from datetime import time as dt_time
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
-
-try:
-    import yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
-
-import joblib
-import numpy as np
+import sys
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import roc_auc_score
+import json
+import numpy as np
+from ta.trend import ADXIndicator
+from ta.volatility import AverageTrueRange, KeltnerChannel, BollingerBands, DonchianChannel
 
-# _PriorCorrectedModel lives in a stable shared module so that joblib can
-# always resolve it by fully-qualified name regardless of which script is
-# __main__ at load time.  Import it here so the name is available in this
-# module's namespace (used below when wrapping the calibrated model).
-from src.ml_predictor.prior_corrected_model import (  # noqa: F401
-    _PriorCorrectedModel,
-    fit_cross_fitted_blended_calibrator,
-)
+sys.path.insert(0, str(Path(__file__).parent))
 
-# BaggedXGBClassifier / BaggedXGBRegressor live in the same kind of stable,
-# importable module for the same joblib/__main__ reason — see
-# bagged_models.py's docstring. They implement seed-variance bagging: N
-# models identical except for random_state, averaged together, since
-# subsample=0.8/colsample_bytree=0.8 make each model's tree-building a random
-# draw even with XGBOOST_PARAMS' random_state held fixed.
-from src.ml_predictor.bagged_models import BaggedXGBClassifier, BaggedXGBRegressor  # noqa: F401
-from src.ml_predictor.symbol_demeaning import (
-    demean_training_features,
-    compute_symbol_baselines,
-    save_symbol_baselines,
-    DEFAULT_BASELINE_PATH as SYMBOL_DEMEAN_BASELINE_PATH,
-)
-# CV WALK-FORWARD FIX: reuse the SAME leak-guarded walk-forward splitter
-# (with FIX 4/5's embargo + symbol purge) that Stage 3/4 feature selection
-# (rfecv_time_aware / genetic_algorithm_selection) already relies on, so the
-# classifier itself gets a multi-fold CV estimate instead of only ever being
-# fit/evaluated against feature_selection.py's single train/val cut. See
-# cv_walk_forward_evaluate() below.
-from src.ml_predictor.feature_selection import time_aware_splits
-from supabase import create_client, Client
-from xgboost import XGBClassifier
+from src.ml_predictor.explosion_predictor import ExplosionPredictor
+from src.ml_predictor.ml_supabase_client import MLPredictionSupabaseClient
 
-# T-1 column name translator (intraday short names → model long names)
 try:
-    from t1_column_map import rename_t1_columns
-    T1_MAP_AVAILABLE = True
+    from tradingview_scraper.symbols.screener import Screener
+    SCREENER_AVAILABLE = True
 except ImportError:
-    T1_MAP_AVAILABLE = False
-    logging.getLogger(__name__).warning(
-        "t1_column_map.py not found — T-1 features will not be renamed. "
-        "Place t1_column_map.py alongside ml_retrain_model.py."
-    )
-
-# Mistake learner — DISABLED (too few samples; circular feedback risk)
-# With only ~18 mistakes, the 3×/2× weighting creates circular feedback:
-# valid setups that fail due to market noise get trained as "bad patterns",
-# causing the model to suppress them on future retrains.
-# Re-enable once a statistically meaningful mistake corpus is available.
-#
-# try:
-#     from ml_mistake_learner import build_mistake_training_samples, log_mistake_summary
-#     MISTAKE_LEARNER_AVAILABLE = True
-# except ImportError:
-#     MISTAKE_LEARNER_AVAILABLE = False
-#     logging.getLogger(__name__).warning(
-#         "ml_mistake_learner.py not found — mistake-learning step will be skipped."
-#     )
-MISTAKE_LEARNER_AVAILABLE = False  # Placeholder — re-enable when corpus is large enough
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-TABLE_BASE                   = "ml_training_base"
-TABLE_WINNERS_CLOSE          = "winners_day_prior_close"
-TABLE_WINNERS_OPEN           = "winners_day_prior_open"
-TABLE_NON_WINNERS_CLOSE      = "non_winners_day_prior_close"
-TABLE_NON_WINNERS_OPEN       = "non_winners_day_prior_open"
-TABLE_WINNERS_MULTIDAY       = "winners_multiday"
-TABLE_NON_WINNERS_MULTIDAY   = "non_winners_multiday"
-
-MODEL_DIR               = Path("ml_models")
-MODEL_PATH              = MODEL_DIR / "best_model.pkl"
-SCALER_PATH             = MODEL_DIR / "scaler.pkl"
-GAIN_REGRESSOR_PATH     = MODEL_DIR / "gain_regressor.pkl"
-METADATA_PATH           = MODEL_DIR / "model_metadata.json"
-FEATURE_IMPORTANCE_PATH = MODEL_DIR / "feature_importance.csv"
-
-# FIX (2026-06-03): Flipped weights so fresh T-1 intraday rows are trusted MORE
-# than the older base CSV daily-bar rows.
-#
-# Previously BASE_CSV_WEIGHT=1.5 / T1_WEIGHT=1.0 told XGBoost: "the older
-# daily-bar snapshots matter 50% more than today's live intraday data." That
-# caused t1_close_ and t1_open_ features to land near-zero in feature
-# importance (RSI_14=0.000155, Volume_Ratio=0.000769) despite being the
-# freshest, most actionable signal available at inference time.
-#
-# UPDATE (2026-07-28): Reverted T1_WEIGHT 2.0 -> 1.0. The 2x multiplier made
-# sense when T1 rows were a minority needing a boost, but the 180-day rolling
-# window now contains far more T1 rows than base rows by sheer count (e.g.
-# 7576 T1 vs 869 base in a recent run) -- stacking a 2x per-row multiplier on
-# top of an already ~8.7:1 row-count advantage pushed base CSV down to ~5% of
-# total training signal, effectively drowning out whatever the t3_/t5_/t10_
-# multiday features (anchored by base rows) contribute. Equal weighting lets
-# the natural row-count ratio do the work instead of compounding it.
-BASE_CSV_WEIGHT         = 1.0
-T1_WEIGHT               = 1.0
-# T-1 rows tagged t1_data_source='daily_fallback' (intraday_data_collector.py)
-# are a coarser daily-bar approximation, not a real 5-min T-1 snapshot -- see
-# validate_symbol_demeaning.py's "ML Validate Symbol-Demeaning Fix" run
-# 2026-08-11, which found the residual leak (that survives both symbol-
-# demeaning and cold-start exclusion) is concentrated specifically in the
-# t1_* columns, not t3/t5/t10.
-#
-# UPDATE (2026-08-11): A flat T1_DAILY_FALLBACK_WEIGHT multiplier applied to
-# *every* daily_fallback row -- regardless of label -- doesn't fix the actual
-# problem. crosstab_check.py showed the skew is asymmetric across labels:
-#   5min share: non-winners=5.1%, winners=30.8%  (25.7pp gap)
-# That gap is a real (and explainable) artifact of the collection pipeline --
-# winners are identified live off a same-day screener so they're far more
-# likely to land inside yfinance's 60-day 5-min window, while the much
-# larger non-winner batch is more often backfilled later and falls outside
-# it -- but a flat discount on daily_fallback rows shrinks both labels'
-# fallback mass by the same factor and leaves the *ratio* (and therefore the
-# leak) untouched. label=1 rows are still ~6x more likely to be tagged
-# '5min' than label=0 rows after a flat multiplier, so t1_data_source (and
-# anything correlated with it) remains a usable label proxy.
-#
-# Fix: inverse-propensity reweight t1_data_source *within each label* so
-# that, after weighting, both labels see the same 5min/daily_fallback mix --
-# the same mix the whole dataset has overall. This removes the
-# source-as-label-proxy signal while still leaving every row with some
-# nonzero weight (no rows dropped) and leaving the *overall* 5min vs.
-# daily_fallback balance of the dataset unchanged (we reweight toward the
-# global marginal, not toward an arbitrary 50/50 split). See
-# _t1_source_propensity_weights() below; computed per-run since the actual
-# label x source mix drifts over time as the live pipeline catches up.
-# Old flat multiplier kept only as an emergency/degenerate-case fallback.
-T1_DAILY_FALLBACK_WEIGHT = 0.5
-# Rows with no t1_data_source tag at all (collected before this field
-# existed, or the column was silently dropped on insert by the schema-retry
-# self-heal in daily_winners_supabase_client.py because the DB table doesn't
-# have the column yet -- see migration note in symbol_demeaning.py) default
-# to full weight rather than being penalised for a gap we can't attribute.
-MIN_T1_ROWS_FOR_EQUAL_WEIGHT = 1800
-
-
-def _t1_source_propensity_weights(
-    source: pd.Series,
-    label: pd.Series,
-    *,
-    min_cell_count: int = 20,
-    weight_cap: tuple[float, float] = (0.2, 5.0),
-) -> pd.Series:
-    """
-    Inverse-propensity multiplier that equalises the t1_data_source mix
-    (5min vs. daily_fallback, or any other tag) *within each label* so it
-    matches the dataset's overall (label-agnostic) mix.
-
-    Why per-label, not a flat discount: a flat multiplier on daily_fallback
-    rows shrinks both labels' fallback mass by the same factor and leaves
-    the label=1 vs label=0 *ratio* of 5min/daily_fallback untouched -- the
-    model can still learn t1_data_source as a label proxy. Reweighting each
-    (label, source) cell to the global marginal removes that correlation
-    directly: for each label, P(source | label) after reweighting equals
-    P(source) overall, so source carries no residual information about
-    label.
-
-    Anchoring to the *global* marginal (rather than e.g. forcing 50/50)
-    keeps the dataset's overall 5min/daily_fallback balance where it
-    started -- only the cross-label skew is corrected, not the base rate.
-
-    Parameters
-    ----------
-    source : per-row category (e.g. t1_data_source); NaN rows get weight 1.0
-             untouched, matching the "untagged rows keep full weight" policy
-             used elsewhere for this column.
-    label  : per-row label (0/1).
-    min_cell_count : a label group smaller than this is left at weight 1.0
-             for all its rows -- too few rows to estimate a stable
-             per-source propensity, and a noisy correction is worse than
-             none.
-    weight_cap : clamp bounds so degenerate cells (a source that's almost
-             entirely one label) don't produce extreme multipliers that
-             swamp everything else in sample_weight.
-
-    Returns
-    -------
-    pd.Series of per-row multipliers, aligned to `source`'s index, meant to
-    be multiplied into the existing sample_weight (not used standalone).
-    """
-    weights = pd.Series(1.0, index=source.index)
-    mask = source.notna() & label.notna()
-    if mask.sum() == 0:
-        return weights
-
-    s = source[mask]
-    l = label[mask]
-    overall_props = s.value_counts(normalize=True)
-
-    for lbl, lbl_mask in l.groupby(l).groups.items():
-        n_lbl = len(lbl_mask)
-        if n_lbl < min_cell_count:
-            continue  # too few rows for a stable estimate -- leave at 1.0
-        lbl_props = s.loc[lbl_mask].value_counts(normalize=True)
-        for src_val, p_target in overall_props.items():
-            p_actual = lbl_props.get(src_val, 0.0)
-            if p_actual <= 0:
-                continue  # this label never saw this source -- nothing to reweight
-            w = float(np.clip(p_target / p_actual, weight_cap[0], weight_cap[1]))
-            row_mask = (l.index.isin(lbl_mask)) & (s == src_val)
-            weights.loc[s.index[row_mask]] = w
-
-    return weights
-
-# Validation window — the most recent N weeks of labelled data are reserved for
-# validation; everything before that window is used for training.
-#
-# Why dynamic instead of a fixed date:
-#   A hardcoded date causes the val set to grow every week as new T-1 rows
-#   accumulate, which shifts scale_pos_weight, changes the early-stopping signal,
-#   and makes week-over-week metric comparisons unreliable.  Pinning to "the last
-#   N weeks" keeps the val window the same size every retrain regardless of when
-#   the job runs.
-#
-# Tune VAL_WEEKS to taste:
-#   • Too small  → noisy AUC / unstable early stopping.
-#   • Too large  → less training data, slower to adapt to recent market regimes.
-#   8 weeks (≈ 2 months) is a reasonable starting point.
-#
-# RAISED 8 → 12 (2026-08-13): with 8 weeks the val set carried only ~160
-# positives, which RC6 then splits in half (interleaved) between the
-# early-stopping holdout and the isotonic calibration holdout — leaving each
-# with only ~80 positives. That's thin enough that: (1) AUC on the
-# early-stopping half is noisy round-to-round, so XGBoost's patience counter
-# trips after ~16 trees on what is mostly sampling noise rather than genuine
-# non-improvement (see the UNDERTRAINED warning in train_model()); and
-# (2) isotonic regression — a nonparametric, nonsmooth step-function fit —
-# produces hard flat plateaus with that few calibration points, which is why
-# predict_proba() was returning identical values for many different inputs.
-# 12 weeks (~1.5x the val/cal rows) directly targets both symptoms at once
-# without touching early_stopping_rounds or the calibration method. If
-# best_iteration is still <30 after this change, the next lever to pull is
-# CAL_MIN_POS / the cal-vs-stop split ratio in main() (currently a 50/50
-# interleave — could shift toward giving early-stopping more of the val set
-# than calibration, since isotonic degrades more gracefully with fewer points
-# than AUC-based early stopping does).
-#
-# CAUTION observed in practice: because row volume is NOT uniform over time
-# (recent weeks can carry far more rows than older ones), an 8→12 week bump
-# was observed to nearly triple val size (1.1k→3.3k rows) while train
-# collapsed by ~2/3 (4.9k→1.6k) — badly starving the gain regressor, which
-# only trains on the classifier's train split. See the MAX_VAL_FRACTION
-# guard in train_val_split(), which now caps val at a fraction of total
-# dated rows regardless of what VAL_WEEKS resolves to, so raising VAL_WEEKS
-# further should no longer have this runaway effect.
-VAL_WEEKS = 12
-
-# ---------------------------------------------------------------------------
-# Purge / embargo gap at the train/val boundary
-# ---------------------------------------------------------------------------
-# The train/val split below is a hard date cutoff. Several of the most
-# important features (t3_hv_30, t3_hv_20, t5_hv_10, ...) are rolling windows
-# up to N days deep. Without a gap, a train row dated just before the cutoff
-# and a val row dated just after it (especially for the same symbol) have
-# rolling-window feature vectors that overlap heavily in the underlying days
-# they're computed from — nothing is "from the future," but the two rows are
-# highly autocorrelated purely because they sit next to each other in time.
-# This inflates val AUC relative to what the model will see on a genuinely
-# fresh period, in exactly the way purged/embargoed CV (de Prado) is
-# designed to prevent.
-#
-# EMBARGO_DAYS_FLOOR / EMBARGO_DAYS_CAP bound the *inferred* gap (below).
-# The floor guards against a feature-name scan that happens to find nothing
-# and would otherwise embargo 0 days; the cap guards against a stray large
-# number in an unrelated column name (e.g. a year) blowing the gap out to
-# something absurd and starving train of data.
-EMBARGO_DAYS_FLOOR = 5
-EMBARGO_DAYS_CAP   = 90
-
-# FIX 5's symbol purge (below, in train_val_split) drops train rows that
-# share a symbol with a val row. Originally this was a flat, all-time
-# set-membership check: ANY train row for a symbol was dropped if that
-# symbol appeared ANYWHERE in val, regardless of how far apart the two
-# rows were in time. For a universe with recurring small-cap movers, that
-# meant a single val appearance could purge months of that ticker's train
-# history -- and widening --lookback-days made this *worse*, not better,
-# since it just handed the purge more old rows of the same recurring
-# symbols to delete.
-#
-# SYMBOL_PURGE_WINDOW_MULTIPLIER scopes the purge to time instead: a train
-# row is only purged if it falls within
-# (EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER) calendar days of THAT
-# SYMBOL's nearest val occurrence. Default 1.0 reuses EMBARGO_DAYS itself,
-# since EMBARGO_DAYS already represents the calendar-day span over which a
-# rolling-window feature's value stays autocorrelated with the row that
-# produced it -- the same mechanism that makes symbol-level memorization
-# possible in the first place. Override via the SYMBOL_PURGE_WINDOW_MULTIPLIER
-# env var if a wider or narrower margin is wanted.
-SYMBOL_PURGE_WINDOW_MULTIPLIER = float(
-    os.environ.get("SYMBOL_PURGE_WINDOW_MULTIPLIER", "1.0")
-)
-
-# Rolling-window feature lengths (SMA_50, hv_30, t10_*, ...) are counted in
-# TRADING days, but the embargo gap itself is subtracted from a CALENDAR-day
-# cutoff (pd.Timedelta(days=EMBARGO_DAYS)). A straight day-for-day mapping
-# therefore undercounts the true gap by ~2 non-trading days per 5 trading
-# days (weekends; more around holidays). E.g. a genuine 50-*trading*-day SMA
-# window spans ~70 calendar days, not 50 — so an embargo of exactly 50
-# calendar days still leaves ~20 days of real autocorrelation across the
-# train/val boundary. TRADING_TO_CALENDAR_RATIO converts the inferred
-# trading-day window into an equivalent calendar-day gap before clamping.
-TRADING_TO_CALENDAR_RATIO = 7.0 / 5.0  # 7 calendar days per 5 trading days
-
-# Minimum number of days of pre-embargo data train_val_split will insist on
-# keeping for TRAIN, even if that means shrinking the inferred embargo below
-# what the deepest rolling-window feature would otherwise call for. Purely a
-# safety floor against the embargo silently consuming the entire train
-# window (see the guard in train_val_split) -- it does not replace choosing
-# a sane --lookback-days for the actual dataset.
-MIN_TRAIN_WINDOW_DAYS = 14
-
-# Matches the deepest rolling-window length actually present in a set of
-# feature column names, so the embargo automatically widens if someone adds
-# a feature with a longer lookback (e.g. hv_45) without anyone remembering
-# to bump a hardcoded constant. Column names encode window length as a
-# trailing/embedded integer — SMA_50, EMA_26, hv_30, Volume_MA20, HV_10,
-# BBL_20_2.0_2.0, MACD_12_26_9, etc. — so every integer run in the name is a
-# candidate window length; we take the max across all feature columns,
-# clamped to a sane [floor, cap] range.
-_WINDOW_NUMBER_RE = re.compile(r"\d+")
-
-
-def _infer_embargo_days(
-    feature_cols,
-    floor: int = EMBARGO_DAYS_FLOOR,
-    cap: int = EMBARGO_DAYS_CAP,
-) -> int:
-    """Infer the purge/embargo gap (in CALENDAR days) from the deepest
-    rolling-window length encoded in the given feature column names.
-
-    The raw max window found in column names is a count of TRADING days
-    (that's how every technical indicator here is computed). We convert it
-    to calendar days via TRADING_TO_CALENDAR_RATIO before clamping, since
-    the embargo is ultimately applied against calendar-day timestamps.
-
-    Falls back to `floor` if no plausible window length is found (e.g. an
-    empty feature list), and clamps the result to `cap` so a stray large
-    number in an unrelated column name can't blow the train set apart.
-    """
-    max_window = 0
-    for col in feature_cols:
-        for match in _WINDOW_NUMBER_RE.findall(col):
-            try:
-                n = int(match)
-            except ValueError:
-                continue
-            # Decimal fragments like "2.0" in BBL_20_2.0_2.0 surface as "2"
-            # and "0" — harmless, they're just smaller than the real window
-            # numbers and won't win the max(). Ignore implausibly large
-            # numbers (e.g. a stray year or id) outright rather than let
-            # them dominate the max before clamping.
-            if n > cap:
-                continue
-            max_window = max(max_window, n)
-
-    trading_days = max_window if max_window > 0 else floor
-    calendar_days = math.ceil(trading_days * TRADING_TO_CALENDAR_RATIO)
-    return int(max(floor, min(cap, calendar_days)))
+    SCREENER_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
-# Filter-aware negative sampling — loosening config
-# ---------------------------------------------------------------------------
-# These values are read from config.yaml (non_winners section) at import time
-# so they stay in sync with the same knobs used by the live detector.
-# If config.yaml is absent or unreadable the defaults below are used.
-#
-#   loosening_passes   – how many times to retry with progressively looser
-#                        filters before falling back to fully-unfiltered rows.
-#                        0 = no loosening (original behaviour).
-#   loosening_step_pct – % to relax each min_* / max_* threshold per pass.
-#                        At pass N filters are relaxed by (step * N) %.
-#   min_hard_neg_ratio – stop loosening once hard-negative rows >= this
-#                        fraction of the total negatives needed for that date.
-#                        1.0 = fill everything from filtered pool if possible.
+# TV screener column → base indicator name mappings
 # ---------------------------------------------------------------------------
 
-def _load_loosening_config() -> dict:
-    """Read loosening knobs from config.yaml -> non_winners section.
-    Returns defaults if the file is absent or the key is missing."""
-    defaults = {
-        "loosening_passes":   5,
-        "loosening_step_pct": 20.0,
-        "min_hard_neg_ratio": 0.80,
-    }
-    try:
-        cfg_path = Path("config.yaml")
-        if cfg_path.exists() and _YAML_AVAILABLE:
-            with open(cfg_path, "r") as f:
-                cfg = yaml.safe_load(f) or {}
-            nw = cfg.get("non_winners", {})
-            for key in defaults:
-                if key in nw:
-                    defaults[key] = type(defaults[key])(nw[key])
-    except Exception:
-        pass   # silently keep defaults — retrain must not fail over config issues
-    return defaults
-
-_LOOSENING_CFG = _load_loosening_config()
-SAMPLING_LOOSENING_PASSES   = _LOOSENING_CFG["loosening_passes"]
-SAMPLING_LOOSENING_STEP_PCT = _LOOSENING_CFG["loosening_step_pct"]
-SAMPLING_MIN_HARD_NEG_RATIO = _LOOSENING_CFG["min_hard_neg_ratio"]
-
-
-def _compute_val_cutoff(df_with_dates: "pd.DataFrame") -> "pd.Timestamp":
-    """Return the cutoff Timestamp that keeps the most recent VAL_WEEKS of data
-    as the validation set.
-
-    The cutoff is derived from the actual data rather than wall-clock time so
-    that the val window stays stable even when the training job is backfilled or
-    run on stale data.  Falls back to (today − VAL_WEEKS) if no valid dates are
-    found in the dataframe.
-    """
-    import pandas as _pd
-
-    date_series: "_pd.Series | None" = None
-    for col in ("detection_date", "event_date", "date"):
-        if col in df_with_dates.columns:
-            parsed = _pd.to_datetime(df_with_dates[col], errors="coerce")
-            if parsed.notna().any():
-                date_series = parsed
-                break
-
-    if date_series is not None and date_series.notna().any():
-        max_date = date_series.max()
-    else:
-        max_date = _pd.Timestamp.today().normalize()
-
-    cutoff = max_date - _pd.Timedelta(weeks=VAL_WEEKS)
-    return cutoff
-
-# FIX 3: Minimum number of positive examples required in the val set before
-# training proceeds. If the cutoff date produces fewer than this many winners,
-# training aborts with a clear message rather than producing a junk model.
-MIN_VAL_POSITIVES = 50
-
-# ── CV WALK-FORWARD FIX ────────────────────────────────────────────────────
-# train_val_split()'s reported best_val_auc / blind_cal_auc are point
-# estimates off a single ~VAL_WEEKS-wide cut. cv_walk_forward_evaluate()
-# (below) reuses time_aware_splits() to add a multi-fold walk-forward
-# estimate of the SAME classifier recipe, run before the final single-split
-# fit. Configurable via env vars so a run can disable it (e.g. CI smoke
-# tests on tiny fixture data) without touching code.
-CV_N_SPLITS = int(os.environ.get("CV_N_SPLITS", "5"))
-CV_MIN_TRAIN_FRAC = float(os.environ.get("CV_MIN_TRAIN_FRAC", "0.4"))
-CV_EVALUATION_ENABLED = os.environ.get("CV_EVALUATION_ENABLED", "1").lower() in ("1", "true", "yes")
-
-# Train-set size guards — abort if the training split is too thin to generalise.
-# These fire when the Supabase tables are sparse (new deployment, data gaps, or
-# a lookback_days window that returned far less data than expected).
-#
-# MIN_TRAIN_POSITIVES: minimum winner examples needed in the train split.
-#   XGBoost with early stopping requires enough positives for the loss surface
-#   to carry a meaningful gradient signal.  50 is intentionally conservative;
-#   raise it once you have more accumulated data.
-# MIN_TRAIN_ROWS: minimum total rows (positives + negatives) in the train split.
-#   A very small train set will overfit regardless of regularisation settings.
-MIN_TRAIN_POSITIVES = 50
-MIN_TRAIN_ROWS      = 200
-
-# FIX 4: Intraday high threshold — a stock is considered a "winner" even if
-# it didn't close at the top, as long as it hit this intraday gain.
-#
-# CLAUDE FIX (2026-08-19): lowered from 20.0 -> 15.0. The 20.0 value was set
-# "to be unambiguous," but apply_intraday_high_labels()'s own docstring cites
-# the actual evidence: 476 rows with actual_high_pct >= 15% were sitting in
-# training as label=0 (i.e. real 15-19% intraday winners were still being
-# taught to the model as "not a winner" at the 20.0 cutoff). Since relabelling
-# is now sourced from all T-1 tables (not just winners_day_prior_*), the
-# selection-bias concern that originally justified a conservative/high
-# threshold no longer applies at 15% either — see the docstring below.
-# This directly targets "AVOID/HOLD stocks outperforming BUY/STRONG BUY in
-# production," which is still happening at 20.0, just less often than before.
-INTRADAY_WIN_THRESHOLD = 15.0  # %
-# NOTE: ml_track_comprehensive_accuracy.py's became_winner definition should
-# be updated to match this threshold — see that file's WIN_THRESHOLD-equivalent
-# constant — or accuracy reporting and training labels will disagree on what
-# counts as a "winner."
-
-# scale_pos_weight caps — prevent extreme corrections while still respecting
-# the actual class imbalance. scale_pos_weight is always computed live from
-# n_neg/n_pos in train_model() (never hardcoded), so this cap holds regardless
-# of where the true ratio drifts to — at a 7% positive rate that's ~13x, up
-# from the ~8.8x seen when SPW_MAX was last tuned; both clamp to the same 5.0.
-# SPW_MAX raised from 3.0 → 5.0: the previous cap of 3.0 on an ~8.8x imbalance
-# under-weighted positives so severely that the logloss surface was distorted,
-# making it harder for early stopping to detect genuine improvement and
-# contributing to the model halting at best_iteration=12.
-SPW_MIN = 0.5
-SPW_MAX = 5.0    # Restored from 10.0 → 5.0.
-                 #
-                 # Root-cause analysis: the jump to 10.0 was intended to restore
-                 # BUY/STRONG BUY signals that were being suppressed.  The real cause
-                 # of that suppression was the isotonic calibrator being fitted on a
-                 # val set whose positive rate (~10–25%) was far below the screened
-                 # inference universe's positive rate, not an insufficient SPW.
-                 #
-                 # At SPW=10 with eval_metric="auc" (rank-based, ignores calibration),
-                 # XGBoost pushes raw probabilities so high that 50–60%+ of post-screener
-                 # stocks cluster at ≥0.90, making STRONG_BUY / BUY thresholds trivially
-                 # easy to satisfy and effectively meaningless as absolute cutoffs.
-                 # The RC6 _detect_bimodal workaround detects this and falls back to
-                 # percentile-based ranking, but that means the absolute probability
-                 # output is no longer interpretable at all.
-                 #
-                 # The correct fix is:
-                 #   1. Keep SPW ≤ 5.0 to prevent over-weighting positives when
-                 #      eval_metric="auc" is used (AUC training amplifies the effect).
-                 #   2. Apply prior-probability correction in the calibration step
-                 #      (see SCREENER_POSITIVE_RATE and the corrected train_model())
-                 #      to account for the base-rate mismatch between val set and the
-                 #      screened inference universe.  This restores interpretable
-                 #      absolute probabilities without inflating them globally.
-
-# Prior-probability correction for post-training isotonic calibration.
-#
-# Background:
-#   The calibration set is carved from the val split, which has a positive rate
-#   matching roughly the unscreened (or lightly screened) universe — typically
-#   ~10–25%.  But at inference time, every stock passed through the screener
-#   first.  The screener raises the effective positive rate to ~30–50%.
-#
-#   Isotonic calibration fits a monotone mapping from raw score → probability
-#   using the calibration set's base rate as an implicit anchor.  When that
-#   anchor is far below the inference base rate, the calibrator systematically
-#   under-estimates probabilities for screened stocks.
-#
-#   Prior-probability correction (Bayes odds-ratio adjustment) shifts the
-#   calibrated output to account for this mismatch without refitting the model:
-#
-#       odds_corrected = odds_calibrated * (p_inf / (1 - p_inf))
-#                                        / (p_cal / (1 - p_cal))
-#
-#   where p_inf is the estimated positive rate of the screened inference universe
-#   and p_cal is the positive rate of the calibration set.
-#
-#   Set SCREENER_POSITIVE_RATE to the observed fraction of screened candidates
-#   that eventually become winners (i.e. hit >=INTRADAY_WIN_THRESHOLD).
-#   Query ml_prediction_accuracy to estimate this from production history:
-#       SELECT COUNT(*) FILTER (WHERE became_winner) * 1.0 / COUNT(*)
-#       FROM ml_prediction_accuracy
-#       WHERE prediction_date >= NOW() - INTERVAL '90 days';
-#   If this query is unavailable, 0.35 is a conservative starting estimate
-#   for a well-tuned screener targeting 20%+ intraday gains.
-#
-#   FIX (2026-06-03): Disabled prior correction (set to None).
-#
-#   SCREENER_POSITIVE_RATE was a manual knob that applied a Bayes odds-ratio
-#   shift to push probabilities upward at inference time, on the theory that
-#   the screened inference universe has a higher positive rate than the training
-#   set. In practice this introduces more problems than it solves:
-#
-#   1. The "correct" value is unknown and has to be guessed. A value that is
-#      even modestly too high inflates probabilities across the board and causes
-#      the saturation problem seen in the pre-RC6 logs (25/44 stocks hitting
-#      0.9098, all signals collapsing to HOLD after relative ranking).
-#
-#   2. The model's own isotonic calibration already accounts for any base-rate
-#      mismatch it can observe in the val set. Stacking a manual Bayes shift on
-#      top of that double-corrects and creates a miscalibrated pkl.
-#
-#   3. The right fix for base-rate mismatch is to make the training positive
-#      rate match the inference positive rate — which is achieved by tuning
-#      SPW_MAX and the sample weights, not by post-hoc probability shifting.
-#
-#   With SCREENER_POSITIVE_RATE=None the model returns raw isotonic-calibrated
-#   probabilities. The RC7/RC8/RC9 safety nets in explosion_predictor.py will
-#   catch any residual clustering if calibration drifts.
-#
-#   FIX (2026-08-19): Re-enabled, but as a MEASURED trailing value instead of
-#   a hand-picked constant. The 2026-06-03 disable traded one failure mode
-#   for another: instead of the pre-RC6 saturation bug (probabilities
-#   over-corrected to 0.90+), the classifier now systematically caps out
-#   below 0.50 even for true winners on held-out validation data (see the
-#   2026-08-19 retrain log — 0 validation rows scored above 0.5, class-1
-#   recall at the 0.5 cutoff was 0.00). Isotonic calibration alone doesn't
-#   fix a base-rate mismatch this large (13.8% training positive rate vs. a
-#   screened inference universe that's meaningfully higher); SPW/weight
-#   tuning wasn't closing that gap either. estimate_screener_positive_rate()
-#   below replaces the old static guess with a trailing measurement from
-#   ml_prediction_accuracy, recomputed every retrain so it tracks the
-#   screener's actual observed win rate as filters change over time, rather
-#   than going stale like a hardcoded constant would.
-SCREENER_POSITIVE_RATE: float | None = None  # overwritten by main() at runtime — see below
-
-SCREENER_POSITIVE_RATE_FALLBACK = 0.35
-SCREENER_POSITIVE_RATE_LOOKBACK_DAYS = 90
-# Sanity bounds — if the measured rate falls outside this range, something is
-# probably wrong with the query/table rather than a genuine base-rate shift
-# (e.g. a schema change, an empty table, or a became_winner column that's
-# briefly all-False/all-True after a migration). Fall back rather than trust
-# an implausible number and risk recreating the old saturation bug.
-SCREENER_POSITIVE_RATE_MIN = 0.05
-SCREENER_POSITIVE_RATE_MAX = 0.80
-
-
-def estimate_screener_positive_rate(
-    client,
-    lookback_days: int = SCREENER_POSITIVE_RATE_LOOKBACK_DAYS,
-    fallback: float = SCREENER_POSITIVE_RATE_FALLBACK,
-) -> float:
-    """
-    Trailing realized win rate of the screened inference universe, measured
-    directly from ml_prediction_accuracy rather than hand-picked.
-
-    Replaces the old approach of hardcoding SCREENER_POSITIVE_RATE as a
-    module constant. A fixed guess goes stale as the screener's filters
-    change (learned_filters.json has already been retightened several times
-    — min_price/max_price/min_hv10 etc. all shift the true positive rate of
-    whatever passes the screener), and an over-aggressive guess is exactly
-    what caused the pre-RC6 saturation bug. Recomputing this every retrain
-    from actual outcomes keeps the correction anchored to reality instead of
-    to whatever value someone typed in on a given day.
-
-    Uses became_winner (aligned with INTRADAY_WIN_THRESHOLD — see that
-    constant's definition above) over the trailing `lookback_days` window.
-    Falls back to `fallback` if the table is unreachable, empty, or the
-    measured rate is outside [SCREENER_POSITIVE_RATE_MIN,
-    SCREENER_POSITIVE_RATE_MAX] — an implausible value is more likely a data
-    problem than a genuine base-rate shift, and silently trusting it risks
-    recreating the old over/under-correction bugs.
-    """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
-
-    try:
-        resp = (
-            client.table("ml_prediction_accuracy")
-            .select("became_winner")
-            .gte("prediction_date", cutoff)
-            .execute()
-        )
-        rows = resp.data or []
-    except Exception as e:
-        logger.warning(
-            f"[SCREENER_POSITIVE_RATE] Query against ml_prediction_accuracy failed "
-            f"({e}) — using fallback={fallback}."
-        )
-        return fallback
-
-    n_total = len(rows)
-    if n_total == 0:
-        logger.warning(
-            f"[SCREENER_POSITIVE_RATE] No ml_prediction_accuracy rows in the trailing "
-            f"{lookback_days} days — using fallback={fallback}."
-        )
-        return fallback
-
-    n_winners = sum(1 for r in rows if r.get("became_winner"))
-    rate = n_winners / n_total
-
-    if not (SCREENER_POSITIVE_RATE_MIN <= rate <= SCREENER_POSITIVE_RATE_MAX):
-        logger.warning(
-            f"[SCREENER_POSITIVE_RATE] Measured rate {rate:.3f} ({n_winners}/{n_total} "
-            f"over {lookback_days}d) is outside the plausible range "
-            f"[{SCREENER_POSITIVE_RATE_MIN}, {SCREENER_POSITIVE_RATE_MAX}] — "
-            f"using fallback={fallback} instead. Investigate before trusting this "
-            f"table's became_winner values."
-        )
-        return fallback
-
-    logger.info(
-        f"[SCREENER_POSITIVE_RATE] Measured {rate:.3f} ({n_winners}/{n_total} winners "
-        f"over trailing {lookback_days}d) — using this as the prior-correction anchor."
-    )
-    return rate
-
-# CALIBRATION_N_SPLITS / CALIBRATION_BLEND_WEIGHT: knobs for the cross-fitted,
-# isotonic/sigmoid-blended calibrator (see fit_cross_fitted_blended_calibrator
-# in src/ml_predictor/prior_corrected_model.py). A single isotonic fit on a
-# small calibration set is a jumpy, nonparametric step function that can show
-# large unreachable gaps in the calibrated-probability range as an artifact
-# of the fixed split rather than a real property of the model. Cross-fitting
-# (K isotonic + K sigmoid calibrators averaged across folds) smooths that out
-# without needing more calibration data.
-#   CALIBRATION_N_SPLITS: requested number of folds; auto-reduced if the cal
-#     set doesn't have enough positives/negatives to support it.
-#   CALIBRATION_BLEND_WEIGHT: weight given to the isotonic ensemble output;
-#     the sigmoid ensemble gets (1 - this). 0.7 keeps isotonic as the
-#     dominant signal while sigmoid fills in any remaining plateaus.
-CALIBRATION_N_SPLITS: int = 5
-CALIBRATION_BLEND_WEIGHT: float = 0.7
-
-
-
-# _PriorCorrectedModel was previously defined inline here, which caused
-# a pickle deserialization failure: joblib recorded the class path as
-# __main__._PriorCorrectedModel when ml_retrain_model.py was __main__ at
-# save time, then failed to find it when __main__ was ml_screen_and_predict.py
-# at load time.  The class now lives in src/ml_predictor/prior_corrected_model.py
-# and is imported at the top of this file; call-sites below are unchanged.
-
-# SEED-VARIANCE BAGGING: with subsample=0.8/colsample_bytree=0.8 and a small
-# dataset, part of a single run's val AUC / val R² is just which random draw
-# XGBoost made for row & feature sampling at a fixed random_state. Training
-# BAGGING_N_SEEDS models that differ only in random_state and averaging their
-# predictions cancels that seed-dependent component while keeping the signal
-# (common across seeds) intact. Applied to both the classifier (train_model)
-# and the gain regressor (train_gain_regressor) — not the tier-fallback
-# multiclass classifier, which is a minor auxiliary path.
-# Cost scales linearly with BAGGING_N_SEEDS (each seed refits from scratch
-# with its own early stopping); 5-10 seeds is the recommended range.
-BAGGING_N_SEEDS  = 7
-BAGGING_SEED_BASE = 42  # first seed == the original single-model random_state,
-                         # so BAGGING_N_SEEDS=1 reproduces the pre-bagging behaviour
-
-# DIAGNOSTIC (2026-08-26): one-off check of whether the gain regressor's
-# per-seed early-stopping picks are as unstable as the classifier's were
-# before the consensus-stopping fix (see BaggedXGBClassifier). The classifier
-# showed per-seed spread ~108% of its mean (6-34 around ~26); if the
-# regressor's spread is proportionally similar, it likely needs the same
-# consensus-curve treatment. If it stays tight even with more seeds, the
-# regressor's current per-seed early stopping is fine as-is.
-# Overridable via env var so this can be bumped for a single diagnostic run
-# without permanently changing BAGGING_N_SEEDS (and therefore classifier cost
-# too, since that constant is shared). Defaults to BAGGING_N_SEEDS, i.e. no
-# behavior change unless explicitly set.
-_gain_regressor_diagnostic_n_seeds_raw = os.environ.get("GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS", "").strip()
-GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS = (
-    int(_gain_regressor_diagnostic_n_seeds_raw)
-    if _gain_regressor_diagnostic_n_seeds_raw
-    else BAGGING_N_SEEDS
-)
-
-# RC14: RECENCY WEIGHTING + WINDOW-ENSEMBLING (2026-08-19)
-# ─────────────────────────────────────────────────────────────────────────
-# Motivation: CV walk-forward evaluation showed AUC below 0.5 in most folds
-# despite clean feature-leakage / symbol-fingerprint / stability-gate
-# diagnostics — i.e. the features carry real univariate signal (see
-# diagnose_feature_leakage.py output, top AUC 0.72) but the fitted model's
-# out-of-sample rank ordering doesn't reliably generalise across time. This
-# is consistent with regime instability in a small-cap momentum screener
-# (the pattern that predicts a winner in one calendar window can partially
-# invert in the next), not a code bug — every existing leakage/stability
-# check came back clean. Two independent, additive mitigations:
-#
-#   1. RECENCY WEIGHTING — up-weight rows closer to "now" (smooth
-#      exponential decay by calendar age) so the SAME training window used
-#      today already leans toward whatever regime the model is about to be
-#      deployed into, without shrinking the window the way widening
-#      VAL_WEEKS did (that starved the gain regressor — see the comment
-#      above MAX_VAL_FRACTION in train_val_split()). Applied once to
-#      combined_df["sample_weight"] before prepare_features() runs, so it
-#      flows through to every downstream consumer of sample_weight
-#      (classifier train, CV walk-forward evaluation, gain regressor).
-#
-#   2. WINDOW-ENSEMBLING — BAGGING_N_SEEDS already bags across random seeds
-#      on the SAME training window to cancel seed-dependent variance. This
-#      extends that same principle to REGIME variance: each bagged seed is
-#      now also fit on a different lookback window (e.g. full history / last
-#      12mo / last 6mo), so no single seed's model can anchor entirely on
-#      whichever regime happens to dominate the full window. Averaging
-#      predict_proba across seeds-times-windows hedges against regime
-#      dominance the same way seed-bagging already hedges against
-#      initialization variance. Applied only inside train_model()'s seed
-#      loop — the val/cal split, calibration, and CV walk-forward evaluation
-#      report the CV are unaffected.
-RECENCY_WEIGHTING_ENABLED = False
-RECENCY_HALF_LIFE_DAYS    = 90   # sample weight halves every 90 calendar days
-                                  # back from the most recent training row;
-                                  # undated (mistake-sample) rows are left at
-                                  # their existing weight, never decayed.
-
-WINDOW_ENSEMBLE_ENABLED       = True
-# None = no truncation (full train window). Cycled across BAGGING_N_SEEDS
-# seeds in order (index i % len(list)) so with the default 7 seeds each
-# window gets used at least twice and the ensemble always includes at least
-# one full-history seed as a floor against a too-aggressive window guess.
-WINDOW_ENSEMBLE_LOOKBACK_DAYS = [None, 365, 180]
-WINDOW_ENSEMBLE_MIN_POS       = 20   # a truncated window with fewer than
-WINDOW_ENSEMBLE_MIN_NEG       = 20   # this many pos/neg falls back to the
-                                      # full train window for that seed
-                                      # instead of fitting on too little data
-
-XGBOOST_PARAMS = {
-    "n_estimators":       500,
-    "max_depth":          4,       # raised 3→4 (2026-08-13): depth=3 was shown to over-discretize
-                                    # raw predict_proba into a small number of distinct leaf-score
-                                    # combinations, which — combined with eval_metric="auc" not
-                                    # rewarding a spread-out probability surface — fed the isotonic
-                                    # calibrator too few distinct raw-score clusters, producing hard
-                                    # flat plateaus (empty 0.5-0.7 / 0.8-0.9 calibrated-probability
-                                    # bins). depth=4 gives the calibrator more granularity to work
-                                    # with while still well short of the original depth=6 that was
-                                    # overfitting. Re-check val AUC / early-stopping iteration after
-                                    # this change in case it needs to come back down.
-    "learning_rate":      0.05,
-    "subsample":          0.8,
-    "colsample_bytree":   0.8,
-    "min_child_weight":   4,       # loosened from 10 → was over-constraining the smaller,
-                                    # denser 22-feature/lookback-fixed training set (early
-                                    # stopping was firing after only 3 trees)
-    "gamma":              0.3,     # REVERTED (2026-08-13): the gamma=0.15 experiment moved the
-                                    # raw-score ceiling up slightly (isotonic breakpoints reached
-                                    # ~0.76 vs ~0.62) but produced NO change in calibrated output
-                                    # (cal proba mean 0.171 vs 0.172, still 0% >=0.90, same
-                                    # unreachable 0.583-0.750 calibrated gap) and flat AUC (0.8318
-                                    # vs 0.8309 early-stop). Confirms the STRONG_BUY ceiling is a
-                                    # calibration-data/informative-row-count limit, not tree
-                                    # capacity — the calibrator has no confirmed positives near the
-                                    # high end regardless of how far raw scores reach. Back to 0.3;
-                                    # don't re-try gamma for this specific problem again without new
-                                    # informative rows first.
-    "reg_alpha":          0.2,     # loosened from 0.5 → less L1 regularisation
-    "reg_lambda":         1.5,     # loosened from 2.0 → less L2 regularisation
-    "scale_pos_weight":   3,       # overridden at train time (clamped to SPW_MIN/MAX)
-    "objective":          "binary:logistic",
-    # eval_metric changed from "logloss" to "auc", then "auc" to "aucpr":
-    # logloss is sensitive to predicted probability calibration.  When the val
-    # set has a very different positive rate from the train set (e.g. val has
-    # 27% positives vs train 9.5%), scale_pos_weight causes logloss on the val
-    # set to be noisy from tree 1, triggering early stopping after just 7 trees.
-    # AUC is rank-based and immune to this calibration skew — it only cares
-    # whether the model separates positives from negatives, not the absolute
-    # probability level, so it gives a stable and meaningful early-stopping signal.
-    #
-    # However, ROC-AUC weighs the whole ranking equally, including the easy
-    # majority-negative tail that we never act on. What we actually use in
-    # production is top-20%-by-score precision/recall (a precision-at-K
-    # objective), not the full ranking. At the screened universe's ~15%
-    # positive rate, PR-AUC (average precision) is far more sensitive to
-    # ranking quality in the high-score region than ROC-AUC is — it's still
-    # rank-based (so it keeps the calibration-skew immunity above) but it
-    # concentrates on precision/recall trade-offs the way our downstream
-    # top-K selection does, so early stopping now tracks the metric we
-    # actually make decisions on instead of a more generic ranking score.
-    "eval_metric":        "aucpr",
-    "use_label_encoder":  False,
-    "random_state":       42,
-    "n_jobs":             -1,
-    # Lowered from 100 → 40. At 100 rounds of patience with n_estimators=500,
-    # training was running to best_iteration≈478 — i.e. XGBoost kept adding
-    # trees for as long as loss kept improving on X_val_xgb, which is also the
-    # set the classification report / probability distribution are evaluated
-    # on. That's model selection against the "held-out" set, not a blind
-    # evaluation, and it manifested as a bimodal (hard 0 / hard 1) probability
-    # collapse on X_val_xgb that did NOT appear on the truly untouched
-    # calibration set (X_cal_fit), which stayed well-spread (std≈0.44) the
-    # whole time. 40 rounds of patience still tolerates normal noisy plateaus
-    # but stops the model well before it can memorize X_val_xgb round-by-round.
-    "early_stopping_rounds": 50,
+TV_TO_MODEL_BASE = {
+    "close":                        "Close",
+    "open":                         "Open",
+    "high":                         "High",
+    "low":                          "Low",
+    "volume":                       "Volume",
+    "change":                       "price_change_1d",
+    "change_abs":                   "MOM_10",
+    # RSI — use today's value only; RSI[1] is yesterday's bar and must NOT
+    # overwrite RSI_14 with a stale reading.
+    "RSI":                          "RSI_14",
+    # Stochastic — today's K/D only; [1] variants are T-1 bars.
+    "Stoch.K":                      "STOCHk_14_3_3",
+    "Stoch.D":                      "STOCHd_14_3_3",
+    # Williams %R — today's value only; W.R[1] is T-1.
+    "W.R":                          "WILLR_14",
+    "MACD.macd":                    "MACD_12_26_9",
+    "MACD.signal":                  "MACDs_12_26_9",
+    "BB.upper":                     "BBU_20_2.0_2.0",
+    "BB.lower":                     "BBL_20_2.0_2.0",
+    "BB.basis":                     "BBM_20_2.0_2.0",
+    "BBPower":                      "BBP_20_2.0_2.0",
+    "EMA5":                         "EMA_5",
+    "EMA10":                        "EMA_10",
+    "EMA20":                        "EMA_20",
+    # EMA30 is NOT mapped: the TV screener exposes a 30-period EMA while the
+    # model feature EMA_26 is a 26-period EMA.  Feeding a wrong-period value
+    # corrupts the feature; EMA_26 is left NaN and imputed by the model.
+    "EMA50":                        "EMA_50",
+    "SMA5":                         "SMA_5",
+    "SMA10":                        "SMA_10",
+    "SMA20":                        "SMA_20",
+    # SMA30 is NOT mapped: the TV screener's 30-period SMA is a distinct
+    # indicator from the model's SMA_50 (50-period).  The old mapping silently
+    # duplicated SMA_50 with the wrong period value.
+    "SMA50":                        "SMA_50",
+    "Mom":                          "MOM_10",
+    "AO":                           "AO",
+    "CCI20":                        "CCI_20",
+    "UO":                           "UO",
+    "ROC":                          "ROC_10",
+    "relative_volume_10d_calc":     "Volume_Ratio",
+    "VWMA":                         "VWMA_20",
+    "ATR":                          "ATR_14",
+    "ADX":                          "ADX_14",
+    "ADX+DI":                       "DMP_14",
+    "ADX-DI":                       "DMN_14",
+    "Volatility.D":                 "HV_20",
+    "gap":                          "Gap_Pct",
+    "premarket_gap":                "Gap_Pct",
+    "High.52W":                     "high_52w",
+    "Low.52W":                      "low_52w",
+    "Aroon.Up":                     "AROONU_25",
+    "Aroon.Down":                   "AROOND_25",
 }
 
-# Columns excluded from the feature matrix X.
-NON_FEATURE_COLS = {
-    "id", "created_at", "updated_at", "date", "symbol", "ticker",
-    "label", "source", "sample_weight", "detection_date", "explosion_date",
-    "change_pct", "rank", "notes", "mistake_type", "actual_gain_pct",
-    "actual_high_pct", "_sort_date",
-    # Label-leaking columns: present in training tables but unavailable at prediction time
-    "gain_pct", "volume_spike",
-    # TRUE GAIN TARGET FIX: the gain-regressor's own label columns — never features
-    "true_gain_pct", "_unified_gain_target",
-    # Training metadata: table bookkeeping columns, not predictive signals
-    "snapshot_date", "snapshot_type", "snapshot_time",
-    "event_date", "days_since_event", "interval",
-    # ── Raw OHLCV multiday features (t3/t5/t10) ──────────────────────────────
-    # These are price-level features that do not generalise out-of-sample:
-    #   • Affected by stock splits, reverse splits, and delistings.
-    #   • Susceptible to survivor bias in historical training data.
-    #   • t3_high alone held 19.2 % feature importance, indicating the model
-    #     was learning "high-priced stocks explode" rather than a real signal.
-    # The multiday_feature_collector no longer writes these columns for new rows.
-    # They are explicitly excluded here so that any legacy historical rows that
-    # still carry them in the DB do not leak back into future retrains.
-    # Derived / normalised indicators (price_vs_sma20, volume_ratio, hv_*, etc.)
-    # that depend on price internally are still included — they capture the
-    # signal without exposing the raw price level.
-    "t3_open", "t3_high", "t3_low", "t3_close", "t3_volume",
-    "t5_open", "t5_high", "t5_low", "t5_close", "t5_volume",
-    "t10_open", "t10_high", "t10_low", "t10_close", "t10_volume",
-    # ── Raw OHLCV T-1 features ────────────────────────────────────────────────
-    # The same price-level generalisation problem applies to T-1 snapshots.
-    # A $2 stock and a $50 stock have fundamentally different volatility regimes;
-    # including the raw price teaches the model price-level patterns rather than
-    # true momentum signals.  Derived indicators (RSI, ATR%, MACD, etc.) that
-    # are internally price-normalised are retained — they capture the signal
-    # without exposing the absolute price level.
-    # Both the close-snapshot and open-snapshot variants are excluded.
-    #
-    # FIX: t1_close_Volume / t1_open_Volume were missing from this set even
-    # though they are raw (unnormalised) share counts with exactly the same
-    # generalisation problem as raw OHLC — worse, in fact: base_csv rows and
-    # T-1-collected rows populate this column from two different sources
-    # (TradingView screener vs yfinance intraday) at two different scales,
-    # so raw Volume was effectively acting as a proxy for "which pipeline
-    # produced this row" rather than a real momentum signal. That proxy is
-    # trivially separable, which is almost certainly why best_iteration was
-    # collapsing to single digits: XGBoost saturated its achievable AUC in a
-    # handful of rounds because it didn't have to do any real work. The
-    # normalised counterparts (Volume_Ratio, Volume_MA5/10/20, OBV — see
-    # normalise_t1()) are retained; they capture the same signal without
-    # exposing the raw, source-dependent scale.
-    "t1_close_Close", "t1_close_High", "t1_close_Low", "t1_close_Open", "t1_close_Volume",
-    "t1_open_Close",  "t1_open_High",  "t1_open_Low",  "t1_open_Open",  "t1_open_Volume",
-}
-
-T1_MARKER_PREFIXES = ("t1_", "open_", "close_")
-
+EXTRA_TV_COLUMNS = [
+    "RSI", "RSI[1]", "Stoch.K", "Stoch.D", "Stoch.K[1]", "Stoch.D[1]",
+    "W.R", "W.R[1]", "MACD.macd", "MACD.signal",
+    "BB.upper", "BB.lower", "BB.basis", "BBPower",
+    "EMA5", "EMA10", "EMA20", "EMA50",
+    "SMA5", "SMA10", "SMA20", "SMA50",
+    "Mom", "AO", "CCI20", "UO", "ROC",
+    "relative_volume_10d_calc", "VWMA",
+    "ATR", "ADX", "ADX+DI", "ADX-DI", "Volatility.D",
+    "gap", "Aroon.Up", "Aroon.Down",
+    "close", "open", "high", "low", "volume", "change",
+]
 
 # ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-# logging.basicConfig() is a no-op if any handler already exists on the root
-# logger (e.g. the GitHub Actions runner pre-configures one).  Explicitly
-# installing a StreamHandler guarantees our format and level are always applied,
-# regardless of the calling environment.
+# Gain estimation curve — probability → expected intraday high % gain.
 #
-# --verbose / --lookback-days / --use-all-timepoints are parsed in main() via
-# argparse; here we only set up the handler at INFO level.  main() will call
-# _configure_logging(logging.DEBUG) when --verbose is passed.
-def _configure_logging(level: int = logging.INFO) -> None:
-    """Install a stdout StreamHandler on the root logger (idempotent)."""
-    root = logging.getLogger()
-    root.setLevel(level)
-    # Remove any existing handlers so we own the format completely.
-    for h in root.handlers[:]:
-        root.removeHandler(h)
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(level)
-    handler.setFormatter(
-        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    )
-    root.addHandler(handler)
+# These values are anchored to the actual distribution of explosive mover
+# intraday highs (from daily_winners / ml_prediction_accuracy history):
+#   - p ≥ 0.95: truly explosive moves (100 %+ seen regularly on STRONG BUY)
+#   - p ≥ 0.90: strong movers, typically 50–80 % intraday high
+#   - p ≥ 0.80: solid movers, 30–50 %
+#   - Below 0.60: conservative — model is not confident
+#
+# The curve is used ONLY when the gain regressor and isotonic calibrator are
+# both unavailable (rank_fallback path).  When the regressor is healthy it
+# predicts freely from the training data, so there is no ceiling there.
+# ---------------------------------------------------------------------------
+_GAIN_CURVE: list[tuple[float, float]] = [
+    # (min_probability, base_gain_pct)
+    (0.95, 150.0),
+    (0.90,  80.0),
+    (0.85,  55.0),
+    (0.80,  40.0),
+    (0.75,  30.0),
+    (0.70,  23.0),
+    (0.65,  17.0),
+    (0.60,  13.0),
+    (0.55,  10.0),
+    (0.50,   7.0),
+    (0.00,   4.0),
+]
 
-    # Silence noisy third-party HTTP / networking libraries.
-    # They stay visible at WARNING+ so connection errors still surface.
-    _QUIET_LOGGERS = [
-        "urllib3", "urllib3.connectionpool",
-        "httpx",
-        "httpcore", "httpcore.http11", "httpcore.http2", "httpcore.connection",
-        "hpack", "h2",
-        "requests",
-        "charset_normalizer",
-        "postgrest", "gotrue", "realtime", "supabase",
-        "websockets", "websockets.client", "websockets.server",
-        "asyncio",
+_LOWERCASE_PREFIXES = ("t3", "t5", "t10")
+
+SCREENER_HV_MIN_CAP    = 30.0
+SCREENER_VOL_RATIO_CAP = 2.5
+
+# FIX 6: All flat-bar prefixes used by the base CSV training data.
+_FLAT_PREFIXES = ("t3", "t5", "t10")
+
+# FIX 7: Minimum bars needed for open-window indicator calculation.
+T1_OPEN_MIN_BARS = 5
+
+
+def _uses_lowercase(prefix: str) -> bool:
+    return any(prefix == p or prefix.startswith(p + "_") for p in _LOWERCASE_PREFIXES)
+
+
+def _is_hybrid_model(predictor: "ExplosionPredictor") -> bool:
+    """Return True if the model has both t1_ and t3/t5/t10 features."""
+    has_t1   = any(f.startswith("t1_") for f in predictor.feature_names)
+    has_flat = any(
+        f.startswith("t3_") or f.startswith("t5_") or f.startswith("t10_")
+        for f in predictor.feature_names
+    )
+    return has_t1 and has_flat
+
+
+def setup_logging(verbose: bool = False):
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    return logging.getLogger(__name__)
+
+
+def log_probability_distribution(predictions_df: pd.DataFrame, logger: logging.Logger, label: str = ""):
+    if predictions_df.empty:
+        logger.warning("Cannot log probability distribution — predictions DataFrame is empty")
+        return
+
+    probs = predictions_df['explosion_probability']
+    title = f"PROBABILITY DISTRIBUTION{' — ' + label if label else ''}"
+
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info(title)
+    logger.info("=" * 70)
+
+    buckets = [
+        ("0–10%  (AVOID)",   probs < 0.10),
+        ("10–20% (AVOID)",   (probs >= 0.10) & (probs < 0.20)),
+        ("20–30% (AVOID)",   (probs >= 0.20) & (probs < 0.30)),
+        ("30–40% (AVOID)",   (probs >= 0.30) & (probs < 0.40)),
+        ("40–50% (AVOID)",   (probs >= 0.40) & (probs < 0.50)),
+        ("50–60% (HOLD)",    (probs >= 0.50) & (probs < 0.60)),
+        ("60–70% (HOLD)",    (probs >= 0.60) & (probs < 0.70)),
+        ("70–80% (BUY)",     (probs >= 0.70) & (probs < 0.80)),
+        ("80–90% (BUY)",     (probs >= 0.80) & (probs < 0.90)),
+        ("90–100% (STRONG)", probs >= 0.90),
     ]
-    for name in _QUIET_LOGGERS:
-        logging.getLogger(name).setLevel(logging.WARNING)
 
-_configure_logging()
-logger = logging.getLogger(__name__)
+    total     = len(probs)
+    bar_width = 30
+
+    for bucket_label, mask in buckets:
+        count = mask.sum()
+        pct   = (count / total * 100) if total > 0 else 0
+        bar   = "█" * int(pct / 100 * bar_width)
+        logger.info(f"  {bucket_label:<22} {count:>4}  ({pct:>5.1f}%)  {bar}")
+
+    logger.info("-" * 70)
+    logger.info(f"  Total stocks evaluated:  {total}")
+    logger.info(f"  Min probability:         {probs.min():.4f} ({probs.min()*100:.2f}%)")
+    logger.info(f"  Max probability:         {probs.max():.4f} ({probs.max()*100:.2f}%)")
+    logger.info(f"  Mean probability:        {probs.mean():.4f} ({probs.mean()*100:.2f}%)")
+    logger.info(f"  Median probability:      {probs.median():.4f} ({probs.median()*100:.2f}%)")
+    logger.info(f"  Std deviation:           {probs.std():.6f}")
+
+    if probs.std() < 0.02:
+        logger.warning(
+            f"  ⚠️  VERY LOW PROB STD ({probs.std():.6f}) — likely feature prefix mismatch."
+            f"\n      Check that build_features_from_tv_data is populating the correct prefix."
+        )
+    elif probs.std() < 0.05:
+        logger.warning(f"  ⚠️  LOW PROB STD ({probs.std():.4f}) — limited feature discrimination.")
+    else:
+        logger.info(f"  ✅ Probability std {probs.std():.4f} — distribution looks healthy.")
+
+    logger.info("")
+    logger.info("  Signal breakdown:")
+    if 'signal' in predictions_df.columns:
+        signal_counts = predictions_df['signal'].value_counts()
+        for signal in ['STRONG BUY', 'BUY', 'HOLD', 'AVOID']:
+            count = signal_counts.get(signal, 0)
+            pct   = (count / total * 100) if total > 0 else 0
+            logger.info(f"    {signal:<12} {count:>4}  ({pct:>5.1f}%)")
+
+    if 'target_gain_pct' in predictions_df.columns:
+        gains     = predictions_df['target_gain_pct']
+        gain_std  = gains.std()
+        gain_mean = gains.mean()
+        logger.info("")
+        logger.info(f"  Gain estimates:  mean={gain_mean:.1f}%  std={gain_std:.2f}%"
+                    + ("  ⚠️  FLAT — rank correction applied" if gain_std < 1.0 else "  ✅"))
+
+    logger.info("")
+    logger.info("  Top 10 stocks by probability:")
+    logger.info(f"  {'#':<4} {'Symbol':<8} {'Prob':>8}  {'Raw':>8}  {'Signal':<13} {'Gain'}")
+    logger.info("  " + "-" * 50)
+    for rank, (_, row) in enumerate(predictions_df.head(10).iterrows(), 1):
+        prob_pct = row['explosion_probability'] * 100
+        # RC11: raw_model_score retains full granularity even when
+        # explosion_probability is tied across many rows (isotonic
+        # calibrator plateau collapse) — show both so it's clear the
+        # ranking isn't arbitrary among calibrated-probability ties.
+        raw_pct  = row.get('raw_model_score', float('nan')) * 100
+        signal   = row.get('signal', 'N/A')
+        symbol   = row.get('symbol', 'N/A')
+        gain     = row.get('target_gain_pct', 0)
+        logger.info(f"  {rank:<4} {symbol:<8} {prob_pct:>7.2f}%  {raw_pct:>7.2f}%  {signal:<13} +{gain:.1f}%")
+
+    logger.info("")
 
 
-# ---------------------------------------------------------------------------
-# Supabase helpers
-# ---------------------------------------------------------------------------
-
-def get_supabase_client() -> Client:
-    url = os.environ.get("SUPABASE_URL")
-    key = os.environ.get("SUPABASE_KEY")
-    if not url or not key:
-        logger.error("SUPABASE_URL and SUPABASE_KEY must be set.")
-        sys.exit(1)
-    return create_client(url, key)
-
-
-FETCH_BUFFER_DAYS = 10  # see full rationale in docstring below
-
-
-def fetch_table_paginated(
-    client: Client,
-    table: str,
-    page_size: int = 1000,
-    date_columns: Optional[list] = None,
-    cutoff_date: Optional[str] = None,
-    order_column: str = "id",
-) -> pd.DataFrame:
-    """Fetch rows from a Supabase table using pagination.
-
-    If ``date_columns`` and ``cutoff_date`` are given, apply a server-side
-    ``col >= cutoff_date`` filter (OR'd across every column in
-    ``date_columns``, plus rows where all of them are NULL, so mistake /
-    legacy rows without a date are never silently dropped). This cuts
-    egress on tables that hold long history but where only a recent window
-    is ever used for training. The exact, row-accurate lookback filter
-    still runs afterwards in Python (see FETCH_BUFFER_DAYS), so results are
-    identical to fetching the whole table -- only the transferred byte
-    count changes.
-
-    BUGFIX: each ``.range()`` call below is a *separate* SQL query, not a
-    cursor over one snapshot. Postgres/PostgREST does NOT guarantee stable
-    row ordering across separate queries unless an explicit ``ORDER BY`` is
-    given -- without one, the planner is free to return rows in scan order,
-    which can shift between two paginated calls seconds apart if there is
-    ANY concurrent write on the table (an UPDATE writes a new MVCC row
-    version, which can land in a different scan position than the old one).
-    On a table like ``ml_training_base`` that other scripts write into
-    out-of-band (e.g. a labeling backfill flipping label 0->1 mid-fetch),
-    this can silently skip or duplicate rows across the page boundary with
-    no error -- e.g. a clean-looking ``pos=0`` result on a table that
-    genuinely has positives, just because they crossed a page boundary at
-    the wrong moment. Pinning an explicit order (primary key by default)
-    makes pagination deterministic and immune to concurrent writes.
+def _us_market_holidays(year: int) -> set:
     """
-    def _build(q):
-        return q.order(order_column)
+    Return the set of NYSE/Nasdaq market holidays for the given year.
 
-    query = _build(client.table(table).select("*"))
+    Covers all 9 full-day closures observed by both exchanges.
+    Early-close days (Black Friday, Christmas Eve) are NOT included because
+    the market is still open — only full-day closures matter here.
 
-    if date_columns and cutoff_date:
-        # PostgREST or_() syntax: "col1.gte.DATE,col2.gte.DATE,col1.is.null"
-        # A row passes if ANY clause matches: keep it if it's recent by any
-        # available date column, or if it has no date at all (better to
-        # over-fetch a few stray rows than to silently lose ones the old
-        # full-fetch would have kept).
-        clauses = [f"{col}.gte.{cutoff_date}" for col in date_columns]
-        clauses += [f"{col}.is.null" for col in date_columns]
-        query = query.or_(",".join(clauses))
+    Rules used:
+      New Year's Day       Jan 1  (observed Mon if Sun, Fri if Sat)
+      MLK Day              3rd Mon in Jan
+      Presidents Day       3rd Mon in Feb
+      Good Friday          Friday before Easter (computed via anonymous gregor.)
+      Memorial Day         Last Mon in May
+      Juneteenth           Jun 19 (observed Mon if Sun, Fri if Sat)
+      Independence Day     Jul 4  (observed Mon if Sun, Fri if Sat)
+      Labor Day            1st Mon in Sep
+      Thanksgiving         4th Thu in Nov
+      Christmas Day        Dec 25 (observed Mon if Sun, Fri if Sat)
+    """
+    from datetime import date
+    import calendar
 
-    def _run(q):
-        rows_, offset_ = [], 0
-        while True:
-            resp = q.range(offset_, offset_ + page_size - 1).execute()
-            batch = resp.data or []
-            rows_.extend(batch)
-            logger.info(f"  {table}: fetched {len(rows_)} rows so far...")
-            if len(batch) < page_size:
-                break
-            offset_ += page_size
-        return rows_
+    def _observed(d: date) -> date:
+        """If holiday falls on Sat → Fri; Sun → Mon."""
+        if d.weekday() == 5:   # Saturday
+            return d - timedelta(days=1)
+        if d.weekday() == 6:   # Sunday
+            return d + timedelta(days=1)
+        return d
+
+    def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+        """Return the n-th occurrence (1-based) of weekday in month/year."""
+        first = date(year, month, 1)
+        offset = (weekday - first.weekday()) % 7
+        return first + timedelta(days=offset + (n - 1) * 7)
+
+    def _last_weekday(year: int, month: int, weekday: int) -> date:
+        """Return the last occurrence of weekday in month/year."""
+        last = date(year, month, calendar.monthrange(year, month)[1])
+        offset = (last.weekday() - weekday) % 7
+        return last - timedelta(days=offset)
+
+    def _easter(year: int) -> date:
+        """Anonymous Gregorian algorithm for Easter Sunday."""
+        a = year % 19
+        b = year // 100
+        c = year % 100
+        d = b // 4
+        e = b % 4
+        f = (b + 8) // 25
+        g = (b - f + 1) // 3
+        h = (19 * a + b - d - g + 15) % 30
+        i = c // 4
+        k = c % 4
+        l = (32 + 2 * e + 2 * i - h - k) % 7
+        m = (a + 11 * h + 22 * l) // 451
+        month = (h + l - 7 * m + 114) // 31
+        day   = ((h + l - 7 * m + 114) % 31) + 1
+        return date(year, month, day)
+
+    holidays = {
+        _observed(date(year, 1, 1)),                          # New Year's Day
+        _nth_weekday(year, 1, 0, 3),                          # MLK Day (3rd Mon Jan)
+        _nth_weekday(year, 2, 0, 3),                          # Presidents Day (3rd Mon Feb)
+        _easter(year) - timedelta(days=2),                    # Good Friday
+        _last_weekday(year, 5, 0),                            # Memorial Day (last Mon May)
+        _observed(date(year, 6, 19)),                         # Juneteenth
+        _observed(date(year, 7, 4)),                          # Independence Day
+        _nth_weekday(year, 9, 0, 1),                          # Labor Day (1st Mon Sep)
+        _nth_weekday(year, 11, 3, 4),                         # Thanksgiving (4th Thu Nov)
+        _observed(date(year, 12, 25)),                        # Christmas Day
+    }
+    return holidays
+
+
+def _is_trading_day(d) -> bool:
+    """Return True if d is a weekday that is not a US market holiday."""
+    from datetime import date as date_type
+    if isinstance(d, datetime):
+        d = d.date()
+    if d.weekday() >= 5:   # weekend
+        return False
+    # Check holidays for this year and (for Jan 1 edge case) prior year
+    if d in _us_market_holidays(d.year):
+        return False
+    return True
+
+
+def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
+    """
+    Determine the prediction date for the current run.
+
+    Logic:
+      1. Query daily_winners for the latest detection_date (last day winners
+         were actually tracked).
+      2. Advance one calendar day at a time past that date, skipping weekends
+         AND US market holidays, until we reach the next valid trading day.
+      3. Clamp to today: if the script is running on a valid trading day and
+         the calculated next day is still in the future, return today instead.
+         This handles the case where the winners tracker hasn't been updated
+         yet for the most recent session (e.g. a holiday pushed detection_date
+         one day behind).
+
+    Fallback: if the table is empty or the query fails, use today (or the
+    most recent past trading day) so the workflow never hard-crashes.
+    """
+    logger = logging.getLogger(__name__)
+    est = pytz.timezone('America/New_York')
+    today = datetime.now(est).date()
 
     try:
-        rows = _run(query)
-    except Exception as e:
-        # Two possible causes bucketed together here: (1) one of date_columns
-        # doesn't exist on this table's schema, or (2) order_column ("id" by
-        # default) doesn't exist. Both are rejected outright by PostgREST
-        # only once .execute() actually runs, not when .order()/.or_() are
-        # called client-side. Don't let either take down the whole retrain --
-        # retry without the date filter first (most common case), and if
-        # that still fails, retry once more with no explicit order at all
-        # (falls back to non-deterministic pagination -- logged loudly).
-        if date_columns and cutoff_date:
-            logger.warning(
-                f"  {table}: filtered fetch failed ({e}); retrying without "
-                f"the date filter. Check that {date_columns} actually exist "
-                f"on '{table}'."
-            )
-            try:
-                rows = _run(_build(client.table(table).select("*")))
-            except Exception as e2:
-                logger.warning(
-                    f"  {table}: ordered fetch also failed ({e2}); falling "
-                    f"back to unordered pagination. Check that '{order_column}' "
-                    f"actually exists on '{table}'. Row skip/duplication "
-                    "across pages is possible if the table is written to "
-                    "concurrently during this fetch."
-                )
-                rows = _run(client.table(table).select("*"))
-        else:
-            logger.warning(
-                f"  {table}: ordered fetch failed ({e}); falling back to "
-                f"unordered pagination. Check that '{order_column}' actually "
-                f"exists on '{table}'. Row skip/duplication across pages is "
-                "possible if the table is written to concurrently during "
-                "this fetch."
-            )
-            rows = _run(client.table(table).select("*"))
-
-    df = pd.DataFrame(rows)
-    logger.info(f"  {table}: total {len(df)} rows, {len(df.columns)} columns")
-    return df
-
-
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-
-def _fetch_cutoff(lookback_days: Optional[int]) -> Optional[str]:
-    """Server-side fetch cutoff = lookback_days + FETCH_BUFFER_DAYS ago.
-
-    Looser than the exact client-side lookback filter on purpose (see
-    FETCH_BUFFER_DAYS) -- this only trims what crosses the wire, the exact
-    cutoff is still enforced in Python afterwards.
-    """
-    if not lookback_days:
-        return None
-    return (
-        datetime.now().date() - timedelta(days=lookback_days + FETCH_BUFFER_DAYS)
-    ).isoformat()
-
-
-def _table_max_date(client: Client, table: str, date_column: str) -> Optional[str]:
-    """Cheap 1-row query for the newest value of date_column in a table.
-
-    Used to decide whether a full fetch is even worth doing, instead of
-    paginating the whole table and finding out afterward it's stale.
-    Returns None if the table is empty, the column doesn't exist, or the
-    query fails for any reason (caller should fall back to a real fetch).
-    """
-    try:
-        resp = (
-            client.table(table)
-            .select(date_column)
-            .order(date_column, desc=True)
+        response = (
+            supabase.client.table("daily_winners")
+            .select("detection_date")
+            .order("detection_date", desc=True)
             .limit(1)
             .execute()
         )
-        rows = resp.data or []
-        return rows[0].get(date_column) if rows else None
+        if response.data:
+            last_date_str = response.data[0]["detection_date"]
+            last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
+
+            # Advance past last_date, skipping weekends + holidays
+            prediction_day = last_date + timedelta(days=1)
+            while not _is_trading_day(prediction_day):
+                prediction_day += timedelta(days=1)
+
+            # Clamp: only kicks in for a genuine backfill lag (e.g. a holiday
+            # or an outage left daily_winners more than one trading day behind
+            # today). A gap of exactly one day is the normal, expected case
+            # (yesterday's winners -> predicting today's session) and must
+            # NOT be clamped, or the script will perpetually predict for the
+            # day that already closed instead of the upcoming session.
+            if (prediction_day - today).days > 1 and _is_trading_day(today):
+                logger.info(
+                    f"Prediction date derived from daily_winners: "
+                    f"last={last_date}  →  next trading day={prediction_day} "
+                    f"(clamped to today={today})"
+                )
+                return today.isoformat()
+
+            logger.info(
+                f"Prediction date derived from daily_winners: "
+                f"last={last_date}  →  next trading day={prediction_day}"
+            )
+            return prediction_day.isoformat()
     except Exception as e:
-        logger.debug(f"  {table}: max-date pre-check failed ({e}); will fall back to a full fetch")
+        logger.warning(f"Could not fetch most recent winners date: {e}")
+
+    # ── Fallback: use today if it's a trading day, else most recent past day ─
+    logger.warning("Falling back to time-based prediction date.")
+    fallback = today
+    while not _is_trading_day(fallback):
+        fallback -= timedelta(days=1)
+    return fallback.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# SmartScreener
+# ---------------------------------------------------------------------------
+
+class SmartScreener:
+    """Intelligent screener using model-derived filters."""
+
+    TV_FILTER_MAP = {
+        "min_price":           ("close",                    "greater"),
+        "max_price":           ("close",                    "less"),
+        "min_volume":          ("volume",                   "greater"),
+        "min_rsi":             ("RSI",                      "greater"),
+        "max_rsi":             ("RSI",                      "less"),
+        "min_rsi7":            ("RSI[1]",                   "greater"),
+        "max_rsi7":            ("RSI[1]",                   "less"),
+        "min_volume_ratio":    ("relative_volume_10d_calc", "greater"),
+        "min_relative_volume": ("relative_volume_10d_calc", "greater"),
+        "min_hv10":            ("Volatility.D",             "greater"),
+        "max_hv10":            ("Volatility.D",             "less"),
+        "min_hv20":            ("Volatility.D",             "greater"),
+        "max_hv20":            ("Volatility.D",             "less"),
+        "min_adx":             ("ADX",                      "greater"),
+        "min_atr14":           ("ATR",                      "greater"),
+    }
+
+    DEFAULT_FILTERS = {
+        "min_price":           0.50,
+        "max_price":           100.0,
+        "min_volume":          200_000,
+        "min_volume_ratio":    1.5,
+        "min_relative_volume": 1.5,
+    }
+
+    def __init__(self, config: dict = None, logger=None):
+        import logging
+        self.logger = logger or logging.getLogger(__name__)
+        self.config = config or {}
+        self.filters = self._load_learned_filters()
+        if SCREENER_AVAILABLE:
+            self.screener = Screener()
+        else:
+            self.screener = None
+
+    def _load_learned_filters(self) -> dict:
+        defaults = dict(self.DEFAULT_FILTERS)
+        try:
+            filter_path = Path("ml_models/learned_filters.json")
+            if filter_path.exists():
+                with open(filter_path, "r") as f:
+                    learned = json.load(f)
+
+                active = []
+                for key, value in learned.items():
+                    if key.startswith("_"):
+                        continue
+                    if value is None:
+                        continue
+
+                    if key in ("min_hv10", "min_hv20") and float(value) > SCREENER_HV_MIN_CAP:
+                        self.logger.info(
+                            f"  Clamping {key}={value:.2f} → {SCREENER_HV_MIN_CAP} "
+                            f"(raw winner p10 too aggressive for broad screening)"
+                        )
+                        value = SCREENER_HV_MIN_CAP
+
+                    if key in ("min_volume_ratio", "min_relative_volume") and float(value) > SCREENER_VOL_RATIO_CAP:
+                        self.logger.info(f"  Clamping {key}={value:.2f} → {SCREENER_VOL_RATIO_CAP}")
+                        value = SCREENER_VOL_RATIO_CAP
+
+                    defaults[key] = value
+                    active.append(f"{key}={value}")
+
+                self.logger.info(f"✓ Loaded learned filters: {', '.join(active)}")
+            else:
+                self.logger.info("No learned_filters.json found — using permissive defaults")
+        except Exception as e:
+            self.logger.warning(f"Could not load learned filters: {e} — using defaults")
+        return defaults
+
+    def screen_with_tradingview(self, max_results: int = 1500) -> "pd.DataFrame":
+        import pandas as pd
+
+        if not SCREENER_AVAILABLE or self.screener is None:
+            self.logger.error("TradingView screener not available!")
+            return pd.DataFrame()
+
+        self.logger.info("=" * 60)
+        self.logger.info("SMART SCREENER — applying model-driven filters")
+        self.logger.info("=" * 60)
+
+        tv_col_bounds: dict = {}
+        filter_log = []
+
+        for filter_key, (tv_col, operation) in self.TV_FILTER_MAP.items():
+            value = self.filters.get(filter_key)
+            if value is None:
+                continue
+            if tv_col not in tv_col_bounds:
+                tv_col_bounds[tv_col] = {}
+            if operation == "greater":
+                existing = tv_col_bounds[tv_col].get("min")
+                if existing is None or value > existing:
+                    tv_col_bounds[tv_col]["min"] = value
+                    filter_log.append(f"{tv_col} > {value}  [{filter_key}]")
+            elif operation == "less":
+                existing = tv_col_bounds[tv_col].get("max")
+                if existing is None or value < existing:
+                    tv_col_bounds[tv_col]["max"] = value
+                    filter_log.append(f"{tv_col} < {value}  [{filter_key}]")
+
+        tv_filters = []
+        for tv_col, bounds in tv_col_bounds.items():
+            if "min" in bounds:
+                tv_filters.append({"left": tv_col, "operation": "greater", "right": bounds["min"]})
+            if "max" in bounds:
+                tv_filters.append({"left": tv_col, "operation": "less", "right": bounds["max"]})
+
+        self.logger.info(f"Active filters ({len(tv_filters)}):")
+        for line in filter_log:
+            self.logger.info(f"  {line}")
+
+        columns_to_fetch = list(set(EXTRA_TV_COLUMNS))
+
+        try:
+            result = self.screener.screen(
+                market="america",
+                filters=tv_filters,
+                sort_by="relative_volume_10d_calc",
+                sort_order="desc",
+                limit=max_results,
+                columns=columns_to_fetch,
+            )
+
+            if result.get("status") == "success" and result.get("data"):
+                df = pd.DataFrame(result["data"])
+                n_indicator_cols = sum(1 for c in df.columns if c in EXTRA_TV_COLUMNS)
+                self.logger.info(
+                    f"✓ Screened {len(df)} stocks with {len(df.columns)} columns "
+                    f"({n_indicator_cols} indicator columns)"
+                )
+                if n_indicator_cols < 5:
+                    self.logger.warning(
+                        "  ⚠️  Very few indicator columns returned. "
+                        "tradingview-scraper may not support columns= for this version."
+                    )
+                return df
+
+            self.logger.warning("Retrying without columns= parameter (version fallback)...")
+            result = self.screener.screen(
+                market="america",
+                filters=tv_filters,
+                sort_by="relative_volume_10d_calc",
+                sort_order="desc",
+                limit=max_results,
+            )
+            if result.get("status") == "success" and result.get("data"):
+                df = pd.DataFrame(result["data"])
+                self.logger.info(
+                    f"✓ Screened {len(df)} stocks (default columns only: {list(df.columns)})"
+                )
+                self.logger.warning(
+                    "  ⚠️  Using default TV columns only (no RSI/ATR/etc). "
+                    "Upgrade tradingview-scraper to >=0.4.19 for indicator columns."
+                )
+                return df
+
+            self.logger.warning("Screener returned no data or error status")
+            return pd.DataFrame()
+
+        except Exception as e:
+            self.logger.error(f"Screening failed: {e}")
+            return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# FIX 12: Accurate entry price from the last available 1-minute candle
+# ---------------------------------------------------------------------------
+
+def fetch_accurate_entry_price(symbol: str, logger=None) -> float | None:
+    """
+    Fetch the true current/entry price for `symbol` from the most recent
+    available 1-minute candle.
+
+    The TradingView screener's `close` field is used to seed `current_price`
+    in build_features_from_tv_data(), but it does not reliably reflect the
+    actual last trade around pre-market/after-hours — which matters because
+    predictions are generated and locked in before the regular session opens.
+
+    Preference order:
+      1. The last 1-minute bar of the current session, including pre-market
+         and after-hours (prepost=True) — e.g. the after-hours closing bar
+         if the market has already closed for the day.
+      2. If today has no 1m bars yet (e.g. this runs very early before
+         yfinance has backfilled anything for the new session), widen the
+         window and fall back to the most recent 1m bar available at all.
+
+    Returns None if no price data can be fetched, so callers can fall back
+    to the TradingView screener close instead of dropping the stock.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return None
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        hist = ticker.history(period="1d", interval="1m", prepost=True)
+        if hist.empty:
+            # Nothing for today yet — widen the window and just take
+            # whatever the last available 1-minute bar is.
+            hist = ticker.history(period="5d", interval="1m", prepost=True)
+
+        if hist.empty or "Close" not in hist.columns:
+            return None
+
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            return None
+
+        return float(closes.iloc[-1])
+
+    except Exception as e:
+        if logger:
+            logger.debug(f"fetch_accurate_entry_price({symbol}) failed: {e}")
         return None
 
 
-def load_base_training_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
-    """Load original CSV data from ml_training_base.
+# ---------------------------------------------------------------------------
+# FIX 6: Feature building — fills ALL relevant prefix groups
+# ---------------------------------------------------------------------------
 
-    OPT-IN GATE (added alongside the T1-everywhere migration): ml_training_base
-    was the original bootstrap seed table (t3_/t5_/t10_ features only, no t1_
-    features, and no guarantee it was built under the same price/quality rules
-    as the current data pipeline). Once a database has T1 data on every row,
-    this table is legacy and should not silently keep feeding into retrains
-    just because its rows haven't aged past lookback_days yet.
-
-    Default is now OFF. Set USE_BASE_TRAINING_DATA=1/true/yes in the environment
-    (or pass --use-base-training-data on the CLI) to include it again — e.g. if
-    you're bootstrapping a brand-new database and genuinely want the seed data.
+def build_features_from_tv_data(
+    row: dict,
+    symbol: str,
+    feature_prefix: str = "t1_close",
+) -> dict:
     """
-    if os.environ.get("USE_BASE_TRAINING_DATA", "").lower() not in ("1", "true", "yes"):
-        logger.info(
-            f"'{TABLE_BASE}' SKIPPED (USE_BASE_TRAINING_DATA not set — default is off). "
-            "Training will use T-1 data only. Pass --use-base-training-data or set "
-            "USE_BASE_TRAINING_DATA=1 to include the legacy seed table."
+    Convert a single TradingView screener row into a feature dict.
+
+    Writes values ONLY to the requested feature_prefix (e.g. t1_close_*).
+    t3_/t5_/t10_* columns must NOT be populated from TV screener data —
+    those prefixes represent daily-bar snapshots from the training CSV and
+    must be filled exclusively from T-1 yfinance intraday indicators via
+    fetch_t1_data_for_symbol → _write_flat_prefix_features.  Filling them
+    with today's TV screener row (as the old fill_flat_prefixes=True path
+    did) made t3/t5/t10 identical to each other and to t1, corrupting 2/3
+    of the hybrid model's flat-prefix features on every production run.
+    """
+    result = {
+        "symbol":   symbol,
+        "exchange": "NASDAQ",
+    }
+
+    seen_targets: set = set()
+
+    def _write(prefix: str, model_name: str, fval: float):
+        target = f"{prefix}_{model_name}"
+        if _uses_lowercase(prefix):
+            target = target.lower()
+        if target not in seen_targets:
+            result[target] = fval
+            seen_targets.add(target)
+
+    for tv_col, model_name in TV_TO_MODEL_BASE.items():
+        value = row.get(tv_col)
+        if value is None:
+            value = row.get(tv_col.lower())
+        if value is None:
+            for k in row:
+                if k.lower() == tv_col.lower():
+                    value = row[k]
+                    break
+
+        if value is None:
+            continue
+
+        try:
+            fval = float(value)
+            if np.isnan(fval) or np.isinf(fval):
+                continue
+        except (TypeError, ValueError):
+            continue
+
+        # Write to the primary model prefix (e.g. t1_close_RSI_14).
+        # t3_/t5_/t10_* columns are intentionally NOT written here — they are
+        # populated from T-1 yfinance intraday data in fetch_t1_data_for_symbol.
+        _write(feature_prefix, model_name, fval)
+
+    close_val = row.get("close") or row.get("Close")
+    if close_val is not None:
+        try:
+            result["current_price"] = float(close_val)
+        except (TypeError, ValueError):
+            pass
+
+    # Derived features
+    close = result.get("current_price") or result.get(f"{feature_prefix}_Close")
+
+    def _derived(prefix: str, close_v: float):
+        if _uses_lowercase(prefix):
+            ema20 = result.get(f"{prefix}_ema_20")
+            ema50 = result.get(f"{prefix}_ema_50")
+            ema10 = result.get(f"{prefix}_ema_10")
+            sma20 = result.get(f"{prefix}_sma_20")
+            if ema20: result[f"{prefix}_price_vs_ema20"] = (close_v / ema20 - 1) * 100
+            if sma20: result[f"{prefix}_price_vs_sma20"] = (close_v / sma20 - 1) * 100
+            # EMA_12_26_Diff intentionally NOT computed: EMA_12/EMA_26 are
+            # deliberately left unfetched above (period mismatch with the TV
+            # screener's own EMA fields) — faking it from ema20/ema50 gave a
+            # correct-looking feature holding the wrong indicator entirely.
+            # Left unset so the model imputes it, same as EMA_26 itself.
+            sma50 = result.get(f"{prefix}_sma_50")
+            if sma20 and sma50: result[f"{prefix}_sma_20_50_diff"] = sma20 - sma50
+        else:
+            ema20 = result.get(f"{prefix}_EMA_20")
+            ema50 = result.get(f"{prefix}_EMA_50")
+            ema10 = result.get(f"{prefix}_EMA_10")
+            sma20 = result.get(f"{prefix}_SMA_20")
+            if ema20: result[f"{prefix}_Price_vs_EMA20"] = (close_v / ema20 - 1) * 100
+            if sma20: result[f"{prefix}_Price_vs_SMA20"] = (close_v / sma20 - 1) * 100
+            # EMA_12_26_Diff intentionally NOT computed: EMA_12/EMA_26 are
+            # deliberately left unfetched above (period mismatch with the TV
+            # screener's own EMA fields) — faking it from ema20/ema50 gave a
+            # correct-looking feature holding the wrong indicator entirely.
+            # Left unset so the model imputes it, same as EMA_26 itself.
+            sma50 = result.get(f"{prefix}_SMA_50")
+            if sma20 and sma50: result[f"{prefix}_SMA_20_50_Diff"] = sma20 - sma50
+
+    if close and close > 0:
+        _derived(feature_prefix, close)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# T-1 intraday indicator computation
+# ---------------------------------------------------------------------------
+
+def _compute_indicators(c: pd.Series, h: pd.Series, l: pd.Series,
+                         v: pd.Series, o: pd.Series) -> dict:
+    """
+    Compute comprehensive technical indicators from OHLCV series.
+
+    FIX 8: Added TSI, Keltner Channel, Donchian Channel, VWAP, and ATR slope.
+    """
+    ind = {}
+
+    def safe(series, default=0.0):
+        try:
+            val = float(series.iloc[-1])
+            return default if (np.isnan(val) or np.isinf(val)) else val
+        except Exception:
+            return default
+
+    ind["close"]  = float(c.iloc[-1])
+    ind["open"]   = float(o.iloc[0])
+    ind["high"]   = float(h.max())
+    ind["low"]    = float(l.min())
+    ind["volume"] = float(v.sum())
+    close_v = ind["close"]
+
+    # ── RSI (multiple periods) ──────────────────────────────────────────────
+    # FIX: previously ewm(com=period-1, min_periods=period) with default
+    # adjust=True. ta.momentum.RSIIndicator (the real training-time source
+    # for "rsi"/RSI_14) uses ewm(alpha=1/period, adjust=False) — same decay
+    # rate (com=period-1 <=> alpha=1/period), but adjust=True vs False is a
+    # different recursion (adjust=True re-weights every historical bar every
+    # step; adjust=False is the pure recursive/Wilder-style update). They
+    # converge only asymptotically, and T-1 series here are short (~78 bars
+    # for a full day, ~12 for the open window), so this mismatch was live
+    # for effectively the whole window, not just a negligible warm-up period.
+    # Also: ta sets RSI=100 outright when the down-average is exactly 0
+    # (pure uptrend, no losses in the window) instead of leaving it
+    # undefined; the previous rs = ag/al.replace(0, nan) produced NaN in
+    # that case, which safe() then quietly replaced with 50 (neutral) —
+    # the opposite signal from what training would have produced (100,
+    # maximally overbought).
+    # A second, subtler mismatch: gain/loss were previously built with
+    # .clip(lower=0)/.clip(upper=0), which leaves the leading NaN from
+    # c.diff() as NaN. ta builds them with .where(delta > 0, 0.0), which
+    # turns that same leading NaN into 0.0. That one-bar difference shifts
+    # where the ewm's min_periods warm-up threshold is first satisfied,
+    # producing a materially wrong value for the first several bars after
+    # warm-up (verified: 43.12 vs 32.08 at the boundary bar) even with the
+    # smoothing method itself fixed — now using .where() to match exactly.
+    delta = c.diff()
+    gain  = delta.where(delta > 0, 0.0)
+    loss  = -delta.where(delta < 0, 0.0)
+    for period, col_name in [(7, "rsi7"), (14, "rsi"), (21, "rsi21"), (28, "rsi28")]:
+        ag = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        al = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+        rs = ag / al
+        rsi_series = pd.Series(
+            np.where(al == 0, 100.0, 100 - (100 / (1 + rs))), index=c.index
         )
-        return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
+        ind[col_name] = safe(rsi_series, 50.0)
+    ind["rsi[1]"] = ind["rsi"]
+    ind["rsi14"]  = ind["rsi"]   # alias for column-map dedup
 
-    logger.info(f"Loading base training data from '{TABLE_BASE}'...")
+    # ── MACD ───────────────────────────────────────────────────────────────
+    ema12     = c.ewm(span=12, adjust=False).mean()
+    ema26     = c.ewm(span=26, adjust=False).mean()
+    macd_line = ema12 - ema26
+    macd_sig  = macd_line.ewm(span=9, adjust=False).mean()
+    ind["macd.macd"]   = safe(macd_line)
+    ind["macd.signal"] = safe(macd_sig)
+    ind["macd_diff"]   = safe(macd_line - macd_sig)
 
-    cutoff = _fetch_cutoff(lookback_days)
+    # ── Moving averages ─────────────────────────────────────────────────────
+    for n in [5, 10, 12, 20, 26, 50]:
+        ind[f"ema{n}"] = safe(c.ewm(span=n, adjust=False).mean(), float(c.mean()))
+    for n in [5, 10, 20, 50]:
+        ind[f"sma{n}"] = safe(c.rolling(n).mean(), float(c.mean()))
 
-    # ml_training_base is a mostly-static historical seed table (uploaded once
-    # via upload_base_training_data.py, not continuously appended to like the
-    # T-1 tables). Once its newest event_date falls outside the lookback
-    # window, EVERY retrain from here on would fetch and then immediately
-    # discard the whole table. A single tiny query up front tells us that
-    # cheaply, instead of paginating potentially the entire table only to end
-    # up with 0 usable rows.
-    if cutoff is not None:
-        max_date = _table_max_date(client, TABLE_BASE, "event_date")
-        if max_date is not None and max_date < cutoff:
-            logger.info(
-                f"  {TABLE_BASE}: newest event_date is {max_date}, older than the "
-                f"{cutoff} fetch cutoff — table is stale relative to the "
-                f"{lookback_days}-day lookback window. Skipping the fetch "
-                "entirely (T-1 data covers the training window instead)."
-            )
-            return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
-
-    # ml_training_base only has event_date (no detection_date) -- see
-    # combine_datasets(). Filtering on a column that doesn't exist on this
-    # table would make PostgREST reject the whole query, so we deliberately
-    # do NOT include detection_date here.
-    df = fetch_table_paginated(
-        client, TABLE_BASE,
-        date_columns=["event_date"],
-        cutoff_date=cutoff,
-    )
-    if df.empty:
-        if cutoff is not None:
-            # Distinguish "table is genuinely missing/misconfigured" (fatal,
-            # same as before) from "table has rows, just none inside the
-            # lookback window" (expected once the seed CSV ages out — not an
-            # error, just means base contributes nothing to this retrain).
-            unfiltered_probe = fetch_table_paginated(client, TABLE_BASE, page_size=1)
-            if not unfiltered_probe.empty:
-                logger.info(
-                    f"  {TABLE_BASE}: no rows within the lookback window "
-                    f"(cutoff={cutoff}), but the table itself is not empty — "
-                    "base data is just older than lookback_days. Continuing "
-                    "with T-1 data only."
-                )
-                return pd.DataFrame(columns=["symbol", "event_date", "label", "sample_weight", "source"])
-
-        logger.error(
-            f"Table '{TABLE_BASE}' is empty! "
-            "Run upload_base_training_data.py first."
+    # WMA approximations
+    for n in [10, 20]:
+        weights = np.arange(1, n + 1, dtype=float)
+        wma_vals = c.rolling(n).apply(
+            lambda x: np.dot(x, weights[-len(x):]) / weights[-len(x):].sum()
+            if len(x) >= 2 else float(x.iloc[-1]),
+            raw=True
         )
-        sys.exit(1)
+        ind[f"wma{n}"] = safe(wma_vals, float(c.mean()))
 
-    if "label" not in df.columns:
-        logger.error(f"'{TABLE_BASE}' has no 'label' column.")
-        sys.exit(1)
+    sma20_v = ind.get("sma20") or float(c.mean())
+    ema20_v = ind.get("ema20") or float(c.mean())
+    ema10_v = ind.get("ema10") or float(c.mean())
+    ema12_v = ind.get("ema12") or float(c.mean())
+    ema26_v = ind.get("ema26") or float(c.mean())
 
-    # Normalise the stock identifier column to "symbol" so that combine_datasets
-    # and all downstream deduplication logic uses a single consistent column name.
-    # ml_training_base stores the ticker under the column "ticker" while T-1 tables
-    # use "symbol".  Without this rename, after pd.concat the base rows have
-    # symbol=NaN (the T-1 column) and ticker=<value>, causing drop_duplicates on
-    # (symbol, event_date) to treat every ticker on the same date as the same stock,
-    # collapsing all per-date base rows into a single row.
-    if "symbol" not in df.columns and "ticker" in df.columns:
-        df = df.rename(columns={"ticker": "symbol"})
-        logger.info("  Renamed 'ticker' -> 'symbol' for consistency with T-1 tables")
-    elif "symbol" not in df.columns:
-        logger.warning("  Neither 'symbol' nor 'ticker' column found in base data — deduplication may be incorrect")
+    # Always compute price-vs-MA derivatives; the denominator is never zero
+    # because sma20_v/ema20_v fall back to c.mean() which is non-zero in
+    # practice.  Writing unconditionally eliminates any residual risk of the
+    # key being absent in the open window (train/test skew).
+    ind["price_vs_sma20"] = (close_v / sma20_v - 1) * 100 if sma20_v else 0.0
+    ind["price_vs_ema20"] = (close_v / ema20_v - 1) * 100 if ema20_v else 0.0
+    ind["ema_12_26_diff"] = ema12_v - ema26_v
+    ind["sma_20_50_diff"] = ind.get("sma20", 0) - ind.get("sma50", 0)
 
-    if "sample_weight" not in df.columns:
-        df["sample_weight"] = BASE_CSV_WEIGHT
-    df["source"] = df.get("source", "base_csv")
+    # ── Stochastic ─────────────────────────────────────────────────────────
+    # FIX: previously smoothed raw %K with rolling(3).mean() and called that
+    # "stoch.k", then smoothed AGAIN with another rolling(3).mean() for
+    # "stoch.d" — a double-smoothing pass that doesn't exist in training.
+    # ta.momentum.StochasticOscillator (the real training-time source for
+    # "stoch.k"/"stoch.d") defines stoch() as the RAW, unsmoothed %K and
+    # stoch_signal() as a single rolling(smooth_window).mean() over that raw
+    # %K. So "stoch.k" should be the raw %K itself, and "stoch.d" should be
+    # one rolling(3).mean() pass over it — not two.
+    lo14  = l.rolling(14).min()
+    hi14  = h.rolling(14).max()
+    rng14 = (hi14 - lo14).replace(0, np.nan)
+    raw_k = 100 * (c - lo14) / rng14
+    stk   = raw_k
+    std   = raw_k.rolling(3).mean()
+    ind["stoch.k"]    = safe(stk, 50.0)
+    ind["stoch.d"]    = safe(std, 50.0)
+    ind["stoch.k[1]"] = ind["stoch.k"]
+    ind["stoch.d[1]"] = ind["stoch.d"]
+    ind["w.r"]        = safe(-100 * (hi14 - c) / rng14, -50.0)
 
-    n_pos = int((df['label']==1).sum())
-    n_neg = int((df['label']==0).sum())
-    pos_rate = n_pos / max(1, len(df))
-    logger.info(f"Base data: {len(df)} rows, pos={n_pos}, neg={n_neg}, pos_rate={pos_rate:.1%}")
+    # ── ATR ────────────────────────────────────────────────────────────────
+    # FIX: previously hand-rolled with a flat tr.rolling(period).mean(),
+    # which is the same bug class already found and fixed for ADX below —
+    # ta.volatility.AverageTrueRange (the real training-time source, used
+    # directly in intraday_data_collector.py) uses Wilder's recursive
+    # smoothing instead, which decays a volatility spike gradually rather
+    # than dropping it off a cliff after exactly `window` bars. A flat mean
+    # and Wilder's smoothing diverge most right after a volatility spike —
+    # exactly the regime a "strong buy" candidate is likely to be in.
+    # Still build `tr` (true range) here too: it's reused below by the
+    # DMI/ADXR fallback and by CCI/Ultimate-Oscillator-style calcs elsewhere
+    # in this function that don't have a `ta` equivalent.
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs(),
+    ], axis=1).max(axis=1)
 
-    # Warn if the base data positive rate is unexpectedly high.
-    # Expected range is ~5-20% for explosive-stock prediction.
-    # If this number jumps week-over-week, the base table may have had extra
-    # winner rows inserted (or negative rows deleted) outside of the normal
-    # upload_base_training_data.py workflow.
+    _atr_dollar = {}
+    for period, col_name in [(7, "atr7"), (14, "atr"), (20, "atr20")]:
+        try:
+            _atr_dollar[period] = AverageTrueRange(
+                high=h, low=l, close=c, window=period
+            ).average_true_range()
+            ind[col_name] = safe(_atr_dollar[period], 0.5)
+        except Exception:
+            _atr_dollar[period] = tr.rolling(period).mean()
+            ind[col_name] = safe(_atr_dollar[period], 0.5)
+    ind["atr14"] = ind["atr"]   # alias
+
+    # Normalise ATR_14 to % of close, matching intraday_data_collector.py
+    # (training's T-1 source), which converts the `ta` library's dollar ATR
+    # to %-of-close so it lines up with multiday_feature_collector's
+    # pandas_ta-derived ATRr (already % of close). Do this AFTER computing
+    # the raw dollar ind["atr"]/["atr14"] above (those stay in dollars —
+    # only the slope input is normalised) to match training exactly.
+    _close_safe = c.replace(0, np.nan)
+    atr14_pct_series = _atr_dollar[14] / _close_safe * 100
+
+    # ATR slope
+    # FIX: previously diff(5) — but training's atr_14_slope (both
+    # intraday_data_collector.py and multiday_feature_collector.py) is
+    # diff(1) of the normalised (%-of-close) ATR series, not diff(5). Using
+    # the wrong lag here would still have produced a systematically wrong
+    # value for t1_open_ATR_14_Slope even after fixing the ATR smoothing
+    # itself, since a 5-bar delta and a 1-bar delta are simply different
+    # quantities.
+    if len(atr14_pct_series.dropna()) >= 2:
+        ind["atr_pct"] = safe(atr14_pct_series.diff(1), 0.0)
+    else:
+        ind["atr_pct"] = 0.0
+
+    # ── ADX / DMI ──────────────────────────────────────────────────────────
+    # FIX: previously hand-rolled with flat .rolling(14).mean() smoothing,
+    # which decays much faster than Wilder's recursive smoothing that the
+    # real training-time source (ta.trend.ADXIndicator, used directly in
+    # intraday_data_collector.py) actually uses. Diverged most during trend
+    # reversals / choppy stretches — exactly where it matters. Now calling
+    # the same ta library class training uses, so this can't drift again.
     #
-    # Two-tier warning:
-    #   >20%: advisory — rate is above the expected ceiling but not critical.
-    #         Likely causes: short LOOKBACK window over-representing a recent
-    #         winning streak, or mild label drift.
-    #   >25%: stronger warning — investigate before relying on this model.
-    if pos_rate > 0.25:
-        logger.warning(
-            f"BASE DATA WARNING: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows). "
-            "Expected ~5-20%. If this increased since the last run, check whether "
-            "extra rows were inserted into ml_training_base (e.g. by intraday_high_labels "
-            "or a backfill script), or whether negative rows were accidentally deleted."
-        )
-    elif pos_rate > 0.20:
-        logger.warning(
-            f"BASE DATA ADVISORY: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows), "
-            "above the expected ~5-20% ceiling. This is not yet critical, but may indicate "
-            "that a short LOOKBACK window is over-representing recent winning periods, or "
-            "that mild label drift has occurred. Monitor week-over-week; if the rate "
-            "continues rising, investigate ml_training_base for label imbalance."
-        )
-    elif pos_rate == 0.0 and len(df) > 0:
-        # Low-end counterpart to the >20%/>25% checks above. ml_training_base
-        # is a mostly-static historical seed table (see docstring above) --
-        # if its winner (label=1) rows happen to be concentrated in older
-        # event_dates than its non-winner rows, a rolling lookback_days
-        # cutoff can silently filter out every positive while keeping all
-        # the negatives. That doesn't fail loudly anywhere downstream: the
-        # combined dataset still trains fine, but the classifier can end up
-        # doing very little real work to separate this all-negative base
-        # subset from the (real) positives elsewhere in the data, which
-        # tends to show up indirectly as an unusually low best_iteration.
-        logger.warning(
-            f"BASE DATA WARNING: positive rate is 0.0% (0/{len(df)} rows) within the "
-            f"current lookback window. Expected ~5-20%. ml_training_base is documented "
-            "as a mostly-static seed table -- if its winner rows are dated older than "
-            "its non-winner rows, a rolling lookback cutoff can filter out all positives "
-            "while keeping all negatives. This tends to show up indirectly as an unusually "
-            "low best_iteration during training. Check the label/event_date "
-            "distribution in ml_training_base directly, or consider decoupling its fetch "
-            "cutoff from the rolling lookback_days window used for the T-1 tables."
-        )
-    elif pos_rate < 0.05:
-        logger.warning(
-            f"BASE DATA ADVISORY: positive rate is {pos_rate:.1%} ({n_pos}/{len(df)} rows), "
-            "below the expected ~5-20% floor. Not necessarily an error, but worth a glance "
-            "at the label/event_date distribution in ml_training_base if this is new."
+    # RC13 FIX (2026-08-13): ta.trend.ADXIndicator's internal Wilder
+    # smoothing can raise IndexError ("index 0 is out of bounds for axis 0
+    # with size 0") or ValueError ("negative dimensions are not allowed") on
+    # short/marginal-length series — which 5-min bars for a thin small-cap
+    # routinely produce even after clearing the len(day_bars) >= 20 gate
+    # above (that gate counts raw bars, not the effectively-shorter series
+    # ADXIndicator needs after its own internal smoothing/dropna). Before
+    # this fix, that exception propagated all the way out of
+    # _compute_indicators and discarded every indicator already computed
+    # above (RSI, MACD, moving averages, stochastic, ATR, Bollinger, etc.)
+    # for the entire symbol — turning one marginal indicator's failure into
+    # a total T-1 feature loss. Isolated here so a failure only costs the
+    # 3 ADX/DMI values (which already have safe() defaults elsewhere in
+    # this function), not the whole indicator set.
+    try:
+        _adx_ind = ADXIndicator(high=h, low=l, close=c, window=14)
+        ind["adx"]    = safe(_adx_ind.adx(), 20.0)
+        ind["adx+di"] = safe(_adx_ind.adx_pos(), 20.0)
+        ind["adx-di"] = safe(_adx_ind.adx_neg(), 20.0)
+    except Exception as _adx_exc:
+        ind["adx"]    = 20.0
+        ind["adx+di"] = 20.0
+        ind["adx-di"] = 20.0
+        logging.getLogger(__name__).debug(
+            f"ADXIndicator failed on {len(c)}-bar series "
+            f"({type(_adx_exc).__name__}: {_adx_exc}) — using defaults for "
+            "adx/adx+di/adx-di, rest of indicators unaffected."
         )
 
-    return df
+    # NOTE: pdm/ndm/dx below are kept (unchanged, still flat-rolling) purely
+    # because `dx` is reused by the ADXR calc further down. ADXR has the same
+    # shape of smoothing mismatch as adx/adx+di/adx-di did — not fixed here,
+    # since it wasn't part of this fix's scope, but worth addressing next.
+    up_move = h.diff()
+    dn_move = -l.diff()
+    pdm = pd.Series(np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0), index=c.index)
+    ndm = pd.Series(np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0), index=c.index)
+    atr14 = _atr_dollar[14].replace(0, np.nan)
+    pdi   = 100 * pdm.rolling(14).mean() / atr14
+    ndi   = 100 * ndm.rolling(14).mean() / atr14
+    dx    = 100 * (pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)
 
-def audit_base_data(base_df: pd.DataFrame) -> None:
-    """Call this immediately after load_base_training_data() to catch label corruption."""
-    if base_df.empty:
-        logger.info("BASE DATA AUDIT: base_df is empty (skipped or no rows in lookback window) — nothing to audit.")
+    # ── Bollinger Bands ────────────────────────────────────────────────────
+    # FIX: previously hand-rolled with c.rolling(20).std(), which is pandas'
+    # sample std (ddof=1). ta.volatility.BollingerBands (the real
+    # training-time source) uses population std (ddof=0) internally — a
+    # ~2.6% systematic width difference that shows up directly in
+    # t1_open_BBB_20_2.0_2.0 (bb_width), the second-most-important of the
+    # 13 production features. Same bug class as ATR/Keltner: two independent
+    # formula implementations that can drift, replaced with the one library
+    # call training already uses.
+    try:
+        _bb = BollingerBands(close=c, window=20, window_dev=2)
+        bb_up  = _bb.bollinger_hband()
+        bb_lo  = _bb.bollinger_lband()
+        bb_mid = _bb.bollinger_mavg()
+    except Exception:
+        bb_mid = c.rolling(20).mean()
+        bb_std = c.rolling(20).std(ddof=0)
+        bb_up  = bb_mid + 2 * bb_std
+        bb_lo  = bb_mid - 2 * bb_std
+    ind["bb.upper"]  = safe(bb_up,  close_v)
+    ind["bb.lower"]  = safe(bb_lo,  close_v)
+    ind["bb.middle"] = safe(bb_mid, close_v)
+    ind["bb_width"]  = safe((bb_up - bb_lo) / bb_mid.replace(0, np.nan) * 100, 0.0)
+    ind["bbpower"]   = safe((c - bb_lo) / (bb_up - bb_lo).replace(0, np.nan), 0.5)
+
+    # Keltner Channel
+    # FIX: previously hand-rolled as EMA(close,20) ± 2×flat-mean-ATR(10).
+    # ta.volatility.KeltnerChannel (the real training-time source) doesn't
+    # just do that — it has its own basis/band construction internally, so
+    # the hand-rolled version was both smoothing-mismatched (flat mean vs
+    # Wilder's) and structurally different from what training actually
+    # computes. t3_kcle_20_2/t10_kcle_20_2/t10_kcue_20_2 are production
+    # features, though for those specific ones the live pipeline already
+    # routes through the (consistent) multiday code path — this fixes the
+    # keltner_* values ml_screen_and_predict.py computes directly for any
+    # other T-1-sourced consumer.
+    try:
+        _kc = KeltnerChannel(high=h, low=l, close=c, window=20)
+        kc_up  = _kc.keltner_channel_hband()
+        kc_lo  = _kc.keltner_channel_lband()
+        kc_mid = _kc.keltner_channel_mband()
+    except Exception:
+        kc_mid = c.ewm(span=20, adjust=False).mean()
+        kc_atr = tr.rolling(10).mean()
+        kc_up  = kc_mid + 2.0 * kc_atr
+        kc_lo  = kc_mid - 2.0 * kc_atr
+    ind["keltner_upper"]  = safe(kc_up,  close_v)
+    ind["keltner_lower"]  = safe(kc_lo,  close_v)
+    ind["keltner_middle"] = safe(kc_mid, close_v)
+
+    # Donchian Channel (20-period)
+    # The hand-rolled version already matched ta's DonchianChannel formula
+    # closely (min/max/midpoint have no alternate smoothing to diverge on),
+    # but switching to the library call here too removes any chance of a
+    # future silent drift and keeps this section consistent with the rest.
+    try:
+        _dc = DonchianChannel(high=h, low=l, close=c, window=20)
+        dc_up  = _dc.donchian_channel_hband()
+        dc_lo  = _dc.donchian_channel_lband()
+        dc_mid = _dc.donchian_channel_mband()
+    except Exception:
+        dc_up  = h.rolling(20).max()
+        dc_lo  = l.rolling(20).min()
+        dc_mid = (dc_up + dc_lo) / 2
+    ind["donchian_upper"]  = safe(dc_up,  close_v)
+    ind["donchian_lower"]  = safe(dc_lo,  close_v)
+    ind["donchian_middle"] = safe(dc_mid, close_v)
+
+    # ── Volume ─────────────────────────────────────────────────────────────
+    # Use min_periods=1 so that partial windows (e.g. the open window with
+    # only 12 bars) still produce a real rolling mean rather than NaN — this
+    # avoids the safe() default (v.mean()) silently replacing the indicator
+    # and keeps the feature distribution closer to what the model was trained
+    # on (where full 20-bar windows were always available at close time).
+    vm5  = v.rolling(5,  min_periods=1).mean()
+    vm10 = v.rolling(10, min_periods=1).mean()
+    vm20 = v.rolling(20, min_periods=1).mean()
+    ind["volume_sma5"]  = safe(vm5,  float(v.mean()))
+    ind["volume_sma10"] = safe(vm10, float(v.mean()))
+    ind["volume_sma20"] = safe(vm20, float(v.mean()))
+    ind["volume_ratio"] = safe(v / vm20.replace(0, np.nan), 1.0)
+
+    # ── OBV ────────────────────────────────────────────────────────────────
+    obv_vals = [0.0]
+    c_arr, v_arr = c.values, v.values
+    for i in range(1, len(c_arr)):
+        if   c_arr[i] > c_arr[i - 1]: obv_vals.append(obv_vals[-1] + v_arr[i])
+        elif c_arr[i] < c_arr[i - 1]: obv_vals.append(obv_vals[-1] - v_arr[i])
+        else:                          obv_vals.append(obv_vals[-1])
+    ind["obv"] = float(obv_vals[-1])
+
+    # ── Volume → ratio to volume_sma20 ───────────────────────────────────────
+    # FIX (2026-07-24): this local _compute_indicators duplicate had diverged
+    # from src/intraday_data_collector.py's _normalize(), which divides
+    # volume_sma5/volume_sma10/obv by volume_sma20 so they're scale-free
+    # ratios (matching how the model was trained) instead of raw share
+    # counts. That missing step was producing t1_close_Volume_MA5,
+    # t1_open_Volume_MA5, and t1_open_Volume_MA10 values in the hundreds of
+    # thousands to millions live, versus a ~0.5-3.0 ratio in training —
+    # a multi-million-x scale mismatch after StandardScaler transform.
+    _safe_vm20 = vm20.replace(0, np.nan)
+    _last_vm20 = float(vm20.iloc[-1]) if len(vm20) else 0.0
+    ind["volume_sma5"]  = safe(vm5 / _safe_vm20, 1.0)
+    ind["volume_sma10"] = safe(vm10 / _safe_vm20, 1.0)
+    ind["obv"]          = (ind["obv"] / _last_vm20) if _last_vm20 else 0.0
+    ind["volume_sma20"] = 1.0
+
+    # ── CMF ────────────────────────────────────────────────────────────────
+    # FIX: this was missing the rolling .sum() on the numerator entirely.
+    # ta.volume.ChaikinMoneyFlowIndicator (the real training-time source for
+    # "cmf"/CMF_20) is sum(money_flow_volume, window) / sum(volume, window).
+    # The previous code computed mf_mult * v (a single bar's money-flow
+    # volume, via safe()'s .iloc[-1]) divided by the rolling SUM of volume —
+    # mixing a one-bar numerator with a 20-bar-summed denominator, which
+    # isn't CMF at all, just a differently-scaled and differently-behaved
+    # quantity that happens to share its name. Also matches ta's mfv.fillna(0)
+    # step (rather than dropping/propagating NaN from a zero-range bar into
+    # the window sum) so a single zero-range bar doesn't NaN out the whole
+    # rolling sum it falls inside.
+    # With <20 bars v.rolling(20).sum() is all-NaN, causing safe() to return
+    # 0.0 (instead of a real Chaikin Money Flow value). Use the full
+    # available window when fewer than 20 bars are present so the feature
+    # carries a real signal.
+    mf_mult = ((c - l) - (h - c)) / (h - l).replace(0, np.nan)
+    mfv = (mf_mult * v).fillna(0.0)
+    _cmf_win = min(20, len(v))
+    _mfv_roll_sum = mfv.rolling(_cmf_win).sum()
+    _v_roll_sum = v.rolling(_cmf_win).sum().replace(0, np.nan)
+    ind["cmf"] = safe(_mfv_roll_sum / _v_roll_sum, 0.0)
+
+    # ── CCI ────────────────────────────────────────────────────────────────
+    tp    = (h + l + c) / 3
+    tp_ma = tp.rolling(20).mean()
+    tp_md = tp.rolling(20).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    ind["cci20"] = safe((tp - tp_ma) / (0.015 * tp_md.replace(0, np.nan)), 0.0)
+
+    # ── AO / MOM / ROC ─────────────────────────────────────────────────────
+    ind["ao"]  = safe((h + l).rolling(5).mean() / 2 - (h + l).rolling(34).mean() / 2, 0.0)
+    ind["mom"] = safe(c.diff(10), 0.0)
+    ind["roc"] = safe(c.pct_change(10) * 100, 0.0)
+
+    # TSI (True Strength Index)
+    pc        = c.diff(1)
+    double_smooth_pc  = pc.ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    double_smooth_apc = pc.abs().ewm(span=25, adjust=False).mean().ewm(span=13, adjust=False).mean()
+    tsi_denom = double_smooth_apc.replace(0, np.nan)
+    tsi_series = 100 * double_smooth_pc / tsi_denom
+    ind["tsi"]       = safe(tsi_series, 0.0)
+    # NOTE: previously had ind["kst"] = ind["tsi"] here — a bare duplicate of
+    # the TSI value mislabeled as KST (a structurally different indicator,
+    # never actually computed in this file). t1_column_map.py no longer maps
+    # "kst" to anything, so that duplicate was dead weight. Removed rather
+    # than left in place, to avoid it being mistaken for real signal later.
+
+    # ── Ultimate Oscillator ────────────────────────────────────────────────
+    bp   = c - pd.concat([l, c.shift()], axis=1).min(axis=1)
+    tr_u = (pd.concat([h, c.shift()], axis=1).max(axis=1)
+            - pd.concat([l, c.shift()], axis=1).min(axis=1))
+    a7  = bp.rolling(7).sum()  / tr_u.rolling(7).sum().replace(0, np.nan)
+    a14 = bp.rolling(14).sum() / tr_u.rolling(14).sum().replace(0, np.nan)
+    a28 = bp.rolling(28).sum() / tr_u.rolling(28).sum().replace(0, np.nan)
+    ind["uo"] = safe(100 * (4 * a7 + 2 * a14 + a28) / 7, 50.0)
+
+    # ── Volatility (annualised HV) ─────────────────────────────────────────
+    log_ret = np.log(c / c.shift(1))
+    for hv_w, col_name in [(10, "volatility_10d"), (20, "volatility_20d"), (30, "volatility_30d")]:
+        ind[col_name] = safe(log_ret.rolling(hv_w).std() * np.sqrt(252 * 78) * 100, 0.0)
+
+    # ── Price changes ──────────────────────────────────────────────────────
+    for n, col_name in [(1, "price_change_1d"), (2, "price_change_2d"),
+                         (3, "price_change_3d"), (5, "price_change_5d")]:
+        if len(c) > n:
+            prev = float(c.iloc[-(n + 1)])
+            ind[col_name] = ((close_v / prev) - 1) * 100 if prev else 0.0
+
+    # ── Gap ────────────────────────────────────────────────────────────────
+    if len(c) > 1:
+        prev_bar = float(c.iloc[-2])
+        if prev_bar:
+            ind["gap_%"] = (float(o.iloc[0]) / prev_bar - 1) * 100
+
+    # ── Aroon ──────────────────────────────────────────────────────────────
+    # Always compute Aroon regardless of bar count to avoid train/test skew.
+    # When fewer than 26 bars are available (e.g. the open window with ~12
+    # bars), we use the actual available window length so that a real signal
+    # is produced instead of being silently omitted and later filled with the
+    # model's _get_default_value() fallback (typically 0 or median).
+    aroon_win = min(26, len(h))
+    if aroon_win >= 2:
+        hi_idx = h.rolling(aroon_win).apply(lambda x: float(np.argmax(x)), raw=True)
+        lo_idx = l.rolling(aroon_win).apply(lambda x: float(np.argmin(x)), raw=True)
+        aroon_denom = float(aroon_win - 1) if aroon_win > 1 else 1.0
+        ind["aroon_up"]        = safe(hi_idx / aroon_denom * 100, 50.0)
+        ind["aroon_down"]      = safe(lo_idx / aroon_denom * 100, 50.0)
+        ind["aroon_indicator"] = ind["aroon_up"] - ind["aroon_down"]
+    else:
+        ind["aroon_up"]        = 50.0
+        ind["aroon_down"]      = 50.0
+        ind["aroon_indicator"] = 0.0
+
+    # VWAP
+    try:
+        tp_vwap = (h + l + c) / 3
+        cum_vol = v.cumsum().replace(0, np.nan)
+        vwap_series = (tp_vwap * v).cumsum() / cum_vol
+        ind["vwap"] = safe(vwap_series, close_v)
+    except Exception:
+        ind["vwap"] = close_v
+
+    # ── HMA (Hull Moving Average) ─────────────────────────────────────────
+    for n, col_name in [(9, "hma9"), (20, "hma20")]:
+        try:
+            half = n // 2
+            sqrt_n = int(round(n ** 0.5))
+            weights_half = np.arange(1, half + 1, dtype=float)
+            weights_n    = np.arange(1, n + 1, dtype=float)
+            weights_sqrt = np.arange(1, sqrt_n + 1, dtype=float)
+            wma_half = c.rolling(half).apply(
+                lambda x: np.dot(x, weights_half[-len(x):]) / weights_half[-len(x):].sum(), raw=True)
+            wma_n = c.rolling(n).apply(
+                lambda x: np.dot(x, weights_n[-len(x):]) / weights_n[-len(x):].sum(), raw=True)
+            hma_raw = 2 * wma_half - wma_n
+            hma = hma_raw.rolling(sqrt_n).apply(
+                lambda x: np.dot(x, weights_sqrt[-len(x):]) / weights_sqrt[-len(x):].sum(), raw=True)
+            ind[col_name] = safe(hma, float(c.mean()))
+        except Exception:
+            ind[col_name] = float(c.mean())
+
+    # ── Price vs SMA50 ───────────────────────────────────────────────────
+    sma50_v = ind.get("sma50") or float(c.mean())
+    ind["price_vs_sma50"] = (close_v / sma50_v - 1) * 100 if sma50_v else 0.0
+
+    # ── Slope indicators (5-bar linear slope) ────────────────────────────
+    def _slope(series, n=5):
+        s = series.dropna()
+        if len(s) < n:
+            return 0.0
+        y = s.iloc[-n:].values.astype(float)
+        x = np.arange(n, dtype=float)
+        try:
+            return float(np.polyfit(x, y, 1)[0])
+        except Exception:
+            return 0.0
+
+    sma20_series = c.rolling(20).mean()
+    ema20_series = c.ewm(span=20, adjust=False).mean()
+    rsi14_delta  = c.diff()
+    rsi14_gain   = rsi14_delta.clip(lower=0)
+    rsi14_loss   = (-rsi14_delta.clip(upper=0))
+    rsi14_ag     = rsi14_gain.ewm(com=13, min_periods=14).mean()
+    rsi14_al     = rsi14_loss.ewm(com=13, min_periods=14).mean()
+    rsi14_series = 100 - (100 / (1 + rsi14_ag / rsi14_al.replace(0, np.nan)))
+
+    # Normalise the MA series to % distance from close BEFORE computing the
+    # slope (matching multiday/intraday, which diff() the already-normalised
+    # MA columns). A slope of the raw dollar MA is a dollar-per-bar figure
+    # that scales with the stock's price level, not a %-per-bar figure.
+    sma20_norm_series = (sma20_series / c.replace(0, np.nan) - 1) * 100
+    ema20_norm_series = (ema20_series / c.replace(0, np.nan) - 1) * 100
+    ind["sma_20_slope"] = _slope(sma20_norm_series)
+    ind["ema_20_slope"] = _slope(ema20_norm_series)
+    ind["rsi_14_slope"] = _slope(rsi14_series)  # RSI is already 0-100, unitless
+
+    # ── Fast MACD (5/13/1) and MACD ROC ─────────────────────────────────
+    ema5_f  = c.ewm(span=5,  adjust=False).mean()
+    ema13_f = c.ewm(span=13, adjust=False).mean()
+    macd_fast_line = ema5_f - ema13_f
+    macd_fast_sig  = macd_fast_line.ewm(span=1, adjust=False).mean()
+    ind["macd_fast"]  = safe(macd_fast_line)
+    ind["macdh_fast"] = safe(macd_fast_line - macd_fast_sig)
+    ind["macds_fast"] = safe(macd_fast_sig)
+    # MACD ROC = rate of change of standard MACD line
+    # Matches base training (multiday_feature_collector.py):
+    #   df["macd_roc"] = df["MACD_12_26_9"].pct_change(1) * 100
+    # Previously used pct_change(3), a 3-bar window that didn't match the
+    # 1-bar window base training was actually computed with.
+    macd_std = ema12 - ema26  # already computed above
+    ind["macd_roc"] = safe(macd_std.pct_change(1) * 100, 0.0)
+
+    # ── Stochastic variants ───────────────────────────────────────────────
+    stk_raw = (100 * (c - l.rolling(14).min()) /
+               (h.rolling(14).max() - l.rolling(14).min()).replace(0, np.nan))
+    stk_smooth = stk_raw.rolling(3).mean()
+    ind["stochh_14_3_3"] = safe(stk_smooth.rolling(3).max(), 50.0)
+
+    # STOCH 5,3,1
+    lo5  = l.rolling(5).min()
+    hi5  = h.rolling(5).max()
+    rng5 = (hi5 - lo5).replace(0, np.nan)
+    stk5 = (100 * (c - lo5) / rng5).rolling(3).mean()
+    std5 = stk5.rolling(1).mean()
+    ind["stochk_5_3_1"] = safe(stk5, 50.0)
+    ind["stochd_5_3_1"] = safe(std5, 50.0)
+    ind["stochh_5_3_1"] = safe(stk5.rolling(1).max(), 50.0)
+
+    # ── StochRSI ─────────────────────────────────────────────────────────
+    rsi_s   = rsi14_series
+    rsi_min = rsi_s.rolling(14).min()
+    rsi_max = rsi_s.rolling(14).max()
+    stoch_rsi = (rsi_s - rsi_min) / (rsi_max - rsi_min).replace(0, np.nan)
+    stochrsi_k = stoch_rsi.rolling(3).mean() * 100
+    stochrsi_d = stochrsi_k.rolling(3).mean()
+    ind["stochrsik_14_14_3_3"] = safe(stochrsi_k, 50.0)
+    ind["stochrsid_14_14_3_3"] = safe(stochrsi_d, 50.0)
+
+    # ── CCI 14 ───────────────────────────────────────────────────────────
+    tp14   = (h + l + c) / 3
+    tp_ma14 = tp14.rolling(14).mean()
+    tp_md14 = tp14.rolling(14).apply(lambda x: np.abs(x - x.mean()).mean(), raw=True)
+    ind["cci"] = safe((tp14 - tp_ma14) / (0.015 * tp_md14.replace(0, np.nan)), 0.0)
+
+    # ── OBV SMA20 ─────────────────────────────────────────────────────────
+    # With <20 bars (typical in the open window) rolling(20) is all-NaN.
+    # Fall back to the mean of whatever OBV values we do have so the feature
+    # is populated with a real signal rather than 0.0, which would introduce
+    # train/test skew vs. the full-session close window.
+    obv_series = pd.Series(obv_vals, index=c.index)
+    obv_sma20_raw = obv_series.rolling(20).mean()
+    _obv_sma20_val = safe(obv_sma20_raw, float("nan"))
+    if _obv_sma20_val != _obv_sma20_val:  # isnan check without import
+        _obv_sma20_val = float(obv_series.mean()) if len(obv_series) > 0 else 0.0
+    # Same ratio-to-volume_sma20 treatment already applied to `obv` itself
+    # above (the 2026-07-24 fix) — obv_sma20 is a moving average OF that same
+    # cumulative-volume series, so it needs the identical scale-free ratio,
+    # not raw absolute share counts.
+    ind["obv_sma20"] = (_obv_sma20_val / _last_vm20) if _last_vm20 else 0.0
+
+    # ── ADXR (ADX smoothed) ───────────────────────────────────────────────
+    adx_series = dx.rolling(14).mean()
+    ind["adxr"] = safe(adx_series.rolling(2).mean(), 20.0)
+
+    # ── MFI 14 (Money Flow Index) ─────────────────────────────────────────
+    tp_mfi = (h + l + c) / 3
+    mf     = tp_mfi * v
+    pos_mf = mf.where(tp_mfi > tp_mfi.shift(1), 0.0)
+    neg_mf = mf.where(tp_mfi < tp_mfi.shift(1), 0.0)
+    mfr    = pos_mf.rolling(14).sum() / neg_mf.rolling(14).sum().replace(0, np.nan)
+    ind["mfi"] = safe(100 - (100 / (1 + mfr)), 50.0)
+
+    # ── ROC 20 and MOM 20 ─────────────────────────────────────────────────
+    ind["roc20"] = safe(c.pct_change(20) * 100, 0.0)
+    ind["mom20"] = safe(c.diff(20), 0.0)
+
+    # ── Supertrend (10, 3) ────────────────────────────────────────────────
+    try:
+        atr10 = tr.rolling(10).mean()
+        basic_upper = (h + l) / 2 + 3 * atr10
+        basic_lower = (h + l) / 2 - 3 * atr10
+        final_upper = basic_upper.copy()
+        final_lower = basic_lower.copy()
+        supertrend  = pd.Series(np.nan, index=c.index)
+        direction   = pd.Series(1, index=c.index)
+        for i in range(1, len(c)):
+            fu_prev = final_upper.iloc[i-1]
+            fl_prev = final_lower.iloc[i-1]
+            final_upper.iloc[i] = (
+                basic_upper.iloc[i]
+                if basic_upper.iloc[i] < fu_prev or c.iloc[i-1] > fu_prev
+                else fu_prev
+            )
+            final_lower.iloc[i] = (
+                basic_lower.iloc[i]
+                if basic_lower.iloc[i] > fl_prev or c.iloc[i-1] < fl_prev
+                else fl_prev
+            )
+            if pd.isna(supertrend.iloc[i-1]):
+                supertrend.iloc[i] = final_upper.iloc[i]
+                direction.iloc[i]  = -1
+            elif supertrend.iloc[i-1] == fu_prev:
+                if c.iloc[i] <= final_upper.iloc[i]:
+                    supertrend.iloc[i] = final_upper.iloc[i]
+                    direction.iloc[i]  = -1
+                else:
+                    supertrend.iloc[i] = final_lower.iloc[i]
+                    direction.iloc[i]  = 1
+            else:
+                if c.iloc[i] >= final_lower.iloc[i]:
+                    supertrend.iloc[i] = final_lower.iloc[i]
+                    direction.iloc[i]  = 1
+                else:
+                    supertrend.iloc[i] = final_upper.iloc[i]
+                    direction.iloc[i]  = -1
+        ind["supert"]   = safe(supertrend, close_v)
+        ind["supert_d"] = safe(direction.astype(float), 1.0)
+        ind["supert_l"] = safe(final_lower, close_v)
+        ind["supert_s"] = safe(final_upper, close_v)
+    except Exception:
+        ind["supert"]   = close_v
+        ind["supert_d"] = 1.0
+        ind["supert_l"] = close_v
+        ind["supert_s"] = close_v
+
+    # ── Normalise every remaining dollar-scale indicator ─────────────────────
+    # This duplicates the normalisation blocks in
+    # src/multiday_feature_collector.py and src/intraday_data_collector.py,
+    # which run at data-collection time on the training data. This function
+    # is a THIRD, independent reimplementation used for live t1_close_*/
+    # t1_open_* scoring, and it never had the equivalent step — so every
+    # dollar-scale indicator below was written straight through in raw
+    # dollar terms while the model was trained on %-of-close / %-distance
+    # versions of the same features. That mismatch (verified against
+    # multiday_feature_collector.py's normalisation list) is what produced
+    # things like t1_open_MOM_10 percentiles in the tens of thousands after
+    # the StandardScaler transform — MOM was only ever fixed at the collector
+    # level, not here.
+    #
+    # Three normalisation strategies (matching the collectors exactly):
+    #   A. Dollar bands/lines → (value / close - 1) * 100  = % distance from close
+    #   B. Signed dollar diffs → value / close * 100        = % of close
+    #   C. ATR (dollar in this `ta`-based implementation, unlike pandas_ta's
+    #      ATRr used at training time, which is already % of close)
+    _safe_close_v = close_v if close_v not in (0, 0.0) else None
+
+    if _safe_close_v:
+        # A. Moving averages / bands / channels / VWAP / Supertrend bands
+        #    → % distance from close
+        for _col in [
+            "sma5", "sma10", "sma20", "sma50",
+            "ema5", "ema10", "ema12", "ema20", "ema26", "ema50",
+            "wma10", "wma20",
+            "hma9", "hma20",
+            "bb.upper", "bb.lower", "bb.middle",
+            "keltner_upper", "keltner_lower", "keltner_middle",
+            "donchian_upper", "donchian_lower", "donchian_middle",
+            "vwap",
+            "supert", "supert_l", "supert_s",   # supert_d (±1 direction) is unitless — left alone
+        ]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = (ind[_col] / _safe_close_v - 1) * 100
+
+        # B. Signed dollar differences (MACD variants, MOM, AO) → % of close
+        for _col in [
+            "macd.macd", "macd.signal", "macd_diff",
+            "macd_fast", "macdh_fast", "macds_fast",
+            "mom", "mom20",
+            "ao",
+        ]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = ind[_col] / _safe_close_v * 100
+
+        # C. ATR variants → % of close
+        for _col in ["atr", "atr7", "atr20"]:
+            if _col in ind and ind[_col] is not None:
+                ind[_col] = ind[_col] / _safe_close_v * 100
+        if "atr" in ind:
+            ind["atr14"] = ind["atr"]   # re-derive alias from the now-normalised value
+
+    # ── Re-derive MA-spread features from the now-normalised (%-of-close)
+    # values ──────────────────────────────────────────────────────────────
+    # These were originally computed above from the raw dollar MAs, which
+    # gives a dollar-scale spread. multiday_feature_collector.py computes
+    # these AFTER normalising each MA to % of close, so the result is a
+    # %-point spread instead — re-derive here the same way, now that sma20/
+    # sma50/ema12/ema26 have been normalised in place above.
+    if "ema12" in ind and "ema26" in ind:
+        ind["ema_12_26_diff"] = ind["ema12"] - ind["ema26"]
+    if "sma20" in ind and "sma50" in ind:
+        ind["sma_20_50_diff"] = ind["sma20"] - ind["sma50"]
+
+    return ind
+
+
+# ---------------------------------------------------------------------------
+# FIX 9 (revised): Fetch real T-3/T-5/T-10 daily-bar snapshots
+# ---------------------------------------------------------------------------
+
+# Calendar days of lookback needed so that all MAs (up to SMA_50) have
+# enough history even when the furthest offset is T-10.
+_MULTIDAY_LOOKBACK_DAYS = 120
+
+# Offset in calendar days for each flat prefix — must match the training
+# pipeline in multiday_feature_collector.py exactly.
+_MULTIDAY_TIMEFRAMES = {"t3": 3, "t5": 5, "t10": 10}
+
+
+def _fetch_real_multiday_features(
+    symbol: str,
+    detection_date: "datetime",
+    result: dict,
+    logger: "logging.Logger",
+) -> None:
+    """
+    Fetch daily OHLCV bars from yfinance and write genuine T-3, T-5, and T-10
+    indicator snapshots into `result` under the t3_*/t5_*/t10_* keys.
+
+    Uses the same _compute_indicators logic and PANDAS_TA_TO_BASE column map
+    as multiday_feature_collector.py so that prediction-time features are
+    identical in structure to the training-time features.
+    """
+    try:
+        from src.multiday_feature_collector import (
+            _compute_indicators as _daily_compute,
+            _snapshot_for_offset,
+            PANDAS_TA_TO_BASE,
+        )
+    except ImportError as exc:
+        logger.warning(
+            f"{symbol}: could not import multiday_feature_collector — "
+            f"t3/t5/t10 features will be absent ({exc})"
+        )
         return
 
-    n_pos = int((base_df['label'] == 1).sum())
-    n_neg = int((base_df['label'] == 0).sum())
-    pos_rate = n_pos / len(base_df)
-    
-    logger.info(f"BASE DATA AUDIT:")
-    logger.info(f"  Positive rate: {pos_rate:.1%}  ({n_pos} pos / {n_neg} neg)")
-    
-    if pos_rate > 0.40:
-        logger.error(
-            f"CRITICAL: Base data has {pos_rate:.1%} positive rate. "
-            "This is way too high for explosive-stock prediction. "
-            "Expected ~5-20%. Your ml_training_base table likely has "
-            "far too few non-winner rows. Check upload_base_training_data.py."
-        )
-    
-    # Check if 'source' column tells us where the imbalance comes from
-    if 'source' in base_df.columns:
-        logger.info(f"  Label breakdown by source:")
-        for src, grp in base_df.groupby('source'):
-            p = (grp['label'] == 1).mean()
-            logger.info(f"    {src}: {p:.1%} positive ({len(grp)} rows)")
-    
-    # Check intraday relabelling impact
-    # NOTE: previously hardcoded to 15.0, which had drifted out of sync with
-    # INTRADAY_WIN_THRESHOLD (20.0) used by apply_intraday_high_labels() — this
-    # diagnostic was overstating how many rows would actually get upgraded.
-    if 'actual_high_pct' in base_df.columns:
-        would_upgrade = (
-            (base_df['label'] == 0) & 
-            (pd.to_numeric(base_df['actual_high_pct'], errors='coerce') >= INTRADAY_WIN_THRESHOLD)
-        ).sum()
-        logger.info(f"  Rows intraday_high_labels would upgrade: {would_upgrade}")
-
-
-def load_multiday_data(client: Client, lookback_days: Optional[int] = None) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Load the backfilled / daily-generated T-3/T-5/T-10 feature tables.
-
-    Returns two DataFrames (winners_multiday, non_winners_multiday), each
-    indexed by (symbol, detection_date) and containing only the t3_/t5_/t10_
-    feature columns plus those two key columns.
-
-    These are joined onto the T-1 rows inside load_t1_data() so that every
-    T-1 training row ends up with the full feature set the model expects.
-    """
-    result = {}
-    for table, key in [
-        (TABLE_WINNERS_MULTIDAY,     "winners"),
-        (TABLE_NON_WINNERS_MULTIDAY, "non_winners"),
-    ]:
-        try:
-            df = fetch_table_paginated(
-                client, table,
-                date_columns=["detection_date"],
-                cutoff_date=_fetch_cutoff(lookback_days),
-            )
-            if df.empty:
-                logger.warning(f"  {table}: table is empty or does not exist")
-                result[key] = pd.DataFrame()
-                continue
-
-            logger.info(f"  {table}: raw fetch {len(df)} rows, sample cols: {sorted(df.columns.tolist())[:15]}")
-
-            # Keep only key columns + feature columns (drop Supabase bookkeeping)
-            keep = {"symbol", "detection_date"}
-            feature_cols = [c for c in df.columns
-                            if c.startswith(("t3_", "t5_", "t10_"))]
-
-            if not feature_cols:
-                logger.warning(
-                    f"  {table}: NO t3_/t5_/t10_ columns found! "
-                    f"All columns: {sorted(df.columns.tolist())}"
-                )
-                result[key] = pd.DataFrame()
-                continue
-
-            keep.update(feature_cols)
-            df = df[[c for c in df.columns if c in keep]].copy()
-
-            # Normalise detection_date to plain string YYYY-MM-DD for joining
-            df["detection_date"] = pd.to_datetime(
-                df["detection_date"], errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-            df = df.dropna(subset=["symbol", "detection_date"])
-
-            # Drop dupes (shouldn't happen but be safe)
-            df = df.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-
-            sample_dates = df["detection_date"].dropna().head(3).tolist()
-            logger.info(
-                f"  {table}: {len(df)} rows, "
-                f"{len(feature_cols)} multiday feature columns, "
-                f"sample dates: {sample_dates}"
-            )
-            result[key] = df
-
-        except Exception as e:
-            logger.error(f"Could not load '{table}': {e}", exc_info=True)
-            result[key] = pd.DataFrame()
-
-    return result.get("winners", pd.DataFrame()), result.get("non_winners", pd.DataFrame())
-
-
-def _join_multiday(
-    t1_df: pd.DataFrame,
-    multiday_df: pd.DataFrame,
-    table_name: str,
-) -> pd.DataFrame:
-    """
-    Left-join multiday (t3_/t5_/t10_) features onto a T-1 DataFrame.
-
-    Rows without a matching multiday entry keep NaN for the multiday columns —
-    XGBoost handles this natively, so they still contribute intraday signal.
-    """
-    if multiday_df.empty:
-        logger.warning(
-            f"  {table_name}: no multiday data to join — "
-            "t3/t5/t10 features will be NaN for these rows"
-        )
-        return t1_df
-
-    # Normalise detection_date in t1_df to the same plain string format
-    if "detection_date" not in t1_df.columns:
-        logger.warning(f"  {table_name}: no detection_date column, skipping multiday join")
-        return t1_df
-
-    t1_copy = t1_df.copy()
-    t1_copy["detection_date"] = pd.to_datetime(
-        t1_copy["detection_date"], errors="coerce"
-    ).dt.strftime("%Y-%m-%d")
-
-    sym_col = next((c for c in ["symbol", "ticker"] if c in t1_copy.columns), None)
-    if not sym_col:
-        logger.warning(f"  {table_name}: no symbol column, skipping multiday join")
-        return t1_df
-
-    # Diagnostic: show sample keys from both sides so date format mismatches are obvious
-    t1_sample = list(zip(
-        t1_copy[sym_col].head(3).tolist(),
-        t1_copy["detection_date"].head(3).tolist()
-    ))
-    md_sample = list(zip(
-        multiday_df["symbol"].head(3).tolist(),
-        multiday_df["detection_date"].head(3).tolist()
-    ))
-    logger.info(f"  {table_name}: T-1 join keys sample    : {t1_sample}")
-    logger.info(f"  {table_name}: multiday join keys sample: {md_sample}")
-
-    before_cols = len(t1_copy.columns)
-    merged = t1_copy.merge(
-        multiday_df,
-        left_on=[sym_col, "detection_date"],
-        right_on=["symbol", "detection_date"],
-        how="left",
-        suffixes=("", "_md"),
-    )
-
-    # If sym_col != "symbol", the merge introduced a duplicate "symbol" column — drop it
-    if sym_col != "symbol" and "symbol" in merged.columns:
-        merged = merged.drop(columns=["symbol"])
-
-    multiday_cols_added = [c for c in merged.columns
-                           if c.startswith(("t3_", "t5_", "t10_"))
-                           and c not in t1_df.columns]
-    n_matched = merged[multiday_cols_added[0]].notna().sum() if multiday_cols_added else 0
-
-    logger.info(
-        f"  {table_name}: joined {len(multiday_cols_added)} multiday columns, "
-        f"{n_matched}/{len(merged)} rows have multiday data "
-        f"({n_matched/len(merged)*100:.0f}% coverage)"
-    )
-    return merged
-
-def load_t1_data(client: Client, lookback_days: Optional[int] = None) -> pd.DataFrame:
-    """
-    Load accumulated T-1 winner and non-winner samples, then join in the
-    corresponding T-3/T-5/T-10 multiday features so every row has the full
-    feature set the model expects.
-
-    Column flow
-    -----------
-    T-1 intraday columns  → renamed via t1_column_map → t1_close_* / t1_open_*
-    Multiday columns      → loaded separately          → t3_* / t5_* / t10_*
-    Both are joined on (symbol, detection_date) into one unified row.
-
-    Fix: close and open tables for the same label are merged into a single row
-    per (symbol, detection_date) — t1_close_* features from the close snapshot
-    and t1_open_* features from the open snapshot coexist in the same row.
-    Previously they were concatenated as separate rows, causing every T-1 event
-    to appear twice and inflating validation AUC via near-identical duplicates.
-    """
-    logger.info("Loading accumulated T-1 training data...")
-
-    # Load multiday tables once — reused for both open and close variants
-    logger.info("Loading multiday feature tables for T-1 enrichment...")
-    winners_multiday, non_winners_multiday = load_multiday_data(client, lookback_days=lookback_days)
-
-    # Each label (winner=1, non-winner=0) has a close table and an open table.
-    # We load them as paired groups and merge close+open features into a single
-    # row per (symbol, detection_date) so the same event is never duplicated.
-    PAIR_CONFIG = [
-        # (close_table,           open_table,             label, multiday_df)
-        (TABLE_WINNERS_CLOSE,    TABLE_WINNERS_OPEN,    1, winners_multiday),
-        (TABLE_NON_WINNERS_CLOSE, TABLE_NON_WINNERS_OPEN, 0, non_winners_multiday),
-    ]
-
-    # Metadata columns that exist in both tables but should not be prefixed.
-    # We keep the close-table copy and ignore the open-table copy on merge.
-    META_COLS = {"symbol", "detection_date", "label", "source",
-                 "explosion_date", "interval", "days_since_event",
-                 "t3_high_pct", "t5_high_pct", "t10_high_pct"}  # multiday cols added later
-
-    def _load_and_rename(table: str, prefix: str) -> pd.DataFrame:
-        """Fetch one table and rename its intraday feature columns."""
-        df = fetch_table_paginated(
-            client, table,
-            date_columns=["detection_date"],
-            cutoff_date=_fetch_cutoff(lookback_days),
-        )
-        if df.empty:
-            return df
-        df["label"]  = -1          # placeholder; caller sets the real value
-        df["source"] = table
-
-        # ── Non-winners price ceiling guard ────────────────────────────────
-        # non_winners_day_prior_close contains historical rows with prices far
-        # above the $50 range winners are drawn from. Rather than backfilling
-        # or cleaning the table, filter them out here at fetch time so every
-        # future retrain excludes this contamination immediately. Historical
-        # rows in Supabase are left untouched.
-        if table == TABLE_NON_WINNERS_CLOSE and "close" in df.columns:
-            before_n = len(df)
-            df["close"] = pd.to_numeric(df["close"], errors="coerce")
-            df = df[df["close"] <= 50.0]
-            dropped = before_n - len(df)
-            if dropped > 0:
-                logger.info(
-                    f"  {table}: dropped {dropped} row(s) with close > $50.0 "
-                    f"({before_n} -> {len(df)})"
-                )
-        if T1_MAP_AVAILABLE:
-            before = len(df.columns)
-            df     = rename_t1_columns(df, prefix=prefix)
-            after  = len([c for c in df.columns if c.startswith(prefix)])
-            logger.info(
-                f"  {table}: renamed {after} feature columns "
-                f"(had {before}, kept metadata + {after} features)"
-            )
-            dupes = df.columns[df.columns.duplicated()].tolist()
-            if dupes:
-                logger.warning(
-                    f"  {table}: dropping {len(dupes)} duplicate column(s) "
-                    f"after rename: {dupes[:10]}"
-                )
-                df = df.loc[:, ~df.columns.duplicated(keep="first")]
-            # Normalise any features that are still in raw dollar / cumulative-
-            # volume scale.  Rows collected after the intraday_data_collector fix
-            # are already normalised and will be detected as such and skipped.
-            # Older rows are normalised here so training always uses scale-free
-            # features regardless of when the row was collected.
-            df = normalise_t1_features(df, prefix=prefix)
-        else:
-            logger.warning(
-                f"  {table}: column map unavailable — "
-                "T-1 features will be NaN in model (not ideal but won't crash)"
-            )
-        return df
-
-    frames = []
-
-    for close_table, open_table, label, multiday_df in PAIR_CONFIG:
-        try:
-            close_df = _load_and_rename(close_table, prefix="t1_close")
-            open_df  = _load_and_rename(open_table,  prefix="t1_open")
-
-            if close_df.empty and open_df.empty:
-                continue
-
-            if close_df.empty:
-                # Only open data available — no close features, proceed with open only
-                logger.warning(
-                    f"  {close_table}: empty — using open-only rows for label={label}"
-                )
-                merged = open_df
-            elif open_df.empty:
-                # Only close data available
-                logger.warning(
-                    f"  {open_table}: empty — using close-only rows for label={label}"
-                )
-                merged = close_df
-            else:
-                # ── Merge close + open into one row per (symbol, detection_date) ──
-                # Keep only t1_open_* feature columns from open_df (drop shared
-                # metadata so we don't get _x/_y suffixes after the merge).
-                open_feature_cols = [c for c in open_df.columns if c.startswith("t1_open_")]
-                join_key = ["symbol", "detection_date"]
-                # Guard: only keep join keys that actually exist in open_df
-                open_key_cols = [c for c in join_key if c in open_df.columns]
-                # Carry open's t1_data_source along under a temp name so a row
-                # whose close-side snapshot is missing/untagged can still be
-                # weighted correctly off the open-side tag (coalesced below).
-                # We don't just prefer open over close -- close's tag is kept
-                # canonical when both are present, matching the existing
-                # "close-table metadata wins" convention for this merge.
-                carry_cols = list(open_feature_cols)
-                has_open_source = "t1_data_source" in open_df.columns
-                if has_open_source:
-                    open_df = open_df.rename(columns={"t1_data_source": "_open_t1_data_source"})
-                    carry_cols.append("_open_t1_data_source")
-                open_slim = open_df[open_key_cols + carry_cols]
-
-                merged = close_df.merge(
-                    open_slim,
-                    on=open_key_cols,
-                    how="outer",       # keep rows that exist in only one table
-                    suffixes=("", "_open_dup"),
-                )
-                # Drop any accidental duplicate suffix columns
-                dup_cols = [c for c in merged.columns if c.endswith("_open_dup")]
-                if dup_cols:
-                    merged = merged.drop(columns=dup_cols)
-
-                # Coalesce t1_data_source: prefer close's tag (canonical, per
-                # the "close-table metadata wins" convention above), fall back
-                # to open's tag only when close's is missing/NaN.
-                if "_open_t1_data_source" in merged.columns:
-                    if "t1_data_source" in merged.columns:
-                        merged["t1_data_source"] = merged["t1_data_source"].fillna(
-                            merged["_open_t1_data_source"]
-                        )
-                    else:
-                        merged["t1_data_source"] = merged["_open_t1_data_source"]
-                    merged = merged.drop(columns=["_open_t1_data_source"])
-
-                # Deduplicate within this label's merged frame (outer join can
-                # introduce duplicates when join keys match multiple times)
-                sym_col_local = next(
-                    (c for c in ["symbol", "ticker"] if c in merged.columns), None
-                )
-                if sym_col_local and "detection_date" in merged.columns:
-                    before_n = len(merged)
-                    merged = merged.drop_duplicates(
-                        subset=[sym_col_local, "detection_date"], keep="first"
-                    )
-                    if len(merged) < before_n:
-                        logger.info(
-                            f"  label={label}: dropped {before_n - len(merged)} "
-                            "intra-label duplicates after close+open merge"
-                        )
-
-                logger.info(
-                    f"  label={label}: merged {len(close_df)} close rows + "
-                    f"{len(open_df)} open rows → {len(merged)} unique events"
-                )
-
-            merged["label"]  = label
-            merged["source"] = close_table   # canonical source for this label group
-
-            # ── Join multiday (t3/t5/t10) features ───────────────────────────
-            merged = _join_multiday(merged, multiday_df, close_table)
-
-            frames.append(merged)
-
-        except Exception as e:
-            logger.warning(f"Could not load T-1 pair ({close_table}, {open_table}): {e}")
-
-    if not frames:
-        logger.warning("No T-1 data found. Training on base data only.")
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True, sort=False)
-    combined["sample_weight"] = T1_WEIGHT
-
-    if "t1_data_source" in combined.columns:
-        fallback_mask = combined["t1_data_source"] == "daily_fallback"
-        n_fallback = int(fallback_mask.sum())
-        n_untagged = int(combined["t1_data_source"].isna().sum())
-
-        propensity_w = _t1_source_propensity_weights(
-            combined["t1_data_source"], combined["label"]
-        )
-        used_propensity = not propensity_w.eq(1.0).all()
-
-        if used_propensity:
-            combined["sample_weight"] = combined["sample_weight"] * propensity_w
-            # Log the resulting per-label source mix so a skew regression is
-            # visible in retrain logs without re-running crosstab_check.py.
-            _mix = (
-                combined.assign(_w=propensity_w)
-                .groupby(["label", "t1_data_source"])["_w"]
-                .agg(["count", "mean"])
-            )
-            logger.info(
-                f"  t1_data_source: propensity-reweighted per label to match "
-                f"the overall {combined['t1_data_source'].value_counts(normalize=True).to_dict()} "
-                f"mix ({n_fallback} daily_fallback row(s), {n_untagged} untagged "
-                f"row(s) left at 1.0x). Per (label, source) multiplier:\n{_mix}"
-            )
-        else:
-            # Fallback for degenerate cases (e.g. one label has < min_cell_count
-            # tagged rows this run) where propensity reweighting couldn't be
-            # estimated for any group -- keep the old flat discount rather than
-            # silently leaving daily_fallback rows at full, unweighted trust.
-            combined.loc[fallback_mask, "sample_weight"] = (
-                combined.loc[fallback_mask, "sample_weight"] * T1_DAILY_FALLBACK_WEIGHT
-            )
-            logger.warning(
-                f"  t1_data_source: propensity reweighting was a no-op this run "
-                f"(too few rows in at least one label group) -- fell back to a "
-                f"flat {T1_DAILY_FALLBACK_WEIGHT}x discount on {n_fallback} "
-                f"daily_fallback row(s). This does NOT correct the label-skew "
-                f"leak by itself; check t1_data_source counts per label."
-            )
-    else:
-        logger.warning(
-            "  t1_data_source column not present after load/merge -- cannot "
-            "down-weight daily_fallback rows this run. Check that the "
-            "winners_day_prior_open/close and non_winners_day_prior_open/close "
-            "tables actually have a t1_data_source column (see migration note)."
-        )
-
-    t1_feature_cols = [c for c in combined.columns
-                       if c.startswith("t1_close_") or c.startswith("t1_open_")]
-    multiday_feature_cols = [c for c in combined.columns
-                             if c.startswith(("t3_", "t5_", "t10_"))]
-    non_null_t1       = combined[t1_feature_cols].notna().any().sum() if t1_feature_cols else 0
-    non_null_multiday = combined[multiday_feature_cols].notna().any().sum() if multiday_feature_cols else 0
-
-    logger.info(f"T-1 data: {len(combined)} rows, "
-                f"pos={int((combined['label']==1).sum())}, "
-                f"neg={int((combined['label']==0).sum())}")
-    logger.info(f"T-1 intraday feature columns populated : {non_null_t1}/{len(t1_feature_cols)}")
-    logger.info(f"T-1 multiday feature columns populated : {non_null_multiday}/{len(multiday_feature_cols)}")
-
-    # Warn if multiday coverage is low — most rows should have it after backfill
-    if multiday_feature_cols:
-        rows_with_any_multiday = combined[multiday_feature_cols].notna().any(axis=1).sum()
-        coverage_pct = rows_with_any_multiday / len(combined) * 100
-        if coverage_pct < 50:
-            logger.warning(
-                f"  ⚠️  Only {coverage_pct:.0f}% of T-1 rows have multiday features. "
-                "Run the backfill script (backfill_multiday_features.py) to improve coverage."
-            )
-        else:
-            logger.info(f"  ✅ {coverage_pct:.0f}% of T-1 rows have multiday features")
-
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# RC6 FIX: Enrich mistake samples with actual_gain_pct from accuracy table
-# ---------------------------------------------------------------------------
-
-def enrich_mistakes_with_gains(
-    mistake_df: pd.DataFrame,
-    client: Client,
-) -> pd.DataFrame:
-    """
-    RC6 FIX: Fetch actual_gain_pct and actual_high_pct for mistake rows from
-    ml_prediction_accuracy so they contribute to gain regressor training.
-
-    Without this, mistake rows have no gain target and are silently excluded
-    from the regressor's winner_mask, wasting the corrective signal they carry.
-
-    FIX2 (denominator consistency): ml_prediction_accuracy.actual_high_pct is
-    NOT guaranteed to be computed on the same base as
-    _compute_correct_actual_high_pct's prev_close-based value. The tracker
-    (ml_track_comprehensive_accuracy.py) prefers a prev_close-denominated
-    yfinance figure, but falls back to a same-day-close-denominated figure
-    (high / same-day price - 1) whenever yfinance data is unavailable for a
-    symbol/date. Silently merging that column in — as the previous
-    implementation did — mixes two incompatible scales into a single gain
-    target: same-day-close-based values cluster near 0% (the denominator and
-    numerator are close together intraday), while prev_close-based values
-    span the true intraday range. That is exactly the ~122pp split reported
-    in the FIX2 diagnostic.
-
-    To keep both sources on the same base, we re-derive actual_high_pct
-    directly from daily_winners via _compute_correct_actual_high_pct — the
-    same function RC2 uses for winner rows — for every mistake row we can
-    match. Only when a row has no daily_winners match (so no reliable
-    prev_close is obtainable) do we fall back to the accuracy table's value,
-    and we mark that fallback explicitly so it can be distinguished/excluded
-    downstream instead of being silently blended in as if it were on the
-    same base.
-    """
-    if mistake_df.empty:
-        return mistake_df
-
-    if "symbol" not in mistake_df.columns or "detection_date" not in mistake_df.columns:
-        return mistake_df
-
-    logger.info("RC6: Enriching mistake samples with actual gain data...")
-
-    # Collect unique (symbol, date) pairs from mistake rows
-    pairs = (
-        mistake_df[["symbol", "detection_date"]]
-        .dropna()
-        .drop_duplicates()
-    )
-
-    if pairs.empty:
-        return mistake_df
-
-    dates = pairs["detection_date"].unique().tolist()
-    symbols = pairs["symbol"].unique().tolist()
-
-    # ── Primary source: daily_winners, run through _compute_correct_actual_high_pct
-    # so the denominator (prev_close) exactly matches RC2's winner rows. ──────────
-    winners_corrected = pd.DataFrame()
     try:
-        winners_rows = []
-        for i in range(0, len(dates), 20):
-            date_chunk = dates[i:i + 20]
-            try:
-                resp = (
-                    client.table("daily_winners")
-                    .select("symbol, detection_date, price, high, open, close, prev_close_db")
-                    .in_("detection_date", date_chunk)
-                    .in_("symbol", symbols)
-                    .execute()
-                )
-                if resp.data:
-                    winners_rows.extend(resp.data)
-            except Exception as e:
-                logger.debug(f"RC6: daily_winners fetch chunk failed: {e}")
+        import yfinance as yf
 
-        if winners_rows:
-            winners_raw = pd.DataFrame(winners_rows)
-            winners_corrected = _compute_correct_actual_high_pct(winners_raw)
-    except Exception as e:
-        logger.debug(f"RC6: could not fetch/correct daily_winners for mistake rows: {e}")
-
-    # ── Fallback source: ml_prediction_accuracy (denominator not guaranteed) ────
-    accuracy_rows = []
-    for i in range(0, len(dates), 20):
-        date_chunk = dates[i:i + 20]
-        try:
-            resp = (
-                client.table("ml_prediction_accuracy")
-                .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-                .in_("prediction_date", date_chunk)
-                .in_("symbol", symbols)
-                .execute()
-            )
-            if resp.data:
-                accuracy_rows.extend(resp.data)
-        except Exception as e:
-            logger.debug(f"RC6: accuracy fetch chunk failed: {e}")
-
-    if winners_corrected.empty and not accuracy_rows:
-        logger.info("RC6: No accuracy or daily_winners data found for mistake symbols — skipping enrichment")
-        return mistake_df
-
-    result = mistake_df.copy()
-    if "actual_gain_pct" not in result.columns:
-        result["actual_gain_pct"] = np.nan
-    if "actual_high_pct" not in result.columns:
-        result["actual_high_pct"] = np.nan
-    result["_gain_source"] = "none"
-
-    # Step 1: fill from daily_winners (prev_close-based — same base as RC2).
-    n_from_winners = 0
-    if not winners_corrected.empty:
-        wc = winners_corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
-        if "change_pct" in winners_corrected.columns:
-            wc["actual_gain_pct"] = winners_corrected["change_pct"]
-        merged = result.merge(
-            wc,
-            on=["symbol", "detection_date"],
-            how="left",
-            suffixes=("", "_rc2"),
-        )
-        for col in ["actual_gain_pct", "actual_high_pct"]:
-            rc2_col = f"{col}_rc2"
-            if rc2_col in merged.columns:
-                fillable = merged[col].isna() & merged[rc2_col].notna()
-                merged.loc[fillable, col] = merged.loc[fillable, rc2_col]
-                if col == "actual_high_pct":
-                    n_from_winners = int(fillable.sum())
-                    merged.loc[fillable, "_gain_source"] = "daily_winners_prev_close"
-                merged = merged.drop(columns=[rc2_col])
-        result = merged
-
-    # Step 2: fall back to ml_prediction_accuracy ONLY for rows still missing a
-    # gain target. Tag these explicitly since their denominator may not match
-    # the prev_close base used above (the accuracy tracker can fall back to a
-    # same-day-close denominator when yfinance data is unavailable).
-    #
-    # FIX2: previously this step filled actual_high_pct from the accuracy
-    # table's raw value (whatever denominator it happened to use), tagged it
-    # '_gain_source' == 'accuracy_table_unverified_base', logged a warning
-    # about it — and then dropped the tag a few lines later, so the warning
-    # was the only trace of the problem and the unverified values were
-    # blended into the gain regressor's training pool anyway. We now only
-    # blend actual_high_pct when the row's actual_high_pct_source confirms a
-    # prev_close base (or the source column isn't present at all yet, for
-    # backward compatibility with un-migrated deployments). Same-day-price
-    # -sourced values are excluded from actual_high_pct (left NaN) rather
-    # than filled — actual_gain_pct is unaffected since it isn't used as the
-    # regressor's primary target.
-    n_from_accuracy = 0
-    n_from_accuracy_excluded = 0
-    if accuracy_rows:
-        acc_df = pd.DataFrame(accuracy_rows).rename(columns={"prediction_date": "detection_date"})
-        acc_df = acc_df.dropna(subset=["symbol", "detection_date"])
-        has_source_col = "actual_high_pct_source" in acc_df.columns
-
-        merge_cols = ["symbol", "detection_date", "actual_gain_pct", "actual_high_pct"]
-        if has_source_col:
-            merge_cols.append("actual_high_pct_source")
-
-        merged = result.merge(
-            acc_df[merge_cols],
-            on=["symbol", "detection_date"],
-            how="left",
-            suffixes=("", "_acc"),
+        fetch_start = detection_date - timedelta(days=_MULTIDAY_LOOKBACK_DAYS)
+        ticker = yf.Ticker(symbol)
+        daily_df = ticker.history(
+            start=fetch_start.strftime("%Y-%m-%d"),
+            end=(detection_date + timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval="1d",
+            auto_adjust=True,
         )
 
-        # actual_gain_pct: fill unconditionally (not the regressor's primary target).
-        acc_col = "actual_gain_pct_acc"
-        if acc_col in merged.columns:
-            fillable = merged["actual_gain_pct"].isna() & merged[acc_col].notna()
-            merged.loc[fillable, "actual_gain_pct"] = merged.loc[fillable, acc_col]
-            merged = merged.drop(columns=[acc_col])
+        if daily_df is None or daily_df.empty:
+            logger.debug(f"{symbol}: no daily bar data for multiday features")
+            return
 
-        # actual_high_pct: only fill when the denominator is verified prev_close
-        # (or unknown, for backward compatibility) — never when it's flagged
-        # as the same-day-price fallback.
-        acc_col = "actual_high_pct_acc"
-        if acc_col in merged.columns:
-            if has_source_col:
-                verified = merged["actual_high_pct_source_acc"] != "winners_table_same_day_price"
-            else:
-                verified = pd.Series(True, index=merged.index)  # no tag available — old behaviour
-            fillable = merged["actual_high_pct"].isna() & merged[acc_col].notna() & verified
-            excluded = merged["actual_high_pct"].isna() & merged[acc_col].notna() & ~verified
-            merged.loc[fillable, "actual_high_pct"] = merged.loc[fillable, acc_col]
-            merged.loc[fillable, "_gain_source"] = "accuracy_table_unverified_base"
-            n_from_accuracy = int(fillable.sum())
-            n_from_accuracy_excluded = int(excluded.sum())
-            merged = merged.drop(columns=[acc_col])
-            if has_source_col:
-                merged = merged.drop(columns=["actual_high_pct_source_acc"], errors="ignore")
-        result = merged
-        if n_from_accuracy_excluded > 0:
-            logger.info(
-                f"FIX2: Excluded {n_from_accuracy_excluded} mistake rows from actual_high_pct "
-                "fill because their accuracy-table value used the same-day-price "
-                "denominator (left as NaN instead of blending an incompatible base)."
-            )
+        # Strip timezone so index comparisons work uniformly
+        daily_df.index = pd.to_datetime(daily_df.index).tz_localize(None)
 
-    # Clip to non-negative, matching RC2's treatment, so the two sources can't
-    # diverge on sign conventions either.
-    valid = result["actual_high_pct"].notna()
-    result.loc[valid, "actual_high_pct"] = result.loc[valid, "actual_high_pct"].clip(lower=0)
+        detection_ts = pd.Timestamp(detection_date).tz_localize(None)
 
-    n_accuracy_base = int((result["_gain_source"] == "accuracy_table_unverified_base").sum())
-    if n_accuracy_base > 0:
+        filled = 0
+        for prefix, offset in _MULTIDAY_TIMEFRAMES.items():
+            snap = _snapshot_for_offset(daily_df, detection_ts, offset)
+            if not snap:
+                logger.debug(f"{symbol}: empty snapshot for {prefix} (offset={offset})")
+                continue
+            for base_name, val in snap.items():
+                if val is None:
+                    continue
+                col = f"{prefix}_{base_name}"
+                result[col] = val
+                filled += 1
+
+        logger.debug(
+            f"{symbol}: wrote {filled} real multiday features "
+            f"(t3/t5/t10) from daily bars"
+        )
+
+    except Exception as exc:
         logger.warning(
-            f"RC6/FIX2: {n_accuracy_base} mistake rows fell back to ml_prediction_accuracy's "
-            f"actual_high_pct with an unverified denominator (no matching daily_winners row "
-            f"to recompute a prev_close-based value). These are tagged '_gain_source' == "
-            f"'accuracy_table_unverified_base' and should be treated with lower confidence."
+            f"{symbol}: failed to fetch real multiday features — {exc}. "
+            "t3/t5/t10 columns will be absent for this symbol."
         )
 
-    enriched_count = result["actual_high_pct"].notna().sum()
-    logger.info(
-        f"RC6: Enriched {enriched_count}/{len(result)} mistake rows with gain data "
-        f"(daily_winners/prev_close: {n_from_winners}, accuracy_table fallback: {n_from_accuracy})"
+
+def _most_recent_completed_trading_day(logger):
+    """
+    RC13 (2026-08-13): fallback "yesterday" used when the T-1 5-min intraday
+    fetch fails, so the T-3/T-5/T-10 daily-bar fetch (a completely
+    independent yfinance call) still has a detection_date to anchor on
+    instead of being skipped along with the intraday fetch.
+    """
+    d = datetime.now().date() - timedelta(days=1)
+    while not _is_trading_day(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = False) -> dict:
+    """
+    Fetch T-1 intraday 5-min data and compute technical indicators.
+    Returns dict with t1_close_* and t1_open_* keys ready for model input.
+
+    FIX 7: t1_open_* features are now always populated.
+    FIX 9 (revised): When fill_flat_prefixes=True (hybrid model), REAL T-3/T-5/T-10
+           daily-bar snapshots are fetched via _fetch_real_multiday_features() and
+           written under t3_/t5_/t10_* columns.  The old approach of copying T-1
+           intraday indicators into all three prefix columns has been removed.
+
+    RC13 FIX (2026-08-13): the T-1 5-min intraday fetch and the T-3/T-5/T-10
+    daily-bar fetch used to live inside ONE try block with early `return {}`
+    checks on the intraday side and a blanket `except Exception: return {}`
+    at the bottom. Since 5-min intraday data is far more likely to be thin,
+    delayed, or rate-limited than daily bars — especially for the kind of
+    low-liquidity small caps an explosion screener surfaces — any intraday
+    hiccup silently wiped out the daily-bar features too, even though that's
+    a completely independent yfinance call that usually would have
+    succeeded. On a live batch this showed up as dozens of stocks going
+    100%-NaN across every t1_/t3_/t5_ feature simultaneously (see RC12 log),
+    which XGBoost's missing-value branches then routed to the same leaf —
+    an honest tie, but on essentially no real data for the majority of the
+    batch. The two fetches are now independent: an intraday failure is
+    logged with its actual exception (no more silent swallow) and no longer
+    blocks the daily-bar fetch from running.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {}
+
+    try:
+        from t1_column_map import rename_t1_columns as _rename
+        _t1_map_available = True
+    except ImportError:
+        _rename = None
+        _t1_map_available = False
+
+    result = {}
+    yesterday = None
+
+    # ── Phase 1: T-1 5-min intraday fetch (independent — failure here no ──
+    # longer blocks Phase 2 below) ──────────────────────────────────────────
+    try:
+        ticker      = yf.Ticker(symbol)
+        df_intraday = ticker.history(period="5d", interval="5m")
+
+        if df_intraday.empty or len(df_intraday) < 50:
+            logger.warning(
+                f"{symbol}: T-1 intraday fetch returned "
+                f"{0 if df_intraday.empty else len(df_intraday)} bars (< 50 "
+                "required) — t1_close_*/t1_open_* will be absent for this "
+                "symbol, but the daily-bar t3/t5/t10 fetch will still run."
+            )
+        else:
+            if df_intraday.index.tz is None:
+                df_intraday.index = df_intraday.index.tz_localize("America/New_York")
+            else:
+                df_intraday.index = df_intraday.index.tz_convert("America/New_York")
+
+            available_dates = sorted(df_intraday.index.date, reverse=True)
+            if available_dates:
+                yesterday = available_dates[0]
+                day_bars  = df_intraday[df_intraday.index.date == yesterday].copy()
+
+                if len(day_bars) < 20:
+                    logger.warning(
+                        f"{symbol}: only {len(day_bars)} T-1 intraday bars for "
+                        f"{yesterday} (< 20 required) — t1_close_*/t1_open_* "
+                        "will be absent for this symbol."
+                    )
+                else:
+                    day_bars.columns = [c.lower() for c in day_bars.columns]
+
+                    # ── Close-of-day indicators (full session) ──────────────
+                    close_indicators = _compute_indicators(
+                        day_bars["close"], day_bars["high"], day_bars["low"],
+                        day_bars["volume"], day_bars["open"]
+                    )
+
+                    # ── Open indicators (first ~1 hour of session) ───────────
+                    open_bars = day_bars[day_bars.index.time <= dt_time(10, 30)]
+
+                    open_indicators: dict = {}
+                    if len(open_bars) >= T1_OPEN_MIN_BARS:
+                        open_indicators = _compute_indicators(
+                            open_bars["close"], open_bars["high"], open_bars["low"],
+                            open_bars["volume"], open_bars["open"]
+                        )
+                        logger.debug(f"{symbol}: computed open indicators from {len(open_bars)} bars")
+                    else:
+                        logger.debug(
+                            f"{symbol}: only {len(open_bars)} open bars (< {T1_OPEN_MIN_BARS}), "
+                            "copying close indicators as open fallback"
+                        )
+                        open_indicators = dict(close_indicators)
+
+                    if _t1_map_available:
+                        # ── Rename and write t1_close_* ──────────────────────
+                        close_df      = pd.DataFrame([close_indicators])
+                        close_renamed = _rename(close_df, prefix="t1_close")
+                        for col in close_renamed.columns:
+                            val = close_renamed.iloc[0][col]
+                            if pd.notna(val):
+                                try:
+                                    result[col] = float(val)
+                                except (TypeError, ValueError):
+                                    pass
+
+                        # ── Rename and write t1_open_* ───────────────────────
+                        open_df      = pd.DataFrame([open_indicators])
+                        open_renamed = _rename(open_df, prefix="t1_open")
+                        for col in open_renamed.columns:
+                            val = open_renamed.iloc[0][col]
+                            if pd.notna(val):
+                                try:
+                                    result[col] = float(val)
+                                except (TypeError, ValueError):
+                                    pass
+                    else:
+                        for k, val in close_indicators.items():
+                            result[f"t1_close_{k}"] = val
+                        for k, val in open_indicators.items():
+                            result[f"t1_open_{k}"] = val
+    except Exception as exc:
+        logger.warning(
+            f"{symbol}: T-1 intraday fetch/compute failed ({type(exc).__name__}: "
+            f"{exc}) — t1_close_*/t1_open_* will be absent for this symbol, "
+            "but the daily-bar t3/t5/t10 fetch will still run."
+        )
+
+    # ── Phase 2: T-3/T-5/T-10 daily-bar snapshots — a SEPARATE yfinance ──
+    # call from Phase 1, so it runs regardless of whether Phase 1 succeeded.
+    # Uses the intraday-derived `yesterday` as the anchor date when
+    # available (keeps exact parity with the old behavior); falls back to
+    # the most recent completed trading day when Phase 1 didn't produce one.
+    if fill_flat_prefixes:
+        detection_date_for_multiday = datetime.combine(
+            yesterday if yesterday is not None else _most_recent_completed_trading_day(logger),
+            dt_time(0, 0),
+        )
+        _fetch_real_multiday_features(symbol, detection_date_for_multiday, result, logger)
+
+    t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
+    t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
+    flat_count     = sum(1 for k in result if k.startswith("t3_"))
+    logger.debug(
+        f"{symbol}: t1_close_* = {t1_close_count}, "
+        f"t1_open_* = {t1_open_count}, "
+        f"t3_* = {flat_count} (from real daily bars)"
     )
-    result = result.drop(columns=["_gain_source"], errors="ignore")
+
+    if not result:
+        logger.warning(
+            f"{symbol}: BOTH the T-1 intraday and T-3/T-5/T-10 daily-bar "
+            "fetches produced nothing — this symbol will have zero real "
+            "features and will fall back to defaults/imputation for every "
+            "column. Check the warnings above for the actual fetch failure "
+            "reason(s)."
+        )
+
+    # Store the accurate t3 count as metadata so the display loop can read
+    # it after predictions are generated (predictions_df doesn't carry raw
+    # feature columns, so counting t3_ there always returns 0).
+    result["_meta_t3_count"] = flat_count
+
     return result
 
 
 # ---------------------------------------------------------------------------
-# RC2 FIX: Correct gain target computation (prev_close denominator)
+# Gain estimation helpers
 # ---------------------------------------------------------------------------
 
-def _compute_correct_actual_high_pct(
-    winners_df: pd.DataFrame,
-    source_label: str = "winners",
+def _prob_to_gain(probability: float) -> float:
+    """
+    Convert a probability score to a base gain estimate using _GAIN_CURVE.
+    Used as the final fallback when both the regressor and isotonic calibrator
+    are unavailable.  The curve is anchored to real explosive-mover intraday
+    highs, so high-confidence predictions can reach 100 %+.
+    """
+    for min_prob, gain in _GAIN_CURVE:
+        if probability >= min_prob:
+            return gain
+    return _GAIN_CURVE[-1][1]
+
+
+def _apply_gain_rank_correction(
+    predictions_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    feature_prefix: str,
+    logger: logging.Logger,
 ) -> pd.DataFrame:
     """
-    RC2 FIX: Compute actual_high_pct using the PREVIOUS day's close as the
-    denominator, not the same-day close (which produces near-zero values and
-    was the root cause of the compressed gain range in the regressor).
+    Emergency fallback applied only when the predictor returns near-identical
+    gain estimates (std < 1 %).  Instead of a fixed floor-to-ceiling formula,
+    the correction is anchored to each stock's probability score via
+    _GAIN_CURVE, with a small rank-based spread added on top.  This means:
 
-    prev_close source priority (tracked and logged separately):
-      1. prev_close_db  — a dedicated column already present in winners_df
-         (e.g. stored by the daily pipeline at insertion time). This is the
-         most reliable source and does not depend on the symbol appearing on
-         consecutive days.
-      2. shift(1) within symbol group — only valid when the same symbol
-         appears on back-to-back days in daily_winners. For one-off small-cap
-         winners this produces NaN for every row, so we track how many rows
-         actually benefit from it.
-      3. same-day open — last-resort fallback. Noisier than a true prev_close
-         but still far better than same-day close. We log a WARNING when this
-         fallback fires for more than OPEN_FALLBACK_WARN_PCT of rows, because
-         a high fallback rate signals that shift(1) is not providing real data.
-
-    Args:
-        winners_df: DataFrame from daily_winners with columns:
-                    symbol, detection_date, price (same-day close),
-                    high, open, close, and optionally prev_close_db.
-
-    Returns:
-        winners_df with corrected actual_high_pct column added/overwritten
-        and a '_prev_close_source' diagnostic column (dropped before return).
+    - A 0.95-probability STRONG BUY stock can receive a 100 %+ estimate.
+    - A 0.55-probability HOLD stock gets ~10 %, not an artificially inflated
+      number just because it happens to rank highly in a mediocre pool.
+    - The `gain_source` column is set to "rank_fallback" on every overwritten
+      row so callers and the Supabase table can distinguish model estimates
+      from fallback values.
     """
-    # Fraction of rows allowed to use the open fallback before we warn.
-    OPEN_FALLBACK_WARN_PCT = 0.20  # warn if >20 % of rows fall back to open
+    if 'target_gain_pct' not in predictions_df.columns:
+        return predictions_df
 
-    if winners_df.empty:
-        return winners_df
+    gains    = predictions_df['target_gain_pct']
+    gain_std = gains.std()
 
-    required = {"symbol", "detection_date", "high"}
-    if not required.issubset(winners_df.columns):
-        logger.warning(
-            f"RC2: {source_label} missing required columns {required - set(winners_df.columns)} "
-            "— cannot compute corrected actual_high_pct"
-        )
-        return winners_df
-
-    df = winners_df.copy()
-    df["detection_date"] = pd.to_datetime(df["detection_date"], errors="coerce")
-    df = df.sort_values(["symbol", "detection_date"])
-
-    n_total = len(df)
-    df["prev_close"] = np.nan
-    df["_prev_close_source"] = "none"
-
-    # ── Source 1: explicit prev_close_db column stored at insertion time ──────
-    # This is the most reliable source: no assumption about consecutive rows.
-    if "prev_close_db" in df.columns:
-        db_vals = pd.to_numeric(df["prev_close_db"], errors="coerce")
-        mask_db = db_vals.notna() & (db_vals > 0)
-        df.loc[mask_db, "prev_close"] = db_vals[mask_db]
-        df.loc[mask_db, "_prev_close_source"] = "db"
-        n_db = int(mask_db.sum())
-        logger.info(f"RC2: prev_close_db column supplied {n_db}/{n_total} rows ({source_label})")
-    else:
-        n_db = 0
-
-    # ── Source 2: shift(1) within consecutive symbol rows ────────────────────
-    # Only fills rows that still have no prev_close (not already set by db).
-    # For symbols that appear only once in daily_winners, shift produces NaN
-    # and we get nothing — that is expected and correct behaviour; do not
-    # treat these NaNs as the open-fallback trigger.
-    close_col = "close" if "close" in df.columns else ("price" if "price" in df.columns else None)
-    if close_col:
-        shifted = df.groupby("symbol")[close_col].shift(1)
-        shifted_numeric = pd.to_numeric(shifted, errors="coerce")
-        # Apply only where prev_close is still missing
-        mask_shift = (
-            df["_prev_close_source"] == "none"
-        ) & shifted_numeric.notna() & (shifted_numeric > 0)
-        df.loc[mask_shift, "prev_close"] = shifted_numeric[mask_shift]
-        df.loc[mask_shift, "_prev_close_source"] = "shift"
-        n_shift = int(mask_shift.sum())
-
-        # Rows where shift produced NaN (one-off symbols): count them explicitly
-        mask_shift_nan = (df["_prev_close_source"] == "none") & shifted_numeric.isna()
-        n_shift_nan_oneoff = int(mask_shift_nan.sum())
-        if n_shift_nan_oneoff > 0:
-            logger.info(
-                f"RC2: shift(1) produced NaN for {n_shift_nan_oneoff}/{n_total} rows "
-                f"(symbols appear only once in {source_label} — open fallback will be used)"
+    if gain_std >= 1.0:
+        # Model gains look healthy — just ensure gain_source is stamped
+        if 'gain_source' not in predictions_df.columns:
+            predictions_df = predictions_df.copy()
+            predictions_df['gain_source'] = predictions_df.get(
+                'gain_source', pd.Series('model', index=predictions_df.index)
             )
-    else:
-        n_shift = 0
+        return predictions_df
 
-    # ── Source 3: same-day open as last-resort fallback ──────────────────────
-    if "open" in df.columns:
-        open_numeric = pd.to_numeric(df["open"], errors="coerce")
-        mask_open = (
-            df["_prev_close_source"] == "none"
-        ) & open_numeric.notna() & (open_numeric > 0)
-        df.loc[mask_open, "prev_close"] = open_numeric[mask_open]
-        df.loc[mask_open, "_prev_close_source"] = "open"
-        n_open = int(mask_open.sum())
-    else:
-        n_open = 0
-
-    n_none = int((df["_prev_close_source"] == "none").sum())
-
-    logger.info(
-        f"RC2: prev_close sources ({source_label}) — db:{n_db}  shift:{n_shift}  "
-        f"open_fallback:{n_open}  missing:{n_none}  total:{n_total}"
+    logger.warning(
+        f"  ⚠️  FLAT GAIN ESTIMATES detected (std={gain_std:.4f}%). "
+        f"Applying probability-anchored rank fallback correction."
     )
 
-    # Warn loudly when the open fallback is carrying the majority of rows,
-    # because that means shift(1) is not providing real prev_close data.
-    n_non_db = n_total - n_db  # rows that couldn't use the reliable db source
-    if n_non_db > 0 and n_open / n_total > OPEN_FALLBACK_WARN_PCT:
-        logger.warning(
-            f"RC2 WARNING: {n_open}/{n_total} rows ({n_open / n_total:.1%}) of {source_label} "
-            f"are using same-day open as prev_close proxy. This is a noisy fallback. "
-            f"Consider storing prev_close_db in the {source_label} table at insertion "
-            f"time (e.g. from the yfinance previous-day close) to improve accuracy. "
-            f"shift(1) only helps when the same symbol appears on consecutive days in "
-            f"{source_label}, which is rare for one-off small-cap rows."
-        )
+    df    = predictions_df.copy()
+    probs = df['explosion_probability']
 
-    # ── Compute corrected actual_high_pct ────────────────────────────────────
-    high_vals = pd.to_numeric(df["high"], errors="coerce")
-    prev_close_vals = pd.to_numeric(df["prev_close"], errors="coerce")
+    # Base gain from the probability curve (tied to model confidence, not rank)
+    base_gains = probs.apply(_prob_to_gain)
 
-    valid_mask = prev_close_vals.notna() & (prev_close_vals > 0) & high_vals.notna()
-    df["actual_high_pct"] = np.nan
-    df.loc[valid_mask, "actual_high_pct"] = (
-        (high_vals[valid_mask] / prev_close_vals[valid_mask] - 1) * 100
-    ).clip(lower=0)
+    # Small rank-based spread on top: ±20 % of the base gain, so stocks with
+    # the same bucket probability are still differentiated.  This keeps the
+    # spread proportional — a 100 % base gets ±20 %, a 10 % base gets ±2 %.
+    prob_ranks   = probs.rank(pct=True)           # 0..1, higher = better
+    rank_spread  = (prob_ranks - 0.5) * 0.40      # -0.20 .. +0.20 multiplier
+    corrected_gains = base_gains * (1.0 + rank_spread)
 
-    # Also compute actual_gain_pct if change_pct not available from same source
-    if "change_pct" not in df.columns and "price" in df.columns:
-        price_vals = pd.to_numeric(df["price"], errors="coerce")
-        df.loc[valid_mask, "change_pct"] = (
-            (price_vals[valid_mask] / prev_close_vals[valid_mask] - 1) * 100
-        )
-
-    n_corrected = int(valid_mask.sum())
-    if n_corrected > 0:
-        pct_range = df.loc[valid_mask, "actual_high_pct"]
-        # Break down corrected rows by source for transparency
-        src_counts = df.loc[valid_mask, "_prev_close_source"].value_counts().to_dict()
-        logger.info(
-            f"RC2: Corrected actual_high_pct for {n_corrected}/{n_total} {source_label} rows "
-            f"(range: {pct_range.min():.1f}%–{pct_range.max():.1f}%, "
-            f"mean: {pct_range.mean():.1f}%) | sources: {src_counts}"
-        )
+    # RSI adjustment: stocks near RSI 60 (momentum without being overbought)
+    # get a small boost; extremely overbought (RSI > 80) get a haircut
+    if _uses_lowercase(feature_prefix):
+        rsi_col = f"{feature_prefix}_rsi_14"
+        vol_col = f"{feature_prefix}_volume_ratio"
     else:
-        logger.warning(
-            f"RC2: Could not compute corrected actual_high_pct for {source_label} — "
-            "no prev_close data available"
-        )
+        rsi_col = f"{feature_prefix}_RSI_14"
+        vol_col = f"{feature_prefix}_Volume_Ratio"
 
-    # Drop diagnostic column before returning
-    df = df.drop(columns=["_prev_close_source"], errors="ignore")
+    if features_df is not None and not features_df.empty:
+        feat_indexed = features_df.set_index("symbol") if "symbol" in features_df.columns else features_df
 
-    # Restore string dates
-    df["detection_date"] = df["detection_date"].dt.strftime("%Y-%m-%d")
+        if rsi_col in feat_indexed.columns:
+            rsi_vals = df['symbol'].map(feat_indexed[rsi_col]) if 'symbol' in df.columns else None
+            if rsi_vals is not None and rsi_vals.notna().sum() > 5:
+                # +5 % boost near RSI 60, haircut when RSI > 80
+                rsi_filled   = rsi_vals.fillna(55)
+                rsi_boost    = (1.0 - (abs(rsi_filled - 60) / 40).clip(0, 1)) * 0.05
+                rsi_overbought_cut = ((rsi_filled - 80).clip(0, 20) / 20) * -0.10
+                corrected_gains = corrected_gains * (1 + rsi_boost + rsi_overbought_cut)
+
+        if vol_col in feat_indexed.columns:
+            vol_vals = df['symbol'].map(feat_indexed[vol_col]) if 'symbol' in df.columns else None
+            if vol_vals is not None and vol_vals.notna().sum() > 5:
+                # Up to +10 % boost for relative volume 5×; proportional below that
+                vol_score = (vol_vals.fillna(1.0) - 1.0).clip(0, 4) / 4.0
+                corrected_gains = corrected_gains * (1 + vol_score * 0.10)
+
+    # No hard ceiling — explosive movers genuinely go 100 %+.
+    # Floor at 3 % to avoid negative or zero estimates on low-probability stocks.
+    corrected_gains = corrected_gains.clip(lower=3.0)
+
+    df['target_gain_pct']  = corrected_gains
+    df['target_gain_low']  = corrected_gains * 0.50   # conservative scenario
+    df['target_gain_high'] = corrected_gains * 1.60   # explosive scenario
+    df['gain_source']      = 'rank_fallback'
+
+    if 'current_price' in df.columns:
+        df['target_price']      = df['current_price'] * (1 + df['target_gain_pct']  / 100)
+        df['target_price_low']  = df['current_price'] * (1 + df['target_gain_low']  / 100)
+        df['target_price_high'] = df['current_price'] * (1 + df['target_gain_high'] / 100)
+
+    n_fallback = len(df)
+    logger.warning(
+        f"  ⚠️  gain_source='rank_fallback' applied to all {n_fallback} rows. "
+        f"Gain estimates are NOT from the model — they are probability-anchored "
+        f"approximations. Retrain the gain regressor to restore model-based estimates."
+    )
+    logger.info(
+        f"  Corrected gain range: "
+        f"{corrected_gains.min():.1f}%–{corrected_gains.max():.1f}%  "
+        f"std={corrected_gains.std():.1f}%"
+    )
+
+    # Per-signal breakdown so the log makes the distribution visible
+    if 'signal' in df.columns:
+        for sig in ['STRONG BUY', 'BUY', 'HOLD', 'AVOID']:
+            mask = df['signal'] == sig
+            if mask.any():
+                g = corrected_gains[mask]
+                logger.info(
+                    f"    {sig:<12}: n={mask.sum():>4}  "
+                    f"gain {g.min():.1f}%–{g.max():.1f}%  "
+                    f"(mean {g.mean():.1f}%)"
+                )
     return df
 
 
-# ---------------------------------------------------------------------------
-# DAILY-OUTCOME GAIN TARGET FIX: build the gain-regressor training label the
-# SAME WAY the classifier gets its label — straight from the daily_winners /
-# daily_non_winners tables, joined onto the classifier's existing feature-row
-# pool by (symbol, detection_date), with NO second snapshot table required to
-# "agree" before a row counts.
-#
-# WHY THIS EXISTS (root cause of the regressor's tiny informative pool):
-#   The classifier's label is nearly free — it's just "which table did this
-#   row's FEATURES come from" (winners_day_prior_* vs non_winners_day_prior_*),
-#   assigned at ingestion. Every T-1 row that has features gets a label.
-#
-#   The regressor's previous primary target ('true_gain_pct', built by
-#   fetch_market_snapshot_gain_targets() below) instead required an INNER JOIN
-#   between two independently-populated snapshot tables
-#   (winners_market_close x winners_day_prior_close). If either collector
-#   missed a day, or the dates didn't line up, the row silently vanished from
-#   the training pool entirely — with no warning. That inner join, not a lack
-#   of underlying data, is what collapsed the informative pool to ~239
-#   winners + ~26 non-winners even though daily_winners alone has ~1990 rows.
-#
-#   daily_winners / daily_non_winners already store the actual measured
-#   outcome (open/high/close, and — via _compute_correct_actual_high_pct — a
-#   correctly prev_close-denominated actual_high_pct) for every scanned
-#   symbol, with no second table needed to corroborate it. Left-joining that
-#   directly onto the SAME feature-row pool the classifier already trains on
-#   (winners_day_prior_*/non_winners_day_prior_* + t3_/t5_/t10_ multiday,
-#   built in load_t1_data()) gives the regressor access to essentially the
-#   same row count as the classifier, just with a continuous target instead
-#   of a binary one — exactly mirroring how the classifier is trained.
-# ---------------------------------------------------------------------------
-
-def fetch_daily_outcomes_gain_targets(
-    client: Client,
-    winners_corrected_df: "Optional[pd.DataFrame]" = None,
-) -> pd.DataFrame:
+def _get_calibrated_gain_estimate(probability: float) -> float:
     """
-    Build (symbol, detection_date) -> gain-outcome directly from daily_winners
-    and daily_non_winners — the same tables that already hold ~1990+ real,
-    directly-measured outcomes — instead of requiring a second snapshot table
-    to independently corroborate the row (see module comment above).
-
-    Args:
-        winners_corrected_df: optional pre-fetched, pre-corrected daily_winners
-            DataFrame (output of _compute_correct_actual_high_pct on the raw
-            daily_winners table), already computed by the RC2 enrichment step
-            in main() for combined_df.actual_high_pct. When supplied, this
-            function reuses it instead of re-fetching + re-correcting
-            daily_winners from scratch — daily_winners was previously being
-            fetched and corrected twice per retrain run (once here, once in
-            the RC2 block), doubling the network/compute cost and duplicating
-            every RC2 log line. Pass None to have this function fetch and
-            correct daily_winners itself (e.g. when called standalone).
-
-    Returns:
-        DataFrame with columns: symbol, detection_date, daily_outcome_gain_pct,
-        label (1 for daily_winners rows, 0 for daily_non_winners rows). Empty
-        DataFrame (same columns, zero rows) if neither source table is usable.
+    Rule-based gain backstop for individual NaN rows after the main gain
+    pipeline has run.  Uses the same _GAIN_CURVE as _prob_to_gain so both
+    paths are consistent.  Replaces the old hard-coded table that topped out
+    at 30 % regardless of model confidence.
     """
-    frames = []
-
-    # ── Winners: reuse the caller's already-corrected daily_winners if given ──
-    if winners_corrected_df is not None and not winners_corrected_df.empty and "actual_high_pct" in winners_corrected_df.columns:
-        out = winners_corrected_df[["symbol", "detection_date", "actual_high_pct"]].copy()
-        out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
-        out["detection_date"] = pd.to_datetime(
-            out["detection_date"], errors="coerce"
-        ).dt.strftime("%Y-%m-%d")
-        out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
-        out["label"] = 1
-        out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-        if not out.empty:
-            logger.info(
-                f"daily_outcome_gain_pct: daily_winners (reused from RC2 fetch, no "
-                f"duplicate query) -> {len(out)} rows with a corrected gain outcome "
-                f"(range {out['daily_outcome_gain_pct'].min():.1f}%"
-                f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
-                f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
-            )
-            frames.append(out)
-    else:
-        # No pre-corrected frame supplied (e.g. standalone call, or the RC2
-        # fetch above failed/returned empty) — fetch and correct it here.
-        SOURCE_TABLES = [("daily_winners", 1)]
-        for table_name, label in SOURCE_TABLES:
-            try:
-                raw_df = fetch_table_paginated(client, table_name)
-            except Exception as e:
-                logger.warning(f"daily_outcome_gain_pct: could not fetch '{table_name}': {e}")
-                continue
-            if raw_df.empty:
-                logger.warning(f"daily_outcome_gain_pct: '{table_name}' is empty — skipping")
-                continue
-            if not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
-                logger.warning(
-                    f"daily_outcome_gain_pct: '{table_name}' missing required columns "
-                    f"{{'symbol', 'detection_date', 'high'}} - "
-                    f"{set(raw_df.columns)} — skipping"
-                )
-                continue
-            corrected = _compute_correct_actual_high_pct(raw_df, source_label=table_name)
-            if "actual_high_pct" not in corrected.columns:
-                logger.warning(
-                    f"daily_outcome_gain_pct: '{table_name}' correction produced no "
-                    "actual_high_pct column — skipping"
-                )
-                continue
-            out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
-            out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
-            out["detection_date"] = pd.to_datetime(
-                out["detection_date"], errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-            out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
-            out["label"] = label
-            out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-            if not out.empty:
-                logger.info(
-                    f"daily_outcome_gain_pct: {table_name} -> {len(out)} rows with a "
-                    f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
-                    f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
-                    f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
-                )
-                frames.append(out)
-            else:
-                logger.warning(
-                    f"daily_outcome_gain_pct: '{table_name}' produced 0 rows with a valid "
-                    "corrected gain outcome — skipping"
-                )
-
-    # ── Non-winners: always fetched fresh here — no earlier step in main() ──
-    # already fetches/corrects daily_non_winners, so there's nothing to reuse.
-    try:
-        raw_df = fetch_table_paginated(client, "daily_non_winners")
-    except Exception as e:
-        logger.warning(f"daily_outcome_gain_pct: could not fetch 'daily_non_winners': {e}")
-        raw_df = pd.DataFrame()
-    if raw_df.empty:
-        logger.warning("daily_outcome_gain_pct: 'daily_non_winners' is empty — skipping")
-    elif not {"symbol", "detection_date", "high"}.issubset(raw_df.columns):
-        logger.warning(
-            "daily_outcome_gain_pct: 'daily_non_winners' missing required columns "
-            f"{{'symbol', 'detection_date', 'high'}} - {set(raw_df.columns)} — skipping"
-        )
-    else:
-        corrected = _compute_correct_actual_high_pct(raw_df, source_label="daily_non_winners")
-        if "actual_high_pct" not in corrected.columns:
-            logger.warning(
-                "daily_outcome_gain_pct: 'daily_non_winners' correction produced no "
-                "actual_high_pct column — skipping"
-            )
-        else:
-            out = corrected[["symbol", "detection_date", "actual_high_pct"]].copy()
-            out = out.rename(columns={"actual_high_pct": "daily_outcome_gain_pct"})
-            out["detection_date"] = pd.to_datetime(
-                out["detection_date"], errors="coerce"
-            ).dt.strftime("%Y-%m-%d")
-            out = out.dropna(subset=["symbol", "detection_date", "daily_outcome_gain_pct"])
-            out["label"] = 0
-            out = out.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-            if not out.empty:
-                logger.info(
-                    f"daily_outcome_gain_pct: daily_non_winners -> {len(out)} rows with a "
-                    f"corrected gain outcome (range {out['daily_outcome_gain_pct'].min():.1f}%"
-                    f"-{out['daily_outcome_gain_pct'].max():.1f}%, "
-                    f"mean {out['daily_outcome_gain_pct'].mean():.1f}%)"
-                )
-                frames.append(out)
-            else:
-                logger.warning(
-                    "daily_outcome_gain_pct: 'daily_non_winners' produced 0 rows with a "
-                    "valid corrected gain outcome — skipping"
-                )
-
-    if not frames:
-        logger.warning(
-            "daily_outcome_gain_pct: no usable rows from daily_winners/daily_non_winners — "
-            "gain regressor will fall back to the market-snapshot / legacy target sources."
-        )
-        return pd.DataFrame(columns=["symbol", "detection_date", "daily_outcome_gain_pct", "label"])
-
-    result = pd.concat(frames, ignore_index=True)
-    result = result.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-    logger.info(
-        f"daily_outcome_gain_pct: {len(result)} total rows with a directly-measured "
-        "daily_winners/daily_non_winners gain outcome (no second-table join required)"
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# TRUE GAIN TARGET FIX: build the gain-regressor training label directly from
-# the market-day OHLC snapshots the pipeline already collects, instead of
-# ml_prediction_accuracy (a separate, yfinance-backed *tracking* table that
-# only has rows for symbols the model has already scored).
-#
-# WHY A NEW COLUMN NAME ("true_gain_pct") INSTEAD OF REUSING actual_high_pct:
-#   'actual_high_pct' is already overloaded with two incompatible meanings
-#   elsewhere in this file:
-#     1. ml_prediction_accuracy's own column — a post-hoc outcome captured by
-#        the accuracy tracker, sometimes prev_close-denominated, sometimes
-#        same-day-close-denominated depending on yfinance availability
-#        (see enrich_mistakes_with_gains's FIX2 notes above).
-#     2. The RC2-corrected version computed above in
-#        _compute_correct_actual_high_pct(), which uses prev_close.
-#   Mixing a third computation into that same column name would make the
-#   denominator-mismatch bugs even harder to diagnose. 'true_gain_pct' is
-#   used only for this pipeline, so it can never silently collide with either
-#   of the above.
-#
-# SOURCE TABLES (already written by intraday_data_collector.py — no yfinance
-# dependency, no dependency on the model having already scored the symbol):
-#   winners_market_close      / non_winners_market_close
-#       -> 'high' column, captured from the last 5-minute bar of the actual
-#          detection-day session (snapshot_time ~15:55-16:00). This is the
-#          closing-bar high, NOT a full-day intraday high — a stock that
-#          spiked mid-day and faded back down by the close will understate
-#          its true peak gain here. Still a real, directly-measured value
-#          with no external dependency, and a strictly better training
-#          signal than leaving the row unlabeled.
-#   winners_day_prior_close   / non_winners_day_prior_close
-#       -> 'close' column, captured from the prior trading day, but written
-#          with detection_date set to the SAME detection_date as the
-#          market_close snapshot (see intraday_data_collector.py's
-#          "Keep original detection date" comments). This is the correct
-#          prev_close denominator.
-# ---------------------------------------------------------------------------
-
-def fetch_market_snapshot_gain_targets(client: Client) -> pd.DataFrame:
-    """
-    Compute true_gain_pct = (market_close.high / day_prior_close.close - 1) * 100
-    for every (symbol, detection_date) pair that has both snapshots, for both
-    winners and non-winners.
-
-    Returns:
-        DataFrame with columns: symbol, detection_date, true_gain_pct, label
-        (label=1 for rows sourced from the winners_* tables, 0 for
-        non_winners_*). Empty DataFrame (same columns, zero rows) if none of
-        the four source tables could be used.
-    """
-    TABLE_PAIRS = [
-        ("winners_market_close",     "winners_day_prior_close",     1),
-        ("non_winners_market_close", "non_winners_day_prior_close", 0),
-    ]
-
-    frames = []
-    for market_table, prior_table, label in TABLE_PAIRS:
-        try:
-            market_df = fetch_table_paginated(client, market_table)
-        except Exception as e:
-            logger.warning(f"true_gain_pct: could not fetch '{market_table}': {e}")
-            continue
-        if market_df.empty:
-            logger.warning(f"true_gain_pct: '{market_table}' is empty — skipping")
-            continue
-        if "high" not in market_df.columns:
-            logger.warning(f"true_gain_pct: '{market_table}' has no 'high' column — skipping")
-            continue
-
-        try:
-            prior_df = fetch_table_paginated(client, prior_table)
-        except Exception as e:
-            logger.warning(f"true_gain_pct: could not fetch '{prior_table}': {e}")
-            continue
-        if prior_df.empty:
-            logger.warning(f"true_gain_pct: '{prior_table}' is empty — skipping")
-            continue
-        close_col = next((c for c in ("close", "Close") if c in prior_df.columns), None)
-        if close_col is None:
-            logger.warning(f"true_gain_pct: '{prior_table}' has no close column — skipping")
-            continue
-
-        m = market_df[["symbol", "detection_date", "high"]].copy()
-        p = prior_df[["symbol", "detection_date", close_col]].rename(columns={close_col: "prev_close"})
-
-        m["detection_date"] = pd.to_datetime(m["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        p["detection_date"] = pd.to_datetime(p["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        m = m.dropna(subset=["symbol", "detection_date"])
-        p = p.dropna(subset=["symbol", "detection_date"])
-        m = m.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-        p = p.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-
-        merged = m.merge(p, on=["symbol", "detection_date"], how="inner")
-        merged["high"]       = pd.to_numeric(merged["high"], errors="coerce")
-        merged["prev_close"] = pd.to_numeric(merged["prev_close"], errors="coerce")
-
-        valid = merged["high"].notna() & merged["prev_close"].notna() & (merged["prev_close"] > 0)
-        merged = merged[valid].copy()
-        if merged.empty:
-            logger.warning(
-                f"true_gain_pct: {market_table} x {prior_table} joined but no rows had "
-                "both a valid high and a valid prev_close — skipping"
-            )
-            continue
-
-        merged["true_gain_pct"] = ((merged["high"] / merged["prev_close"] - 1) * 100).clip(lower=0)
-        merged["label"] = label
-
-        logger.info(
-            f"true_gain_pct: {market_table} x {prior_table} -> {len(merged)} rows "
-            f"(range {merged['true_gain_pct'].min():.1f}%-{merged['true_gain_pct'].max():.1f}%, "
-            f"mean {merged['true_gain_pct'].mean():.1f}%)"
-        )
-        frames.append(merged[["symbol", "detection_date", "true_gain_pct", "label"]])
-
-    if not frames:
-        logger.warning(
-            "true_gain_pct: no market-snapshot gain data available from any source table — "
-            "gain regressor will fall back to ml_training_base.gain_pct / legacy accuracy-table sources."
-        )
-        return pd.DataFrame(columns=["symbol", "detection_date", "true_gain_pct", "label"])
-
-    result = pd.concat(frames, ignore_index=True)
-    result = result.drop_duplicates(subset=["symbol", "detection_date"], keep="last")
-    logger.info(f"true_gain_pct: {len(result)} total rows with market-snapshot-derived gain targets")
-    return result
-
-
-def attach_true_gain_targets(
-    combined_df: pd.DataFrame,
-    market_gain_df: pd.DataFrame,
-    daily_outcome_df: "Optional[pd.DataFrame]" = None,
-) -> pd.DataFrame:
-    """
-    Merge gain-outcome sources onto combined_df by (symbol, detection_date),
-    and build a single unified gain target column '_unified_gain_target' that
-    the gain regressor reads first. Priority (highest first):
-
-        1. daily_outcome_gain_pct  — DIRECTLY from daily_winners /
-                                      daily_non_winners (see
-                                      fetch_daily_outcomes_gain_targets()
-                                      above). Simple left-join onto the SAME
-                                      feature-row pool the classifier trains
-                                      on (winners_day_prior_*/
-                                      non_winners_day_prior_* + t3_/t5_/t10_
-                                      multiday) — no second snapshot table
-                                      has to independently corroborate the
-                                      row for it to count. This is the
-                                      regressor's equivalent of "does this
-                                      row's features exist" for the
-                                      classifier, and should cover close to
-                                      the full daily_winners/daily_non_winners
-                                      population.
-        2. true_gain_pct           — market-snapshot-derived (T-1 rows).
-                                      Requires winners_market_close AND
-                                      winners_day_prior_close to BOTH have a
-                                      matching row (inner join) — kept only
-                                      as a secondary fallback for rows that
-                                      daily_outcome_gain_pct didn't reach.
-        3. gain_pct                — ml_training_base's own pre-computed gain
-                                      column, previously collected but never
-                                      used as a regression target (only
-                                      excluded from the feature matrix to
-                                      avoid classifier leakage). Covers the
-                                      base-CSV rows that neither of the above
-                                      can reach (they have no detection_date).
-
-    Rows with none of these sources populated are left NaN in
-    '_unified_gain_target' and train_gain_regressor() falls back to its
-    legacy actual_high_pct / actual_gain_pct / accuracy-table logic for them.
-    """
-    combined_df = combined_df.copy()
-
-    symbol_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
-    has_join_keys = symbol_col and "detection_date" in combined_df.columns
-    _key = (
-        pd.to_datetime(combined_df["detection_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-        if has_join_keys else None
-    )
-
-    # ── Source 1 (highest priority): daily_winners / daily_non_winners ──────
-    if has_join_keys and daily_outcome_df is not None and not daily_outcome_df.empty:
-        _lookup_daily = daily_outcome_df.set_index(
-            ["symbol", "detection_date"]
-        )["daily_outcome_gain_pct"]
-        keys = list(zip(combined_df[symbol_col], _key))
-        combined_df["daily_outcome_gain_pct"] = [_lookup_daily.get(k, np.nan) for k in keys]
-        n_matched_daily = combined_df["daily_outcome_gain_pct"].notna().sum()
-        logger.info(
-            f"daily_outcome_gain_pct: matched onto {n_matched_daily}/{len(combined_df)} "
-            "combined_df rows (direct daily_winners/daily_non_winners join)"
-        )
-    else:
-        combined_df["daily_outcome_gain_pct"] = np.nan
-        logger.info(
-            "daily_outcome_gain_pct: nothing to merge (no daily_outcome_df data or "
-            "no symbol/detection_date columns)"
-        )
-
-    # ── Source 2: market-snapshot true_gain_pct (secondary fallback) ────────
-    if has_join_keys and not market_gain_df.empty:
-        _lookup = market_gain_df.set_index(["symbol", "detection_date"])["true_gain_pct"]
-        keys = list(zip(combined_df[symbol_col], _key))
-        combined_df["true_gain_pct"] = [_lookup.get(k, np.nan) for k in keys]
-        n_matched = combined_df["true_gain_pct"].notna().sum()
-        logger.info(f"true_gain_pct: matched onto {n_matched}/{len(combined_df)} combined_df rows")
-    else:
-        combined_df["true_gain_pct"] = np.nan
-        logger.info("true_gain_pct: nothing to merge (no market_gain_df data or no detection_date column)")
-
-    unified = combined_df["daily_outcome_gain_pct"].copy()
-    n_filled_from_snapshot = int((unified.isna() & combined_df["true_gain_pct"].notna()).sum())
-    unified = unified.fillna(combined_df["true_gain_pct"])
-    if n_filled_from_snapshot:
-        logger.info(
-            f"_unified_gain_target: filled {n_filled_from_snapshot} additional rows from "
-            "true_gain_pct (market-snapshot fallback, used where daily_outcome_gain_pct was NaN)"
-        )
-
-    if "gain_pct" in combined_df.columns:
-        gain_pct_numeric = pd.to_numeric(combined_df["gain_pct"], errors="coerce")
-        n_filled_from_base = int((unified.isna() & gain_pct_numeric.notna()).sum())
-        unified = unified.fillna(gain_pct_numeric)
-        logger.info(
-            f"_unified_gain_target: filled {n_filled_from_base} additional rows from "
-            "ml_training_base.gain_pct (previously unused as a regression target)"
-        )
-
-    combined_df["_unified_gain_target"] = unified
-    n_total_unified = int(combined_df["_unified_gain_target"].notna().sum())
-    logger.info(
-        f"_unified_gain_target populated for {n_total_unified}/{len(combined_df)} rows "
-        "(daily_outcome_gain_pct > true_gain_pct > ml_training_base.gain_pct, in priority order)"
-    )
-    return combined_df
-
-
-# ---------------------------------------------------------------------------
-# Data preparation
-# ---------------------------------------------------------------------------
-
-def apply_intraday_high_labels(
-    combined_df: pd.DataFrame,
-    threshold: float = INTRADAY_WIN_THRESHOLD,
-) -> pd.DataFrame:
-    """
-    Re-label rows where actual_high_pct >= threshold as winners (label=1).
-
-    WHY ALL SOURCES ARE NOW ELIGIBLE
-    ---------------------------------
-    The previous version restricted relabelling to winners_day_prior_* rows only,
-    citing a "selection-bias" concern: non_winners_day_prior rows only appear because
-    they passed the screener, so relabelling them could teach the model "screener
-    passer with high volatility → winner" rather than a genuine signal.
-
-    That concern was originally used to justify a conservative 20% threshold.  But
-    the data directly refutes the concern even at 15%:
-
-        476 rows in ml_prediction_accuracy have actual_high_pct >= 15% with
-        became_winner = false — meaning nearly 500 REAL explosive moves were sitting
-        in non_winners_day_prior as label=0 training samples.  The model was being
-        trained that "stock hits +15-20% intraday = not a winner".  This is the
-        primary cause of AVOID/HOLD stocks outperforming BUY/STRONG BUY in
-        production.
-
-    CLAUDE FIX (2026-08-19): threshold lowered 20% -> 15% (see
-    INTRADAY_WIN_THRESHOLD above). At 15% the move is still unambiguous — a stock
-    does not hit +15% intraday by luck of passing a screener filter. The
-    circular-bias argument does not apply at this size. Restricting to
-    winners_day_prior (or leaving the bar at 20%) was silently poisoning the
-    negative class with genuine winners in the 15-19% range on top of the ones
-    already addressed at 20%.
-
-    The selection-bias guard is retained for base_csv rows only, because those rows
-    do not have reliable actual_high_pct values sourced from the same pipeline.
-
-    Only upgrades label from 0→1 (never downgrades 1→0).
-    """
-    if "actual_high_pct" not in combined_df.columns:
-        return combined_df
-
-    combined_df = combined_df.copy()
-    before = int((combined_df["label"] == 1).sum())
-
-    # All T-1 rows (winners AND non-winners) are eligible for relabelling.
-    # base_csv rows are excluded: their actual_high_pct values come from a
-    # different pipeline and may not be computed with the same prev_close
-    # denominator, making them unreliable for threshold comparisons.
-    if "source" in combined_df.columns:
-        is_base_csv = combined_df["source"].str.contains("base_csv", na=False)
-        eligible = ~is_base_csv
-        n_eligible      = int(eligible.sum())
-        n_base_excluded = int(is_base_csv.sum())
-        logger.info(
-            f"Intraday-high relabelling: {n_eligible} T-1 rows eligible "
-            f"(winners + non-winners); {n_base_excluded} base_csv rows excluded "
-            f"(unreliable actual_high_pct source)."
-        )
-    else:
-        logger.warning(
-            "Intraday-high relabelling: 'source' column not found. "
-            "Applying relabelling to ALL rows. "
-            "Ensure load_t1_data() sets df['source'] = table_name."
-        )
-        eligible = pd.Series(True, index=combined_df.index)
-
-    high_pct = pd.to_numeric(combined_df["actual_high_pct"], errors="coerce")
-    mask = (
-        (combined_df["label"] == 0) &
-        eligible &
-        (high_pct >= threshold)
-    )
-
-    # Break down the upgrade count by source so we can see how many were
-    # previously-hidden non-winner explosions vs winners-table mislabels.
-    if "source" in combined_df.columns and mask.any():
-        for src_label, src_mask in [
-            ("winners_day_prior",     combined_df["source"].str.contains("winners_day_prior", na=False) & ~combined_df["source"].str.contains("non_winners", na=False)),
-            ("non_winners_day_prior", combined_df["source"].str.contains("non_winners_day_prior", na=False)),
-        ]:
-            n_src = int((mask & src_mask).sum())
-            if n_src:
-                logger.info(f"  → {n_src} upgrades from {src_label}")
-
-    combined_df.loc[mask, "label"] = 1
-    # Bump sample weight — these are high-signal corrective examples.
-    # CLAUDE FIX (2026-08-19): raised 1.5x -> 2.5x. These rows are directly
-    # correcting the exact contamination that was training the model to
-    # associate big up-moves with "not a winner" (see docstring above) — at
-    # only 1.5x they were outnumbered by the much larger pool of genuinely-
-    # negative rows they were mixed in with, so the correction was real but
-    # weak. 2.5x keeps them well inside the SPW_MIN/SPW_MAX clamp on the
-    # overall positive class while giving these specific corrective examples
-    # more influence than an average winner row.
-    combined_df.loc[mask, "sample_weight"] = combined_df.loc[mask, "sample_weight"] * 2.5
-
-    after = int((combined_df["label"] == 1).sum())
-    if after > before:
-        logger.info(
-            f"Intraday-high relabelling: {after - before} rows upgraded to label=1 "
-            f"(actual_high_pct >= {threshold}%)"
-        )
-    else:
-        logger.info("Intraday-high relabelling: no rows upgraded (none met criteria).")
-    return combined_df
-
-
-def combine_datasets(base_df: pd.DataFrame, t1_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Concatenate base + T-1 data.
-
-    FIX 5: Deduplicate by (symbol, date) after concatenation.
-    The same stock+date can appear in both the base CSV and T-1 tables,
-    causing the model to overfit to repeated examples. We keep the T-1
-    version (which has richer features) when duplicates exist.
-
-    When both detection_date (T-1 rows) and event_date (base-CSV rows) are
-    present we deduplicate each partition by its own date key separately,
-    so residual within-source duplicates are still eliminated without
-    incorrectly treating the two date columns as interchangeable.
-
-    NOTE: mistake samples should be added AFTER this function returns,
-    so their custom sample_weights (3.0 / 2.0) are not overwritten here.
-    """
-    if base_df.empty:
-        logger.info("Combining: T-1 data only (base data empty or outside lookback window)")
-        return t1_df.copy()
-
-    if t1_df.empty:
-        logger.info("Combining: base data only (no T-1 data yet)")
-        return base_df.copy()
-
-    t1_count = len(t1_df)
-    # NOTE (2026-08-06): This used to branch on t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
-    # with different behaviour in each branch. Since the 2026-06-03 fix below,
-    # both branches apply the exact same BASE_CSV_WEIGHT / T1_WEIGHT values —
-    # the threshold no longer changes what happens, only what gets logged. Left
-    # as a single unconditional path; MIN_T1_ROWS_FOR_EQUAL_WEIGHT is still used
-    # for the informational "equal_weight_applied" metadata field at save time.
-    #
-    # FIX (2026-06-03): Previously the >= branch forced base weights to 1.0,
-    # overriding BASE_CSV_WEIGHT and accidentally making T-1 rows equal to
-    # (or lower than) base rows when T1_WEIGHT < BASE_CSV_WEIGHT. Now we
-    # always apply BASE_CSV_WEIGHT / T1_WEIGHT so the intentional weighting
-    # is respected regardless of how many T-1 rows are present.
-    logger.info(
-        f"T-1 data: {t1_count} rows "
-        f"({'>=' if t1_count >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT else '<'} "
-        f"threshold {MIN_T1_ROWS_FOR_EQUAL_WEIGHT}). "
-        f"Base rows weighted {BASE_CSV_WEIGHT}x, T-1 rows weighted {T1_WEIGHT}x."
-    )
-    base_df = base_df.copy()
-    base_df["sample_weight"] = BASE_CSV_WEIGHT
-
-    # ── Step 1: Deduplicate each frame independently, using its own natural key ──
-    #
-    # Deduplicate BEFORE concat so we never need to re-split the combined frame.
-    # This avoids every previous attempt to infer which rows belong to which
-    # source after the fact (via source column, detection_date.notna(), etc.) —
-    # all of which broke because ml_training_base contains rows from multiple
-    # pipelines with mixed source values and mixed date columns.
-    #
-    # base_df key  : (symbol, event_date)   — base rows are identified by when
-    #                the stock event happened, not when they were collected.
-    #                Multiple snapshot rows for the same event (t3/t5/t10 intervals
-    #                stored as separate rows) share the same (symbol, event_date)
-    #                and are correctly collapsed here to one row.
-    # t1_df key    : (symbol, detection_date) — T-1 rows are identified by the
-    #                day-prior detection date.  The close+open merge in
-    #                load_t1_data() already produces one row per event, but we
-    #                dedup again here as a safety net.
-    #
-    # keep="last": within base_df, later snapshots (t10 > t5 > t3) carry more
-    # history and should be preferred.  Supabase pagination returns rows in
-    # insertion order, so t10 rows (inserted last) tend to come last.
-
-    base_sym = next((c for c in ["symbol", "ticker"] if c in base_df.columns
-                     and base_df[c].notna().any()), None)
-    t1_sym   = next((c for c in ["symbol", "ticker"] if c in t1_df.columns
-                     and t1_df[c].notna().any()), None)
-
-    n_base_before = len(base_df)
-    n_t1_before   = len(t1_df)
-
-    # Capture label counts before dedup so we can audit what was dropped.
-    base_pos_before = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
-    base_neg_before = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
-    base_rate_before = base_pos_before / max(1, base_pos_before + base_neg_before)
-    logger.info(
-        f"Base data pre-dedup: {n_base_before} rows, "
-        f"pos={base_pos_before}, neg={base_neg_before}, "
-        f"pos_rate={base_rate_before:.1%}"
-    )
-
-    if base_sym and "event_date" in base_df.columns:
-        base_df = base_df.drop_duplicates(subset=[base_sym, "event_date"], keep="last")
-    elif base_sym and "detection_date" in base_df.columns:
-        base_df = base_df.drop_duplicates(subset=[base_sym, "detection_date"], keep="last")
-
-    if t1_sym and "detection_date" in t1_df.columns:
-        t1_df = t1_df.drop_duplicates(subset=[t1_sym, "detection_date"], keep="first")
-
-    n_base_dropped = n_base_before - len(base_df)
-    n_t1_dropped   = n_t1_before   - len(t1_df)
-
-    # Compute per-label dedup impact so we can detect asymmetric row loss.
-    # If dedup disproportionately drops negatives (e.g. many t3/t5/t10 snapshots
-    # exist only for non-winners), the post-dedup positive rate will be inflated
-    # relative to the pre-dedup rate, and the model will train on a skewed set.
-    base_pos_after = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
-    base_neg_after = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
-    base_pos_dropped = base_pos_before - base_pos_after
-    base_neg_dropped = base_neg_before - base_neg_after
-
-    logger.info(
-        f"Pre-concat dedup — base: {n_base_before} → {len(base_df)} "
-        f"(dropped {n_base_dropped} rows: {base_pos_dropped} pos + {base_neg_dropped} neg, "
-        f"key={base_sym}+event_date); "
-        f"T-1: {n_t1_before} → {len(t1_df)} "
-        f"(dropped {n_t1_dropped}, key={t1_sym}+detection_date)"
-    )
-
-    # Warn when dedup removes a disproportionate share of one label.
-    # A healthy dedup should drop roughly equal fractions of positives and
-    # negatives.  When negatives are dropped at a much higher rate the post-dedup
-    # positive rate rises, leading to an under-estimated scale_pos_weight and a
-    # model that under-penalises false positives.
-    if n_base_dropped > 0 and base_pos_before > 0 and base_neg_before > 0:
-        frac_pos_dropped = base_pos_dropped / base_pos_before
-        frac_neg_dropped = base_neg_dropped / base_neg_before
-        if frac_neg_dropped > frac_pos_dropped + 0.10:
-            logger.warning(
-                f"DEDUP ASYMMETRY WARNING: dedup dropped {frac_neg_dropped:.1%} of "
-                f"negatives but only {frac_pos_dropped:.1%} of positives from base data. "
-                f"({base_neg_dropped} neg rows vs {base_pos_dropped} pos rows removed.) "
-                "This raises the post-dedup positive rate and may cause scale_pos_weight "
-                "to underestimate the true class imbalance. Likely cause: multiple "
-                "snapshot rows (t3/t5/t10) exist only for non-winner events. "
-                "Check whether ml_training_base stores extra rows for non-winners."
-            )
-
-    # Log base label distribution post-dedup so we can catch label imbalance early
-    base_pos = int((base_df["label"] == 1).sum()) if "label" in base_df.columns else 0
-    base_neg = int((base_df["label"] == 0).sum()) if "label" in base_df.columns else 0
-    base_rate = base_pos / max(1, base_pos + base_neg)
-    logger.info(
-        f"Base data after dedup: {len(base_df)} rows, "
-        f"pos={base_pos}, neg={base_neg}, pos_rate={base_rate:.1%}"
-    )
-    if base_rate > 0.30:
-        logger.warning(
-            f"Base data post-dedup positive rate is {base_rate:.1%}. "
-            "Each (symbol, event_date) pair should have one canonical label. "
-            "If winners and non-winners share the same (symbol, event_date) with "
-            "different labels, keep=last may be selecting winners over non-winners. "
-            "Consider auditing ml_training_base for conflicting label rows."
-        )
-    elif base_rate > 0.20:
-        # Rate is in the 20–30% amber zone.  Log with context so the operator
-        # can decide whether to investigate.  Key risk: a short LOOKBACK window
-        # (e.g. 90 days) covering a recent period with unusually many winners
-        # will inflate positive rate without any data corruption.
-        logger.warning(
-            f"Base data post-dedup positive rate is {base_rate:.1%} "
-            f"({base_pos} pos / {base_neg} neg). "
-            "This is above the expected ~5-20% ceiling. "
-            "Possible causes: (1) short LOOKBACK window covering an unusually "
-            "winner-heavy period — the model may over-represent recent market "
-            "conditions; (2) asymmetric dedup dropped more negatives than positives "
-            "(see DEDUP ASYMMETRY WARNING above if present); "
-            "(3) mild label drift in ml_training_base. "
-            "Check the pre-dedup vs post-dedup counts above to isolate the cause."
-        )
-
-    # ── Step 2: Concat (T-1 first so it wins any cross-source duplicates) ─────
-    combined = pd.concat([t1_df, base_df], ignore_index=True, sort=False)
-
-    # ── Step 3: Cross-source dedup — T-1 beats base for the same event ────────
-    # A stock may appear in both T-1 (identified by detection_date) and base
-    # (identified by event_date) for the same real-world day. The two source
-    # frames use DIFFERENT date columns for the same underlying event, so the
-    # previous version — which only matched on detection_date — could never
-    # actually catch a base-vs-T-1 duplicate: base rows generally don't
-    # populate detection_date, so `has_det` excluded them from the dedup pass
-    # entirely (hence 0 rows ever dropped here in practice, even when a base
-    # row and a T-1 row referred to the exact same symbol+day).
-    #
-    # Fix: build a single unified key per row — detection_date if present,
-    # else event_date — so a base row and a T-1 row for the same symbol+day
-    # collide on the same key regardless of which date column each happened
-    # to populate. T-1 is concatenated first (line above), so keep="first"
-    # still prefers the richer T-1 row.
-    cross_sym = next((c for c in ["symbol", "ticker"] if c in combined.columns), None)
-    has_any_date_col = ("detection_date" in combined.columns) or ("event_date" in combined.columns)
-    if cross_sym and has_any_date_col:
-        n_before_cross = len(combined)
-
-        unified_key = pd.Series(pd.NaT, index=combined.index, dtype="datetime64[ns]")
-        if "detection_date" in combined.columns:
-            unified_key = pd.to_datetime(combined["detection_date"], errors="coerce")
-        if "event_date" in combined.columns:
-            # BUG FIX (cross-source dedup date alignment): detection_date (T-1
-            # rows) is the day BEFORE the explosion, while event_date (base
-            # rows) is the explosion day itself -- the two columns are offset
-            # by 1 business day for the SAME real-world event. Every other
-            # place in this file that reconciles these two date columns
-            # (train_gain_regressor, the lookback filter, the RC2/RC3 merges --
-            # see the other `- pd.tseries.offsets.BDay(1)` usages in this
-            # module) shifts event_date back 1 business day before comparing
-            # it to detection_date. This dedup pass previously compared them
-            # raw, so a base row and a T-1 row describing the exact same
-            # symbol+event never collided on the same key (their dates
-            # differed by 1 day) and BOTH survived as near-duplicate feature
-            # snapshots of the same event -- one could land in train and the
-            # other in val, independent of the (already-correct) per-source
-            # dedup keys above. Shifting event_date -1 BDay here makes the
-            # unified key agree with detection_date for the same event, so
-            # true cross-source duplicates are finally caught.
-            event_parsed = (
-                pd.to_datetime(combined["event_date"], errors="coerce")
-                - pd.tseries.offsets.BDay(1)
-            )
-            # Only fill in where detection_date was missing so we never
-            # overwrite a real T-1 key.
-            unified_key = unified_key.fillna(event_parsed)
-
-        combined["_cross_dedup_key"] = unified_key
-        has_key = unified_key.notna()
-
-        cross_deduped = combined[has_key].drop_duplicates(
-            subset=[cross_sym, "_cross_dedup_key"], keep="first"
-        )
-        combined = pd.concat([cross_deduped, combined[~has_key]], ignore_index=True, sort=False)
-        combined = combined.drop(columns=["_cross_dedup_key"])
-        n_cross_dropped = n_before_cross - len(combined)
-        if n_cross_dropped > 0:
-            logger.info(
-                f"Cross-source dedup: removed {n_cross_dropped} rows where T-1 and base "
-                f"shared the same (symbol, unified-date) ({n_before_cross} → {len(combined)}), "
-                "using detection_date ?? event_date as the unified key."
-            )
-        else:
-            logger.info(
-                "Cross-source dedup: 0 rows removed — no symbol+date overlap found "
-                "between base and T-1 sources for this run."
-            )
-
-    logger.info(f"Combined dataset: {len(combined)} rows")
-
-    n_pos = int((combined["label"] == 1).sum())
-    n_neg = int((combined["label"] == 0).sum())
-
-    if n_pos > 0 and n_pos / (n_pos + n_neg) > 0.40:
-        # Log a breakdown by source to diagnose which data source is causing the imbalance.
-        if "source" in combined.columns:
-            logger.error("Positive rate breakdown by source:")
-            for src, grp in combined.groupby("source"):
-                grp_pos = int((grp["label"] == 1).sum())
-                grp_neg = int((grp["label"] == 0).sum())
-                grp_rate = grp_pos / max(1, grp_pos + grp_neg)
-                logger.error(f"  {src}: {len(grp)} rows, pos={grp_pos}, neg={grp_neg}, rate={grp_rate:.1%}")
-        logger.error(
-            f"ABORTING: positive rate {n_pos/(n_pos+n_neg):.1%} is too high. "
-            "Expected ~5-20% for explosive-stock prediction. "
-            "Likely causes: (1) deduplication wiped most negative rows — check "
-            "that the 'source' column is populated on base rows; "
-            "(2) ml_training_base itself has corrupt/missing negatives; "
-            "(3) intraday_high_labels relabelled too many negatives as winners."
-        )
-        sys.exit(1)
-
-    logger.info(
-      f"Combined dataset: {len(combined)} rows, "
-      f"{len(combined.columns)} columns, "
-      f"pos={n_pos}, neg={n_neg}, "
-      f"pos_rate={n_pos/len(combined)*100:.1f}%"
-    )
-
-    if n_neg == 0:
-        logger.error(
-            "CRITICAL: No negative (non-winner) samples found. "
-            "The model cannot train without both classes."
-        )
-        sys.exit(1)
-
-    if n_pos > 0 and (n_neg / n_pos) < 0.2:
-        logger.warning(
-            f"Class imbalance WARNING: {n_pos} positives vs {n_neg} negatives "
-            f"(ratio {n_neg/n_pos:.2f}). scale_pos_weight will compensate, "
-            "but consider accumulating more non-winner data."
-        )
-
-    return combined
-
-
-def apply_recency_weights(combined_df: pd.DataFrame, logger_: logging.Logger) -> pd.DataFrame:
-    """RC14: Multiply combined_df['sample_weight'] by a smooth exponential
-    recency decay, so rows closer to "now" count more during training.
-
-    weight_multiplier = 0.5 ** (days_before_most_recent_row / RECENCY_HALF_LIFE_DAYS)
-
-    The most recent dated row gets multiplier 1.0; a row RECENCY_HALF_LIFE_DAYS
-    old gets 0.5; a row 2x that old gets 0.25; etc. Undated rows (mistake
-    samples forced into train — see train_val_split() FIX 2) are left at
-    multiplier 1.0 since they have no age to decay by and already receive
-    their own weighting elsewhere.
-
-    Uses the same detection_date/event_date unification rule as
-    _cv_sort_date_and_symbols() / train_val_split() FIX 1, kept independent
-    for the same reason those two are independent of each other: this is a
-    small, stable rule that isn't worth risking a shared-helper refactor on.
-
-    No-op (logs and returns combined_df unchanged) if RECENCY_WEIGHTING_ENABLED
-    is False or no usable date column is found.
-    """
-    if not RECENCY_WEIGHTING_ENABLED:
-        logger_.info("RC14: recency weighting disabled (RECENCY_WEIGHTING_ENABLED=False) — skipping.")
-        return combined_df
-
-    has_detection = "detection_date" in combined_df.columns
-    has_event = "event_date" in combined_df.columns
-    if not (has_detection or has_event):
-        logger_.warning(
-            "RC14: no detection_date/event_date column found — skipping recency weighting."
-        )
-        return combined_df
-
-    sort_date = pd.Series(pd.NaT, index=combined_df.index)
-    if has_detection:
-        sort_date = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-    if has_event:
-        event_parsed = pd.to_datetime(combined_df["event_date"], errors="coerce")
-        sort_date = sort_date.fillna(event_parsed)
-
-    dated_mask = sort_date.notna()
-    n_dated = int(dated_mask.sum())
-    if n_dated == 0:
-        logger_.warning("RC14: no dated rows found — skipping recency weighting.")
-        return combined_df
-
-    most_recent = sort_date[dated_mask].max()
-    days_before = (most_recent - sort_date[dated_mask]).dt.total_seconds() / 86400.0
-    decay = np.power(0.5, days_before / RECENCY_HALF_LIFE_DAYS)
-
-    if "sample_weight" not in combined_df.columns:
-        combined_df["sample_weight"] = 1.0
-
-    combined_df.loc[dated_mask, "sample_weight"] = (
-        combined_df.loc[dated_mask, "sample_weight"].astype(float) * decay
-    )
-
-    oldest = sort_date[dated_mask].min()
-    span_days = (most_recent - oldest).days
-    logger_.info(
-        f"RC14: recency weighting applied to {n_dated} dated row(s) "
-        f"(half_life={RECENCY_HALF_LIFE_DAYS}d, date span={span_days}d, "
-        f"most_recent={most_recent.date()}, oldest={oldest.date()}). "
-        f"Weight multiplier range: [{decay.min():.4f}, {decay.max():.4f}]. "
-        f"{int((~dated_mask).sum())} undated row(s) left unmodified."
-    )
-    return combined_df
-
-
-def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
-    """
-    Extract feature matrix X, labels y, and sample weights w.
-
-    Returns:
-        X: DataFrame of features (NaN preserved here; build_scaler fills to 0.0
-           after standardisation so training and inference use the same representation)
-        y: Series of labels (0/1)
-        w: Series of sample weights
-    """
-    y = df["label"].astype(int)
-    w = (
-        df["sample_weight"].astype(float)
-        if "sample_weight" in df.columns
-        else pd.Series(1.0, index=df.index)
-    )
-
-    FEATURE_PREFIXES = ("t1_close_", "t1_open_", "t3_", "t5_", "t10_")
-    feature_cols = [
-        c for c in df.columns
-        if any(c.startswith(pfx) for pfx in FEATURE_PREFIXES)
-        and c not in NON_FEATURE_COLS  # exclude raw OHLCV and other non-predictive cols
-    ]
-
-    X = df[feature_cols].copy()
-
-    for col in X.columns:
-        X[col] = pd.to_numeric(X[col], errors="coerce")
-
-    X = X.replace([np.inf, -np.inf], np.nan)
-
-    # ── FIX (2026-08-11): symbol-fingerprint demeaning for HV_10/20/30 ─────
-    # diagnose_symbol_fingerprint_leak.py showed HV_10/20/30's ~0.75-0.76 raw
-    # AUC is ~80% "which stock is this" (between-symbol AUC 0.79-0.84) and
-    # only ~20% real day-to-day signal (within-symbol AUC 0.55-0.60). Rather
-    # than excluding HV outright (which would throw away the real slice),
-    # every lag/side variant of HV_10/20/30 is replaced here with the
-    # causally-demeaned residual: raw − that symbol's trailing mean computed
-    # from strictly earlier rows only. See src/ml_predictor/symbol_demeaning.py
-    # for the full mechanics and cold-start handling. This changes what the
-    # model is trained on, not how data is collected — combined_df / df still
-    # carry the raw values untouched.
-    if "symbol" in df.columns and "detection_date" in df.columns:
-        X = demean_training_features(X, df["symbol"], df["detection_date"])
-    else:
-        logger.warning(
-            "[symbol-demean] 'symbol'/'detection_date' not in df — skipping HV "
-            "symbol-fingerprint demeaning for this run (raw HV values kept as-is)"
-        )
-
-    # ── REMOVED (2026-08-06): has_t1_features binary flag ───────────────────
-    # This used to be added as a trained feature so XGBoost could branch on
-    # "is this row real T-1 data or an imputed base-CSV row" separately from
-    # the t1_ columns themselves. Removed because it's a source-provenance
-    # leak risk: if T-1 rows and base-CSV rows have different positive rates
-    # for reasons unrelated to real stock behavior (different collection eras,
-    # different selection criteria), the model can partly learn "this row
-    # came from the T-1 pipeline" as a shortcut instead of learning from the
-    # actual indicator values. It was also a source of train/inference
-    # skew — explosion_predictor.py force-set it to 1.0 for every live
-    # prediction, so whatever split the model learned between flag=0 and
-    # flag=1 rows during training silently applied to 100% of live rows.
-    #
-    # Now that t1_ lookback covers 180 days and t1 coverage is ~100% of the
-    # training set, base-CSV rows are a small-to-negligible minority anyway,
-    # so this flag bought little signal for real (non-provenance) reasons.
-    # Log-only diagnostic below replaces it — same visibility, no leak risk.
-    if "source" in df.columns:
-        n_t1_rows = int(df["source"].str.contains("day_prior", na=False).sum())
-    else:
-        t1_cols = [c for c in X.columns if c.startswith(("t1_close_", "t1_open_"))]
-        n_t1_rows = (
-            int((X[t1_cols].notna().mean(axis=1) > 0.5).sum()) if t1_cols else 0
-        )
-    n_base_rows = len(X) - n_t1_rows
-    logger.info(
-        f"Row source mix (diagnostic only, not a feature): "
-        f"{n_t1_rows} T-1 rows, {n_base_rows} base rows"
-    )
-
-    # ── OPTIONAL: restrict to a pre-computed feature subset ────────────────
-    # If src/ml_predictor/feature_selection.py has been run (see that module's
-    # docstring), it writes ml_models/feature_selection/selected_features.json.
-    # Setting USE_SELECTED_FEATURES=1 in the environment restricts X to that
-    # subset instead of all ~395 raw columns. Default behaviour (flag unset)
-    # is unchanged — nothing about this file's normal operation depends on
-    # the feature_selection module.
-    if os.environ.get("USE_SELECTED_FEATURES", "").lower() in ("1", "true", "yes"):
-        selected_path = Path("ml_models/feature_selection/selected_features.json")
-        if selected_path.exists():
-            with open(selected_path) as f:
-                selected = json.load(f).get("final_features", [])
-            missing = [c for c in selected if c not in X.columns]
-            if missing:
-                logger.warning(
-                    f"USE_SELECTED_FEATURES: {len(missing)} selected features "
-                    f"not present in current data (schema drift): {missing[:10]}..."
-                )
-            keep = [c for c in selected if c in X.columns]
-            # (has_t1_features removed entirely 2026-08-06 — see prepare_features()
-            # above. It's no longer added to X, so there's nothing to re-add here.)
-            X = X[keep]
-            logger.info(
-                f"USE_SELECTED_FEATURES active — restricted to {X.shape[1]} features "
-                f"from {selected_path}"
-            )
-        else:
-            logger.warning(
-                f"USE_SELECTED_FEATURES=1 but {selected_path} not found — "
-                "run `python -m src.ml_predictor.feature_selection` first. "
-                "Falling back to the full feature set."
-            )
-
-    logger.info(f"Feature matrix: {X.shape[0]} rows × {X.shape[1]} features")
-    nan_pct = X.isna().mean().mean() * 100
-    logger.info(f"Overall NaN rate: {nan_pct:.1f}% (expected for cross-lag rows)")
-
-    return X, y, w
-
-
-# ---------------------------------------------------------------------------
-# Scaling
-# ---------------------------------------------------------------------------
-#
-# Moved to src/ml_predictor/feature_scaling.py so that explosion_predictor.py
-# (live prediction) imports and calls the EXACT SAME functions instead of
-# maintaining its own parallel implementation. See that module's docstring.
-from src.ml_predictor.feature_scaling import (          # noqa: E402
-    compute_winsor_bounds,
-    apply_winsor_bounds,
-    build_scaler,
-    scale_with_fitted_scaler,
-    normalise_t1_features,
-)
-
-def train_model(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    w_train: pd.Series,
-    X_val: pd.DataFrame,
-    y_val: pd.Series,
-    X_cal: pd.DataFrame = None,
-    y_cal: pd.Series = None,
-    X_val_full: pd.DataFrame = None,
-    y_val_full: pd.Series = None,
-    n_estimators_ceiling: Optional[int] = None,
-    hyperparams_override: Optional[dict] = None,
-    screener_positive_rate: Optional[float] = None,
-    train_dates: Optional[pd.Series] = None,
-) -> object:
-    """Train XGBClassifier from scratch with early stopping.
-
-    CV WALK-FORWARD FIX: n_estimators_ceiling, when provided, is the
-    recommended_n_estimators from cv_walk_forward_evaluate() — the mean
-    early-stopping best_iteration across several walk-forward folds (plus
-    headroom), rather than XGBOOST_PARAMS' fixed default. This run's actual
-    tree count is still chosen by early stopping against X_val/y_val (so
-    calibration and the tail-guarantee logic below are unaffected) — the
-    ceiling only prevents a single noisy val cut from growing the model far
-    past what several independent folds agree generalises.
-
-    HYPERPARAMETER SEARCH FIX: hyperparams_override, when provided, is
-    search_hyperparameters()'s best_params for {max_depth, min_child_weight,
-    gamma, reg_alpha, reg_lambda, subsample, colsample_bytree} — the winner
-    of a real search scored on the walk-forward CV folds, replacing the
-    corresponding hand-tuned values in XGBOOST_PARAMS for this run only
-    (XGBOOST_PARAMS itself is left untouched as the documented fallback/
-    baseline). Every other XGBOOST_PARAMS entry (learning_rate, objective,
-    eval_metric, n_estimators, scale_pos_weight, early_stopping_rounds) is
-    unaffected.
-
-    RC6: If X_cal/y_cal are supplied (a held-out calibration set), the raw
-    XGBoost model is wrapped with a cross-fitted, isotonic/sigmoid-blended
-    calibrator (see fit_cross_fitted_blended_calibrator() in
-    src/ml_predictor/prior_corrected_model.py) before being returned.
-    Isotonic regression fits a rank-preserving monotone step function to the
-    calibration data and does NOT anchor to the calibration set's base
-    rate — making it robust to the mismatch between the val-set positive
-    rate (~10–25%) and the screened inference universe's higher positive
-    rate. Pure sigmoid (Platt scaling) anchors to the cal-set base rate and
-    was suppressing all inference probabilities to 0.50–0.68, which is why
-    isotonic remains the dominant component of the blend; sigmoid is only
-    blended in (weight = 1 - CALIBRATION_BLEND_WEIGHT) to smooth over the
-    unreachable-probability gaps a single small-sample isotonic fit can show.
-    Both components are cross-fitted (K folds averaged) rather than fit once
-    on the whole calibration set, so the result isn't sensitive to exactly
-    which rows land in a single fixed split.
-    The calibrator is fitted on X_cal/y_cal (not X_train) so that no
-    training data leaks into the calibration fit.
-
-    RC14: If train_dates is supplied (same index as X_train/y_train/w_train),
-    each bagged seed is fit on a lookback-window-truncated slice of the
-    training set — cycling through WINDOW_ENSEMBLE_LOOKBACK_DAYS — instead of
-    every seed seeing the identical full window. This extends the existing
-    seed-bagging (which cancels random-init variance) to also cancel some of
-    the regime-dependence a single training window can bake in. A window that
-    would leave fewer than WINDOW_ENSEMBLE_MIN_POS/MIN_NEG examples falls back
-    to the full window for that seed. No-op if train_dates is None or
-    WINDOW_ENSEMBLE_ENABLED is False — every seed then sees the full window,
-    identical to pre-RC14 behaviour.
-    """
-    params = XGBOOST_PARAMS.copy()
-
-    if hyperparams_override:
-        _changed = {
-            k: (params.get(k), v) for k, v in hyperparams_override.items()
-            if params.get(k) != v
-        }
-        params.update(hyperparams_override)
-        if _changed:
-            logger.info(
-                "  Using search_hyperparameters() results in place of hand-tuned "
-                "XGBOOST_PARAMS for this run:"
-            )
-            for k, (old, new) in _changed.items():
-                logger.info(f"    {k}: {old} -> {new}")
-
-    if n_estimators_ceiling is not None and n_estimators_ceiling > 0:
-        _original_n_estimators = params["n_estimators"]
-        params["n_estimators"] = min(params["n_estimators"], max(30, int(n_estimators_ceiling)))
-        if params["n_estimators"] != _original_n_estimators:
-            logger.info(
-                f"  n_estimators capped {_original_n_estimators} -> {params['n_estimators']} "
-                "(CV walk-forward recommendation: mean early-stopping best_iteration "
-                "across folds, see cv_walk_forward_evaluate())."
-            )
-
-    n_pos = int((y_train == 1).sum())
-    n_neg = int((y_train == 0).sum())
-    if n_pos > 0 and n_neg > 0:
-        raw_spw = n_neg / n_pos
-        # FIX 3: clamp scale_pos_weight to avoid extreme corrections
-        clamped_spw = max(SPW_MIN, min(SPW_MAX, raw_spw))
-        params["scale_pos_weight"] = round(clamped_spw, 3)
-        if abs(raw_spw - clamped_spw) > 0.01:
-            logger.info(
-                f"  scale_pos_weight: raw={raw_spw:.3f} → clamped to {clamped_spw:.3f} "
-                f"(limits: [{SPW_MIN}, {SPW_MAX}])"
-            )
-        else:
-            logger.info(
-                f"  scale_pos_weight set to {clamped_spw:.3f} "
-                f"(neg={n_neg} / pos={n_pos})"
-            )
-
-    early_stopping = params.pop("early_stopping_rounds", 30)
-
-    logger.info(f"Training {BAGGING_N_SEEDS} XGBoost model(s) from scratch (seed bagging)...")
-    logger.info(f"  Train: {len(X_train)} rows")
-    logger.info(f"  Val:   {len(X_val)} rows")
-
-    # ── RC14: resolve per-seed lookback window (window-ensembling) ──────────
-    use_window_ensemble = (
-        WINDOW_ENSEMBLE_ENABLED
-        and train_dates is not None
-        and train_dates.notna().any()
-    )
-    if WINDOW_ENSEMBLE_ENABLED and train_dates is None:
-        logger.info(
-            "RC14: window-ensembling enabled but no train_dates supplied to "
-            "train_model() — every seed will see the full window (unchanged)."
-        )
-    _most_recent_train_date = None
-    if use_window_ensemble:
-        _most_recent_train_date = train_dates.max()
-        logger.info(
-            f"RC14: window-ensembling ON — cycling seeds through "
-            f"{WINDOW_ENSEMBLE_LOOKBACK_DAYS} day lookback(s) "
-            f"(None = full window), most_recent_train_date="
-            f"{_most_recent_train_date.date() if pd.notna(_most_recent_train_date) else 'n/a'}."
-        )
-
-    _seed_models = []
-    _seed_windows_used = []
-    _seed_curves = []
-    _seed_peaks = []
-    for _i in range(BAGGING_N_SEEDS):
-        _seed = BAGGING_SEED_BASE + _i
-        _seed_params = {**params, "random_state": _seed}
-
-        # ── Resolve this seed's training subset ─────────────────────────
-        _window_days = None
-        _X_tr_seed, _y_tr_seed, _w_tr_seed = X_train, y_train, w_train
-        if use_window_ensemble:
-            _window_days = WINDOW_ENSEMBLE_LOOKBACK_DAYS[_i % len(WINDOW_ENSEMBLE_LOOKBACK_DAYS)]
-            if _window_days is not None:
-                _cutoff = _most_recent_train_date - pd.Timedelta(days=_window_days)
-                # Undated rows (mistake samples) are always kept — mirrors
-                # train_val_split() FIX 2's "undated rows never get purged".
-                _mask = (train_dates >= _cutoff) | train_dates.isna()
-                _mask = _mask.reindex(X_train.index, fill_value=True)
-                _cand_X, _cand_y, _cand_w = X_train[_mask], y_train[_mask], w_train[_mask]
-                _n_pos_win = int((_cand_y == 1).sum())
-                _n_neg_win = int((_cand_y == 0).sum())
-                if _n_pos_win >= WINDOW_ENSEMBLE_MIN_POS and _n_neg_win >= WINDOW_ENSEMBLE_MIN_NEG:
-                    _X_tr_seed, _y_tr_seed, _w_tr_seed = _cand_X, _cand_y, _cand_w
-                else:
-                    logger.info(
-                        f"  Seed {_seed}: {_window_days}d window would leave only "
-                        f"{_n_pos_win} pos / {_n_neg_win} neg (need ≥"
-                        f"{WINDOW_ENSEMBLE_MIN_POS}/{WINDOW_ENSEMBLE_MIN_NEG}) — "
-                        "falling back to the full train window for this seed."
-                    )
-                    _window_days = None  # record what was actually used, not what was requested
-        _seed_windows_used.append(_window_days)
-
-        # scale_pos_weight is base-rate-dependent, so it must be recomputed
-        # per seed whenever the window truncation changes that seed's train
-        # subset's class balance (matches _fit_and_score_cv_folds()'s
-        # per-fold recomputation for the same reason).
-        _n_pos_seed = int((_y_tr_seed == 1).sum())
-        _n_neg_seed = int((_y_tr_seed == 0).sum())
-        if _n_pos_seed > 0 and _n_neg_seed > 0:
-            _raw_spw_seed = _n_neg_seed / _n_pos_seed
-            _seed_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, _raw_spw_seed)), 3)
-
-        # CONSENSUS STOPPING FIX (undertrained-classifier root cause #2):
-        # Fitting each seed with its OWN early_stopping_rounds picks that
-        # seed's round off its own per-round validation curve. On this val
-        # set (a few hundred positives), that curve is noisy enough that
-        # otherwise-identical seeds (same train/val data, only random_state
-        # differs) can pick wildly different rounds — observed in practice:
-        # best_iteration ranging ~6-33 across 7 seeds. Averaging those noisy
-        # PICKS (the old behaviour) just averages the noise; it doesn't
-        # remove it. It also inherited the aucpr/ROC-AUC metric-name mix-up
-        # fixed in _fit_and_score_cv_folds() above — "best_val_auc" here was
-        # actually PR-AUC (XGBOOST_PARAMS sets eval_metric="aucpr").
-        #
-        # Fix: don't early-stop each seed individually. Instead fit every
-        # seed to the SAME full tree budget (params["n_estimators"], already
-        # capped by cv_walk_forward_evaluate's recommendation) while asking
-        # XGBoost to also track true ROC-AUC per round (eval_metric=["aucpr",
-        # "auc"]) via evals_result(). AFTER all seeds are fit, average their
-        # per-round auc curves together — THIS is the noise-cancelling step,
-        # the same seed-bagging principle this whole class exists for,
-        # applied to curve selection instead of to final predictions — and
-        # pick the argmax of the smoothed, averaged curve as one shared
-        # stopping point for every seed (applied at inference via
-        # iteration_range in BaggedXGBClassifier).
-        _seed_params_curve = {**_seed_params, "eval_metric": ["aucpr", "auc"]}
-        _seed_model = XGBClassifier(**_seed_params_curve)
-        _seed_model.fit(
-            _X_tr_seed,
-            _y_tr_seed,
-            sample_weight=_w_tr_seed.values,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
-        _seed_curve = _seed_model.evals_result()["validation_0"]["auc"]
-        _seed_peak_iter = int(np.argmax(_seed_curve)) + 1
-        _seed_curves.append(_seed_curve)
-        _seed_peaks.append(_seed_peak_iter)
-        logger.info(
-            f"  Seed {_seed} ({_i + 1}/{BAGGING_N_SEEDS}) "
-            f"[window={_window_days if _window_days is not None else 'full'}, "
-            f"train_rows={len(_X_tr_seed)}, pos={_n_pos_seed}, neg={_n_neg_seed}]: "
-            f"own-curve peak={_seed_peak_iter}/{len(_seed_curve)} "
-            f"auc_at_peak={_seed_curve[_seed_peak_iter - 1]:.4f}  "
-            f"auc_at_final={_seed_curve[-1]:.4f}"
-        )
-        _seed_models.append(_seed_model)
-
-    if use_window_ensemble:
-        _window_counts = pd.Series(
-            [w if w is not None else "full" for w in _seed_windows_used]
-        ).value_counts().to_dict()
-        logger.info(f"RC14: window-ensemble seed distribution actually used: {_window_counts}")
-
-    # Average the per-seed curves round-by-round (all seeds trained to the
-    # identical tree budget above, so lengths match without padding), then
-    # pick the argmax of the SMOOTHED curve — the noise-cancelling step.
-    _curve_arr = np.array(_seed_curves)  # shape (n_seeds, n_estimators)
-    _mean_curve = _curve_arr.mean(axis=0)
-    _consensus_iter = int(np.argmax(_mean_curve)) + 1
-    _consensus_score = float(_mean_curve[_consensus_iter - 1])
-    logger.info(
-        f"  Per-seed curve peaks (noisy, own val curve each): {_seed_peaks} "
-        f"— spread {min(_seed_peaks)}-{max(_seed_peaks)} illustrates why picking "
-        "each seed's own peak independently is unstable."
-    )
-    logger.info(
-        f"  Consensus stopping point (argmax of the seed-AVERAGED auc curve): "
-        f"iteration={_consensus_iter}/{len(_mean_curve)}  auc={_consensus_score:.4f} "
-        "— this is what every seed is truncated to at inference."
-    )
-
-    # BAGGING: average predict_proba across the seeds below (BaggedXGBClassifier)
-    # instead of picking a single seed's model. This is the same bagging
-    # principle feature_selection.py already uses for *stability* (selecting
-    # features that repeatedly survive across resampled runs) — here it's
-    # applied to the trained model's output instead of to feature selection.
-    model = BaggedXGBClassifier(
-        _seed_models,
-        consensus_iteration=_consensus_iter,
-        per_seed_peaks=_seed_peaks,
-        consensus_score=_consensus_score,
-    )
-
-    logger.info(
-        f"  Bagged across {model.n_seeds_} seeds — "
-        f"consensus best_iteration={model.best_iteration}  "
-        f"consensus val AUC={model.best_score:.4f}"
-    )
-    # Warn if the consensus stopping point is suspiciously early — indicates
-    # the val set is too small, too imbalanced, or temporally
-    # non-representative. Unlike the old per-seed-average check, this is now
-    # measured off the smoothed curve, so a low value here is much less
-    # likely to just be seed noise.
-    if model.best_iteration < 30:
-        val_pos  = int((y_val == 1).sum())
-        val_neg  = int((y_val == 0).sum())
-        val_rate = val_pos / max(1, val_pos + val_neg)
-        logger.warning(
-            f"  ⚠️  UNDERTRAINED: consensus best_iteration={model.best_iteration} "
-            f"(the seed-averaged val AUC curve peaks after only {model.best_iteration} "
-            f"trees). Val set: {val_pos} pos / {val_neg} neg ({val_rate:.1%} positive "
-            "rate). Because this is now the argmax of a curve averaged across "
-            f"{model.n_seeds_} seeds (not one seed's own noisy pick), a low number "
-            "here is more likely a genuine early plateau than random-seed noise — "
-            "possible causes: (1) val set still has too few positives (<20) for a "
-            "stable curve even after averaging; (2) val period has a very different "
-            "class distribution from train; (3) heavy regularisation params "
-            "(gamma/min_child_weight) need loosening."
-        )
-
-    # Warn if val AUC is suspiciously perfect — sign of data leakage
-    if model.best_score > 0.999:
-        logger.warning(
-            f"  ⚠️  Val AUC={model.best_score:.4f} is suspiciously high. "
-            "This may indicate data leakage or label overlap. "
-            "Check that the validation set does not overlap with training dates."
-        )
-
-    # RC6 (revised): Post-training probability calibration with prior correction.
-    #
-    # CALIBRATION STRATEGY:
-    #   Step 1 — Isotonic calibration: fit a rank-preserving monotone mapping
-    #     from raw XGBoost scores to probabilities on the held-out calibration
-    #     set.  Isotonic is preferred over sigmoid (Platt scaling) because
-    #     sigmoid anchors to the calibration set's positive base rate, which
-    #     suppresses all inference probabilities when the screened inference
-    #     universe has a higher base rate than the val/cal set.
-    #
-    #   Step 2 — Prior-probability correction (Bayes odds-ratio adjustment):
-    #     Even isotonic calibration implicitly anchors to the calibration set's
-    #     base rate.  When the calibration set is carved from the val split
-    #     (positive rate ~10–25%) but inference runs on a screened universe
-    #     (positive rate ~30–50%), the isotonic output is systematically too
-    #     low for screened stocks.
-    #
-    #     Correction formula (Saerens et al. 2002 / du Plessis & Sugiyama 2014):
-    #
-    #       Let p_c = calibration-set positive rate (known from y_cal)
-    #           p_i = screened inference positive rate (SCREENER_POSITIVE_RATE)
-    #           q   = raw isotonic-calibrated probability
-    #
-    #       odds_corrected = (q / (1 - q)) * (p_i / (1 - p_i)) / (p_c / (1 - p_c))
-    #       p_corrected    = odds_corrected / (1 + odds_corrected)
-    #
-    #     This is applied element-wise at inference time via a thin wrapper that
-    #     calls the underlying CalibratedClassifierCV and then shifts odds.
-    #     The wrapper is transparent to the rest of the codebase (it still
-    #     implements predict_proba / predict / classes_).
-    #
-    #     SCREENER_POSITIVE_RATE is configurable at the top of this file.
-    #     Set it to None to disable prior correction and use raw isotonic output.
-    if X_cal is not None and y_cal is not None:
-        n_cal_pos = int((y_cal == 1).sum())
-        n_cal_neg = int((y_cal == 0).sum())
-        if n_cal_pos >= 10 and n_cal_neg >= 10:
-            p_cal = n_cal_pos / max(1, n_cal_pos + n_cal_neg)
-            logger.info(
-                f"RC6: Fitting cross-fitted isotonic/sigmoid-blended probability "
-                f"calibrator on {len(y_cal)} calibration samples "
-                f"({n_cal_pos} pos / {n_cal_neg} neg, rate={p_cal:.1%})."
-            )
-
-            # TAIL-GUARANTEE FIX (2026-08-13): the cal/early-stop split assigns
-            # rows by time-position, independent of raw score. With very few
-            # extreme-score rows in the whole val set, whichever side of the
-            # split they land on is close to a coin flip — and if they land in
-            # the early-stop half instead of cal, the isotonic calibrator's
-            # highest achievable output step drops (it can only output y-values
-            # it saw evidence for), silently capping predicted probabilities
-            # well below 1.0 (e.g. losing the 0.8-1.0 output range entirely)
-            # even though nothing about the underlying model changed.
-            # Fix: after the split is fixed, explicitly check whether the most
-            # extreme-scoring val rows (by raw model score) are present in the
-            # calibration set, and if not, add them in (union, not swap — cal
-            # set only grows, early-stopping is already done by this point so
-            # there's no leakage concern in adding more rows to X_cal here).
-            if X_val_full is not None and y_val_full is not None and len(X_val_full) > len(X_cal):
-                _raw_full = model.predict_proba(X_val_full)[:, 1]
-                _TAIL_GUARANTEE_N = max(5, int(0.01 * len(X_val_full)))  # top/bottom 1%, min 5
-                _order = np.argsort(_raw_full)
-                _tail_positions = np.concatenate([_order[:_TAIL_GUARANTEE_N], _order[-_TAIL_GUARANTEE_N:]])
-                _tail_idx = X_val_full.index[_tail_positions]
-                _missing_tail_idx = _tail_idx.difference(X_cal.index)
-                if len(_missing_tail_idx) > 0:
-                    X_cal = pd.concat([X_cal, X_val_full.loc[_missing_tail_idx]])
-                    y_cal = pd.concat([y_cal, y_val_full.loc[_missing_tail_idx]])
-                    logger.info(
-                        f"  RC6-tailfix: added {len(_missing_tail_idx)} extreme-raw-score "
-                        f"val row(s) (top/bottom {_TAIL_GUARANTEE_N} by raw score) into the "
-                        "calibration set that weren't already there — prevents the "
-                        "calibrated output range from silently shrinking based on which "
-                        "side of the time-position split they happened to land on."
-                    )
-
-            calibrated_model, _n_splits_used = fit_cross_fitted_blended_calibrator(
-                model,
-                X_cal,
-                y_cal,
-                n_splits=CALIBRATION_N_SPLITS,
-                blend_weight=CALIBRATION_BLEND_WEIGHT,
-            )
-            _n_cal_pos = int((y_cal == 1).sum())
-            _n_cal_neg = int((y_cal == 0).sum())
-            if _n_splits_used != CALIBRATION_N_SPLITS:
-                logger.info(
-                    f"  RC6: calibration set too small for {CALIBRATION_N_SPLITS} "
-                    f"folds — used {_n_splits_used} fold(s) instead "
-                    f"({_n_cal_pos} pos / {_n_cal_neg} neg in calibration set, "
-                    f"~{min(_n_cal_pos, _n_cal_neg) // max(1, _n_splits_used)} of "
-                    f"the rarer class per fold)."
-                )
-            else:
-                logger.info(
-                    f"  RC6: calibration set supports full {_n_splits_used}-fold "
-                    f"split ({_n_cal_pos} pos / {_n_cal_neg} neg, "
-                    f"~{min(_n_cal_pos, _n_cal_neg) // max(1, _n_splits_used)} of "
-                    f"the rarer class per fold)."
-                )
-            logger.info(
-                f"  RC6: calibrator = {_n_splits_used}-fold cross-fitted isotonic "
-                f"blended with {_n_splits_used}-fold cross-fitted sigmoid "
-                f"(blend_weight={CALIBRATION_BLEND_WEIGHT:.2f} isotonic / "
-                f"{1.0 - CALIBRATION_BLEND_WEIGHT:.2f} sigmoid)."
-            )
-
-            # Sanity-check: log how calibration shifted the distribution
-            raw_proba = model.predict_proba(X_cal)[:, 1]
-            cal_proba = calibrated_model.predict_proba(X_cal)[:, 1]
-            logger.info(
-                f"  Raw proba  — mean={raw_proba.mean():.3f}  "
-                f"std={raw_proba.std():.3f}  "
-                f"pct>=0.90: {(raw_proba>=0.90).mean():.1%}"
-            )
-            logger.info(
-                f"  Cal proba  — mean={cal_proba.mean():.3f}  "
-                f"std={cal_proba.std():.3f}  "
-                f"pct>=0.90: {(cal_proba>=0.90).mean():.1%}"
-            )
-
-            # DIAGNOSTIC (2026-08-13): log the isotonic calibrator's step
-            # breakpoints so any gaps in the calibrated-probability histogram
-            # can be attributed correctly. Isotonic regression is a step
-            # function — cal_proba can only take the distinct y_thresholds_
-            # values below. If a gap (e.g. 0.5-0.7) in the calibrated-output
-            # histogram corresponds to a jump between two consecutive
-            # thresholds here, that's expected PAVA-pooling behaviour, not a
-            # bug. If instead the *raw* scores themselves show a similar gap
-            # (checked below), that indicates the underlying model is
-            # separating rows into distinct clusters rather than a smooth
-            # probability surface — worth understanding but still not
-            # necessarily a bug (e.g. a dominant regime-flag feature).
-            try:
-                # RC6-diag (revised for cross-fitted blended calibrator): log
-                # each fold's isotonic step breakpoints, then check whether the
-                # UNION of all folds' y-thresholds still shows a gap. Because
-                # the final output is the blend of the isotonic-fold average
-                # with the smooth sigmoid-fold average, a gap in any single
-                # fold's steps (or even in their union) doesn't necessarily
-                # produce a gap in the actual blended output — but it's still
-                # useful to see whether the underlying isotonic fits are jumpy.
-                _all_y_thresh = []
-                for _fold_i, _iso in enumerate(calibrated_model._iso_models):
-                    _x_thresh = getattr(_iso, "X_thresholds_", None)
-                    _y_thresh = getattr(_iso, "y_thresholds_", None)
-                    if _x_thresh is not None and _y_thresh is not None:
-                        _steps = list(zip(np.round(_x_thresh, 4), np.round(_y_thresh, 4)))
-                        logger.info(
-                            f"  RC6-diag: isotonic fold {_fold_i} has {len(_steps)} "
-                            f"step breakpoint(s). raw_score→prob steps: {_steps}"
-                        )
-                        _all_y_thresh.extend(_y_thresh.tolist())
-                if _all_y_thresh:
-                    _y_sorted = np.sort(np.unique(np.round(_all_y_thresh, 4)))
-                    _y_gaps = np.diff(_y_sorted)
-                    if len(_y_gaps) > 0 and _y_gaps.max() > 0.15:
-                        _gap_idx = int(np.argmax(_y_gaps))
-                        logger.info(
-                            f"  RC6-diag: largest gap across the union of all "
-                            f"isotonic folds' output thresholds is "
-                            f"{_y_sorted[_gap_idx]:.3f}–{_y_sorted[_gap_idx+1]:.3f} "
-                            f"(width {_y_gaps[_gap_idx]:.3f}). The sigmoid blend "
-                            "component fills in this range in the final output; "
-                            "only the raw per-fold isotonic step function has "
-                            "this hard restriction."
-                        )
-            except (AttributeError, IndexError, TypeError) as _e:
-                logger.debug(f"  RC6-diag: could not introspect isotonic thresholds ({_e}).")
-
-            # Bimodal check on the RAW (pre-calibration) scores — a real gap
-            # here (as opposed to just the calibrated output above) would
-            # suggest the model itself is splitting rows into distinct
-            # clusters rather than a smooth score surface.
-            _raw_sorted = np.sort(raw_proba)
-            if len(_raw_sorted) > 1:
-                _raw_gaps = np.diff(_raw_sorted)
-                _raw_gap_max = float(_raw_gaps.max())
-                if _raw_gap_max > 0.15:
-                    _rg_idx = int(np.argmax(_raw_gaps))
-                    logger.info(
-                        f"  RC6-diag: raw (pre-calibration) scores also show a gap "
-                        f"of {_raw_gap_max:.3f} between {_raw_sorted[_rg_idx]:.3f} and "
-                        f"{_raw_sorted[_rg_idx+1]:.3f} — the model may be separating "
-                        "rows into distinct clusters (e.g. a dominant discrete "
-                        "regime-flag feature) rather than producing a smooth score."
-                    )
-
-            # Step 2: Prior-probability correction for base-rate mismatch.
-            # screener_positive_rate (passed in from main(), measured via
-            # estimate_screener_positive_rate()) takes priority; falls back
-            # to the module-level SCREENER_POSITIVE_RATE for any caller that
-            # still invokes train_model() directly without it (e.g. tests).
-            p_inf = screener_positive_rate if screener_positive_rate is not None else SCREENER_POSITIVE_RATE
-            if p_inf is not None and 0.0 < p_inf < 1.0 and 0.0 < p_cal < 1.0:
-                # Bayes odds-ratio correction factor
-                odds_ratio = (p_inf / (1.0 - p_inf)) / (p_cal / (1.0 - p_cal))
-                logger.info(
-                    f"  Prior correction: p_cal={p_cal:.3f} → p_inf={p_inf:.3f}  "
-                    f"odds_ratio={odds_ratio:.3f}"
-                )
-
-                # Compute corrected probabilities on the cal set for logging
-                raw_odds = cal_proba / np.clip(1.0 - cal_proba, 1e-9, None)
-                corr_odds = raw_odds * odds_ratio
-                corr_proba = corr_odds / (1.0 + corr_odds)
-                logger.info(
-                    f"  Corrected proba — mean={corr_proba.mean():.3f}  "
-                    f"std={corr_proba.std():.3f}  "
-                    f"pct>=0.90: {(corr_proba>=0.90).mean():.1%}"
-                )
-
-                # Warn if correction is so large it may be unreliable
-                if odds_ratio > 10.0:
-                    logger.warning(
-                        f"  ⚠️  RC6: Prior correction odds_ratio={odds_ratio:.2f} is very "
-                        f"large.  Verify that SCREENER_POSITIVE_RATE={p_inf} reflects the "
-                        f"actual fraction of screened candidates that become winners. "
-                        f"Run: SELECT COUNT(*) FILTER (WHERE became_winner)*1.0/COUNT(*) "
-                        f"FROM ml_prediction_accuracy WHERE prediction_date >= NOW()-'90 days'::interval"
-                    )
-
-                # Wrap calibrated_model with prior correction so predict_proba()
-                # automatically applies the Bayes odds-ratio shift at inference.
-                # _PriorCorrectedModel is defined at module level (not inside this
-                # function) so that joblib can pickle it by fully-qualified name.
-                return _PriorCorrectedModel(calibrated_model, float(odds_ratio))
-            else:
-                if p_inf is None:
-                    logger.info(
-                        "  Prior correction disabled (SCREENER_POSITIVE_RATE=None). "
-                        "Returning raw isotonic-calibrated model."
-                    )
-                else:
-                    logger.warning(
-                        f"  Prior correction skipped: invalid "
-                        f"SCREENER_POSITIVE_RATE={p_inf} or p_cal={p_cal:.3f}. "
-                        "Must be strictly between 0 and 1."
-                    )
-                return calibrated_model
-        else:
-            logger.warning(
-                f"RC6: Calibration set too small or imbalanced "
-                f"({n_cal_pos} pos / {n_cal_neg} neg) — "
-                "skipping isotonic calibration. Returning raw model."
-            )
-    else:
-        logger.info(
-            "RC6: No calibration set provided — returning raw (uncalibrated) model. "
-            "Pass X_cal/y_cal to train_model() to enable isotonic calibration."
-        )
-
-    return model
-
-
-def _cv_sort_date_and_symbols(df_work: pd.DataFrame) -> tuple:
-    """Build the same detection_date/event_date unified sort-date column that
-    train_val_split()'s FIX 1 uses, for cv_walk_forward_evaluate() below.
-
-    Deliberately duplicated rather than factored into a shared helper: this
-    ~10-line date-unification rule is simple and stable, while train_val_split
-    is a large, already-hardened function (FIX 1-5) that a shared-helper
-    refactor risks perturbing for no real benefit. Keep both in sync by hand
-    if the date-column convention ever changes.
-
-    Returns (sort_date, symbols) where symbols is None if df_work has no
-    'symbol' column. Both are aligned 1:1 by position with df_work's rows —
-    callers must pass X/y/w/combined_df sharing that same row order (true for
-    every caller in this file, since prepare_features() never reorders rows).
-    """
-    has_detection = "detection_date" in df_work.columns
-    has_event = "event_date" in df_work.columns
-
-    if has_detection or has_event:
-        sort_date = pd.Series(pd.NaT, index=df_work.index)
-        if has_detection:
-            sort_date = pd.to_datetime(df_work["detection_date"], errors="coerce")
-        if has_event:
-            event_parsed = pd.to_datetime(df_work["event_date"], errors="coerce")
-            sort_date = sort_date.fillna(event_parsed)
-    else:
-        date_col = next((c for c in ["date"] if c in df_work.columns), None)
-        sort_date = (
-            pd.to_datetime(df_work[date_col], errors="coerce")
-            if date_col else pd.Series(pd.NaT, index=df_work.index)
-        )
-
-    symbols = df_work["symbol"] if "symbol" in df_work.columns else None
-    return sort_date, symbols
-
-
-def _prep_cv_xy(X: pd.DataFrame, y: pd.Series, w: pd.Series) -> tuple:
-    """Numeric-coerce X and pull y/w to plain arrays, shared by
-    cv_walk_forward_evaluate() and search_hyperparameters() so both fit
-    against an identical feature matrix."""
-    Xc = X.copy()
-    for c in Xc.columns:
-        Xc[c] = pd.to_numeric(Xc[c], errors="coerce")
-    Xc = Xc.replace([np.inf, -np.inf], np.nan)
-    return Xc, y.astype(int).values, w.values
-
-
-def _build_cv_splits(
-    X: pd.DataFrame,
-    combined_df: pd.DataFrame,
-    n_splits: int = CV_N_SPLITS,
-    min_train_frac: float = CV_MIN_TRAIN_FRAC,
-):
-    """Build the walk-forward fold list shared by cv_walk_forward_evaluate()
-    and search_hyperparameters(), so a hyperparameter search and the CV
-    report it feeds are always scored against the IDENTICAL folds (same
-    embargo + symbol purge as train_val_split()'s FIX 4/5).
-
-    Returns (splits, EMBARGO_DAYS) on success, or (None, reason_str) if
-    there isn't enough dated data for n_splits folds, or time_aware_splits()
-    itself raises (e.g. min_train_frac leaves too few rows).
-    """
-    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
-    sort_date, symbols = _cv_sort_date_and_symbols(combined_df)
-
-    n_dated = int(sort_date.notna().sum())
-    if n_dated < (n_splits + 1) * 2:
-        return None, f"insufficient_dated_rows:{n_dated}"
-
-    try:
-        splits = time_aware_splits(
-            sort_date,
-            n_splits=n_splits,
-            min_train_frac=min_train_frac,
-            symbols=symbols,
-            embargo_days=EMBARGO_DAYS,
-            symbol_purge_window_days=EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER,
-        )
-    except ValueError as e:
-        return None, str(e)
-
-    return splits, EMBARGO_DAYS
-
-
-def _fit_and_score_cv_folds(
-    Xc: pd.DataFrame,
-    yv: np.ndarray,
-    wv: np.ndarray,
-    splits: list,
-    params: dict,
-    random_state: int = 42,
-) -> dict:
-    """Fit one XGBOOST_PARAMS-shaped `params` dict across every
-    (train_pos, test_pos) fold in `splits`, scoring each fold with its own
-    early-stopping AUC. Shared by cv_walk_forward_evaluate() (reports the
-    active params' CV performance) and search_hyperparameters() (scores
-    each trial's candidate params) so both use identical fold-fitting logic
-    — a hyperparameter search is only a fair comparison against the
-    legitimacy report if they share the exact same fitting code path.
-
-    Folds with a degenerate class split (all-one-class train or test) are
-    skipped and excluded from the aggregates but still recorded.
-
-    Returns {"fold_aucs", "fold_best_iters", "fold_rows", "n_used"}.
-    """
-    fold_rows, fold_aucs, fold_best_iters = [], [], []
-
-    for i, (train_pos, test_pos) in enumerate(splits):
-        y_tr, y_te = yv[train_pos], yv[test_pos]
-        n_tr_pos, n_tr_neg = int((y_tr == 1).sum()), int((y_tr == 0).sum())
-        n_te_pos, n_te_neg = int((y_te == 1).sum()), int((y_te == 0).sum())
-
-        if n_tr_pos == 0 or n_tr_neg == 0 or n_te_pos == 0 or n_te_neg == 0:
-            fold_rows.append({
-                "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
-                "n_test_pos": n_te_pos, "auc": None, "best_iteration": None, "skipped": True,
-            })
-            continue
-
-        fold_params = params.copy()
-        raw_spw = n_tr_neg / n_tr_pos
-        fold_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, raw_spw)), 3)
-        # random_state may already be a key in `params` (XGBOOST_PARAMS carries
-        # one) — overwrite rather than also passing it as a separate kwarg
-        # below, which would otherwise raise "multiple values for keyword
-        # argument 'random_state'".
-        fold_params["random_state"] = random_state
-        early_stopping = fold_params.pop("early_stopping_rounds", 30)
-        fold_model = XGBClassifier(**fold_params, early_stopping_rounds=early_stopping)
-        fold_model.fit(
-            Xc.iloc[train_pos], y_tr,
-            sample_weight=wv[train_pos],
-            eval_set=[(Xc.iloc[test_pos], y_te)],
-            verbose=False,
-        )
-        fold_iter = int(fold_model.best_iteration)
-
-        # FIX (metric mismatch): fold_model.best_score reflects whatever
-        # eval_metric was configured for early stopping — XGBOOST_PARAMS sets
-        # eval_metric="aucpr" (PR-AUC / average precision), NOT ROC-AUC.
-        # PR-AUC's no-skill baseline is the positive rate (e.g. ~0.136 at a
-        # 13.6% positive rate), not 0.5, so treating best_score as "AUC" and
-        # comparing it to a 0.5 threshold silently used the wrong baseline
-        # and made a model with real edge look worse than random. It also
-        # made this function's output incomparable to rfecv_time_aware()
-        # (src/ml_predictor/feature_selection.py), which scores its folds
-        # with sklearn's roc_auc_score directly.
-        #
-        # Compute true ROC-AUC here explicitly, from the fold's own held-out
-        # predict_proba, so this function's "auc" means the same thing
-        # rfecv_time_aware()'s does and both are safe to compare against 0.5
-        # and against each other. best_score (whatever metric it is) is kept
-        # separately as fold_pr_auc for reference/debugging, not used as the
-        # headline number.
-        fold_proba = fold_model.predict_proba(Xc.iloc[test_pos])[:, 1]
-        fold_auc = float(roc_auc_score(y_te, fold_proba))
-        fold_pr_auc = float(fold_model.best_score)
-
-        fold_aucs.append(fold_auc)
-        fold_best_iters.append(fold_iter)
-        fold_rows.append({
-            "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
-            "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
-            "pr_auc": round(fold_pr_auc, 4),
-            "best_iteration": fold_iter, "skipped": False,
-        })
-
-    return {
-        "fold_aucs": fold_aucs,
-        "fold_best_iters": fold_best_iters,
-        "fold_rows": fold_rows,
-        "n_used": len(fold_aucs),
-    }
-
-
-def cv_walk_forward_evaluate(
-    X: pd.DataFrame,
-    y: pd.Series,
-    w: pd.Series,
-    combined_df: pd.DataFrame,
-    n_splits: int = CV_N_SPLITS,
-    min_train_frac: float = CV_MIN_TRAIN_FRAC,
-    random_state: int = 42,
-    params_override: Optional[dict] = None,
-) -> dict:
-    """
-    Walk-forward CV for the classifier itself, reusing the SAME leak-guarded
-    splitter (time_aware_splits(), with FIX 4's embargo + FIX 5-equivalent
-    symbol purge) that Stage 3/4 feature selection already relies on — see
-    rfecv_time_aware() / genetic_algorithm_selection() in
-    src/ml_predictor/feature_selection.py.
-
-    WHY THIS EXISTS:
-    train_val_split() produces exactly one train/val cut. The reported
-    best_val_auc / blind_cal_auc are therefore point estimates off
-    ~1700-2100 val rows with only ~250-300 positives — noisy enough that a
-    different VAL_WEEKS cutoff date could plausibly move the number by
-    several points, and a single run gives no way to tell whether
-    best_iteration (how many trees the final model uses) reflects real
-    signal or that run's particular val slice.
-
-    This fits the SAME scale_pos_weight recipe as train_model() — using
-    XGBOOST_PARAMS by default, or `params_override` (e.g. the winner of
-    search_hyperparameters()) when given — across n_splits rolling
-    walk-forward folds and reports:
-      - fold_results: per-fold (n_train, n_test, n_test_pos, auc, pr_auc,
-        best_iteration). `auc` is a true sklearn roc_auc_score computed on
-        each fold's held-out predict_proba — directly comparable to 0.5 and
-        to rfecv_time_aware()'s fold scores. `pr_auc` is XGBoost's own
-        early-stopping best_score, which follows whatever eval_metric is
-        configured (XGBOOST_PARAMS uses "aucpr" — PR-AUC / average
-        precision). PR-AUC's no-skill baseline is the positive rate, not
-        0.5, so it is kept separately and must not be read against a 0.5
-        threshold or compared directly to `auc`.
-      - mean_auc / std_auc: the CV estimate (of the true ROC-AUC column) to
-        read alongside (not instead of) train_val_split()'s point estimate.
-      - mean_best_iteration / recommended_n_estimators: the boosting-round
-        hyperparameter, averaged across folds instead of trusted from one
-        run's early stopping.
-
-    This does NOT replace train_val_split() / train_model() — the final
-    model is still fit on the full FIX 1-5 train/val split, so calibration
-    and the gain regressor are unaffected. It's a pre-flight legitimacy
-    check whose recommended_n_estimators is fed back into train_model() as
-    an upper bound on tree count (see n_estimators_ceiling there).
-    """
-    if not CV_EVALUATION_ENABLED:
-        logger.info("cv_walk_forward_evaluate: disabled via CV_EVALUATION_ENABLED=0 — skipping.")
-        return {"skipped": True, "reason": "disabled"}
-
-    splits, embargo_or_reason = _build_cv_splits(X, combined_df, n_splits, min_train_frac)
-    if splits is None:
-        logger.warning(f"cv_walk_forward_evaluate: {embargo_or_reason} — skipping CV evaluation.")
-        return {"skipped": True, "reason": embargo_or_reason}
-    EMBARGO_DAYS = embargo_or_reason
-
-    Xc, yv, wv = _prep_cv_xy(X, y, w)
-    params = (params_override if params_override is not None else XGBOOST_PARAMS).copy()
-
-    logger.info(
-        f"CV walk-forward evaluation: {n_splits} folds requested, "
-        f"embargo={EMBARGO_DAYS}d, symbol_purge_window="
-        f"{EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER:.0f}d "
-        f"(mirrors train_val_split()'s FIX 4/5), "
-        f"params={'searched (search_hyperparameters)' if params_override is not None else 'hand-tuned XGBOOST_PARAMS'}."
-    )
-
-    result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
-    for i, row in enumerate(result["fold_rows"]):
-        if row["skipped"]:
-            logger.info(
-                f"[cv fold {i}] skipped — degenerate class split "
-                f"(train n={row['n_train']}, test n={row['n_test']}, test_pos={row['n_test_pos']})"
-            )
-        else:
-            logger.info(
-                f"[cv fold {i}] train={row['n_train']}  test={row['n_test']} "
-                f"(pos={row['n_test_pos']})  auc={row['auc']:.4f}  "
-                f"pr_auc={row.get('pr_auc', float('nan')):.4f}  "
-                f"best_iteration={row['best_iteration']}"
-            )
-
-    fold_aucs, fold_best_iters, n_used = result["fold_aucs"], result["fold_best_iters"], result["n_used"]
-    if n_used == 0:
-        logger.warning(
-            "cv_walk_forward_evaluate: every fold had a degenerate class split — "
-            "no CV estimate available this run."
-        )
-        return {"skipped": True, "reason": "all_folds_degenerate", "fold_results": result["fold_rows"]}
-
-    mean_auc = float(np.mean(fold_aucs))
-    std_auc = float(np.std(fold_aucs))
-    mean_best_iter = float(np.mean(fold_best_iters))
-    median_best_iter = float(np.median(fold_best_iters))
-    min_best_iter, max_best_iter = int(np.min(fold_best_iters)), int(np.max(fold_best_iters))
-
-    # ── TREE-BUDGET FIX (undertrained-classifier root cause) ────────────────
-    # Previously this used the raw MEAN of fold best_iterations with a flat
-    # +15% headroom and a flat floor of 30. Two problems with that, confirmed
-    # against a run whose 5 folds gave best_iterations [43, 43, 88, 10, 6]:
-    #
-    #   1. The mean (38) is not robust to fold-to-fold noise that spans more
-    #      than an order of magnitude (6 -> 88). A couple of low-iteration
-    #      folds (small/hard test windows) can drag the mean down and that
-    #      noise propagates straight into a hard ceiling on the PRODUCTION
-    #      fit's tree budget. The median (43 here) is far less sensitive to
-    #      one or two outlier folds and is a better summary of "how many
-    #      trees do folds typically need" than the mean is.
-    #   2. A floor of 30 is meaningless in the presence of
-    #      early_stopping_rounds=50 (or whatever XGBOOST_PARAMS/
-    #      params_override actually set): if the ceiling comes out below
-    #      early_stopping_rounds, early stopping's patience window can never
-    #      fully play out — the final fit just trains up to the ceiling and
-    #      best_iteration becomes whichever round happened to look best on a
-    #      still fairly small val set, not "training converged". The floor
-    #      must be comfortably above early_stopping_rounds so patience can
-    #      actually apply before the ceiling is hit.
-    #
-    # Fix: base the estimate on the median (fall back to the mean only when
-    # they're already close, i.e. folds agree), keep the +15% headroom, and
-    # raise the floor to early_stopping_rounds + a margin instead of a flat
-    # 30. Still clamped above by this run's own configured n_estimators.
-    _es_rounds = params.get("early_stopping_rounds", 50)
-    _min_floor = max(30, _es_rounds + 20)
-    _center = median_best_iter
-    recommended_n_estimators = int(
-        np.clip(
-            round(_center * 1.15),
-            _min_floor,
-            params.get("n_estimators", XGBOOST_PARAMS["n_estimators"]),
-        )
-    )
-
-    fold_spread_ratio = (max_best_iter / max(1, min_best_iter))
-
-    logger.info(
-        f"CV walk-forward evaluation ({n_used}/{n_splits} usable folds): "
-        f"AUC = {mean_auc:.4f} \u00b1 {std_auc:.4f}  "
-        f"(fold AUCs: {[round(a, 4) for a in fold_aucs]})  "
-        f"best_iteration per fold: {fold_best_iters}  "
-        f"mean={mean_best_iter:.1f} median={median_best_iter:.1f} -> "
-        f"recommended_n_estimators={recommended_n_estimators} "
-        f"(floor={_min_floor}, early_stopping_rounds={_es_rounds})"
-    )
-    if std_auc > 0.03:
-        logger.warning(
-            f"  \u26a0\ufe0f  CV fold AUC std={std_auc:.4f} is high — the single-cut "
-            "point estimate from train_val_split() (best_val_auc / blind_cal_auc) "
-            "should be read as this CV range, not as precise to a couple points."
-        )
-    if fold_spread_ratio >= 5:
-        logger.warning(
-            f"  \u26a0\ufe0f  CV fold best_iteration spread is wide: min={min_best_iter} "
-            f"max={max_best_iter} (ratio={fold_spread_ratio:.1f}x). Using the median "
-            f"({median_best_iter:.1f}) instead of the mean ({mean_best_iter:.1f}) to "
-            "keep one or two noisy folds from dominating the production tree-budget "
-            "estimate, but treat recommended_n_estimators as a rough range, not a "
-            "precise number, when the folds disagree this much."
-        )
-    if recommended_n_estimators <= _es_rounds:
-        logger.warning(
-            f"  \u26a0\ufe0f  recommended_n_estimators={recommended_n_estimators} <= "
-            f"early_stopping_rounds={_es_rounds}: early stopping's patience window "
-            "cannot fully play out inside this tree budget — the final fit will just "
-            "train to the ceiling and best_iteration will reflect whichever round "
-            "looked best on that budget, not genuine convergence. Consider raising "
-            "the floor further or lowering early_stopping_rounds for this run."
-        )
-
-    return {
-        "skipped": False,
-        "n_splits_requested": n_splits,
-        "n_folds_used": n_used,
-        "embargo_days": EMBARGO_DAYS,
-        "used_searched_params": params_override is not None,
-        "fold_results": result["fold_rows"],
-        "mean_auc": round(mean_auc, 4),
-        "std_auc": round(std_auc, 4),
-        "mean_best_iteration": round(mean_best_iter, 1),
-        "median_best_iteration": round(median_best_iter, 1),
-        "fold_best_iteration_range": [min_best_iter, max_best_iter],
-        "recommended_n_estimators": recommended_n_estimators,
-    }
-
-
-# ── HYPERPARAMETER SEARCH FIX ───────────────────────────────────────────────
-# XGBOOST_PARAMS above carries a long comment history of one-parameter-at-a-
-# time manual edits ("loosened from 10→4", "raised 3→4", "gamma REVERTED")
-# tuned against a single train/val cut. search_hyperparameters() replaces
-# that with a real search over the regularisation/complexity parameters,
-# scored against the walk-forward folds from cv_walk_forward_evaluate()
-# above instead of one split's quirks.
-HPARAM_SEARCH_ENABLED = os.environ.get("HPARAM_SEARCH_ENABLED", "1").lower() in ("1", "true", "yes")
-HPARAM_SEARCH_N_TRIALS = int(os.environ.get("HPARAM_SEARCH_N_TRIALS", "40"))
-# Safety valve so a slow environment can't turn "minutes" into "hours" —
-# optuna's study.optimize() stops issuing new trials once this elapses (the
-# in-flight trial still finishes).
-HPARAM_SEARCH_TIMEOUT_SECONDS = int(os.environ.get("HPARAM_SEARCH_TIMEOUT_SECONDS", "600"))
-HPARAM_SEARCH_RANDOM_STATE = 42
-# Minimum CV AUC improvement over the hand-tuned baseline required before a
-# searched config is actually used (see ACCEPTANCE-GATE FIX below). Folds
-# this small/imbalanced routinely produce AUC deltas of a few thousandths
-# from pure noise; without a gate, a trial that "wins" on noise can carry
-# far heavier regularisation (min_child_weight up to 20, gamma up to 5.0)
-# than the hand-tuned defaults and cause the final fit to converge in a
-# handful of trees regardless of the n_estimators ceiling.
-HPARAM_SEARCH_MIN_DELTA = float(os.environ.get("HPARAM_SEARCH_MIN_DELTA", "0.002"))
-# A delta clearing HPARAM_SEARCH_MIN_DELTA can still be pure noise when the
-# folds themselves are volatile (e.g. baseline_std_auc=0.0795 with only
-# ~1600 rows / ~210 positives per fold). Require the delta to also clear a
-# multiple of that run's own baseline fold std before accepting the search
-# result, so acceptance scales with how noisy this particular run's CV
-# estimate actually is instead of a single fixed number.
-HPARAM_SEARCH_NOISE_MULTIPLIER = float(os.environ.get("HPARAM_SEARCH_NOISE_MULTIPLIER", "1.0"))
-
-# Exactly the parameters called out as hand-tuned by trial-and-error above:
-# max_depth, min_child_weight, gamma, reg_alpha, reg_lambda, subsample,
-# colsample_bytree. (kind, low, high, log_scale) — log_scale=True samples
-# log-uniformly, standard practice for regularisation-strength parameters
-# that matter on a multiplicative rather than additive scale.
-HPARAM_SEARCH_SPACE = {
-    "max_depth":        ("int",   3,    8,   False),
-    "min_child_weight": ("int",   1,    20,  False),
-    "gamma":            ("float", 0.01, 5.0, True),
-    "reg_alpha":        ("float", 0.01, 3.0, True),
-    "reg_lambda":       ("float", 0.1,  5.0, True),
-    "subsample":        ("float", 0.5,  1.0, False),
-    "colsample_bytree": ("float", 0.5,  1.0, False),
-}
-
-
-def search_hyperparameters(
-    X: pd.DataFrame,
-    y: pd.Series,
-    w: pd.Series,
-    combined_df: pd.DataFrame,
-    n_splits: int = CV_N_SPLITS,
-    min_train_frac: float = CV_MIN_TRAIN_FRAC,
-    n_trials: int = HPARAM_SEARCH_N_TRIALS,
-    timeout_seconds: int = HPARAM_SEARCH_TIMEOUT_SECONDS,
-    random_state: int = HPARAM_SEARCH_RANDOM_STATE,
-) -> dict:
-    """
-    Systematic hyperparameter search over max_depth, min_child_weight, gamma,
-    reg_alpha, reg_lambda, subsample, colsample_bytree — scored against the
-    SAME leak-guarded walk-forward folds cv_walk_forward_evaluate() uses
-    (time_aware_splits() with FIX 4/5's embargo + symbol purge), instead of
-    the single train_val_split() cut every value in XGBOOST_PARAMS was
-    hand-tuned against one parameter at a time.
-
-    Uses Optuna (TPE sampler + median pruning) when installed; falls back to
-    plain random search over the same distributions otherwise, so this
-    module carries no hard Optuna dependency. Either way this is a real
-    search — tens of trials x several folds each, not one-parameter-at-a-
-    time — but bounded to "minutes, not hours" via n_trials/timeout_seconds.
-    Every parameter NOT in HPARAM_SEARCH_SPACE (learning_rate, objective,
-    eval_metric, n_estimators, scale_pos_weight, early_stopping_rounds) is
-    taken unchanged from XGBOOST_PARAMS.
-
-    Returns a dict: {skipped, method, n_trials_run, best_params,
-    best_mean_auc, best_std_auc, baseline_mean_auc (XGBOOST_PARAMS' own CV
-    score on the identical folds, for a direct before/after comparison),
-    delta_vs_baseline, top_trials (best 10, for transparency in metadata)}.
-    """
-    if not HPARAM_SEARCH_ENABLED:
-        logger.info("search_hyperparameters: disabled via HPARAM_SEARCH_ENABLED=0 — skipping.")
-        return {"skipped": True, "reason": "disabled"}
-
-    splits, embargo_or_reason = _build_cv_splits(X, combined_df, n_splits, min_train_frac)
-    if splits is None:
-        logger.warning(f"search_hyperparameters: {embargo_or_reason} — skipping search.")
-        return {"skipped": True, "reason": embargo_or_reason}
-    EMBARGO_DAYS = embargo_or_reason
-
-    Xc, yv, wv = _prep_cv_xy(X, y, w)
-    searched_keys = list(HPARAM_SEARCH_SPACE.keys())
-
-    def _build_params(sampled: dict) -> dict:
-        params = XGBOOST_PARAMS.copy()
-        params.update(sampled)
-        return params
-
-    def _score(params: dict) -> tuple:
-        result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
-        if result["n_used"] == 0:
-            return float("-inf"), float("nan"), 0
-        return float(np.mean(result["fold_aucs"])), float(np.std(result["fold_aucs"])), result["n_used"]
-
-    # Baseline: current hand-tuned XGBOOST_PARAMS, scored on the exact same
-    # folds, so the search result reads as "beat / didn't beat the hand-tuned
-    # defaults" instead of a number in a vacuum.
-    baseline_mean_auc, baseline_std_auc, baseline_n_used = _score(XGBOOST_PARAMS.copy())
-    logger.info(
-        f"search_hyperparameters: baseline (current hand-tuned XGBOOST_PARAMS) "
-        f"CV AUC = {baseline_mean_auc:.4f} \u00b1 {baseline_std_auc:.4f} "
-        f"({baseline_n_used}/{len(splits)} folds)"
-    )
-
-    trials_log = []
-    best_params, best_mean_auc, best_std_auc = None, float("-inf"), float("nan")
-    method = "unknown"
-    n_trials_run = 0
-
-    try:
-        import optuna
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        method = "optuna_tpe"
-
-        def objective(trial):
-            sampled = {}
-            for name, (kind, low, high, log) in HPARAM_SEARCH_SPACE.items():
-                if kind == "int":
-                    sampled[name] = trial.suggest_int(name, low, high)
-                else:
-                    sampled[name] = trial.suggest_float(name, low, high, log=log)
-            params = _build_params(sampled)
-            mean_auc, std_auc, n_used = _score(params)
-            trials_log.append({
-                "params": sampled,
-                "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
-                "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
-                "n_folds_used": n_used,
-            })
-            return mean_auc
-
-        sampler = optuna.samplers.TPESampler(seed=random_state)
-        pruner = optuna.pruners.MedianPruner(n_warmup_steps=5)
-        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
-        study.optimize(objective, n_trials=n_trials, timeout=timeout_seconds, show_progress_bar=False)
-
-        n_trials_run = len(study.trials)
-        if study.best_value != float("-inf"):
-            best_params = _build_params(study.best_params)
-            best_mean_auc = float(study.best_value)
-            _match = next((t for t in trials_log if t["params"] == study.best_params), None)
-            best_std_auc = _match["std_auc"] if _match and _match["std_auc"] is not None else float("nan")
-
-    except ImportError:
-        logger.info(
-            "search_hyperparameters: optuna not installed — falling back to plain "
-            "random search over the same distributions (pip install optuna for "
-            "TPE + pruning; sample-efficiency differs, the search space and "
-            "scoring are otherwise identical)."
-        )
-        method = "random_search"
-        rng = np.random.default_rng(random_state)
-        for _ in range(n_trials):
-            sampled = {}
-            for name, (kind, low, high, log) in HPARAM_SEARCH_SPACE.items():
-                if kind == "int":
-                    sampled[name] = int(rng.integers(low, high + 1))
-                elif log:
-                    sampled[name] = float(np.exp(rng.uniform(np.log(low), np.log(high))))
-                else:
-                    sampled[name] = float(rng.uniform(low, high))
-            params = _build_params(sampled)
-            mean_auc, std_auc, n_used = _score(params)
-            n_trials_run += 1
-            trials_log.append({
-                "params": sampled,
-                "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
-                "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
-                "n_folds_used": n_used,
-            })
-            if mean_auc > best_mean_auc:
-                best_params, best_mean_auc, best_std_auc = params, mean_auc, std_auc
-
-    if best_params is None or best_mean_auc == float("-inf"):
-        logger.warning(
-            "search_hyperparameters: no trial produced a usable CV score — "
-            "keeping hand-tuned XGBOOST_PARAMS unchanged."
-        )
-        return {
-            "skipped": True, "reason": "no_usable_trial", "method": method,
-            "n_trials_run": n_trials_run,
-            "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
-        }
-
-    delta = (best_mean_auc - baseline_mean_auc) if baseline_mean_auc != float("-inf") else None
-    if delta is not None:
-        logger.info(
-            f"search_hyperparameters ({method}, {n_trials_run} trials): "
-            f"best CV AUC = {best_mean_auc:.4f} \u00b1 {best_std_auc:.4f} "
-            f"(baseline {baseline_mean_auc:.4f}, delta {delta:+.4f})"
-        )
-    else:
-        logger.info(
-            f"search_hyperparameters ({method}, {n_trials_run} trials): "
-            f"best CV AUC = {best_mean_auc:.4f} \u00b1 {best_std_auc:.4f}"
-        )
-    for k in searched_keys:
-        logger.info(f"  {k}: hand-tuned={XGBOOST_PARAMS[k]}  -> searched={best_params[k]}")
-
-    # ── ACCEPTANCE-GATE FIX ──────────────────────────────────────────────────
-    # Previously this branch only LOGGED "read this as confirming the
-    # hand-tuned values rather than a real improvement" but still returned
-    # `best_params` unconditionally — the caller (train_model(), via
-    # `_searched_params` in the retrain entrypoint) used the searched config
-    # regardless of whether it actually beat the baseline.
-    #
-    # A first attempt gated acceptance on a flat `delta >= 0.002`. That's
-    # still not sufficient: on a run with baseline_std_auc=0.0795 (this run),
-    # a delta of +0.0088 cleared the flat threshold while being barely 11%
-    # of a single fold-to-fold standard deviation — i.e. indistinguishable
-    # from noise despite "passing". HPARAM_SEARCH_SPACE allows
-    # min_child_weight up to 20 and gamma up to 5.0 — an order of magnitude
-    # heavier than the hand-tuned defaults (4 / 0.3) — so a trial that wins
-    # on pure noise can easily land on very heavy regularisation. That,
-    # independent of any n_estimators ceiling, makes the final seed-bagged
-    # fit's early stopping converge in single-digit-to-teens trees (this
-    # run: seed best_iterations of 34,4,5,16,41,5,10 -> mean 16), which is
-    # genuine early stopping against noisy val AUC, not a starved tree
-    # budget — raising n_estimators_ceiling alone cannot fix this, and
-    # neither can a threshold that ignores how noisy this run's folds were.
-    #
-    # Fix: require delta to clear BOTH a small absolute floor
-    # (HPARAM_SEARCH_MIN_DELTA, guards against near-zero deltas even when
-    # folds happen to be very stable) AND a multiple of the baseline fold
-    # noise (HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc, guards
-    # against "passing" a threshold that's tiny relative to how much these
-    # folds already disagree with each other). Otherwise fall back to the
-    # hand-tuned XGBOOST_PARAMS values (best_params effectively unused) and
-    # record why.
-    _noise_bar = HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc if baseline_std_auc == baseline_std_auc else 0.0
-    _required_delta = max(HPARAM_SEARCH_MIN_DELTA, _noise_bar)
-    accepted = delta is not None and delta >= _required_delta
-    if not accepted:
-        logger.info(
-            f"  search_hyperparameters: best searched config beats baseline by only "
-            f"{('%.4f' % delta) if delta is not None else 'n/a'} AUC, which doesn't "
-            f"clear the required bar of {_required_delta:.4f} "
-            f"(= max(min_delta={HPARAM_SEARCH_MIN_DELTA}, "
-            f"{HPARAM_SEARCH_NOISE_MULTIPLIER}\u00d7baseline_std={baseline_std_auc:.4f})) "
-            "— not a real improvement over this noisy a CV estimate. Falling back to "
-            "hand-tuned XGBOOST_PARAMS for this run instead of using the searched "
-            "(possibly over-regularised) config."
-        )
-    top_trials = sorted(
-        (t for t in trials_log if t["mean_auc"] is not None),
-        key=lambda t: t["mean_auc"], reverse=True,
-    )[:10]
-
-    return {
-        "skipped": False,
-        "method": method,
-        "n_trials_run": n_trials_run,
-        "n_splits": len(splits),
-        "embargo_days": EMBARGO_DAYS,
-        "searched_params": searched_keys,
-        "best_params": {k: best_params[k] for k in searched_keys},
-        "accepted": accepted,
-        "min_delta_threshold": HPARAM_SEARCH_MIN_DELTA,
-        "required_delta": round(_required_delta, 4),
-        "best_mean_auc": round(best_mean_auc, 4),
-        "best_std_auc": round(best_std_auc, 4) if best_std_auc == best_std_auc else None,
-        "baseline_mean_auc": round(baseline_mean_auc, 4) if baseline_mean_auc != float("-inf") else None,
-        "baseline_std_auc": round(baseline_std_auc, 4) if baseline_std_auc == baseline_std_auc else None,
-        "delta_vs_baseline": round(delta, 4) if delta is not None else None,
-        "top_trials": top_trials,
-    }
-
-
-def train_val_split(
-    X: pd.DataFrame,
-    y: pd.Series,
-    w: pd.Series,
-    df_with_dates: pd.DataFrame,
-    val_fraction: float = 0.20,  # only used as fallback when no date column exists
-) -> tuple:
-    """
-    FIXED train/val split with three stability improvements:
-
-    FIX 1 — Dynamic cutoff date (VAL_WEEKS most recent weeks) instead of a
-      hardcoded date or a floating fraction.
-      • A hardcoded date caused the val set to grow every week as new T-1 rows
-        accumulated, shifting scale_pos_weight and the early-stopping signal.
-      • The old 20%-of-rows approach gave a different market slice each retrain.
-      • Pinning to "the last VAL_WEEKS weeks of data" keeps the val window the
-        same size every run.  The cutoff is computed from the maximum date found
-        in the training dataframe (not wall-clock time), so backfills are stable.
-
-    FIX 2 — Mistake samples (rows with NaT dates) are forced into the train set.
-      Previously NaT rows sorted to the end and landed in the val set, biasing
-      AUC on the model's own hardest errors rather than a general held-out period.
-
-    FIX 3 — Hard minimum on val positives (MIN_VAL_POSITIVES).
-      If the dynamic cutoff leaves fewer than MIN_VAL_POSITIVES winner rows in
-      val, training aborts with a clear message rather than producing a junk model
-      (previously the code only warned and then continued).
-
-    FIX 4 — Purge/embargo gap at the cutoff (EMBARGO_DAYS).
-      Rows dated within EMBARGO_DAYS immediately before the cutoff are dropped
-      from train entirely (not moved to val). Several top features are rolling
-      windows up to 30 days deep, so a hard cutoff with no gap put train rows
-      and val rows right next to each other in time with highly overlapping
-      (autocorrelated) rolling-window feature vectors — inflating val AUC via
-      boundary adjacency rather than genuine generalisation. The embargo
-      removes that adjacency.
-
-    To change the val window size, adjust VAL_WEEKS in the configuration block.
-    """
-    df_work = df_with_dates.copy()
-
-    # Infer the purge/embargo gap from the deepest rolling-window length
-    # encoded in the feature column names (clamped to [floor, cap]).
-    EMBARGO_DAYS = _infer_embargo_days(list(X.columns))
-
-    # ── Build a unified sort_date from whichever date column(s) exist ────────
-    has_detection = "detection_date" in df_work.columns
-    has_event     = "event_date"     in df_work.columns
-
-    if has_detection or has_event:
-        sort_date = pd.Series(pd.NaT, index=df_work.index)
-        if has_detection:
-            sort_date = pd.to_datetime(df_work["detection_date"], errors="coerce")
-        if has_event:
-            event_parsed = pd.to_datetime(df_work["event_date"], errors="coerce")
-            sort_date = sort_date.fillna(event_parsed)
-
-        df_work["_sort_date"] = sort_date
-        date_col = "_sort_date"
-    else:
-        date_col = next((c for c in ["date"] if c in df_work.columns), None)
-        sort_date = (
-            pd.to_datetime(df_work[date_col], errors="coerce")
-            if date_col else pd.Series(pd.NaT, index=df_work.index)
-        )
-
-    # ── FIX 2: Identify NaT rows (mistake samples) — pin them to train ───────
-    nat_mask = sort_date.isna()
-    n_nat    = int(nat_mask.sum())
-    if n_nat > 0:
-        logger.info(
-            f"FIX 2: {n_nat} rows have NaT dates (mistake samples) — "
-            "forcing them into the train set so they don't pollute val AUC."
-        )
-
-    # ── FIX 1: Dynamic cutoff — last VAL_WEEKS weeks of data held out for val ──
-    VAL_CUTOFF_DATE = "unknown"  # default; overwritten below when date_col is present
-    if date_col is not None:
-        cutoff = _compute_val_cutoff(df_work)
-
-        # ── MAX_VAL_FRACTION guard ───────────────────────────────────────
-        # A fixed calendar window (VAL_WEEKS) assumes roughly steady row
-        # volume over time. That assumption breaks when data collection
-        # volume itself is non-stationary — e.g. the screener started
-        # covering far more symbols/day in recent weeks than it did months
-        # ago. In that case widening VAL_WEEKS to fix a too-small val set
-        # can backfire: going 8→12 weeks was observed to take val from
-        # ~1.1k rows to ~3.3k rows (a ~3x jump for a 1.5x window increase),
-        # while train collapsed from ~4.9k rows to ~1.6k — starving the
-        # classifier's train split and, worse, the gain regressor (which
-        # only sees the classifier's train split) of the majority of
-        # available data. That is very likely why gain-regressor R² got
-        # dramatically worse (-14.6) even though the classifier's own AUC
-        # looked fine.
-        #
-        # Cap val at MAX_VAL_FRACTION of all dated rows: if the VAL_WEEKS
-        # cutoff would take more than that, shrink the window (move cutoff
-        # later/more recent) until val is back under the cap, using a
-        # per-row date quantile so the cap tracks actual row density
-        # instead of calendar time. Never shrink below what's needed for
-        # MIN_VAL_POSITIVES — if the fraction cap and the positive-count
-        # floor conflict, the floor wins and a warning is logged so the
-        # tension is visible instead of silently picking one.
-        MAX_VAL_FRACTION = 0.30
-        _dated = pd.to_datetime(df_work[date_col], errors="coerce")
-        _dated = _dated[_dated.notna()]
-        if len(_dated) > 0:
-            _val_frac_at_cutoff = (_dated >= cutoff).mean()
-            if _val_frac_at_cutoff > MAX_VAL_FRACTION:
-                _capped_cutoff = _dated.quantile(1.0 - MAX_VAL_FRACTION)
-                # Check the capped cutoff still leaves enough positives in val.
-                _cand_val_mask = _dated.index.isin(
-                    _dated[_dated >= _capped_cutoff].index
-                )
-                _cand_val_pos = int(y.reindex(_dated.index).fillna(0)[_cand_val_mask].sum()) \
-                    if hasattr(y, "reindex") else None
-                if _cand_val_pos is None or _cand_val_pos >= MIN_VAL_POSITIVES:
-                    logger.info(
-                        f"MAX_VAL_FRACTION guard: {VAL_WEEKS}-week cutoff would put "
-                        f"{_val_frac_at_cutoff:.1%} of dated rows in val (row volume is "
-                        f"not uniform over time) — capping to {MAX_VAL_FRACTION:.0%} by "
-                        f"moving cutoff {cutoff.date()} → {pd.Timestamp(_capped_cutoff).date()}."
-                    )
-                    cutoff = pd.Timestamp(_capped_cutoff)
-                else:
-                    logger.warning(
-                        f"MAX_VAL_FRACTION guard: {VAL_WEEKS}-week cutoff puts "
-                        f"{_val_frac_at_cutoff:.1%} of dated rows in val, above the "
-                        f"{MAX_VAL_FRACTION:.0%} cap, but shrinking to the cap would drop "
-                        f"val positives to ~{_cand_val_pos} (< MIN_VAL_POSITIVES="
-                        f"{MIN_VAL_POSITIVES}). Keeping the wider {VAL_WEEKS}-week window "
-                        "— train set will be smaller than ideal this run. Consider "
-                        "lowering VAL_WEEKS or investigating why recent weeks are so much "
-                        "denser than older ones."
-                    )
-
-        VAL_CUTOFF_DATE = cutoff.date()  # stored for metadata/logging
-        dates  = pd.to_datetime(df_work[date_col], errors="coerce")
-
-        # ── Purge/embargo gap ────────────────────────────────────────────
-        # Drop rows whose date falls in [cutoff - EMBARGO_DAYS, cutoff) from
-        # TRAIN entirely (they are not moved to val either — they're simply
-        # excluded) so that no train row's rolling-window features are
-        # adjacent in time to a val row's rolling-window features. This
-        # mirrors purged/embargoed CV: it removes the boundary-adjacency
-        # effect that would otherwise inflate val AUC via autocorrelated
-        # feature vectors rather than genuine generalisation.
-        embargo_start = cutoff - pd.Timedelta(days=EMBARGO_DAYS)
-
-        # ── Guard: don't let the embargo eat the entire train window ────────
-        # EMBARGO_DAYS is inferred from feature names and can be as large as
-        # EMBARGO_DAYS_CAP (90d), independent of how much pre-cutoff data
-        # lookback_days actually left us. If embargo_start falls at or before
-        # the earliest dated row, EVERY dated row is a candidate for the
-        # embargo band and none reach train (NaT rows are the only rows that
-        # would survive) -- silently producing a train split with 0 or 1
-        # classes rather than an error. Shrink the embargo instead, down to
-        # a floor, and log loudly so the mismatch between lookback_days and
-        # the inferred embargo is visible rather than surfacing later as a
-        # confusing XGBoost "invalid classes" crash.
-        earliest_dated = dates[~nat_mask].min() if (~nat_mask).any() else pd.NaT
-        if pd.notna(earliest_dated):
-            available_pre_cutoff_days = (cutoff - earliest_dated).days
-            min_required = MIN_TRAIN_WINDOW_DAYS + EMBARGO_DAYS_FLOOR
-            if available_pre_cutoff_days < min_required:
-                logger.warning(
-                    f"Only {available_pre_cutoff_days}d of data exist before the "
-                    f"val cutoff ({cutoff.date()}), but the inferred embargo "
-                    f"({EMBARGO_DAYS}d) plus a {MIN_TRAIN_WINDOW_DAYS}d minimum "
-                    f"train window need {min_required}d. This usually means "
-                    "lookback_days is too small for the deepest rolling-window "
-                    "feature in use (or a data source — e.g. ml_training_base — "
-                    "aged out and stopped padding the window). "
-                    "Shrinking the embargo instead of letting it consume the "
-                    "whole train window; consider raising --lookback-days."
-                )
-                EMBARGO_DAYS = max(
-                    EMBARGO_DAYS_FLOOR,
-                    min(EMBARGO_DAYS, available_pre_cutoff_days - MIN_TRAIN_WINDOW_DAYS),
-                )
-                embargo_start = cutoff - pd.Timedelta(days=EMBARGO_DAYS)
-
-        # FIX 2 applied here: NaT → train regardless of cutoff
-        train_mask   = nat_mask | (dates < embargo_start)
-        embargo_mask = (~nat_mask) & (dates >= embargo_start) & (dates < cutoff)
-        val_mask     = (~nat_mask) & (dates >= cutoff)
-
-        n_embargoed = int(embargo_mask.sum())
-        if n_embargoed > 0:
-            logger.info(
-                f"Purge/embargo: dropping {n_embargoed} rows dated "
-                f"[{embargo_start.date()} \u2192 {cutoff.date()}) \u2014 within "
-                f"{EMBARGO_DAYS}d of the val cutoff \u2014 from train so "
-                "rolling-window features don't straddle the boundary."
-            )
-
-        train_idx = df_work.index[train_mask]
-        val_idx   = df_work.index[val_mask]
-
-        train_dates = dates.loc[train_idx].dropna()
-        val_dates   = dates.loc[val_idx].dropna()
-
-        logger.info(
-            f"FIX 1 — Dynamic cutoff ({VAL_WEEKS}-week val window): cutoff={cutoff.date()}: "
-            f"train {train_dates.min().date() if not train_dates.empty else '?'} "
-            f"→ {train_dates.max().date() if not train_dates.empty else '?'}, "
-            f"val {val_dates.min().date() if not val_dates.empty else '?'} "
-            f"→ {val_dates.max().date() if not val_dates.empty else '?'}, "
-            f"embargoed={n_embargoed}"
-        )
-
-        # ── FIX 5: Symbol-level purge (time-window-scoped) ──────────────────
-        # The date embargo above only guarantees train/val rows aren't
-        # temporally adjacent. It does NOT stop the same symbol appearing on
-        # both sides of the split. Several top features (hv_20/30, atr_14,
-        # cci, dcm, ema-slope, etc.) are rolling-window indicators that stay
-        # close to a stock's own baseline level for weeks/months. If ticker
-        # X shows up in train in June and again in val in September, the
-        # embargo (a date rule) is satisfied, but the model can still
-        # partially re-identify ticker X from residual level/scale
-        # information in those features rather than learning a genuinely
-        # predictive pattern — inflating val AUC via symbol memorization,
-        # not generalisation. See synthetic_leak_test.py, which reproduces
-        # this exact effect with pure-noise labels and a symbol-autocorrelated
-        # feature under a clean time-only split.
-        #
-        # Fix: only purge a train row for symbol X if X's val occurrence is
-        # actually near enough in time for that autocorrelation to matter —
-        # i.e. the train row falls within symbol_purge_window_days of X's
-        # nearest val appearance. A train row for X from months before X's
-        # val appearance is not near the boundary and is not memorization
-        # risk in the same way; keeping it is what the date embargo above
-        # already relies on for every other symbol, and there's nothing
-        # symbol-overlap-specific that should change that logic.
-        #
-        # NOTE: this used to be a flat all-time set-membership purge (any
-        # train row for a symbol dropped if that symbol appeared ANYWHERE in
-        # val). That over-purges hard for a universe with recurring
-        # small-cap movers: one val appearance could wipe out months of a
-        # ticker's train history, and a wider --lookback-days made it worse
-        # by handing the purge more old rows of the same recurring symbols
-        # to delete (which is why purge fraction was rising, not falling,
-        # as lookback grew).
-        if "symbol" in df_work.columns:
-            val_symbols = set(df_work.loc[val_idx, "symbol"].dropna().unique())
-            if val_symbols:
-                symbol_purge_window_days = EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER
-
-                # Earliest val occurrence per symbol. Train always precedes
-                # val here (train_idx is drawn from dates < embargo_start),
-                # so "nearest val occurrence" for gap purposes is always the
-                # earliest one — a later val occurrence of the same symbol
-                # can only be farther from any given train row, never closer.
-                val_symbol_min_date = (
-                    dates.loc[val_idx]
-                    .groupby(df_work.loc[val_idx, "symbol"])
-                    .min()
-                )
-
-                train_symbols = df_work.loc[train_idx, "symbol"]
-                train_dates_for_purge = dates.loc[train_idx]
-
-                overlap_candidate_mask = train_symbols.isin(val_symbols)
-                n_candidates = int(overlap_candidate_mask.sum())
-
-                if n_candidates > 0:
-                    candidate_idx = train_symbols.index[overlap_candidate_mask]
-                    candidate_symbols = train_symbols.loc[candidate_idx]
-                    candidate_dates = train_dates_for_purge.loc[candidate_idx]
-                    nearest_val_date = candidate_symbols.map(val_symbol_min_date)
-
-                    gap_days = (nearest_val_date - candidate_dates).dt.days
-                    # NaT on either side (shouldn't happen given the
-                    # val_symbols/isin filters above, but a missing/odd date
-                    # is possible) is treated as "can't prove it's safe" and
-                    # purged conservatively — same fail-safe stance FIX 2
-                    # takes on undated rows elsewhere in this function.
-                    purge_within_window = gap_days.isna() | (gap_days <= symbol_purge_window_days)
-                    symbol_purge_idx = candidate_idx[purge_within_window.to_numpy()]
-
-                    n_overlap = len(symbol_purge_idx)
-                    n_spared = n_candidates - n_overlap
-
-                    if n_overlap > 0:
-                        overlap_frac = n_overlap / max(1, len(train_idx))
-                        logger.warning(
-                            f"FIX 5 — Symbol purge (time-scoped, window="
-                            f"{symbol_purge_window_days:.0f}d): {n_overlap} "
-                            f"train rows ({overlap_frac:.1%} of train) fall "
-                            f"within {symbol_purge_window_days:.0f}d of their "
-                            f"symbol's nearest val appearance "
-                            f"({len(val_symbols)} distinct val symbols). "
-                            "Dropping these from train to prevent symbol-level "
-                            f"leakage (see synthetic_leak_test.py). {n_spared} "
-                            "additional same-symbol train row(s) fell outside "
-                            "the window and were kept."
-                        )
-                        train_idx = train_idx.difference(symbol_purge_idx)
-                    else:
-                        logger.info(
-                            "FIX 5 — Symbol purge: train/val share "
-                            f"{len(val_symbols)} symbol(s) but no train rows "
-                            f"fall within the {symbol_purge_window_days:.0f}d "
-                            "window — nothing purged."
-                        )
-                else:
-                    logger.info(
-                        "FIX 5 — Symbol purge: no train/val symbol overlap found."
-                    )
-        else:
-            logger.warning(
-                "FIX 5 — Symbol purge skipped: no 'symbol' column in "
-                "combined_df. Train/val may still share tickers; symbol-level "
-                "leakage cannot be ruled out."
-            )
-    else:
-        # No date column at all — fall back to sequential split (last resort)
-        logger.warning(
-            "No date column found — falling back to sequential split. "
-            "Ensure detection_date/event_date columns exist."
-        )
-        split_pos = int(len(X) * (1 - val_fraction))
-        train_idx = X.index[:split_pos]
-        val_idx   = X.index[split_pos:]
-
-    X_train = X.loc[train_idx]
-    X_val   = X.loc[val_idx]
-    y_train = y.loc[train_idx]
-    y_val   = y.loc[val_idx]
-    w_train = w.loc[train_idx]
-    w_val   = w.loc[val_idx]
-
-    logger.info(
-        f"Train/val split (before rebalance): {len(X_train)} train "
-        f"(pos={int((y_train==1).sum())}, neg={int((y_train==0).sum())}), "
-        f"{len(X_val)} val "
-        f"(pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())})"
-    )
-
-    # ── VAL REBALANCE: cap val positive rate to match real-world base rate ────
-    # The 8-week val window is dominated by T-1 rows, which are stored at ~50%
-    # positive rate (equal counts of winners and non-winners per day).  The train
-    # set reflects the real base rate (~10%).  This mismatch makes the val
-    # classification report and probability calibration misleading, and is the
-    # root cause of Mode D (high-prob clustering) firing on every prediction run.
-    #
-    # Fix: compute the positive rate of the TRAIN set and trim val positives
-    # (moving excess to train) until val positive rate ≤ train positive rate + 2pp.
-    # We move rows rather than downsample so no data is thrown away.
-    #
-    # "2pp headroom" allows T-1 rows to contribute a slightly higher positive
-    # rate without requiring us to bleed positives all the way to 9%.
-    _train_pos_rate = int((y_train == 1).sum()) / max(1, len(y_train))
-    _val_pos_rate   = int((y_val == 1).sum())   / max(1, len(y_val))
-    _MAX_VAL_POS_RATE = _train_pos_rate + 0.02   # 2 pp headroom
-
-    if _val_pos_rate > _MAX_VAL_POS_RATE:
-        # How many positives to keep in val so rate == _MAX_VAL_POS_RATE
-        _val_neg = int((y_val == 0).sum())
-        _target_val_pos = max(
-            MIN_VAL_POSITIVES,
-            int(_val_neg * _MAX_VAL_POS_RATE / max(1 - _MAX_VAL_POS_RATE, 1e-9)),
-        )
-        # BUG 5 FIX: move the OLDEST excess positives to train, not the newest.
-        # y_val is time-ordered (val rows are sorted by _sort_date ascending), so
-        # index[_target_val_pos:] selects the most recent excess rows and moves them
-        # to train — leaving the oldest rows in val.  That is exactly backwards:
-        # the purpose of a time-based split is to validate on the most recent period.
-        # Fix: keep the last _target_val_pos positives in val (most recent) and move
-        # the first excess (oldest) ones to train.
-        _all_val_pos_idx = y_val[y_val == 1].index.tolist()
-        _n_excess        = len(_all_val_pos_idx) - _target_val_pos
-        _excess_pos_idx  = pd.Index(_all_val_pos_idx[:_n_excess])   # oldest → train
-
-        if len(_excess_pos_idx) > 0:
-            # Move excess val positives → train.
-            # BUG 4 FIX: rebuild train_idx as a pd.Index (not a plain list) so
-            # that the returned train_idx is always the same type and always
-            # contains the moved rows.  Previously train_idx was reassigned as
-            # list(train_idx) + list(_excess_pos_idx) but as a plain Python list
-            # rather than a pd.Index, creating a type inconsistency with the
-            # non-rebalance code paths where train_idx is a pd.Index.
-            # Using pd.Index(...) here makes the update explicit and ensures the
-            # returned train_idx is always a proper pd.Index containing the
-            # rebalanced rows.
-            _new_val_list   = [i for i in val_idx   if i not in set(_excess_pos_idx)]
-            _new_train_list = list(train_idx) + list(_excess_pos_idx)
-            val_idx   = pd.Index(_new_val_list)
-            train_idx = pd.Index(_new_train_list)
-
-            X_train = X.loc[train_idx]
-            X_val   = X.loc[val_idx]
-            y_train = y.loc[train_idx]
-            y_val   = y.loc[val_idx]
-            w_train = w.loc[train_idx]
-            w_val   = w.loc[val_idx]
-
-            logger.info(
-                f"VAL REBALANCE: moved {len(_excess_pos_idx)} excess positives from val → train "
-                f"(val rate was {_val_pos_rate:.1%} vs train rate {_train_pos_rate:.1%}). "
-                f"New val: {len(X_val)} rows, "
-                f"pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())}, "
-                f"pos_rate={int((y_val==1).sum())/max(1,len(y_val)):.1%}"
-            )
-
-    logger.info(
-        f"Train/val split: {len(X_train)} train "
-        f"(pos={int((y_train==1).sum())}, neg={int((y_train==0).sum())}), "
-        f"{len(X_val)} val "
-        f"(pos={int((y_val==1).sum())}, neg={int((y_val==0).sum())})"
-    )
-
-    # ── FIX 3: Hard minimum on val positives — abort instead of warn ──────────
-    val_pos = int((y_val == 1).sum())
-    if val_pos < MIN_VAL_POSITIVES:
-        logger.error(
-            f"FIX 3 — ABORTING: only {val_pos} positive examples in val set "
-            f"(need ≥ {MIN_VAL_POSITIVES}). "
-            f"The cutoff date {VAL_CUTOFF_DATE!r} is too recent — not enough winners "
-            "have accumulated after it. "
-            "Options: (1) move VAL_CUTOFF_DATE earlier, "
-            "(2) accumulate more labelled data, "
-            "(3) lower MIN_VAL_POSITIVES if you accept noisier early stopping."
-        )
-        sys.exit(1)
-    elif val_pos < 100:
-        logger.warning(
-            f"  ⚠️  Only {val_pos} positive examples in val set "
-            f"({val_pos / max(1, len(y_val)):.1%} of val). "
-            "Early stopping AUC may still be somewhat noisy. "
-            f"Consider moving VAL_CUTOFF_DATE earlier once more data accumulates."
-        )
-    else:
-        logger.info(f"  ✅ Val set has {val_pos} positives — early stopping signal is stable.")
-
-    # ── Hard minimum: train must contain BOTH classes ─────────────────────────
-    # A single-class train set (usually train_pos=0 after the purge/embargo
-    # step ate every dated row, or a VAL REBALANCE that only moved positives
-    # over) fails deep inside XGBoost.fit() with a cryptic "Invalid classes
-    # inferred" error. Catch it here instead, with a message that actually
-    # points at the fix.
-    train_pos = int((y_train == 1).sum())
-    train_neg = int((y_train == 0).sum())
-    if train_pos == 0 or train_neg == 0:
-        logger.error(
-            f"ABORTING: train split has pos={train_pos}, neg={train_neg} — "
-            "missing a class entirely, XGBoost cannot fit on this. "
-            "This almost always means the purge/embargo window consumed the "
-            "whole pre-cutoff train range (EMBARGO_DAYS close to or larger "
-            "than the data available before the val cutoff). "
-            "Options: (1) increase --lookback-days so more pre-cutoff data "
-            "exists, (2) check whether a data source that used to pad the "
-            "training window (e.g. ml_training_base) has gone stale/empty, "
-            "(3) lower VAL_WEEKS so the val cutoff sits later, leaving more "
-            "room before it for train."
-        )
-        sys.exit(1)
-
-    return X_train, X_val, y_train, y_val, w_train, w_val, train_idx
-
-
-# ---------------------------------------------------------------------------
-# Feature importance
-# ---------------------------------------------------------------------------
-
-def compute_feature_importance(
-    model,
-    feature_names: list[str],
-) -> pd.DataFrame:
-    """Generate feature_importance.csv using gain importance.
-
-    RC6: model may be a CalibratedClassifierCV wrapping an XGBClassifier.
-    We unwrap it to access the underlying booster for feature importances.
-    """
-    # RC6: unwrap CalibratedClassifierCV to get the raw XGBClassifier (or,
-    # with seed bagging, the BaggedXGBClassifier wrapping several of them).
-    xgb_model = model
-    if hasattr(model, "calibrated_classifiers_"):
-        # CalibratedClassifierCV stores list of (estimator, calibrator) pairs
-        xgb_model = model.calibrated_classifiers_[0].estimator
-
-    # BAGGING: BaggedXGBClassifier/BaggedXGBRegressor expose
-    # get_feature_importance() which averages gain-importance across seeds,
-    # instead of a single get_booster() call.
-    if hasattr(xgb_model, "get_feature_importance"):
-        scores = xgb_model.get_feature_importance()
-    else:
-        booster = xgb_model.get_booster()
-        scores  = booster.get_score(importance_type="gain")
-
-    importance_list = []
-    for feat, score in scores.items():
-        if feat.startswith("f") and feat[1:].isdigit():
-            idx  = int(feat[1:])
-            name = feature_names[idx] if idx < len(feature_names) else feat
-        else:
-            name = feat
-        importance_list.append({"feature": name, "importance": round(score, 6)})
-
-    fi_df  = pd.DataFrame(importance_list)
-    fi_df  = fi_df.sort_values("importance", ascending=False).reset_index(drop=True)
-    total  = fi_df["importance"].sum()
-    if total > 0:
-        fi_df["importance"] = (fi_df["importance"] / total).round(6)
-
-    logger.info(f"Feature importance computed: {len(fi_df)} features")
-    logger.info("Top 10 features:")
-    for _, row in fi_df.head(10).iterrows():
-        logger.info(f"  {row['feature']:40s} {row['importance']:.4f}")
-
-    return fi_df
-
-
-# ---------------------------------------------------------------------------
-# RC1 + RC3 + RC7 FIX: Gain regressor — broader training set, correct scale input,
-#                       log-transform target, matched hyperparams, higher gain cap
-# ---------------------------------------------------------------------------
-
-# Gains above this percentile are winsorized to prevent a handful of 5000%
-# outliers from dominating the loss.  We keep extreme winners in training
-# (they are the most valuable signal) but cap their label so XGBoost can
-# still split on them meaningfully.  Log-transforming the target (RC7) reduces
-# the distortion from outliers far more than a hard cap.
-_GAIN_WINSOR_PCT = 99.5   # winsorize above this percentile
-
-# RC8 FIX: Winner up-weighting is now DATA-DRIVEN, mirroring exactly how
-# train_model() derives the classifier's scale_pos_weight (n_neg/n_pos,
-# clamped to [SPW_MIN, SPW_MAX]) instead of a fixed number picked by hand.
-# The old approach (_WINNER_WEIGHT_MULTIPLIER = 3.0, tuned down from 8.0,
-# tuned down from who-knows-what before that) was a guess that had to be
-# re-guessed every time the winner/non-winner ratio in the training data
-# shifted. Computing it from n_non_winners/n_winners on THIS run's actual
-# training pool (see train_gain_regressor below) means the weight adapts
-# automatically as more winner data accumulates, exactly like the
-# classifier's scale_pos_weight does. The constants below are only the
-# clamp bounds (and the legacy fallback values used only if the training
-# pool is degenerate — e.g. zero winners).
-REG_WINNER_WEIGHT_MIN = 2.0     # never weight winners less than 2x
-REG_WINNER_WEIGHT_MAX = 8.0     # never let the data-driven ratio run away
-                                # unboundedly on a very winner-scarce run
-_WINNER_WEIGHT_MULTIPLIER = 3.0    # legacy fallback if n_winners or
-                                    # n_non_winners is 0 (ratio undefined)
-
-_HIGH_GAIN_THRESHOLD  = 30.0    # Lowered from 50% — more winners qualify for the boost
-REG_HIGH_GAIN_WEIGHT_MIN = 1.5   # additional multiplier on top of the winner
-REG_HIGH_GAIN_WEIGHT_MAX = 5.0   # weight above, also computed from the actual
-                                  # high-gain / other-winner ratio in this run's data
-_HIGH_GAIN_MULTIPLIER = 3.0     # legacy fallback if n_high_gain or
-                                 # n_other_winners is 0
-
-# RC9: Additional multiplier applied to winner rows, scaled by classifier
-# confidence (clf_proba), on top of the RC8 winner/high-gain weights above.
-# A 50%-confidence winner gets ~REG_CONFIDENCE_WEIGHT_MIN (near-neutral);
-# a near-100%-confidence winner (strong-buy territory) gets pulled toward
-# REG_CONFIDENCE_WEIGHT_MAX, so the regressor is penalised more heavily for
-# under-predicting gain on exactly the rows the classifier is most sure about.
-REG_CONFIDENCE_WEIGHT_MIN = 1.0
-REG_CONFIDENCE_WEIGHT_MAX = 2.5
-
-# RC10 FIX: Hard cap on the COMBINED weight after RC8 (winner + high-gain)
-# and RC9 (confidence) multipliers are all applied on top of the base
-# sample_weight. Each individual factor above is independently clamped, but
-# nothing previously capped their product — in the worst case
-# (label-corrected + winner + high-gain + high-confidence all on one row)
-# that's up to ~1.5 * 8.0 * 5.0 * 2.5 =~ 150x a normal row's weight, which
-# would let a handful of rare, high-conviction rows dominate the regressor's
-# splits far more than any single factor's clamp intended. This cap is
-# applied AFTER all multipliers, so it only trims the tail — most rows are
-# far below it and are completely unaffected.
-REG_TOTAL_WEIGHT_CAP = 20.0
-
-
-
-# Minimum number of gain-labeled rows required in the classifier's TRAIN split
-# before we trust a leak-free regressor fit.  If the train-only pool falls
-# short of this, train_gain_regressor() falls back to training on the full
-# (train+val) pool instead — but it does so loudly, via the return value
-# and a logged warning, rather than silently.  See LEAK-FREE FIX below.
-MIN_TRAIN_ONLY_GAIN_ROWS = 200
-
-
-def train_gain_regressor(
-    X_scaled: pd.DataFrame,           # RC3 FIX: receive pre-scaled features
-    combined_df: pd.DataFrame,
-    feature_names: list[str],
-    client: Client,
-    accuracy_gain_map: "Optional[dict]" = None,  # ISSUE 2 FIX: pre-fetched from main() to avoid redundant DB query
-    _is_fallback_retry: bool = False,  # internal — set True on the leaky-fallback recursive call
-) -> "Optional[object]":
-    """
-    Train a regression model to predict actual % gain for stocks the
-    classifier labels as winners.
-
-    ISSUE #1 (historical): X_scaled was previously passed here with ALL rows
-      (train + val), causing the regressor's own internal time-based val split
-      to be a mixed-regime window that overlapped the classifier's val rows.
-      This was not a correctness issue for the classifier, but it made the
-      regressor's reported val MAE/R² meaningless as an evaluation signal.
-    EVALUATION INTEGRITY FIX: The caller now passes only the classifier's
-      train rows (X_train + combined_df.loc[train_idx]), so the regressor's
-      internal 80/20 split is entirely within the training period and the
-      held-out val window reflects a clean, future-relative evaluation.
-
-    RC1 FIX: Broaden training set beyond just winners.
-      - Winners from daily_winners (with corrected actual_high_pct via prev_close)
-      - Non-winners that have actual_gain_pct in ml_prediction_accuracy
-        (yfinance data captured by the accuracy tracker)
-      This gives far more training samples and a realistic gain distribution.
-
-    RC2 FIX: Use actual_high_pct computed from prev_close (already corrected
-      in the enrichment step before this function is called).
-
-    RC3 FIX: X_scaled is the StandardScaler output, matching exactly what
-      explosion_predictor.py passes to the regressor at inference time.
-      Previously the regressor was trained on raw/filled values but received
-      scaled values → systematically wrong predictions from day one.
-
-    RC4 FIX: The std < 1.0 guard in explosion_predictor.py is relaxed to
-      0.5 (see that file), but we also improve training quality here so the
-      regressor doesn't collapse to the mean.
-
-    MODERATE ISSUE #5 FIX: Internal val split is now time-based (matching the
-      classifier split) rather than random, preventing future gain patterns
-      from leaking into regressor training.
-
-    RC7 FIX: Three changes to stop gain predictions collapsing below 50%:
-      1. Log-transform the gain target (log1p / expm1) so that 5% and 500%
-         gains don't live on wildly different scales.  This gives XGBoost a
-         smoother loss landscape and lets it place splits that distinguish
-         "moderate" from "large" gains without being dominated by rare 5000%
-         outliers.
-      2. Winsorize the log-transformed target at the 99.5th percentile so the
-         handful of extreme outliers don't pull every tree towards them.
-      3. Heavily up-weight winner rows (5×) and extra-large-gain winners (15×
-         combined) so the regressor is penalised much more for under-predicting
-         high-gain stocks than for over-predicting low-gain ones.  Previously
-         the 2× winner bonus was far too weak given the severe class imbalance
-         in gain magnitude (most training rows have gain ≈ 0–5%).
-      4. Match classifier hyperparameters: n_estimators=300, max_depth=5,
-         gamma=1.0, reg_alpha/lambda matching XGBOOST_PARAMS.  The old
-         regressor used looser settings (200 trees, depth 4, no gamma) which
-         caused it to overfit to the abundant low-gain rows.
-      5. Raise the gain cap from 500% to 10 000% so extreme winners are NOT
-         silently excluded from training.  The log transform handles their
-         scale.
-    """
-    from xgboost import XGBRegressor
-
-    # ------------------------------------------------------------------
-    # RC1 FIX: Fetch additional gain data from ml_prediction_accuracy.
-    # ISSUE 2 FIX: if the caller already fetched this data (main() passes it
-    # via accuracy_gain_map after the RC3 backfill query), reuse it directly
-    # to avoid a redundant round-trip.  Fall back to fetching here only when
-    # the caller did not supply it (e.g. when called from other contexts).
-    # ------------------------------------------------------------------
-    if accuracy_gain_map is None:
-        accuracy_gain_map = {}
-        try:
-            logger.info("RC1: Fetching gain data from ml_prediction_accuracy (no pre-fetched data supplied)...")
-            date_col_candidates = [c for c in ("detection_date", "explosion_date", "prediction_date", "date") if c in combined_df.columns]
-            if date_col_candidates:
-                try:
-                    # BUG FIX: previously picked only the first matching column
-                    # for the whole frame (same issue fixed elsewhere in this
-                    # file) — rows lacking that particular column read as NaT
-                    # and were silently excluded from the min-date calculation.
-                    # Combine all candidate date columns per-row instead.
-                    _fallback_dates = pd.Series(pd.NaT, index=combined_df.index)
-                    for _c in date_col_candidates:
-                        _fallback_dates = _fallback_dates.fillna(pd.to_datetime(combined_df[_c], errors="coerce"))
-                    start_date = _fallback_dates.min()
-                    start_date = start_date.date().isoformat() if pd.notna(start_date) else None
-                except Exception:
-                    start_date = None
-            else:
-                start_date = None
-            if start_date is None:
-                import os
-                from datetime import timedelta
-                lookback_days = int(os.environ.get("LOOKBACK", "90"))
-                start_date = (datetime.now().date() - timedelta(days=lookback_days)).isoformat()
-                logger.warning(
-                    f"RC1: Could not derive start_date from combined_df; "
-                    f"falling back to LOOKBACK={lookback_days} days from today ({start_date})"
-                )
-            logger.info(f"RC1: Querying ml_prediction_accuracy from {start_date}")
-            # FIX2: also select actual_high_pct_source so we can tell prev_close
-            # -based values apart from the noisier same-day-price fallback (see
-            # ml_track_comprehensive_accuracy.py). The column may not exist yet
-            # on deployments that haven't run the migration — fall back to the
-            # old select() without it so this doesn't hard-fail.
-            try:
-                resp = (
-                    client.table("ml_prediction_accuracy")
-                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct, actual_high_pct_source")
-                    .gte("prediction_date", start_date)
-                    .not_.is_("actual_gain_pct", "null")
-                    .execute()
-                )
-            except Exception as _e_col:
-                logger.info(
-                    f"RC1: actual_high_pct_source column unavailable ({_e_col}); "
-                    "querying without it (denominator will be treated as unverified)."
-                )
-                resp = (
-                    client.table("ml_prediction_accuracy")
-                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-                    .gte("prediction_date", start_date)
-                    .not_.is_("actual_gain_pct", "null")
-                    .execute()
-                )
-            if resp.data:
-                for row in resp.data:
-                    key = (row["symbol"], row["prediction_date"])
-                    accuracy_gain_map[key] = {
-                        "actual_gain_pct": row.get("actual_gain_pct"),
-                        "actual_high_pct": row.get("actual_high_pct"),
-                        # None = legacy row written before the source column
-                        # existed; treated as unverified (see acc_lookup below).
-                        "actual_high_pct_source": row.get("actual_high_pct_source"),
-                    }
-                logger.info(f"RC1: Got {len(accuracy_gain_map)} gain records from accuracy table")
-        except Exception as e:
-            logger.warning(f"RC1: Could not fetch accuracy gain data: {e}")
-    else:
-        logger.info(f"RC1: Reusing {len(accuracy_gain_map)} pre-fetched gain records from caller (no redundant DB query)")
-
-    # ------------------------------------------------------------------
-    # Determine gain target column — evaluated AFTER the RC1 fetch so
-    # that accuracy-table data can count toward the ≥30 threshold.
-    # ------------------------------------------------------------------
-    gain_col = None
-    # DAILY-OUTCOME GAIN TARGET FIX: '_unified_gain_target' (built in
-    # attach_true_gain_targets()) is checked FIRST. Priority inside that
-    # column: daily_outcome_gain_pct (direct daily_winners/daily_non_winners
-    # join — the SAME row-matching approach the classifier's label already
-    # uses, no second table has to independently corroborate the row) >
-    # true_gain_pct (market_close/day_prior_close inner-join fallback) >
-    # ml_training_base.gain_pct (base-CSV rows with no detection_date). It is
-    # a directly-measured, pipeline-native label with no yfinance/
-    # ml_prediction_accuracy dependency. The legacy columns below remain as a
-    # fallback for any deployment that hasn't backfilled the new tables yet.
-    for candidate in ("_unified_gain_target", "actual_high_pct", "actual_gain_pct", "change_pct"):
-        if candidate in combined_df.columns:
-            col_vals = pd.to_numeric(combined_df[candidate], errors="coerce")
-            non_null = col_vals.notna().sum()
-            if non_null >= 30:
-                gain_col = candidate
-                logger.info(f"Gain regressor target column (from combined_df): '{gain_col}' ({non_null} non-null values)")
-                break
-
-    # If no column in combined_df has enough data, check whether the RC1
-    # accuracy table fetch alone can supply ≥30 rows — use actual_gain_pct
-    # as the target in that case (we will fill it from accuracy_gain_map).
-    if gain_col is None and len(accuracy_gain_map) >= 30:
-        # Inject a synthetic column so the downstream code has something
-        # to read from before the accuracy-map fill loop runs.
-        for candidate in ("actual_high_pct", "actual_gain_pct"):
-            if candidate not in combined_df.columns:
-                combined_df[candidate] = float("nan")
-        gain_col = "actual_gain_pct"
-        logger.info(
-            f"Gain regressor target column (from accuracy table): '{gain_col}' "
-            f"({len(accuracy_gain_map)} records available via RC1 fetch)"
-        )
-
-    if gain_col is None:
-        logger.warning(
-            "No gain column with sufficient data (checked combined_df columns "
-            f"and RC1 accuracy table — {len(accuracy_gain_map)} accuracy rows). "
-            "Skipping gain regressor training."
-        )
-        return None
-
-    # ------------------------------------------------------------------
-    # Build gain targets for every row in combined_df
-    # Priority: actual_high_pct > actual_gain_pct > accuracy table > skip
-    # ------------------------------------------------------------------
-    gain_targets = pd.to_numeric(combined_df[gain_col], errors="coerce").copy()
-
-    if accuracy_gain_map:
-        sym_col = next((c for c in ["symbol", "ticker"] if c in combined_df.columns), None)
-
-        # combined_df has two different date columns depending on data source:
-        #   T-1 rows      -> detection_date  (the day *before* explosion = prediction_date)
-        #   base CSV rows -> event_date      (the explosion day itself = prediction_date + 1)
-        # We need to try both, and for event_date rows subtract 1 business day.
-        has_detection = "detection_date" in combined_df.columns
-        has_event     = "event_date" in combined_df.columns
-
-        if sym_col and (has_detection or has_event):
-            # ISSUE 3 FIX: replace O(n) iterrows loop with vectorised lookup.
-            # Build a Series of (symbol, date_str) lookup keys for each row, try
-            # detection_date first (T-1 rows), then fall back to event_date - 1 BDay
-            # (base CSV rows).  A single map() call replaces the per-row loop.
-
-            # --- Build acc_lookup: (symbol, date_str) -> best gain value ----------
-            # FIX2: exclude rows whose actual_high_pct was computed on the
-            # same-day-price base (winners_table_same_day_price) — that base
-            # compresses gains toward ~0% and mixing it with prev_close-based
-            # values is exactly what produced the FIX2 mean-gain divergence.
-            # Rows with source=None are legacy (written before the source
-            # column existed) and are kept for backward compatibility, but are
-            # NOT the fix — once enough history accumulates with the tag
-            # populated, consider dropping the None case too.
-            _n_acc_excluded_denominator = 0
-            acc_lookup = {}
-            for k, v in accuracy_gain_map.items():
-                _src = v.get("actual_high_pct_source")
-                if _src == "winners_table_same_day_price":
-                    _n_acc_excluded_denominator += 1
-                    continue
-                acc_lookup[k] = v.get("actual_high_pct") or v.get("actual_gain_pct")
-            if _n_acc_excluded_denominator > 0:
-                logger.info(
-                    f"FIX2: Excluded {_n_acc_excluded_denominator} accuracy-table records "
-                    "with same-day-price-denominated actual_high_pct from the gain "
-                    "regressor target pool (incompatible base vs prev_close)."
-                )
-
-            null_mask = gain_targets.isna()
-            valid_det = pd.array([], dtype=bool)  # pre-init; populated in Path 1 if has_detection
-
-            # --- Path 1: detection_date rows (direct key match) -------------------
-            if has_detection and null_mask.any():
-                det_dates = pd.to_datetime(
-                    combined_df.loc[null_mask, "detection_date"], errors="coerce"
-                ).dt.strftime("%Y-%m-%d").fillna("")
-                keys_det = list(zip(combined_df.loc[null_mask, sym_col], det_dates))
-                filled_det = pd.array(
-                    [acc_lookup.get(k) for k in keys_det], dtype=object
-                )
-                valid_det = pd.array(
-                    [v is not None for v in filled_det], dtype=bool
-                )
-                update_idx = gain_targets.index[null_mask][valid_det]
-                gain_targets.loc[update_idx] = pd.to_numeric(
-                    pd.array(filled_det[valid_det], dtype=object), errors="coerce"
-                )
-                null_mask = gain_targets.isna()  # refresh for path 2
-
-            # --- Path 2: event_date - 1 BDay rows (base CSV rows) -----------------
-            n_filled_event = 0
-            if has_event and null_mask.any():
-                ev_raw = pd.to_datetime(
-                    combined_df.loc[null_mask, "event_date"], errors="coerce"
-                )
-                # Subtract 1 business day vectorially; NaT stays NaT
-                pred_dates = (ev_raw - pd.tseries.offsets.BDay(1)).dt.strftime("%Y-%m-%d").fillna("")
-                keys_ev = list(zip(combined_df.loc[null_mask, sym_col], pred_dates))
-                filled_ev = pd.array(
-                    [acc_lookup.get(k) for k in keys_ev], dtype=object
-                )
-                valid_ev = pd.array(
-                    [v is not None for v in filled_ev], dtype=bool
-                )
-                update_idx_ev = gain_targets.index[null_mask][valid_ev]
-                gain_targets.loc[update_idx_ev] = pd.to_numeric(
-                    pd.array(filled_ev[valid_ev], dtype=object), errors="coerce"
-                )
-                n_filled_event = int(valid_ev.sum())
-
-            n_filled_det   = int(valid_det.sum()) if has_detection else 0
-            filled_count   = n_filled_det + n_filled_event
-            logger.info(
-                f"RC1: Filled {filled_count} additional gain targets from accuracy table "
-                f"({n_filled_det} via detection_date, {n_filled_event} via event_date-1BDay)"
-            )
-
-    # ------------------------------------------------------------------
-    # CORE FIX: T-1 non-winner rows without actual_high_pct get gain target = 0.0.
-    #
-    # Root cause of poor regressor training (confirmed in logs):
-    #   - Only T-1 non-winner rows (source = non_winners_day_prior) are eligible.
-    #   - Base CSV rows have genuinely UNKNOWN outcomes: event_date is the explosion
-    #     day so we have no intraday data for what the stock did. Assigning 0.0 to
-    #     ~6,649 base rows (all with the same constant target) collapses the gain
-    #     distribution std from ~1.86 to ~0.88 in log-space, causing the regressor
-    #     to converge in ~35 trees predicting near-zero for everything.
-    #   - Only T-1 rows passed through the daily non-winner screener, so we know
-    #     with confidence they were scanned and did NOT produce a large intraday move.
-    #     Their correct gain target IS ~0%.
-    #
-    # Winner rows with NaN actual_high_pct (no prev_close available) are
-    # excluded — we don't know their true gain so we cannot assign 0.0.
-    # ------------------------------------------------------------------
-    non_winner_rows = combined_df["label"] == 0
-    winner_rows     = combined_df["label"] == 1
-
-    # Identify T-1 non-winner rows (confirmed daily screener output, gain~=0)
-    # vs base CSV rows (unknown outcome, should remain NaN so they're excluded).
-    if "source" in combined_df.columns:
-        t1_non_winner_rows = (
-            non_winner_rows &
-            combined_df["source"].str.contains("non_winners_day_prior", na=False)
-        )
-    else:
-        # No source column — conservatively treat all non-winners as T-1
-        t1_non_winner_rows = non_winner_rows
-
-    # Fill ONLY T-1 non-winners with 0.0; leave base CSV non-winners as NaN
-    #
-    # FIX2: Track exactly which rows receive this explicit 0.0 anchor (as opposed
-    # to a genuine actual_high_pct value backfilled from ml_prediction_accuracy).
-    # Without this, the FIX2 diagnostic below cannot tell the two apart and ends
-    # up comparing real winner gains against a population dominated by this
-    # intentional zero-fill — which will *always* show a huge mean gap that has
-    # nothing to do with a prev_close vs same-day-close denominator mismatch.
-    zero_fill_mask = t1_non_winner_rows & gain_targets.isna()
-    n_nonwinner_filled = int(zero_fill_mask.sum())
-    if n_nonwinner_filled > 0:
-        gain_targets = gain_targets.copy()
-        gain_targets.loc[zero_fill_mask] = 0.0
-        n_base_skipped = int((non_winner_rows & ~t1_non_winner_rows).sum())
-        logger.info(
-            f"CORE FIX: Filled {n_nonwinner_filled} T-1 non-winner rows with gain=0.0 "
-            f"(confirmed screener output — no large intraday move). "
-            f"Skipped {n_base_skipped} base CSV rows (unknown outcome — kept as NaN)."
-        )
-
-    # RC7 FIX: cap (not floor) — reject obvious data errors only
-    valid_gain_mask = gain_targets.notna() & (gain_targets > -100.0) & (gain_targets < 10_000.0)
-
-    # Exclude winner rows with NaN-filled or unreliably low gain only.
-    # Non-winner rows with gain=0.0 are KEPT — they are the true low-end anchor.
-    GAIN_REGRESSOR_MIN_PCT = 3.0  # loosened 5.0→3.0 (2026-08-13): the informative
-    # pool (239 winners + ~26 genuine non-winners) is the hard ceiling on
-    # regressor training signal (see ZERO-ANCHOR SUBSAMPLE diagnostic above),
-    # so excluding winner rows as "noisy" below 5% was giving away scarce
-    # informative rows for comparatively little noise-reduction benefit.
-    # 3% still excludes true data-error-scale rows while keeping more of the
-    # low-end winner signal.
-    low_gain_winner_mask = valid_gain_mask & winner_rows & (gain_targets < GAIN_REGRESSOR_MIN_PCT)
-    n_low_gain_excluded = int(low_gain_winner_mask.sum())
-    if n_low_gain_excluded > 0:
-        valid_gain_mask = valid_gain_mask & ~low_gain_winner_mask
-        logger.info(
-            f"Bug3 FIX: Excluded {n_low_gain_excluded} winner rows with "
-            f"gain < {GAIN_REGRESSOR_MIN_PCT}% as noisy winner targets. "
-            f"Non-winner rows with gain=0.0 are retained as the low-end anchor."
-        )
-
-    # ------------------------------------------------------------------
-    # ZERO-ANCHOR SUBSAMPLING FIX: the CORE FIX zero-fill above routinely
-    # produces ~90% of the regressor's training pool as rows with an
-    # IDENTICAL target (gain=0.0) — e.g. 3837 zero-anchor rows against only
-    # 408 winners + 77 genuine non-zero non-winners in one observed run.
-    # RC8's winner-weight up-weighting (clamped to [REG_WINNER_WEIGHT_MIN,
-    # REG_WINNER_WEIGHT_MAX]) roughly balances total *weight* on each side,
-    # but doesn't fix the underlying problem: half the loss surface is a
-    # single repeated point, so gradient boosting minimizes loss by
-    # collapsing predictions toward ~0 almost everywhere rather than learning
-    # feature-dependent gain structure. That's the direct cause of the
-    # near-flat 0.4%–11.1% predicted-gain range and near-zero/negative R².
-    # Down-sampling (not just down-weighting) the zero-anchor rows to a
-    # bounded multiple of the informative pool (winners + genuine non-zero
-    # non-winners) gives the model room to actually differentiate. The
-    # informative rows are never touched; only the redundant zero-anchor
-    # rows are subsampled, and it's a fixed random_state for reproducibility.
-    # ------------------------------------------------------------------
-    ZERO_ANCHOR_MAX_RATIO = 3.0  # max zero-anchor rows per informative row
-    zero_anchor_valid_mask = valid_gain_mask & zero_fill_mask.reindex(valid_gain_mask.index, fill_value=False)
-    informative_valid_mask = valid_gain_mask & ~zero_anchor_valid_mask
-    n_zero_anchor_valid = int(zero_anchor_valid_mask.sum())
-    n_informative_valid = int(informative_valid_mask.sum())
-    max_zero_anchor_rows = int(n_informative_valid * ZERO_ANCHOR_MAX_RATIO)
-    if n_informative_valid > 0 and n_zero_anchor_valid > max_zero_anchor_rows:
-        _zero_idx = valid_gain_mask.index[zero_anchor_valid_mask]
-        _rng = np.random.RandomState(42)
-        _keep_idx = pd.Index(
-            _rng.choice(_zero_idx.to_numpy(), size=max_zero_anchor_rows, replace=False)
-        )
-        _drop_idx = _zero_idx.difference(_keep_idx)
-        valid_gain_mask = valid_gain_mask.copy()
-        valid_gain_mask.loc[_drop_idx] = False
-        logger.info(
-            f"  ZERO-ANCHOR SUBSAMPLE: {n_zero_anchor_valid} zero-anchor rows vs "
-            f"{n_informative_valid} informative rows (winners + genuine non-zero "
-            f"non-winners) exceeded the {ZERO_ANCHOR_MAX_RATIO:.0f}:1 ratio cap — "
-            f"downsampled zero-anchors to {max_zero_anchor_rows} "
-            f"(dropped {len(_drop_idx)}, kept all informative rows)."
-        )
-    elif n_informative_valid == 0:
-        logger.warning(
-            "  ZERO-ANCHOR SUBSAMPLE: no informative (winner or genuine non-zero "
-            "non-winner) rows available — skipping subsampling, regressor will "
-            "likely underperform regardless."
-        )
-
-    # DIAGNOSTIC (2026-08-13): ZERO_ANCHOR_MAX_RATIO controls the *uninformative*
-    # zero-anchor pool, not the informative pool — n_informative_valid is the
-    # real ceiling on what the regressor can learn from, and this ratio cap
-    # cannot raise it. Surfacing it explicitly here so it's obvious in the
-    # logs (rather than implied) that growing regressor performance requires
-    # more winner/genuine-non-winner rows accumulating over time (or loosening
-    # GAIN_REGRESSOR_MIN_PCT below), not further tuning of this ratio.
-    logger.info(
-        f"  Informative-row ceiling: {n_informative_valid} rows (winners + genuine "
-        f"non-zero non-winners). This is the hard cap on regressor training signal "
-        f"regardless of ZERO_ANCHOR_MAX_RATIO={ZERO_ANCHOR_MAX_RATIO:.0f} — the ratio "
-        f"only controls how many redundant zero-anchor rows are kept alongside it."
-    )
-
-    n_valid = int(valid_gain_mask.sum())
-    n_winners_with_gain = int((combined_df.loc[valid_gain_mask, "label"] == 1).sum()) if valid_gain_mask.any() else 0
-    n_non_winners_with_gain = n_valid - n_winners_with_gain
-
-    # FIX 3: Log how many rows valid_gain_mask drops vs the full combined_df the
-    # classifier trained on.  The regressor's effective training population is much
-    # smaller because most base-CSV and non-winner rows have no gain target.
-    # Surfacing this gap makes it obvious in the logs when the regressor is working
-    # from a very different (and smaller) slice of data than the classifier.
-    n_total_in = len(combined_df)
-    n_dropped  = n_total_in - n_valid
-    logger.info(
-        f"\n── Training gain regressor on {n_valid} rows with gain data ──\n"
-        f"  Input rows (classifier train split): {n_total_in}\n"
-        f"  Dropped (no gain target / out-of-range): {n_dropped} "
-        f"({n_dropped / max(n_total_in, 1):.1%} of classifier train set)\n"
-        f"  Winners with gain:     {n_winners_with_gain}\n"
-        f"  Non-winners with gain: {n_non_winners_with_gain} (RC1: broader training set)\n"
-        f"  Target:      {gain_col} (RC7: cap raised to 10 000%, log-transformed)"
-    )
-
-    # FIX 2: Log gain-target source populations so scale divergence between the
-    # RC2 prev_close-corrected winners and the accuracy-table backfill is visible.
-    # When RC2 and the accuracy table compute actual_high_pct with different
-    # denominators (prev_close vs same-day close), the two populations will have
-    # visibly different distribution statistics here — a clear signal to investigate.
-    #
-    # FIX2 (corrected): the previous version of this check compared winner-row
-    # gains against the *entire* non_winners_day_prior population, which is
-    # dominated by rows the CORE FIX above deliberately set to gain=0.0 (they
-    # never had an actual_high_pct at all — they're a "no big move" anchor, not
-    # a same-day-close-denominated value). Comparing real winner gains to an
-    # intentional 0.0 constant will always look like a huge divergence and has
-    # nothing to do with denominators. We now exclude those explicit zero-fill
-    # rows so the comparison only includes non-winner rows that carry a genuine
-    # actual_high_pct/actual_gain_pct value pulled from the accuracy table.
-    if valid_gain_mask.any() and "source" in combined_df.columns:
-        _gt_valid  = gain_targets[valid_gain_mask]
-        _src_valid = combined_df.loc[valid_gain_mask, "source"]
-        _is_winner = combined_df.loc[valid_gain_mask, "label"] == 1
-        _zero_fill_valid = zero_fill_mask.reindex(valid_gain_mask.index, fill_value=False)[valid_gain_mask]
-
-        _rc2_group = _src_valid.str.contains("winners_day_prior", na=False) & ~_src_valid.str.contains("non_winners", na=False)
-        _acc_group_all = _src_valid.str.contains("non_winners_day_prior", na=False)
-        _acc_group_genuine = _acc_group_all & ~_zero_fill_valid
-        _acc_group_zero_anchor = _acc_group_all & _zero_fill_valid
-
-        for _src_group, _src_label in [
-            (_rc2_group, "daily_winners (RC2 enriched)"),
-            (_acc_group_genuine, "non_winners (accuracy-table backfill, genuine)"),
-            (_acc_group_zero_anchor, "non_winners (explicit 0.0 anchor, CORE FIX)"),
-            (~_src_valid.str.contains("day_prior", na=False), "base_csv / mistake rows"),
-        ]:
-            _grp_vals = _gt_valid[_src_group]
-            if len(_grp_vals) == 0:
-                continue
-            logger.info(
-                f"  Gain source [{_src_label}]: n={len(_grp_vals)}, "
-                f"min={_grp_vals.min():.1f}%, max={_grp_vals.max():.1f}%, "
-                f"mean={_grp_vals.mean():.1f}%, std={_grp_vals.std():.1f}%"
-            )
-        # Warn when the two primary sources have very different mean gains —
-        # a strong signal that they are using incompatible denominators.
-        # Only the *genuine* accuracy-table rows are compared here; the
-        # explicit 0.0 anchor rows are excluded on purpose (see note above).
-        _rc2_vals  = _gt_valid[_rc2_group]
-        _acc_vals  = _gt_valid[_acc_group_genuine]
-        # FIX2: require a larger genuine sample before trusting a mean-diff
-        # warning. n<30 is too small/noisy to distinguish a real denominator
-        # bug from ordinary sampling variance (e.g. n=15 with mean=3.6% is not
-        # a reliable estimate of the true non-winner base rate).
-        MIN_GENUINE_ACC_SAMPLE = 30
-        if len(_rc2_vals) >= 5 and len(_acc_vals) >= MIN_GENUINE_ACC_SAMPLE:
-            _mean_diff = abs(_rc2_vals.mean() - _acc_vals.mean())
-            if _mean_diff > 20.0:
-                logger.warning(
-                    f"  ⚠️  FIX2: Mean gain differs by {_mean_diff:.1f}pp between RC2-enriched "
-                    f"winners ({_rc2_vals.mean():.1f}%) and genuine accuracy-table non-winners "
-                    f"({_acc_vals.mean():.1f}%). This suggests the two sources are computing "
-                    f"actual_high_pct with different denominators (prev_close vs same-day close). "
-                    f"Investigate _compute_correct_actual_high_pct and enrich_mistakes_with_gains "
-                    f"to ensure both use the same base."
-                )
-        elif len(_acc_vals) < MIN_GENUINE_ACC_SAMPLE:
-            logger.info(
-                f"  FIX2: Skipping denominator-divergence check — only {len(_acc_vals)} "
-                f"genuine (non-zero-anchor) accuracy-table non-winner rows available "
-                f"(need ≥{MIN_GENUINE_ACC_SAMPLE}). Most non-winner rows are explicit 0.0 "
-                f"anchors from CORE FIX, which is expected and not a denominator issue; "
-                f"a small genuine sample is also too noisy to draw a conclusion from."
-            )
-
-    if n_valid < 30:
-        logger.warning(f"Only {n_valid} rows with gain data — need ≥30. Skipping gain regressor.")
-        return None
-
-    # ------------------------------------------------------------------
-    # LEAK-FREE FIX (reinstated): the caller (main()) now passes ONLY the
-    # classifier's train-split rows here by default (X_train / combined_df
-    # .loc[train_idx]), so this function's own internal 80/20 time split is
-    # drawn entirely from data the classifier already trained on — no
-    # overlap with the classifier's held-out val/cal windows.
-    #
-    # This was previously reverted (see the superseded "NOTE" left in main()
-    # below) because, at the time, virtually all gain-labeled rows came from
-    # true_gain_pct (the market-snapshot join), which only exists for recent
-    # T-1 rows — i.e. exactly the rows living in the classifier's val window.
-    # Restricting to train_idx therefore left ~0 labeled rows.
-    #
-    # That is no longer the whole picture: attach_true_gain_targets() also
-    # backfills '_unified_gain_target' from ml_training_base.gain_pct, which
-    # is populated across the FULL historical span of the base CSV, not just
-    # the recent val window. That gives the train split real, broadly-
-    # distributed gain labels even after excluding the most recent VAL_WEEKS.
-    #
-    # We still don't take this on faith: if the train-only pool genuinely
-    # doesn't clear MIN_TRAIN_ONLY_GAIN_ROWS, we fall back to the old
-    # (leaky) full-dataset behaviour rather than training on a starved
-    # sample — but we do it visibly, via a WARNING and a metadata flag,
-    # instead of silently baking leakage into every run.
-    # ------------------------------------------------------------------
-    if not _is_fallback_retry and n_valid < MIN_TRAIN_ONLY_GAIN_ROWS:
-        logger.warning(
-            f"LEAK-FREE FIX: only {n_valid} gain-labeled rows in the train-only "
-            f"pool passed to this function (need ≥{MIN_TRAIN_ONLY_GAIN_ROWS} to "
-            "trust a leak-free split). Falling back to training the gain "
-            "regressor on the FULL (train+val) pool instead. This reintroduces "
-            "train/val overlap for the regressor ONLY (the classifier is "
-            "unaffected) — its reported val MAE/R² should be treated as "
-            "optimistic. This fallback should disappear on its own as more "
-            "gain-labeled history accumulates."
-        )
-        _full_df = getattr(train_gain_regressor, "_full_combined_df", None)
-        _full_X  = getattr(train_gain_regressor, "_full_X_scaled", None)
-        if _full_df is not None and _full_X is not None:
-            fallback_model = train_gain_regressor(
-                X_scaled=_full_X,
-                combined_df=_full_df,
-                feature_names=feature_names,
-                client=client,
-                accuracy_gain_map=accuracy_gain_map,
-                _is_fallback_retry=True,
-            )
-            if fallback_model is not None:
-                fallback_model._trained_leak_free = False  # type: ignore[attr-defined]
-            return fallback_model
-        else:
-            logger.warning(
-                "LEAK-FREE FIX: no full-dataset fallback was registered by the "
-                "caller — proceeding with the train-only pool despite being "
-                f"below the {MIN_TRAIN_ONLY_GAIN_ROWS}-row threshold. Results "
-                "may be noisy."
-            )
-
-    # ------------------------------------------------------------------
-    # RC3 FIX: Use X_scaled (already StandardScaler-transformed), not raw
-    # ------------------------------------------------------------------
-    # BUG 4 FIX: align X_scaled to combined_df by shared index labels rather
-    # than by position.  The previous code assumed "X_scaled has the same row
-    # order as combined_df" and then blindly force-assigned X_reg.index =
-    # combined_df.index.  After a VAL REBALANCE the rebalanced rows are
-    # appended to the end of train_idx, so X_train (which came from
-    # X.loc[train_idx]) and combined_df.loc[train_idx] both contain the
-    # rebalanced rows — but any future code change that produces even a tiny
-    # ordering difference between the two DataFrames would silently corrupt
-    # the feature→gain-target mapping.  Using .reindex() makes the alignment
-    # explicit and index-safe regardless of row order.
-    common_idx = X_scaled.index.intersection(combined_df.index)
-    if len(common_idx) == 0:
-        logger.warning(
-            f"RC3: X_scaled and combined_df share no index labels — "
-            "cannot align. Skipping gain regressor."
-        )
-        return None
-    if len(common_idx) < len(combined_df):
-        logger.warning(
-            f"RC3: X_scaled covers {len(common_idx)} of {len(combined_df)} combined_df rows — "
-            "some rows will be excluded from gain regressor training."
-        )
-
-    # Narrow both to the common index so all downstream masks align correctly.
-    # Use reindex on gain_targets (preserves accuracy_gain_map fills from above)
-    # rather than re-deriving from combined_df[gain_col].
-    combined_df  = combined_df.loc[common_idx]
-    gain_targets = gain_targets.reindex(common_idx)
-
-    # Align features to the same index using label-based reindex (not positional).
-    X_reg = X_scaled.reindex(common_idx)
-    y_reg = gain_targets.copy()
-    w_reg = (
-        combined_df["sample_weight"].astype(float)
-        if "sample_weight" in combined_df.columns
-        else pd.Series(1.0, index=combined_df.index)
-    )
-
-    # ------------------------------------------------------------------
-    # RC8 FIX: Up-weight winner rows (and high-gain winners within them)
-    # using the SAME data-driven approach train_model() uses for the
-    # classifier's scale_pos_weight: compute the actual class-imbalance
-    # ratio in this run's training pool, then clamp it to sane bounds.
-    # This replaces the old fixed multipliers (_WINNER_WEIGHT_MULTIPLIER /
-    # _HIGH_GAIN_MULTIPLIER), which had to be hand-re-tuned (8.0→3.0,
-    # 5.0→3.0) every time the winner ratio in the data shifted, and were
-    # the direct cause of the "regressor predictions clustered near
-    # 0–5%" issue once the ratio drifted from when those constants were
-    # last hand-tuned.
-    # ------------------------------------------------------------------
-    winner_mask_valid = (combined_df["label"] == 1) & valid_gain_mask
-    high_gain_mask = winner_mask_valid & (gain_targets >= _HIGH_GAIN_THRESHOLD)
-
-    n_winners     = int(winner_mask_valid.sum())
-    n_non_winners = int((~winner_mask_valid).sum())
-    if n_winners > 0 and n_non_winners > 0:
-        raw_winner_w = n_non_winners / n_winners
-        winner_weight = max(REG_WINNER_WEIGHT_MIN, min(REG_WINNER_WEIGHT_MAX, raw_winner_w))
-    else:
-        raw_winner_w = None
-        winner_weight = _WINNER_WEIGHT_MULTIPLIER  # degenerate case fallback
-
-    n_high_gain     = int(high_gain_mask.sum())
-    n_other_winners = n_winners - n_high_gain
-    if n_high_gain > 0 and n_other_winners > 0:
-        raw_high_gain_w = n_other_winners / n_high_gain
-        high_gain_weight = max(REG_HIGH_GAIN_WEIGHT_MIN, min(REG_HIGH_GAIN_WEIGHT_MAX, raw_high_gain_w))
-    else:
-        raw_high_gain_w = None
-        high_gain_weight = _HIGH_GAIN_MULTIPLIER  # degenerate case fallback
-
-    if winner_mask_valid.any():
-        w_reg = w_reg.copy()
-        w_reg[winner_mask_valid] *= winner_weight
-        if high_gain_mask.any():
-            w_reg[high_gain_mask] *= high_gain_weight
-            logger.info(
-                f"  RC8: winner weight={winner_weight:.2f} "
-                f"(raw neg/pos={n_non_winners}/{n_winners}"
-                f"{f'={raw_winner_w:.2f}' if raw_winner_w is not None else ''}, "
-                f"clamped to [{REG_WINNER_WEIGHT_MIN}, {REG_WINNER_WEIGHT_MAX}]) "
-                f"applied to {n_winners} winner rows; "
-                f"high-gain weight={high_gain_weight:.2f} "
-                f"(raw other/high={n_other_winners}/{n_high_gain}"
-                f"{f'={raw_high_gain_w:.2f}' if raw_high_gain_w is not None else ''}, "
-                f"clamped to [{REG_HIGH_GAIN_WEIGHT_MIN}, {REG_HIGH_GAIN_WEIGHT_MAX}]) "
-                f"applied to {n_high_gain} rows (×{winner_weight * high_gain_weight:.1f} total)"
-            )
-        else:
-            logger.info(
-                f"  RC8: winner weight={winner_weight:.2f} "
-                f"(raw neg/pos={n_non_winners}/{n_winners}"
-                f"{f'={raw_winner_w:.2f}' if raw_winner_w is not None else ''}, "
-                f"clamped to [{REG_WINNER_WEIGHT_MIN}, {REG_WINNER_WEIGHT_MAX}]) "
-                f"applied to {n_winners} winner rows"
-            )
-
-    # ------------------------------------------------------------------
-    # RC9 FIX: Further up-weight winner rows by classifier confidence.
-    # RC8 already up-weights all winners uniformly, but a 51%-confidence
-    # winner and a 99%-confidence (strong-buy) winner get the same weight —
-    # so the regressor has no extra incentive to get the high-confidence
-    # rows' magnitude right, and those are exactly the rows where the
-    # reported gain kept coming out too low. Since clf_proba is now a
-    # feature in X_scaled (see the "REGRESSOR-ONLY clf_proba FEATURE" block
-    # in main()), we can also use it here, at training time, to scale the
-    # winner-row weight itself: within the winner rows, higher classifier
-    # confidence -> proportionally more weight, on top of (not replacing)
-    # the RC8 winner/high-gain multipliers above.
-    # ------------------------------------------------------------------
-    if winner_mask_valid.any() and "clf_proba" in X_reg.columns:
-        conf = X_reg.loc[winner_mask_valid, "clf_proba"].reindex(w_reg.index).fillna(0.5)
-        # Map confidence in [0, 1] onto a [REG_CONFIDENCE_WEIGHT_MIN, MAX]
-        # multiplier so a 50%-confidence winner keeps roughly its RC8 weight
-        # (multiplier ~1x) while a near-100%-confidence winner gets boosted.
-        confidence_multiplier = (
-            REG_CONFIDENCE_WEIGHT_MIN
-            + (REG_CONFIDENCE_WEIGHT_MAX - REG_CONFIDENCE_WEIGHT_MIN)
-            * conf.clip(0.0, 1.0)
-        )
-        w_reg = w_reg.copy()
-        w_reg.loc[winner_mask_valid] *= confidence_multiplier
-        logger.info(
-            f"  RC9: classifier-confidence weight boost applied to "
-            f"{int(winner_mask_valid.sum())} winner rows "
-            f"(multiplier range [{REG_CONFIDENCE_WEIGHT_MIN}, {REG_CONFIDENCE_WEIGHT_MAX}] "
-            f"scaled by clf_proba; mean confidence={conf.mean():.3f})"
-        )
-    elif winner_mask_valid.any():
-        logger.info(
-            "  RC9: skipped — clf_proba not present in this run's feature "
-            "matrix (older training path); winner rows keep RC8 weighting only."
-        )
-
-    # ------------------------------------------------------------------
-    # RC10 FIX: Diagnose and cap the COMBINED weight after RC8 + RC9.
-    # Log the full distribution first (so the cap's effect, if any, is
-    # visible) then clip the tail. Applied to all rows, not just winners —
-    # base sample_weight alone (e.g. the 1.5x label-correction bump) is
-    # already folded into w_reg by this point, so this is the true final
-    # per-row weight the regressor will train on.
-    # ------------------------------------------------------------------
-    w_reg_desc = w_reg.describe(percentiles=[0.5, 0.95, 0.99])
-    logger.info(
-        f"  RC10: pre-cap w_reg distribution — "
-        f"min={w_reg_desc['min']:.2f}  median={w_reg_desc['50%']:.2f}  "
-        f"p95={w_reg_desc['95%']:.2f}  p99={w_reg_desc['99%']:.2f}  "
-        f"max={w_reg_desc['max']:.2f}"
-    )
-    n_capped = int((w_reg > REG_TOTAL_WEIGHT_CAP).sum())
-    if n_capped > 0:
-        w_reg = w_reg.clip(upper=REG_TOTAL_WEIGHT_CAP)
-        logger.info(
-            f"  RC10: capped {n_capped} row(s) at REG_TOTAL_WEIGHT_CAP="
-            f"{REG_TOTAL_WEIGHT_CAP:.1f} (were above it pre-cap)"
-        )
-    else:
-        logger.info(
-            f"  RC10: no rows exceeded REG_TOTAL_WEIGHT_CAP={REG_TOTAL_WEIGHT_CAP:.1f} "
-            "— cap had no effect this run"
-        )
-
-    X_reg_valid = X_reg[valid_gain_mask]
-    y_reg_valid = y_reg[valid_gain_mask]
-    w_reg_valid = w_reg[valid_gain_mask]
-
-    # Fill NaN in scaled features with 0 (mean after scaling = 0).
-    # X_reg is already StandardScaler output, so 0.0 == column mean.
-    # This is consistent with build_scaler() which also fills with 0.0 after
-    # scaling, ensuring all three paths (classifier training, regressor training,
-    # and inference) treat missing values identically.
-    X_reg_fill = X_reg_valid.fillna(0.0)
-
-    # ------------------------------------------------------------------
-    # RC7 FIX: Log-transform the gain target.
-    # Gain % has a heavily right-skewed distribution: most values cluster
-    # near 0–20%, but winners can reach 5000%.  Training XGBoost directly
-    # on raw % means the squared-error loss is dominated by a handful of
-    # extreme values, causing trees to split on "is this stock an outlier?"
-    # rather than on signals that generalise.  log1p(max(gain, 0)) maps:
-    #   0%    → 0.0    200%  → 1.099
-    #   5%    → 0.049  500%  → 1.792
-    #   50%   → 0.405  5000% → 3.912
-    # The regressor predicts in log-space; at inference time we expm1() back.
-    # Winsorize at the 99.5th percentile in log-space to prevent the
-    # remaining extreme values from dominating.
-    # ------------------------------------------------------------------
-    y_log = np.log1p(np.maximum(y_reg_valid.values, 0.0))
-    winsor_cap = np.percentile(y_log, _GAIN_WINSOR_PCT)
-    y_log_winsor = np.minimum(y_log, winsor_cap)
-    n_winsorized = int((y_log > winsor_cap).sum())
-    if n_winsorized > 0:
-        logger.info(
-            f"  RC7: Winsorized {n_winsorized} values above {np.expm1(winsor_cap):.1f}% "
-            f"({_GAIN_WINSOR_PCT}th percentile in log-space)"
-        )
-    y_reg_log = pd.Series(y_log_winsor, index=y_reg_valid.index)
-
-    # Time-based split for the regressor (mirrors the classifier split).
-    # Using a random split here would allow future gain patterns to leak into
-    # training, making val R² optimistic.
-    if len(X_reg_fill) >= 20:
-        # Re-use the date information from combined_df to sort rows
-        _has_detection_reg = "detection_date" in combined_df.columns
-        _has_event_reg     = "event_date" in combined_df.columns
-        _date_col = "detection_date" if _has_detection_reg else ("event_date" if _has_event_reg else None)
-        if _date_col is not None:
-            # BUG FIX (same root cause as the lookback filter above): don't pick
-            # one column for the whole frame. detection_date is NaT for every
-            # base-CSV row, which previously made _dates all-NaT whenever a
-            # split happened to contain mostly/only base rows — collapsing the
-            # val set to 0 rows and crashing mean_absolute_error downstream.
-            # Fall back to event_date (shifted 1 BDay) per-row instead.
-            _dates = pd.Series(pd.NaT, index=combined_df.index)
-            if _has_detection_reg:
-                _dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-            if _has_event_reg:
-                _event_dates_reg = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
-                _dates = _dates.fillna(_event_dates_reg)
-            _dates = _dates.loc[valid_gain_mask]
-            # FIX 1: Mirror train_val_split's FIX 2 — NaT rows are mistake samples
-            # (they have no detection_date/event_date).  sort_values(na_position="last")
-            # previously pushed them to the END of the sorted index, meaning they landed
-            # in the val set (the last 20%).  That contaminated early-stopping RMSE with
-            # the model's own hardest, highest-weight error examples and made val MAE
-            # meaningless as an evaluation signal.
-            # Fix: separate NaT rows explicitly and always append them to the train split.
-            _nat_mask_reg  = _dates.isna()
-            _n_nat_reg     = int(_nat_mask_reg.sum())
-            _dated_idx_reg = _dates[~_nat_mask_reg].sort_values().index   # chronological
-            _nat_idx_reg   = _dates[_nat_mask_reg].index                  # mistake rows
-
-            _split_pos = int(len(_dated_idx_reg) * 0.8)
-            _tr_idx    = _dated_idx_reg[:_split_pos].append(_nat_idx_reg)  # NaT → train
-            _va_idx    = _dated_idx_reg[_split_pos:]
-
-            if _n_nat_reg > 0:
-                logger.info(
-                    f"  FIX1: {_n_nat_reg} NaT rows (mistake samples) pinned to regressor "
-                    f"train split (previously leaked into val via na_position='last')."
-                )
-
-            X_tr   = X_reg_fill.loc[_tr_idx]
-            X_va   = X_reg_fill.loc[_va_idx]
-            y_tr   = y_reg_log.loc[_tr_idx]
-            y_va   = y_reg_log.loc[_va_idx]
-            w_tr   = w_reg_valid.loc[_tr_idx]
-            w_va   = w_reg_valid.loc[_va_idx]
-            # Keep raw (non-log) val targets for human-readable MAE reporting
-            y_va_raw = y_reg_valid.loc[_va_idx]
-            logger.info(
-                f"  Gain regressor time-based split: "
-                f"{len(X_tr)} train / {len(X_va)} val"
-            )
-        else:
-            # No date column — fall back to sequential split (still no random leakage)
-            _split_pos = int(len(X_reg_fill) * 0.8)
-            X_tr = X_reg_fill.iloc[:_split_pos]
-            X_va = X_reg_fill.iloc[_split_pos:]
-            y_tr = y_reg_log.iloc[:_split_pos]
-            y_va = y_reg_log.iloc[_split_pos:]
-            w_tr = w_reg_valid.iloc[:_split_pos]
-            w_va = w_reg_valid.iloc[_split_pos:]
-            y_va_raw = y_reg_valid.iloc[_split_pos:]
-            logger.info(
-                f"  Gain regressor sequential split (no date column): "
-                f"{len(X_tr)} train / {len(X_va)} val"
-            )
-    else:
-        X_tr, X_va, y_tr, y_va, w_tr, w_va = (
-            X_reg_fill, X_reg_fill, y_reg_log, y_reg_log, w_reg_valid, w_reg_valid
-        )
-        y_va_raw = y_reg_valid
-
-
-    # Log gain distribution (in original % space) to diagnose compression
-    y_tr_raw_arr = np.expm1(y_tr.values if hasattr(y_tr, "values") else y_tr)
-    logger.info(
-        f"  Gain target distribution — train set (original % space):\n"
-        f"    min={float(y_tr_raw_arr.min()):.1f}%  "
-        f"max={float(y_tr_raw_arr.max()):.1f}%  "
-        f"mean={float(y_tr_raw_arr.mean()):.1f}%  "
-        f"std={float(y_tr_raw_arr.std()):.1f}%  "
-        f"median={float(np.median(y_tr_raw_arr)):.1f}%"
-    )
-    logger.info(
-        f"  Gain target distribution — train set (log space, what regressor sees):\n"
-        f"    min={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).min()):.3f}  "
-        f"max={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).max()):.3f}  "
-        f"std={float((y_tr.values if hasattr(y_tr, 'values') else y_tr).std()):.3f}"
-    )
-
-    if float(y_tr_raw_arr.std()) < 2.0:
-        logger.warning(
-            f"  ⚠️  Gain target std={float(y_tr_raw_arr.std()):.2f}% is very low. "
-            "The gain distribution is compressed — predictions will be flat. "
-            "Check RC2 fix (prev_close denominator) is working correctly."
-        )
-
-    # ------------------------------------------------------------------
-    # RC7 FIX: Match classifier hyperparameters more closely.
-    # The old regressor used n_estimators=200, max_depth=4, min_child_weight=5,
-    # no gamma, weak regularisation.  The result was a shallower, looser model
-    # that over-generalised toward the mean of the (overwhelmingly low-gain)
-    # training set.  Using the same depth/regularisation as the classifier
-    # forces the regressor to find more specific gain-relevant patterns.
-    # ------------------------------------------------------------------
-    # CAPACITY REDUCTION (2026-08-13): the RC7 fix above matched regressor
-    # capacity to the classifier's depth=5/n_estimators=300, on the theory
-    # that shallow/loose was over-generalising toward the mean. But the
-    # informative training pool here is ~239 winners + ~26 genuine
-    # non-winners (see ZERO-ANCHOR SUBSAMPLE diagnostic) — an order of
-    # magnitude smaller than what the classifier trains on. depth=5 over
-    # ~200 truly-informative rows overfits almost immediately, which is
-    # consistent with best_iteration=1 and near-zero prediction variance
-    # observed in practice (the weighted-eval-set fix below rules out the
-    # other explanation for that symptom). Reducing depth and estimator count
-    # gives the regressor a hypothesis space actually sized to the data it
-    # has, rather than the classifier's much larger training pool.
-    _regressor_base_params = dict(
-        n_estimators=120,      # reduced from 300
-        max_depth=3,            # reduced from 5, back in line with informative-row count
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=4,
-        gamma=0.3,
-        reg_alpha=0.3,          # slightly higher than classifier — fewer rows, more regularisation
-        reg_lambda=2.0,         # slightly higher than classifier — fewer rows, more regularisation
-        objective="reg:squarederror",
-        eval_metric="rmse",
-        n_jobs=-1,
-        early_stopping_rounds=30,
-    )
-    # EVAL-SET WEIGHT FIX (2026-08-12): early_stopping_rounds monitors RMSE on
-    # eval_set, and XGBoost's sklearn API evaluates that RMSE UNWEIGHTED unless
-    # sample_weight_eval_set is passed explicitly — it does NOT reuse
-    # sample_weight from training. ~85% of rows here are the RC1 "explicit 0.0
-    # anchor" non-winners (2355 of 2777), so an unweighted val RMSE is
-    # trivially minimised by predicting ~0 for every row regardless of
-    # features: that's a lower unweighted RMSE than any model that actually
-    # learns the RC8/RC9-upweighted winner-gain signal, because the anchor
-    # rows outnumber winners ~6:1 in val too. That silently defeated the
-    # RC8 (7x winner) / RC9 (confidence-scaled) sample weighting for the
-    # PURPOSES OF EARLY STOPPING even though .fit()'s training loss itself
-    # was correctly weighted — early stopping halted at the first round
-    # whose unweighted val RMSE looked best, which is best_iteration=0 (flat
-    # ~0% prediction) every time, regardless of how well later rounds learned
-    # the actual winner-gain pattern. Passing the SAME per-row weights used
-    # in training to sample_weight_eval_set makes the monitored metric
-    # weighted RMSE, consistent with what the model is actually optimising —
-    # early stopping now selects the iteration that's genuinely best at
-    # predicting winner gains, not the iteration that best predicts the
-    # anchor rows' constant zero.
-    # SEED-VARIANCE BAGGING (same rationale as train_model()'s classifier —
-    # see BAGGING_N_SEEDS comment near XGBOOST_PARAMS): train BAGGING_N_SEEDS
-    # regressors identical except for random_state and average their
-    # predictions, instead of trusting one seed's subsample/colsample_bytree
-    # draw. Particularly relevant here since the gain regressor's informative
-    # training pool is already small (~200 rows per the CAPACITY REDUCTION
-    # note above), so a single seed's draw is a larger share of its variance
-    # than for the classifier.
-    _n_seeds_this_run = GAIN_REGRESSOR_DIAGNOSTIC_N_SEEDS
-    logger.info(f"Training {_n_seeds_this_run} gain-regressor model(s) from scratch (seed bagging)...")
-    _seed_regressors = []
-    _seed_best_iterations = []
-    for _i in range(_n_seeds_this_run):
-        _seed = BAGGING_SEED_BASE + _i
-        _seed_regressor = XGBRegressor(**_regressor_base_params, random_state=_seed)
-        _seed_regressor.fit(
-            X_tr, y_tr,
-            sample_weight=w_tr.values,
-            eval_set=[(X_va, y_va)],
-            sample_weight_eval_set=[w_va.values],
-            verbose=False,
-        )
-        logger.info(
-            f"  Seed {_seed} ({_i + 1}/{_n_seeds_this_run}): "
-            f"best_iteration={_seed_regressor.best_iteration}  "
-            f"best_val_rmse={_seed_regressor.best_score}"
-        )
-        _seed_best_iterations.append(_seed_regressor.best_iteration)
-        _seed_regressors.append(_seed_regressor)
-
-    regressor = BaggedXGBRegressor(_seed_regressors)
-    logger.info(
-        f"  Bagged across {regressor.n_seeds_} seeds — "
-        f"mean best_iteration={regressor.best_iteration} (std={regressor.best_iteration_std_:.1f})"
-    )
-
-    # DIAGNOSTIC: same spread stat we use to judge the classifier's per-seed
-    # stability, so this can be compared apples-to-apples against the
-    # classifier's pre-fix [6, 28, 6, 28, 33, 34, 6]-style spread.
-    _bi_min, _bi_max = min(_seed_best_iterations), max(_seed_best_iterations)
-    _bi_mean = float(np.mean(_seed_best_iterations))
-    _bi_spread = _bi_max - _bi_min
-    _bi_spread_pct = (_bi_spread / _bi_mean * 100.0) if _bi_mean > 0 else float("nan")
-    logger.info(
-        f"  DIAGNOSTIC — per-seed best_iteration spread: {_seed_best_iterations} "
-        f"(min={_bi_min} max={_bi_max} spread={_bi_spread} spread_pct_of_mean={_bi_spread_pct:.0f}%). "
-        f"For reference, the classifier's pre-consensus-fix spread was ~108% of its mean "
-        f"(range 6-34 around ~26) — a spread_pct_of_mean well below that suggests the "
-        f"regressor's per-seed early stopping is stable enough as-is; a comparably large "
-        f"spread_pct_of_mean would argue for the same consensus-curve treatment used in "
-        f"BaggedXGBClassifier."
-    )
-
-    # Evaluate in original % space for interpretability
-    val_pred_log = regressor.predict(X_va)
-    val_pred_pct = np.expm1(val_pred_log)           # inverse of log1p
-    y_va_raw_arr = y_va_raw.values if hasattr(y_va_raw, "values") else np.array(y_va_raw)
-
-    from sklearn.metrics import mean_absolute_error, r2_score
-    mae    = mean_absolute_error(y_va_raw_arr, val_pred_pct)
-    # R² in log-space (what the model was actually trained on) is more meaningful
-    r2_log = r2_score(y_va.values if hasattr(y_va, "values") else y_va, val_pred_log) if len(y_va) > 1 else float("nan")
-    pred_std_pct = float(val_pred_pct.std())
-
-    # DIAGNOSTIC (2026-08-13): the MAE/R² above are UNWEIGHTED, so with ~75%
-    # of val rows being zero-anchors, they mostly measure how well the model
-    # predicts "0" — not how well it predicts actual gain magnitude on the
-    # ~25% of rows (winners + genuine non-winners) that carry the real
-    # signal. Log a weighted version (matching what training actually
-    # optimises) and an informative-rows-only version, so a bad unweighted
-    # R² can be told apart from a model that's actually fine on the rows
-    # that matter.
-    w_va_arr = w_va.values if hasattr(w_va, "values") else np.array(w_va)
-    r2_weighted = r2_score(
-        y_va.values if hasattr(y_va, "values") else y_va, val_pred_log,
-        sample_weight=w_va_arr
-    ) if len(y_va) > 1 else float("nan")
-    mae_weighted = mean_absolute_error(y_va_raw_arr, val_pred_pct, sample_weight=w_va_arr)
-
-    _informative_va_mask = y_va_raw_arr > 0.0   # zero-anchor rows are exactly 0.0
-    n_informative_va = int(_informative_va_mask.sum())
-    if n_informative_va >= 5:
-        r2_informative = r2_score(
-            (y_va.values if hasattr(y_va, "values") else y_va)[_informative_va_mask],
-            val_pred_log[_informative_va_mask]
-        )
-        mae_informative = mean_absolute_error(
-            y_va_raw_arr[_informative_va_mask], val_pred_pct[_informative_va_mask]
-        )
-        pred_vs_actual_corr = float(np.corrcoef(
-            y_va_raw_arr[_informative_va_mask], val_pred_pct[_informative_va_mask]
-        )[0, 1]) if n_informative_va >= 3 else float("nan")
-        logger.info(
-            f"  Gain regressor — INFORMATIVE-ROWS-ONLY (n={n_informative_va}, excludes "
-            f"zero-anchors): MAE={mae_informative:.2f}%  R²={r2_informative:.3f}  "
-            f"pred-vs-actual corr={pred_vs_actual_corr:.3f}"
-        )
-        logger.info(
-            f"  Gain regressor — weighted (matches training objective): "
-            f"MAE={mae_weighted:.2f}%  R²(log)={r2_weighted:.3f}"
-        )
-    else:
-        logger.warning(
-            f"  Gain regressor — only {n_informative_va} informative rows in val; "
-            "too few to compute a meaningful informative-only metric."
-        )
-    logger.info(
-        f"  Gain regressor — val MAE (% space): {mae:.2f}%  "
-        f"R² (log space): {r2_log:.3f}  "
-        f"pred_std (% space): {pred_std_pct:.2f}%"
-    )
-    logger.info(
-        f"  Predicted gains range (% space): {val_pred_pct.min():.1f}% – {val_pred_pct.max():.1f}%"
-    )
-    logger.info(f"  Best iteration: {regressor.best_iteration}")
-
-    # VERIFICATION (2026-08-13): sample_weight_eval_set was confirmed already
-    # wired correctly above (2026-08-12 EVAL-SET WEIGHT FIX) — early stopping
-    # is monitoring weighted RMSE, not the trivially-minimised unweighted
-    # version. So best_iteration landing at 1 is NOT a sign that fix
-    # regressed; it's the capacity/data-volume problem the fixes above target
-    # directly. This check exists so a *future* regression of the eval-set
-    # weighting wiring surfaces immediately instead of being misdiagnosed as
-    # a data problem again.
-    if regressor.best_iteration is not None and regressor.best_iteration <= 1:
-        logger.warning(
-            f"  ⚠️  Gain regressor best_iteration={regressor.best_iteration} — stopped "
-            "almost immediately. sample_weight_eval_set IS being passed (verified "
-            "2026-08-13), so this is most likely the informative-row ceiling "
-            "(see ZERO-ANCHOR SUBSAMPLE diagnostic) combined with model capacity, "
-            "not a reversion of the eval-set weighting fix. If sample_weight_eval_set "
-            "is ever removed from the fit() call above, this same symptom will "
-            "reappear for the OLD reason (unweighted RMSE trivially favouring a "
-            "flat near-zero prediction) — check the fit() call first if this "
-            "warning appears alongside a sudden pred_std collapse."
-        )
-
-    if pred_std_pct < 0.5:
-        logger.warning(
-            f"  ⚠️  Regressor prediction std={pred_std_pct:.3f}% is very flat even after RC7 fixes. "
-            "Root causes: too few training samples with gain data, or "
-            "scaled vs unscaled feature mismatch (RC3). "
-            "The explosion_predictor will use the relaxed std guard (0.5) "
-            "rather than disabling immediately."
-        )
-
-    # Store a flag so explosion_predictor.py knows to apply expm1 at inference
-    regressor._log_transformed_target = True  # type: ignore[attr-defined]
-    # LEAK-FREE FIX: mark whether this fit came from the train-only pool
-    # (leak-free) or the full train+val fallback pool (see guard above).
-    # main() reads this to log/record it in model_metadata.json.
-    regressor._trained_leak_free = not _is_fallback_retry  # type: ignore[attr-defined]
-
-    # ------------------------------------------------------------------
-    # TIER FALLBACK (2026-08-13): with ~239 winners + ~26 genuine non-winners
-    # as the hard informative-row ceiling, a continuous log-space regression
-    # target (winsorized up to 328%) demands more dynamic range than that
-    # sample size can reliably support — hence R² staying deeply negative
-    # across attempts. A coarse 3-tier classification of the same rows needs
-    # far less data per "bucket" to beat a naive baseline, and gives
-    # downstream consumers a usable signal (small/medium/large winner)
-    # while the informative pool grows over future retrain cycles.
-    # This is trained alongside — not instead of — the regressor above, and
-    # saved as a separate artifact; nothing currently reads it, it exists so
-    # callers can migrate to it once its accuracy is validated over a few
-    # retrain cycles.
-    # ------------------------------------------------------------------
-    GAIN_TIERS = [
-        (0.0, 15.0, "small"),     # anchors + sub-threshold winners
-        (15.0, 50.0, "medium"),
-        (50.0, float("inf"), "large"),
-    ]
-
-    def _tier_label(pct: float) -> int:
-        for i, (lo, hi, _name) in enumerate(GAIN_TIERS):
-            if lo <= pct < hi:
-                return i
-        return len(GAIN_TIERS) - 1
-
-    try:
-        from xgboost import XGBClassifier as _XGBClassifierForTiers
-
-        y_tier_tr = y_reg_valid.loc[X_tr.index].apply(_tier_label)
-        y_tier_va = y_reg_valid.loc[X_va.index].apply(_tier_label)
-
-        tier_counts_tr = y_tier_tr.value_counts().to_dict()
-        tier_counts_va = y_tier_va.value_counts().to_dict()
-        logger.info(
-            f"  TIER FALLBACK: training 3-tier gain classifier "
-            f"({', '.join(name for _, _, name in GAIN_TIERS)}) — "
-            f"train tier counts: {tier_counts_tr}"
-        )
-
-        # DIAGNOSTIC (2026-08-13): confirm/deny the backfill-skew explanation
-        # directly, instead of leaving it as a plausible story. If zero-anchor
-        # ("small") rows really are concentrated wherever the historical
-        # non-winner backfill landed (see ml_check_t1_source_skew.yml), that
-        # should show up as: (a) train and val majority classes disagree, and
-        # (b) the zero-anchor share of train is much higher than the
-        # zero-anchor share of val. Log both so a real shift is distinguished
-        # from a fluke of this particular retrain's date range.
-        _train_majority = max(tier_counts_tr, key=tier_counts_tr.get) if tier_counts_tr else None
-        _val_majority = max(tier_counts_va, key=tier_counts_va.get) if tier_counts_va else None
-        if _train_majority is not None and _val_majority is not None and _train_majority != _val_majority:
-            _zero_anchor_tr = float((y_reg_valid.loc[X_tr.index].values == 0.0).mean())
-            _zero_anchor_va = float((y_reg_valid.loc[X_va.index].values == 0.0).mean())
-            _tier_names = [name for _, _, name in GAIN_TIERS]
-            logger.warning(
-                f"  ⚠️  TIER FALLBACK: train/val DISTRIBUTION SHIFT detected — "
-                f"train majority tier='{_tier_names[_train_majority]}' "
-                f"({tier_counts_tr}) vs val majority tier='{_tier_names[_val_majority]}' "
-                f"({tier_counts_va}). Zero-anchor share: train={_zero_anchor_tr:.1%} "
-                f"val={_zero_anchor_va:.1%}. "
-                + (
-                    "This matches the backfill-skew hypothesis (zero-anchor non-winner "
-                    "rows cluster in train because that's where the historical backfill "
-                    "landed) rather than a bug — treat val accuracy on this run as "
-                    "unmeasurable, not as evidence the classifier is broken."
-                    if abs(_zero_anchor_tr - _zero_anchor_va) > 0.15
-                    else
-                    "Zero-anchor share is similar across the split, so backfill skew "
-                    "alone doesn't explain this — the tier shift may be a genuine "
-                    "regime change (e.g. gain magnitudes trending up over time) "
-                    "instead. Worth checking actual_high_pct by date range directly."
-                )
-            )
-
-        if y_tier_tr.nunique() < 2:
-            logger.warning(
-                "  TIER FALLBACK: fewer than 2 distinct tiers present in train "
-                "split — skipping tier classifier this run."
-            )
-            gain_tier_classifier = None
-        else:
-            tier_classifier = _XGBClassifierForTiers(
-                n_estimators=100,
-                max_depth=3,
-                learning_rate=0.05,
-                subsample=0.8,
-                colsample_bytree=0.8,
-                min_child_weight=4,
-                gamma=0.3,
-                reg_alpha=0.3,
-                reg_lambda=2.0,
-                objective="multi:softprob",
-                num_class=len(GAIN_TIERS),
-                eval_metric="mlogloss",
-                random_state=42,
-                n_jobs=-1,
-                early_stopping_rounds=30,
-            )
-            tier_classifier.fit(
-                X_tr, y_tier_tr,
-                sample_weight=w_tr.values,
-                eval_set=[(X_va, y_tier_va)],
-                sample_weight_eval_set=[w_va.values],
-                verbose=False,
-            )
-            tier_pred = tier_classifier.predict(X_va)
-            tier_acc = float((tier_pred == y_tier_va.values).mean())
-            _baseline_acc = float(y_tier_va.value_counts(normalize=True).max())
-            # Raw accuracy (and the majority-class baseline it's compared
-            # against) is exactly the metric that gets distorted by a
-            # train/val distribution shift like the one flagged above — a
-            # classifier that only ever learned "predict small" scores 0%
-            # on a val set that's 99% medium/large, regardless of whether
-            # the model itself is any good. balanced_accuracy (macro-average
-            # of per-class recall) is far less sensitive to that shift, since
-            # it weights each class equally rather than by how often it
-            # shows up in this particular val slice.
-            from sklearn.metrics import balanced_accuracy_score
-            tier_balanced_acc = float(balanced_accuracy_score(y_tier_va.values, tier_pred))
-            logger.info(
-                f"  TIER FALLBACK: val accuracy={tier_acc:.3f} "
-                f"(majority-class baseline={_baseline_acc:.3f}, "
-                f"balanced accuracy={tier_balanced_acc:.3f} [distribution-shift-robust, "
-                f"random-guess floor={1.0 / len(GAIN_TIERS):.3f}], "
-                f"best_iteration={tier_classifier.best_iteration})"
-            )
-            # DIAGNOSTIC (2026-08-13): a correctly-behaving multiclass model
-            # under this exact class imbalance should never score meaningfully
-            # BELOW the majority-class baseline — worst case (zero signal) it
-            # converges to always predicting the majority class, matching the
-            # baseline exactly. If accuracy is well below both the baseline
-            # AND naive random-guess (1/n_classes), that's a bug signal, not
-            # a data-volume signal — log a confusion matrix so it's diagnosable
-            # instead of guessed at.
-            _naive_random = 1.0 / len(GAIN_TIERS)
-            _shift_detected = _train_majority is not None and _val_majority is not None and _train_majority != _val_majority
-            if tier_acc < _naive_random * 0.5 and not _shift_detected:
-                from sklearn.metrics import confusion_matrix
-                _cm = confusion_matrix(y_tier_va.values, tier_pred, labels=list(range(len(GAIN_TIERS))))
-                _pred_dist = pd.Series(tier_pred).value_counts().to_dict()
-                logger.warning(
-                    f"  ⚠️  TIER FALLBACK: accuracy={tier_acc:.3f} is BELOW the naive "
-                    f"random-guess floor ({_naive_random:.3f}) for {len(GAIN_TIERS)} classes "
-                    "— this is NOT explained by small/imbalanced data (a correctly-behaving "
-                    "model under this imbalance converges to the majority-class baseline "
-                    f"({_baseline_acc:.3f}) in the worst case, not below random). Likely an "
-                    "implementation bug (index/label misalignment, or an XGBoost "
-                    "best_iteration/iteration_range mismatch on .predict() after early "
-                    "stopping) rather than a data problem. Confusion matrix (rows=true, "
-                    f"cols=pred, order={[name for _,_,name in GAIN_TIERS]}):\n{_cm}\n"
-                    f"  Predicted-class distribution: {_pred_dist} vs true distribution: "
-                    f"{y_tier_va.value_counts().to_dict()}"
-                )
-            elif tier_acc < _naive_random * 0.5 and _shift_detected:
-                # Same below-random-floor symptom, but already explained above by
-                # the train/val distribution-shift diagnostic — a classifier that
-                # only ever predicts train's majority class will score near-zero
-                # on a val set whose majority class is different. Log the
-                # confusion matrix for completeness (still useful to eyeball)
-                # without re-raising it as a fresh, unexplained bug alarm.
-                from sklearn.metrics import confusion_matrix
-                _cm = confusion_matrix(y_tier_va.values, tier_pred, labels=list(range(len(GAIN_TIERS))))
-                logger.info(
-                    f"  TIER FALLBACK: accuracy={tier_acc:.3f} is below the random-guess "
-                    f"floor, but this is explained by the distribution-shift diagnostic "
-                    f"above (not a new bug). Confusion matrix (rows=true, cols=pred, "
-                    f"order={[name for _,_,name in GAIN_TIERS]}):\n{_cm}\n"
-                    f"  See balanced accuracy ({tier_balanced_acc:.3f}) for a shift-robust read."
-                )
-            elif tier_acc <= _baseline_acc and not _shift_detected:
-                logger.warning(
-                    "  ⚠️  TIER FALLBACK: classifier does not beat the majority-class "
-                    "baseline yet — informative pool is likely still too small for "
-                    "even this coarse a target. Not necessarily a bug; re-check after "
-                    "the informative-row pool grows."
-                )
-            tier_classifier._tier_boundaries = GAIN_TIERS  # type: ignore[attr-defined]
-            gain_tier_classifier = tier_classifier
-    except Exception as _tier_exc:  # noqa: BLE001 - this is a best-effort bonus artifact
-        logger.warning(f"  TIER FALLBACK: skipped due to error: {_tier_exc}")
-        gain_tier_classifier = None
-
-    regressor._gain_tier_classifier = gain_tier_classifier  # type: ignore[attr-defined]
-
-    return regressor
-
-
-# ---------------------------------------------------------------------------
-# Save outputs
-# ---------------------------------------------------------------------------
-
-def save_outputs(
-    model: XGBClassifier,
-    scaler: StandardScaler,
-    fi_df: pd.DataFrame,
-    feature_names: list[str],
-    training_stats: dict,
-    gain_regressor=None,
-    top10_training_stats: dict | None = None,
-    sparse_cols: list | None = None,
-    winsor_bounds: dict | None = None,
-) -> None:
-    """Save model, scaler, gain regressor, feature importance, and metadata.
-
-    sparse_cols: the list of columns build_scaler() determined were sparse
-    (<50% coverage) on the training set. Persisted into model_metadata.json
-    so that explosion_predictor.py can reuse the exact same column list for
-    post-scaling NaN restoration at inference time, instead of recomputing
-    "sparse" from the coverage of whatever batch is being predicted (which
-    is inconsistent — see _scale_features() in explosion_predictor.py).
-
-    winsor_bounds: the per-column (lower, upper) winsorization bounds
-    computed by build_scaler() from X_train only. Persisted into
-    model_metadata.json so explosion_predictor.py can apply the SAME bounds
-    (via feature_scaling.apply_winsor_bounds) to live features before
-    scaling — otherwise a live outlier value that training would have
-    clipped flows straight into the scaler unclipped at inference.
-    """
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-    joblib.dump(model,  MODEL_PATH,  protocol=4)
-    logger.info(f"Saved model  → {MODEL_PATH}")
-
-    joblib.dump(scaler, SCALER_PATH, protocol=4)
-    logger.info(f"Saved scaler → {SCALER_PATH}")
-
-    if gain_regressor is not None:
-        joblib.dump(gain_regressor, GAIN_REGRESSOR_PATH, protocol=4)
-        logger.info(f"Saved gain regressor → {GAIN_REGRESSOR_PATH}")
-    else:
-        logger.info("Gain regressor not trained this run — predictor will use calibrated fallback")
-
-    fi_df.to_csv(FEATURE_IMPORTANCE_PATH, index=False)
-    logger.info(f"Saved feature importance → {FEATURE_IMPORTANCE_PATH}")
-
-    # RC6: model may be a CalibratedClassifierCV wrapping the raw XGBClassifier.
-    # best_iteration / best_score live on the raw booster, not the wrapper.
-    _raw_model = model
-    if hasattr(model, "calibrated_classifiers_"):
-        _raw_model = model.calibrated_classifiers_[0].estimator
-
-    metadata = {
-        "trained_at":            datetime.now(timezone.utc).isoformat(),
-        "source":                "ml_retrain_model.py",
-        "training_approach":     "full_retrain_from_scratch",
-        "n_features":            len(feature_names),
-        "features":              feature_names,
-        "feature_names_sample":  feature_names[:20],
-        "best_iteration":        int(_raw_model.best_iteration),
-        "best_val_auc":          float(_raw_model.best_score),  # NOTE: key name is legacy; metric is now PR-AUC (eval_metric="aucpr"), not ROC-AUC
-        "gain_regressor_trained": gain_regressor is not None,
-        "gain_regressor_fixes":  ["RC1_broader_training", "RC2_prev_close_denominator",
-                                  "RC3_scaled_features", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights"],
-        "sparse_cols":            list(sparse_cols) if sparse_cols else [],
-        "winsor_bounds":          (
-            {col: [lo, hi] for col, (lo, hi) in winsor_bounds.items()}
-            if winsor_bounds else {}
-        ),
-        **training_stats,
-    }
-    if top10_training_stats:
-        metadata["top10_feature_distribution"] = top10_training_stats
-    with open(METADATA_PATH, "w") as f:
-        json.dump(metadata, f, indent=2)
-    logger.info(f"Saved metadata → {METADATA_PATH}")
+    return _prob_to_gain(probability)
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
-
-def _loosen_filters_for_sampling(base_filters: dict, step_pct: float, pass_number: int) -> dict:
-    """
-    Return a copy of base_filters with thresholds relaxed by (step_pct * pass_number) %.
-
-    Mirrors _loosen_filters() in daily_non_winners_detector.py so both systems
-    behave identically when given the same config values.
-    """
-    lf = dict(base_filters)
-    reduction  = (step_pct / 100.0) * pass_number
-    min_factor = max(0.0, 1.0 - reduction)
-    max_factor = 1.0 + reduction
-    for key in list(lf.keys()):
-        if lf[key] is None or str(key).startswith("_"):
-            continue
-        if key.startswith("min_"):
-            lf[key] = lf[key] * min_factor
-        elif key.startswith("max_"):
-            lf[key] = lf[key] * max_factor
-    return lf
-
-
-def _build_filter_mask(negatives: "pd.DataFrame", filters: dict) -> "pd.Series":
-    """
-    Build a boolean Series selecting rows in `negatives` that pass `filters`.
-    Returns an all-True Series (no filtering) when no matching columns exist.
-    """
-    import pandas as pd
-
-    filter_map = [
-        (
-            ["t1_close_Close", "t1_open_Close", "Close", "close", "price"],
-            "min_price", "max_price",
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max-results", type=int, default=1500)
+    parser.add_argument("--top-n",       type=int, default=50)
+    parser.add_argument("--verbose",     "-v", action="store_true")
+    parser.add_argument(
+        "--no-t1",
+        action="store_true",
+        help="Skip T-1 intraday fetch (fastest — uses only TV screener data)",
+    )
+    parser.add_argument(
+        "--t1-limit",
+        type=int,
+        default=500,
+        help=(
+            "Maximum number of screened stocks to enrich with T-1 yfinance intraday "
+            "data (default: 500). Stocks are taken in screener sort order (descending "
+            "relative volume), so stocks ranked beyond this limit are scored on TV "
+            "screener features only — a known lower-fidelity signal. Set to 0 to "
+            "enrich ALL screened stocks (slow: ~0.15 s per stock)."
         ),
-        (
-            ["t1_close_Volume", "t1_open_Volume", "Volume", "volume"],
-            "min_volume", None,
-        ),
-        (
-            ["t1_close_HV_10", "t1_open_HV_10", "HV_10", "hv10", "volatility_10d", "historical_volatility_10"],
-            "min_hv10", "max_hv10",
-        ),
-        (
-            ["t1_close_HV_20", "t1_open_HV_20", "HV_20", "hv20", "volatility_20d", "historical_volatility_20"],
-            "min_hv20", "max_hv20",
-        ),
-        (
-            ["t1_close_Volume_Ratio", "t1_open_Volume_Ratio", "Volume_Ratio", "volume_ratio", "relative_volume", "Relative_Volume"],
-            "min_relative_volume", None,
-        ),
-        (
-            ["t1_close_Volume_Ratio", "t1_open_Volume_Ratio", "Volume_Ratio", "volume_ratio"],
-            "min_volume_ratio", None,
-        ),
+    )
+    parser.add_argument(
+        "--t1-workers",
+        type=int,
+        default=5,
+        help="Number of parallel threads for T-1 yfinance fetches (default: 5).",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Run even if today is a US market holiday (bypasses holiday guard).",
+    )
+
+    args   = parser.parse_args()
+    logger = setup_logging(args.verbose)
+
+    logger.info("=" * 80)
+    logger.info("ML SCREENING & PREDICTION")
+    logger.info("=" * 80)
+
+    # ── Holiday guard ─────────────────────────────────────────────────────────
+    # If the market is closed today there is nothing to predict for, and writing
+    # predictions would poison the accuracy tracker (it would see predictions
+    # made but no winners ever confirmed, dragging down model metrics).
+    # Exit 0 (success) so GitHub Actions does not mark the run as failed.
+    if not args.force:
+        import pytz as _pytz
+        _est  = _pytz.timezone("America/New_York")
+        _today = datetime.now(_est).date()
+        if not _is_trading_day(_today):
+            logger.info(
+                f"Today ({_today}, {_today.strftime('%A')}) is not a trading day "
+                f"— market is closed. Skipping prediction run. "
+                f"Use --force to override."
+            )
+            return 0
+
+    screener = SmartScreener(logger=logger)
+
+    try:
+        predictor = ExplosionPredictor()
+        supabase  = MLPredictionSupabaseClient({})
+    except Exception as e:
+        logger.error(f"Failed to initialize: {e}")
+        return 1
+
+    # FIX 10: derive prediction date from daily_winners rather than wall clock
+    prediction_date = get_next_trading_day(supabase)
+
+    logger.info(f"Prediction date (trading session): {prediction_date}")
+    logger.info(f"Top N to store: {args.top_n}")
+    logger.info("=" * 80)
+
+    # FIX 9: Detect hybrid model — determines whether real T-3/T-5/T-10
+    # daily-bar snapshots should be fetched for t3_/t5_/t10_* columns.
+    model_prefix       = predictor.model_feature_prefix
+    hybrid             = _is_hybrid_model(predictor)
+    fill_flat_prefixes = hybrid
+
+    logger.info(f"✓ Model feature prefix detected: '{model_prefix}'")
+    logger.info(f"  Model is hybrid (t1+t3/t5/t10): {hybrid}")
+    if hybrid:
+        logger.info(
+            "  → TV screener features will be mapped to BOTH t1_close_* AND t3_/t5_/t10_* columns\n"
+            "  → T-1 yfinance indicators will ALSO be written to t3_/t5_/t10_* (FIX 9)"
+        )
+    logger.info(f"  Lowercase keys: {_uses_lowercase(model_prefix)}")
+
+    # ── STEP 1: SCREENING ────────────────────────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 1: INTELLIGENT SCREENING")
+    logger.info("=" * 80)
+
+    screened_df = screener.screen_with_tradingview(max_results=args.max_results)
+    if screened_df.empty:
+        logger.error("No stocks passed screening")
+        return 1
+    logger.info(f"✓ Screened {len(screened_df)} stocks")
+
+    # ── STEP 2: BUILD FEATURES FROM TV DATA ──────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 2: BUILD FEATURES FROM TRADINGVIEW DATA")
+    logger.info("=" * 80)
+
+    enriched_stocks = []
+    failed_count    = 0
+    t1_feature_hits = 0
+
+    for _, row in screened_df.iterrows():
+        try:
+            symbol_full = str(row.get("symbol", ""))
+            if ":" in symbol_full:
+                exchange, symbol = symbol_full.split(":", 1)
+            else:
+                symbol   = symbol_full
+                exchange = "NASDAQ"
+
+            symbol = symbol.strip().upper()
+            if not symbol:
+                failed_count += 1
+                continue
+
+            if exchange == "OTC" or len(symbol) > 5 or "." in symbol:
+                failed_count += 1
+                continue
+
+            row_dict = row.to_dict()
+            features = build_features_from_tv_data(
+                row_dict, symbol,
+                feature_prefix=model_prefix,
+            )
+            features["exchange"] = exchange
+
+            if "current_price" not in features or not features["current_price"]:
+                failed_count += 1
+                continue
+
+            n_model_feats = sum(1 for k in features if k.startswith(f"{model_prefix}_"))
+            if n_model_feats > 3:
+                t1_feature_hits += 1
+
+            enriched_stocks.append(features)
+
+        except Exception as e:
+            logger.debug(f"Error processing row: {e}")
+            failed_count += 1
+
+    logger.info(f"✓ Built features for {len(enriched_stocks)} stocks ({failed_count} skipped)")
+
+    if hybrid and enriched_stocks:
+        sample = enriched_stocks[0]
+        t3_hits = sum(1 for k in sample if k.startswith("t3_"))
+        t1_hits = sum(1 for k in sample if k.startswith("t1_close_"))
+        logger.info(f"  Sample stock '{sample['symbol']}': t3_ cols={t3_hits}, t1_close_ cols={t1_hits}")
+
+    if not enriched_stocks:
+        logger.error("Failed to build features for any stocks")
+        return 1
+
+    # ── STEP 2.5: ACCURATE ENTRY PRICE REFRESH (FIX 12) ──────────────────────
+    # The TradingView screener `close` field can be stale around pre-market —
+    # it doesn't reliably reflect the actual last after-hours trade, which
+    # matters because predictions are generated and locked in before the
+    # regular session opens. Replace it with the last available 1-minute
+    # candle close from yfinance (after-hours bar if present, otherwise the
+    # most recent bar that exists at all). Falls back to the TV close on any
+    # per-symbol fetch failure so a flaky request never drops a stock.
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 2.5: ACCURATE ENTRY PRICE REFRESH")
+    logger.info("=" * 80)
+
+    from concurrent.futures import ThreadPoolExecutor as _PriceTPE, as_completed as _price_as_completed
+
+    price_workers = max(1, min(args.t1_workers, len(enriched_stocks)))
+    price_map     = {}
+
+    with _PriceTPE(max_workers=price_workers) as executor:
+        futures = {
+            executor.submit(fetch_accurate_entry_price, s["symbol"], logger): s["symbol"]
+            for s in enriched_stocks
+        }
+        for future in _price_as_completed(futures):
+            sym = futures[future]
+            try:
+                price_map[sym] = future.result()
+            except Exception as e:
+                logger.debug(f"Entry price fetch failed for {sym}: {e}")
+                price_map[sym] = None
+
+    refreshed = 0
+    for stock in enriched_stocks:
+        new_price = price_map.get(stock["symbol"])
+        if new_price:
+            stock["current_price"] = new_price
+            refreshed += 1
+        # else: keep the TV screener close already written by
+        # build_features_from_tv_data() as a fallback.
+
+    logger.info(
+        f"✓ Refreshed entry price for {refreshed}/{len(enriched_stocks)} stocks "
+        f"from live 1-minute bars ({len(enriched_stocks) - refreshed} kept the "
+        f"TV screener close as fallback)"
+    )
+
+    # ── STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT ────────────────────────────
+    if not args.no_t1:
+        logger.info("\n" + "=" * 80)
+        logger.info("STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT")
+        logger.info("=" * 80)
+
+        # Resolve how many stocks to enrich.  --t1-limit 0 means "all of them".
+        t1_limit = args.t1_limit if args.t1_limit > 0 else len(enriched_stocks)
+        t1_candidates = [s["symbol"] for s in enriched_stocks[:t1_limit]]
+
+        logger.info(
+            f"Computing T-1 indicators from 5-min bars for "
+            f"{len(t1_candidates)} / {len(enriched_stocks)} screened stocks "
+            f"(--t1-limit={t1_limit}, --t1-workers={args.t1_workers})."
+        )
+
+        # ── Known-limitation notice ──────────────────────────────────────────
+        # Stocks are taken in screener sort order (descending relative volume).
+        # Stocks ranked beyond --t1-limit are scored on TV screener features
+        # only, which are lower fidelity than T-1 yfinance intraday indicators.
+        # To eliminate this bias entirely, pass --t1-limit 0, at the cost of
+        # a longer runtime (~0.15 s per additional stock).
+        if t1_limit < len(enriched_stocks):
+            skipped = len(enriched_stocks) - t1_limit
+            logger.warning(
+                f"  ⚠️  {skipped} stocks beyond rank {t1_limit} will be scored on "
+                f"TV screener features only (lower fidelity). "
+                f"Pass --t1-limit 0 to enrich all stocks."
+            )
+
+        if hybrid:
+            logger.info(
+                "  Hybrid model: indicators will ALSO be written as t3_/t5_/t10_* "
+                "to cover features like t3_ema_12, t3_rsi_7, t3_wma_10 (FIX 9)."
+            )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time, random
+
+        t1_map   = {}
+        t1_count = 0
+
+        def fetch_with_jitter(sym):
+            time.sleep(random.uniform(0.05, 0.2))
+            return sym, fetch_t1_data_for_symbol(sym, logger, fill_flat_prefixes=fill_flat_prefixes)
+
+        with ThreadPoolExecutor(max_workers=args.t1_workers) as executor:
+            futures = {executor.submit(fetch_with_jitter, sym): sym for sym in t1_candidates}
+            for i, future in enumerate(as_completed(futures), 1):
+                if i % 50 == 0:
+                    logger.info(
+                        f"  T-1 progress: {i}/{len(t1_candidates)} | enriched: {t1_count}"
+                    )
+                sym, t1_data = future.result()
+                if t1_data:
+                    t1_map[sym] = t1_data
+                    t1_count   += 1
+
+        for stock in enriched_stocks:
+            sym = stock["symbol"]
+            if sym in t1_map:
+                stock.update(t1_map[sym])
+
+        # Coverage report
+        sample = next((s for s in enriched_stocks if s["symbol"] in t1_map), None)
+        if sample:
+            t1c = sum(1 for k in sample if k.startswith("t1_close_"))
+            t1o = sum(1 for k in sample if k.startswith("t1_open_"))
+            t3c = sum(1 for k in sample if k.startswith("t3_"))
+            logger.info(
+                f"  Sample ({sample['symbol']}): "
+                f"t1_close_* = {t1c} features, "
+                f"t1_open_* = {t1o} features, "
+                f"t3_* = {t3c} features"
+            )
+            if t1o == 0:
+                logger.warning(
+                    "  ⚠️  t1_open_* still 0 — check that t1_column_map.py is present "
+                    "alongside this script."
+                )
+            if hybrid and t3c == 0:
+                logger.warning(
+                    "  ⚠️  t3_* still 0 after T-1 enrichment — check that "
+                    "t1_column_map.py exposes INTRADAY_TO_MODEL."
+                )
+
+        logger.info(
+            f"✓ T-1 indicator enrichment: {t1_count}/{len(t1_candidates)} stocks enriched "
+            f"({len(enriched_stocks) - len(t1_candidates)} stocks scored on TV screener features only)"
+        )
+    else:
+        logger.info("\nSTEP 3: Skipped (--no-t1 flag)")
+
+    # ── STEP 4: PREPARE FEATURES + PRE-FLIGHT VARIANCE CHECK ─────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 4: PREPARE FEATURES + PRE-FLIGHT VARIANCE CHECK")
+    logger.info("=" * 80)
+
+    features_df  = pd.DataFrame(enriched_stocks)
+    # Count only columns that are actual model features (i.e. listed in
+    # predictor.feature_names), not all raw columns with the prefix.
+    # Raw columns like current_price, _meta_t3_count, symbol, etc. are
+    # present in the DataFrame but are silently ignored by prepare_features();
+    # including them in the logged count causes the log to show an inflated
+    # number (e.g. 98) vs. what the model actually expects (e.g. 57).
+    model_feature_set = set(predictor.feature_names)
+    model_cols   = [c for c in features_df.columns
+                    if c.startswith(f"{model_prefix}_") and c in model_feature_set]
+    t3_cols      = [c for c in features_df.columns if c.startswith("t3_")]
+    t1_open_cols = [c for c in features_df.columns if c.startswith("t1_open_")]
+
+    logger.info(f"✓ Feature matrix: {len(features_df)} stocks × {len(features_df.columns)} raw columns")
+    logger.info(f"  {model_prefix}_ features matched to model: {len(model_cols)} "
+                f"(model expects {sum(1 for f in predictor.feature_names if f.startswith(f'{model_prefix}_'))})")
+    logger.info(f"  t3_ features present:       {len(t3_cols)}")
+    logger.info(f"  t1_open_ features present:  {len(t1_open_cols)}")
+
+    key_indicators = [
+        "t1_close_RSI_14", "t1_close_ATR_14", "t1_close_ADX_14",
+        "t1_close_TSI_13_25_13", "t1_close_KCUe_20_2", "t1_close_VWAP",
+        "t1_open_RSI_14",  "t1_open_ATR_14",  "t1_open_ADX_14",
+        "t3_rsi_14",       "t3_atr_14",       "t3_adx_14",
+        "t3_ema_12",       "t3_rsi_7",        "t3_wma_10",
+        "t3_volume_ratio", "t1_close_Volume_Ratio",
+    ]
+    zero_var_indicators = []
+    for col in key_indicators:
+        if col in features_df.columns:
+            col_data = pd.to_numeric(features_df[col], errors='coerce').dropna()
+            std_val  = col_data.std() if len(col_data) > 1 else 0.0
+            logger.info(f"  {col}: n={len(col_data)}, mean={col_data.mean():.2f}, std={std_val:.4f}")
+            if std_val < 1e-4 and len(col_data) > 5:
+                zero_var_indicators.append(col)
+
+    if zero_var_indicators:
+        logger.warning(
+            f"\n  ⚠️  ZERO-VARIANCE COLUMNS: {zero_var_indicators}"
+            "\n      Model will output near-identical probabilities for these features."
+        )
+    elif len(features_df) < 20:
+        logger.warning(
+            f"\n  ⚠️  Only {len(features_df)} stocks — too few for a meaningful distribution."
+        )
+    else:
+        logger.info(f"  ✅ Feature variance looks healthy ({len(features_df)} stocks)")
+
+    t3_nonzero = sum(
+        1 for c in features_df.columns
+        if c.startswith("t3_") and features_df[c].std() > 0.01
+    )
+    logger.info(f"t3_ columns with real variance: {t3_nonzero}")
+
+    # ── STEP 5: ML PREDICTION ─────────────────────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 5: ML PREDICTION")
+    logger.info("=" * 80)
+
+    historical_gains = supabase.get_historical_prediction_accuracy(days_back=30)
+
+    try:
+        predictions_df = predictor.predict_with_targets(features_df, historical_gains)
+        logger.info(f"✓ Generated {len(predictions_df)} predictions")
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+
+    prob_std = predictions_df['explosion_probability'].std()
+    if prob_std < 0.001 and len(predictions_df) > 5:
+        logger.error(
+            f"\n  ❌ POST-PREDICTION: prob_std={prob_std:.6f} — all probabilities identical."
+            "\n     The model received uniform feature inputs."
+        )
+
+    # ── STEP 6: GAIN CORRECTION ───────────────────────────────────────────────
+    if 'target_gain_pct' in predictions_df.columns:
+        bad_gain_mask = (
+            predictions_df['target_gain_pct'].isna() |
+            (predictions_df['target_gain_pct'].abs() < 0.5) |
+            (predictions_df['target_gain_pct'] > 500)
+        )
+        # Apply fallback to ALL signals — HOLD/AVOID stocks get regressor-based
+        # gain estimates too, so the gain column is always populated and useful
+        # for comparison (e.g. confirming that AVOID stocks really were projected
+        # lower than BUY stocks).
+        fallback_mask = bad_gain_mask
+
+        if fallback_mask.any():
+            n_bad = fallback_mask.sum()
+            logger.info(f"  Individual gain fallback applied to {n_bad} BUY/STRONG BUY stocks")
+            predictions_df.loc[fallback_mask, 'target_gain_pct'] = (
+                predictions_df.loc[fallback_mask, 'explosion_probability']
+                .apply(_get_calibrated_gain_estimate)
+            )
+            predictions_df.loc[fallback_mask, 'target_gain_low']  = (
+                predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 0.5
+            )
+            predictions_df.loc[fallback_mask, 'target_gain_high'] = (
+                predictions_df.loc[bad_gain_mask, 'target_gain_pct'] * 1.8
+            )
+            # Tag individual-fallback rows so they're distinguishable
+            if 'gain_source' not in predictions_df.columns:
+                predictions_df['gain_source'] = 'model'
+            predictions_df.loc[fallback_mask, 'gain_source'] = 'individual_fallback'
+
+        predictions_df = _apply_gain_rank_correction(
+            predictions_df, features_df, model_prefix, logger
+        )
+
+        if 'current_price' in predictions_df.columns:
+            predictions_df['target_price'] = (
+                predictions_df['current_price'] * (1 + predictions_df['target_gain_pct'] / 100)
+            )
+            predictions_df['target_price_low'] = (
+                predictions_df['current_price'] * (1 + predictions_df['target_gain_low'] / 100)
+            )
+            predictions_df['target_price_high'] = (
+                predictions_df['current_price'] * (1 + predictions_df['target_gain_high'] / 100)
+            )
+
+    log_probability_distribution(
+        predictions_df, logger,
+        label=f"All {len(predictions_df)} screened stocks"
+    )
+
+    # ── STEP 7: TOP PREDICTIONS ───────────────────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info(f"STEP 7: TOP {args.top_n} PREDICTIONS")
+    logger.info("=" * 80)
+    logger.info(
+        f"  Screened: {len(screened_df)}  →  "
+        f"Scored: {len(predictions_df)}  →  "
+        f"Storing top {args.top_n}"
+    )
+
+    top_predictions = predictions_df.head(args.top_n)
+
+    logger.info(f"\nTop {min(20, len(top_predictions))} Predictions for {prediction_date}:")
+    logger.info("-" * 100)
+    logger.info(f"{'#':<4} {'Symbol':<8} {'Signal':<13} {'Prob':<8} {'Raw':<8} {'Price':<10} {'Target':<10} {'Gain':<8} {'t3_cols'}")
+    logger.info("-" * 100)
+
+    # Build a symbol → t3 count lookup from the features DataFrame.
+    # _meta_t3_count was stored there during feature building, before raw
+    # feature columns are dropped when assembling predictions_df.
+    t3_count_by_symbol = {}
+    if "_meta_t3_count" in features_df.columns:
+        t3_count_by_symbol = (
+            features_df.set_index("symbol")["_meta_t3_count"]
+            .fillna(0).astype(int).to_dict()
+        )
+
+    for rank, (_, row) in enumerate(top_predictions.head(20).iterrows(), 1):
+        current_price = row.get('current_price', 0)
+        n_t3 = t3_count_by_symbol.get(row['symbol'], 0)
+        # RC11: show raw_model_score alongside the calibrated probability —
+        # rows tied on 'Prob' (isotonic plateau collapse) are still ranked
+        # correctly via 'Raw', which is what actually drove the order.
+        raw_score = row.get('raw_model_score', float('nan'))
+        logger.info(
+            f"{rank:<4} {row['symbol']:<8} {row['signal']:<13} "
+            f"{row['explosion_probability']*100:>6.2f}%  "
+            f"{raw_score*100:>6.2f}%  "
+            f"${current_price:>8.2f}  "
+            f"${row.get('target_price', 0):>8.2f}  "
+            f"+{row.get('target_gain_pct', 0):>5.1f}%"
+            f"  t3={n_t3}"
+        )
+
+    # ── STEP 8: STORE PREDICTIONS ─────────────────────────────────────────────
+    logger.info("\n" + "=" * 80)
+    logger.info("STEP 8: STORE PREDICTIONS")
+    logger.info("=" * 80)
+
+    predictions_list = [
+        {
+            'symbol':                row['symbol'],
+            'exchange':              row.get('exchange', 'NASDAQ'),
+            'prediction_date':       prediction_date,
+            'explosion_probability': float(row['explosion_probability']),
+            # FIX: store prediction as 1 for BUY/STRONG BUY, 0 otherwise —
+            # derived from signal (percentile rank) rather than the raw XGBoost
+            # 0.5 threshold.  With scale_pos_weight up to 10x the raw model
+            # output is 1 for almost every post-screener stock, so storing it
+            # directly made prediction useless as a BUY/AVOID discriminator and
+            # caused the accuracy tracker to misclassify outcomes (see tracker fix).
+            'prediction':            1 if row.get('signal', '') in ('BUY', 'STRONG BUY') else 0,
+            'signal':                row['signal'],
+            'target_gain_pct':       float(row.get('target_gain_pct', 0)),
+            'target_gain_low':       float(row.get('target_gain_low', 0)),
+            'target_gain_high':      float(row.get('target_gain_high', 0)),
+            'current_price':         float(row.get('current_price', 0)),
+            'target_price':          float(row.get('target_price', 0)),
+            'target_price_low':      float(row.get('target_price_low', 0)),
+            'target_price_high':     float(row.get('target_price_high', 0)),
+            'gain_source':           row.get('gain_source', 'model'),
+            'model_version':         f"{model_prefix}_v9",
+        }
+        for _, row in top_predictions.iterrows()
     ]
 
-    mask = pd.Series(True, index=negatives.index)
-    used = False
-    for candidates, min_key, max_key in filter_map:
-        col = next((c for c in candidates if c in negatives.columns), None)
-        if col is None:
-            continue
-        if min_key and min_key in filters and filters[min_key] is not None:
-            mask &= negatives[col].fillna(-1e9) >= filters[min_key]
-            used = True
-        if max_key and max_key in filters and filters[max_key] is not None:
-            mask &= negatives[col].fillna(1e9) <= filters[max_key]
-            used = True
-    return mask, used
-
-
-def apply_filter_aware_negative_sampling(df, logger=None):
-    """
-    Retraining enhancement:
-    - Keep all winners.
-    - Prefer non-winners that pass learned_filters.json (hard negatives).
-    - If not enough hard negatives exist for a date, progressively loosen the
-      filters (up to SAMPLING_LOOSENING_PASSES times, relaxing by
-      SAMPLING_LOOSENING_STEP_PCT % per pass) before falling back to
-      fully-unfiltered rows.
-    - Graduated upweighting: rows selected on pass 0 (strict filters) receive
-      the highest weight (HARD_NEG_WEIGHT_BASE × decay^0 = 2.0x), rows selected
-      on pass k receive HARD_NEG_WEIGHT_BASE × HARD_NEG_WEIGHT_DECAY^k, and
-      unfiltered fallback rows receive no uplift (1.0x).
-    - Preserve existing mistake-learner weights (multiplied by the pass weight).
-    - FIX: No-winner dates now receive a proportional target (up to 40% of
-      available negatives, capped at 3 × global_neg_ratio) instead of a flat
-      floor of 4, so they contribute meaningfully and the overall winner:non-winner
-      ratio reflects the true 90-day distribution.
-
-    Loosening knobs (all in config.yaml under non_winners:):
-        loosening_passes   – extra passes before unfiltered fallback (default 3)
-        loosening_step_pct – % to relax per pass (default 20)
-        min_hard_neg_ratio – target fraction of negatives from filtered pool
-                             before stopping early (default 0.80)
-    """
-    import json
-    import pandas as pd
-    from pathlib import Path
-
-    if df is None or df.empty or "label" not in df.columns:
-        return df
-
-    # ── Opt-in gate ────────────────────────────────────────────────────────
-    # Filter-aware hard-negative sampling is OFF by default. Set
-    # USE_LEARNED_FILTERS=1/true/yes in the environment (or pass
-    # --use-learned-filters on the CLI, which sets this same env var) to
-    # enable it for a retrain run. This mirrors the USE_SELECTED_FEATURES
-    # opt-in flag used elsewhere in this file.
-    if os.environ.get("USE_LEARNED_FILTERS", "").lower() not in ("1", "true", "yes"):
-        if logger:
-            logger.info(
-                "Filter-aware negative sampling DISABLED (USE_LEARNED_FILTERS not set) "
-                "— using unfiltered negative sampling."
-            )
-        return df
-
-    # ── Load filters fresh from disk ─────────────────────────────────────────
-    # Reading here (not at module import) means any retrain picks up the latest
-    # learned_filters.json without restarting.
-    filters_path = Path("ml_models/learned_filters.json")
-    if not filters_path.exists():
-        return df
-
-    try:
-        base_filters = json.loads(filters_path.read_text())
-    except Exception:
-        return df
-
-    if logger:
-        logger.info("=" * 80)
-        logger.info("FILTER-AWARE NEGATIVE SAMPLING — PROGRESSIVE LOOSENING")
-        logger.info(f"Filters loaded from {filters_path}")
-        logger.info(
-            f"  loosening_passes={SAMPLING_LOOSENING_PASSES}, "
-            f"step_pct={SAMPLING_LOOSENING_STEP_PCT}%, "
-            f"min_hard_neg_ratio={SAMPLING_MIN_HARD_NEG_RATIO:.0%}"
-        )
-        for k, v in base_filters.items():
-            if not str(k).startswith("_"):
-                logger.info(f"  BASE FILTER {k}={v}")
-        logger.info("=" * 80)
-
-    # ── Build a unified sampling date column (coalesce detection_date ?? event_date) ──
-    # combined_df has TWO date columns:
-    #   T-1 rows      → detection_date populated, event_date NaT
-    #   base CSV rows → event_date populated,     detection_date NaT
-    # Using detection_date alone as the grouping key causes base rows to fall
-    # through (NaT never matches any date group), meaning ~13k base negatives
-    # and ~2.7k base winners are invisible to the per-date loop and only a
-    # fraction of T-1 rows (1270 winners / 2742 negatives) are actually sampled.
-    # That produces the observed 59%+ positive rate: base winners are kept
-    # unconditionally while most base negatives are silently dropped.
-    #
-    # Fix: coalesce into _sampling_date so every row has a usable date key.
-    # base CSV event_date is the explosion day (T+1 relative to detection); we
-    # subtract 1 business day to align it with the T-1 detection timeline.
-    df = df.copy()  # avoid mutating caller's DataFrame
-    _SAMPLING_DATE_COL = "_sampling_date"
-
-    if "detection_date" in df.columns or "event_date" in df.columns:
-        _det = pd.to_datetime(
-            df["detection_date"] if "detection_date" in df.columns else pd.Series(pd.NaT, index=df.index),
-            errors="coerce",
-        )
-        if "event_date" in df.columns:
-            _ev = pd.to_datetime(df["event_date"], errors="coerce")
-            _ev_shifted = _ev - pd.tseries.offsets.BDay(1)
-            _unified = _det.fillna(_ev_shifted)
-        else:
-            _unified = _det
-        df[_SAMPLING_DATE_COL] = _unified.dt.strftime("%Y-%m-%d").where(_unified.notna(), None)
-    else:
-        df[_SAMPLING_DATE_COL] = None
-
-    winners   = df[df["label"] == 1].copy()
-    negatives = df[df["label"] == 0].copy()
-
-    if negatives.empty:
-        return df
-
-    # Use the coalesced date for grouping; fall back to raw date cols if needed
-    if df[_SAMPLING_DATE_COL].notna().any():
-        date_col = _SAMPLING_DATE_COL
-    else:
-        date_col = next(
-            (c for c in ["detection_date", "event_date", "trade_date", "date"] if c in df.columns),
-            None,
-        )
-
-    # ── Per-date (or global) negative selection with progressive loosening ────
-    #
-    # Graduated filter-pass weights:
-    #   pass 0 (full filters)         → HARD_NEG_WEIGHT_BASE   (highest weight)
-    #   pass k (loosened k*step_pct%) → HARD_NEG_WEIGHT_BASE * decay^k
-    #   unfiltered fallback           → 1.0  (base weight, no uplift)
-    #
-    # This rewards rows that pass strict filters more than rows that only
-    # pass after loosening, and rewards loosened-pass rows more than
-    # unfiltered fallback rows.
-    HARD_NEG_WEIGHT_BASE  = 2.0   # weight multiplier for a full-filter pass
-    HARD_NEG_WEIGHT_DECAY = 0.75  # per-loosening-pass decay factor
-
-    def _pass_weight(pass_idx: int) -> float:
-        """Return the sample-weight multiplier for a row selected on pass `pass_idx`.
-        pass_idx=0 → full filters (highest); pass_idx>0 → progressively lower;
-        pass_idx=-1 → unfiltered fallback (no uplift, returns 1.0)."""
-        if pass_idx < 0:
-            return 1.0
-        return HARD_NEG_WEIGHT_BASE * (HARD_NEG_WEIGHT_DECAY ** pass_idx)
-
-    def _select_negatives_for_group(neg_group: "pd.DataFrame", target: int) -> "pd.DataFrame":
-        """
-        For a single date-group of negatives, try to fill `target` hard-negative
-        slots using progressively looser filters.  Returns the selected rows,
-        with a '_filter_pass' column recording which pass selected each row
-        (0 = full filters, 1..N = loosened, -1 = unfiltered fallback).
-        """
-        preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
-        # Map: index → pass_idx that selected it
-        selected_pass: dict = {}
-
-        for pass_idx in range(SAMPLING_LOOSENING_PASSES + 1):
-            if pass_idx == 0:
-                active_filters = base_filters
-                label = "full filters"
-            else:
-                active_filters = _loosen_filters_for_sampling(
-                    base_filters, SAMPLING_LOOSENING_STEP_PCT, pass_idx
-                )
-                label = f"loosened {SAMPLING_LOOSENING_STEP_PCT * pass_idx:.0f}%"
-
-            mask, used = _build_filter_mask(neg_group, active_filters)
-            if not used:
-                # No filterable columns found — skip all loosening, fall straight through
-                break
-
-            # Rows that pass this pass's filter AND haven't been picked yet
-            passing_idx = set(neg_group[mask].index) - set(selected_pass.keys())
-            needed = preferred - len(selected_pass)
-            if needed <= 0:
-                break
-
-            take = list(passing_idx)[:needed]
-            for idx in take:
-                selected_pass[idx] = pass_idx
-
-            if logger and pass_idx > 0 and take:
-                logger.info(
-                    f"    pass {pass_idx} ({label}): +{len(take)} hard negatives "
-                    f"(cumulative hard={len(selected_pass)}/{preferred})"
-                )
-
-            if len(selected_pass) >= preferred:
-                break   # have enough hard negatives — stop loosening
-
-        # Fill remaining quota (target - hard) with whatever unselected rows are left
-        remaining_needed = target - len(selected_pass)
-        unselected = neg_group[~neg_group.index.isin(set(selected_pass.keys()))]
-        if remaining_needed > 0 and not unselected.empty:
-            easy_take = unselected.sample(
-                min(len(unselected), remaining_needed), random_state=42
-            )
-            for idx in easy_take.index:
-                selected_pass[idx] = -1  # unfiltered fallback
-
-        result = neg_group.loc[list(selected_pass.keys())].copy()
-        result["_filter_pass"] = [selected_pass[i] for i in result.index]
-        return result
-
-    # ── Run selection ─────────────────────────────────────────────────────────
-    hard_selected_count  = 0
-    random_selected_count = 0
-
-    # Global neg:winner ratio — used as the per-date target on no-winner dates
-    # so they contribute proportionally rather than getting a flat floor of 4.
-    # Capped at 10 to avoid flooding training with negatives on winner-sparse dates.
-    _global_neg_ratio = max(
-        5.25,
-        min(10.0, len(negatives) / max(1, len(winners)))
-    )
-
-    if date_col is None:
-        target_negatives = max(int(len(winners) * _global_neg_ratio), 8)
-        selected_neg = _select_negatives_for_group(negatives, target_negatives)
-
-        # Approximate hard vs easy split for logging
-        if "_filter_pass" in selected_neg.columns:
-            hard_selected_count   = int((selected_neg["_filter_pass"] >= 0).sum())
-            random_selected_count = int((selected_neg["_filter_pass"] < 0).sum())
-        else:
-            full_mask, used = _build_filter_mask(selected_neg, base_filters)
-            hard_selected_count  = int(full_mask.sum()) if used else 0
-            random_selected_count = len(selected_neg) - hard_selected_count
-    else:
-        selected_parts = []
-        winner_dates   = set(winners[date_col].dropna().unique())
-        all_neg_dates  = set(negatives[date_col].dropna().unique())
-
-        for dt in sorted(winner_dates | all_neg_dates):
-            winner_group  = winners[winners[date_col] == dt]
-            n_winners_dt  = len(winner_group)
-
-            if n_winners_dt > 0:
-                # Winner date: sample proportionally to winners on this date
-                target = max(int(n_winners_dt * 5.25), 4)
-            else:
-                # No-winner date: use the global ratio applied to the available
-                # negatives so these dates contribute meaningfully instead of
-                # receiving a token floor of 4.  Cap at a reasonable ceiling so
-                # one huge no-winner date doesn't crowd out everything else.
-                neg_dt_count = int((negatives[date_col] == dt).sum())
-                target = min(
-                    max(int(neg_dt_count * 0.40), 4),   # take up to 40% of available
-                    int(_global_neg_ratio * 3),          # hard cap: 3 × global ratio
-                )
-
-            neg_dt = negatives[negatives[date_col] == dt]
-
-            chosen = _select_negatives_for_group(neg_dt, target)
-            selected_parts.append(chosen)
-
-            if "_filter_pass" in chosen.columns:
-                day_hard = int((chosen["_filter_pass"] >= 0).sum())
-                day_easy = int((chosen["_filter_pass"] < 0).sum())
-            else:
-                full_mask, used = _build_filter_mask(chosen, base_filters)
-                day_hard  = int(full_mask.sum()) if used else 0
-                day_easy  = len(chosen) - day_hard
-            hard_selected_count  += day_hard
-            random_selected_count += day_easy
-
-            preferred = int(target * SAMPLING_MIN_HARD_NEG_RATIO)
-            if logger and n_winners_dt > 0 and day_hard < preferred:
-                logger.info(
-                    f"[{dt}] hard-negative shortage after loosening: "
-                    f"wanted={preferred}, got={day_hard}, backfilled={day_easy}"
-                )
-
-        selected_neg = pd.concat(selected_parts) if selected_parts else negatives.iloc[0:0]
-
-    # ── Graduated upweighting based on which filter pass selected each row ────
-    # Rows that pass full (strict) filters get a higher weight than rows that
-    # only passed after loosening, which in turn outweigh unfiltered fallback rows.
-    # This preserves the corrective signal from hard negatives without flattening
-    # the distinction between "genuinely filter-passing" and "loosened-in" rows.
-    if "sample_weight" in selected_neg.columns and "_filter_pass" in selected_neg.columns:
-        def _apply_graduated_weight(row):
-            base_w = row["sample_weight"] if pd.notna(row["sample_weight"]) else 1.0
-            return base_w * _pass_weight(int(row["_filter_pass"]))
-        selected_neg = selected_neg.copy()
-        selected_neg["sample_weight"] = selected_neg.apply(_apply_graduated_weight, axis=1)
-    elif "sample_weight" in selected_neg.columns:
-        # Fallback: flat upweight (old behaviour) when _filter_pass is absent
-        selected_neg = selected_neg.copy()
-        selected_neg["sample_weight"] = selected_neg["sample_weight"].fillna(1.0) * 1.75
-
-    # Drop internal tracking columns before returning
-    for _internal_col in ["_filter_pass", _SAMPLING_DATE_COL]:
-        if _internal_col in selected_neg.columns:
-            selected_neg = selected_neg.drop(columns=[_internal_col])
-        if _internal_col in winners.columns:
-            winners = winners.drop(columns=[_internal_col])
-
-    result = pd.concat([winners, selected_neg], ignore_index=True)
-
-    if logger:
-        actual_pos_rate = len(winners) / max(len(result), 1)
-        logger.info("=" * 80)
-        logger.info("FILTER-AWARE SELECTION RESULTS")
-        logger.info(f"  Hard negatives (filter-passing) : {hard_selected_count:,}")
-        logger.info(f"  Easy/backfill negatives         : {random_selected_count:,}")
-        logger.info(
-            f"  winners={len(winners):,}, "
-            f"selected_negatives={len(selected_neg):,}, "
-            f"actual_positive_rate={actual_pos_rate:.1%}"
-        )
-        logger.info("=" * 80)
-
-    return result
-
-
-def main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(description="ML weekly full retrain from scratch.")
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Set log level to DEBUG (default: INFO).",
-    )
-    parser.add_argument(
-        "--lookback-days", type=int, default=180, metavar="N",
-        help="How many days of T-1 data to use for training (default: 90).",
-    )
-    parser.add_argument(
-        "--use-all-timepoints", action="store_true", default=True,
-        help="Use both day_prior_close and day_prior_open T-1 tables (default: True).",
-    )
-    parser.add_argument(
-        "--use-learned-filters", action="store_true", default=False,
-        help=(
-            "Enable filter-aware hard-negative sampling using "
-            "ml_models/learned_filters.json during retraining (default: False). "
-            "Equivalent to setting USE_LEARNED_FILTERS=1 in the environment."
-        ),
-    )
-    parser.add_argument(
-        "--use-base-training-data", action="store_true", default=False,
-        help=(
-            "Include the legacy ml_training_base seed table (t3_/t5_/t10_ "
-            "features only, no t1_) in the training set (default: False — "
-            "T-1 data only). Equivalent to setting USE_BASE_TRAINING_DATA=1 "
-            "in the environment. Only useful when bootstrapping a brand-new "
-            "database that doesn't yet have enough T-1 history on its own."
-        ),
-    )
-    args = parser.parse_args()
-
-    if args.verbose:
-        _configure_logging(logging.DEBUG)
-        logger.debug("Verbose logging enabled.")
-
-    if args.use_learned_filters:
-        os.environ["USE_LEARNED_FILTERS"] = "true"
-
-    if args.use_base_training_data:
-        os.environ["USE_BASE_TRAINING_DATA"] = "true"
-
-    logger.info("=" * 60)
-    logger.info("ML RETRAIN — FULL RETRAIN FROM SCRATCH")
-    logger.info(f"  lookback_days       : {args.lookback_days}")
-    logger.info(f"  use_all_timepoints  : {args.use_all_timepoints}")
-    logger.info(f"  use_learned_filters : {os.environ.get('USE_LEARNED_FILTERS', '').lower() in ('1', 'true', 'yes')}")
-    logger.info(f"  use_base_training_data : {os.environ.get('USE_BASE_TRAINING_DATA', '').lower() in ('1', 'true', 'yes')}")
-    logger.info(f"  verbose             : {args.verbose}")
-    logger.info("=" * 60)
-
-    # ── Sanity check: is lookback_days wide enough for the embargo? ───────────
-    # Worst case, the inferred embargo hits EMBARGO_DAYS_CAP (driven by
-    # whatever rolling-window feature happens to be selected that month).
-    # For train to have any real pre-embargo window left, lookback_days needs
-    # to cover: the val window (VAL_WEEKS) + the embargo (up to the cap) +
-    # a minimum train slice (MIN_TRAIN_WINDOW_DAYS). Computed from the same
-    # constants train_val_split's own cap uses, so this can't drift out of
-    # sync with the actual guard.
-    _recommended_min_lookback = (VAL_WEEKS * 7) + EMBARGO_DAYS_CAP + MIN_TRAIN_WINDOW_DAYS
-    if args.lookback_days < _recommended_min_lookback:
-        logger.warning(
-            f"lookback_days={args.lookback_days} is below the recommended "
-            f"minimum of {_recommended_min_lookback}d "
-            f"(= {VAL_WEEKS*7}d val window + {EMBARGO_DAYS_CAP}d worst-case "
-            f"embargo + {MIN_TRAIN_WINDOW_DAYS}d minimum train slice). "
-            "If the deepest rolling-window feature in this run's selected "
-            "features pushes the inferred embargo close to the cap, train "
-            "may end up starved -- train_val_split will auto-shrink the "
-            "embargo to compensate, but that trades away purge protection "
-            "you probably want. Consider raising --lookback-days instead."
-        )
-
-    # ── Connect ──────────────────────────────────────────────────────────────
-    client = get_supabase_client()
-
-    # ── Load standard training data ───────────────────────────────────────────
-    base_df     = load_base_training_data(client, lookback_days=args.lookback_days)
-    t1_df       = load_t1_data(client, lookback_days=args.lookback_days)
-    combined_df = combine_datasets(base_df, t1_df)
-
-    # ── Apply lookback_days filter to combined_df ─────────────────────────────
-    # ml_training_base is fetched in full (can span many months), but only the
-    # most recent lookback_days of base data should participate in training.
-    # Without this, old base-data winners from months ago inflate the winner
-    # count while their corresponding date's non-winners are sparse or absent,
-    # creating a severe class imbalance that the per-date sampler cannot fix.
-    #
-    # T-1 rows (winners_day_prior / non_winners_day_prior) already only span
-    # the accumulation period (~90 days), so this filter mainly trims base CSV rows.
-    # We use the _sampling_date logic: detection_date ?? (event_date - 1 BDay).
-    _lookback_cutoff = (datetime.now().date() - timedelta(days=args.lookback_days)).isoformat()
-    _has_detection = "detection_date" in combined_df.columns
-    _has_event     = "event_date" in combined_df.columns
-    _lb_date_col = "detection_date" if _has_detection else ("event_date" if _has_event else None)
-    if _lb_date_col is not None:
-        # BUG FIX: previously this picked ONE column for the entire dataframe.
-        # Since detection_date exists (populated only on T-1 rows), it was
-        # selected for every row — base-CSV rows (event_date only) showed up
-        # as NaT in detection_date and bypassed the filter entirely via the
-        # `.isna()` passthrough below, letting years of old base data into
-        # train regardless of lookback_days. Fix: build sort dates per-row,
-        # preferring detection_date and falling back to event_date (shifted
-        # back 1 BDay, since event_date is the explosion day T+1) wherever
-        # detection_date is missing — mirroring train_val_split's sort_date.
-        _lb_dates = pd.Series(pd.NaT, index=combined_df.index)
-        if _has_detection:
-            _lb_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-        if _has_event:
-            _event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
-            _lb_dates = _lb_dates.fillna(_event_dates)
-        _lb_mask = (_lb_dates.dt.date.astype(str) >= _lookback_cutoff) | _lb_dates.isna()
-        n_before = len(combined_df)
-        combined_df = combined_df[_lb_mask].copy()
-        n_after = len(combined_df)
-        n_pos_after = int((combined_df["label"] == 1).sum())
-        n_neg_after = int((combined_df["label"] == 0).sum())
-        logger.info(
-            f"Lookback filter ({args.lookback_days}d, cutoff={_lookback_cutoff}): "
-            f"{n_before} → {n_after} rows "
-            f"(pos={n_pos_after}, neg={n_neg_after}, "
-            f"pos_rate={n_pos_after/max(n_after,1):.1%})"
-        )
-    else:
-        logger.warning("Lookback filter: no date column found in combined_df — skipping.")
-
-    # ── RC2 FIX: Enrich with CORRECTED intraday peak gain from daily_winners ──
-    # Use prev_close as denominator instead of same-day close
-    #
-    # SINGLE-FETCH FIX (2026-08-17): daily_winners used to be fetched and
-    # corrected TWICE — once here (feeds combined_df.actual_high_pct, which
-    # apply_intraday_high_labels() below needs) and again inside
-    # fetch_daily_outcomes_gain_targets() (feeds the gain regressor's
-    # daily_outcome_gain_pct). Same table, same correction function, same
-    # result — just duplicated network + compute + log noise. winners_corrected
-    # is now captured here and threaded into fetch_daily_outcomes_gain_targets()
-    # below so daily_winners is only ever fetched/corrected once per run.
-    logger.info("RC2: Fetching daily_winners data for corrected actual_high_pct computation...")
-    winners_corrected: "Optional[pd.DataFrame]" = None
-    try:
-        winners_response = fetch_table_paginated(client, "daily_winners")
-        if not winners_response.empty:
-            required = {"symbol", "detection_date", "high"}
-            if required.issubset(winners_response.columns):
-                # RC2: Apply the corrected computation using prev_close
-                winners_corrected = _compute_correct_actual_high_pct(winners_response)
-
-                _has_detection_rc2 = "detection_date" in combined_df.columns
-                _has_event_rc2     = "event_date" in combined_df.columns
-                symbol_col = next(
-                    (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
-                )
-
-                if symbol_col and (_has_detection_rc2 or _has_event_rc2):
-                    gain_cols = ["symbol", "detection_date", "actual_high_pct"]
-                    if "change_pct" in winners_corrected.columns:
-                        gain_cols.append("change_pct")
-
-                    # BUG FIX: winners_corrected["detection_date"] is datetime64
-                    # (set in _compute_correct_actual_high_pct), while combined_df's
-                    # date_col is typically a plain string/object column pulled from
-                    # Supabase. Merging on mismatched dtypes raises a ValueError
-                    # ("You are trying to merge on str and datetime64[us] columns"),
-                    # which was being silently swallowed by the except Exception
-                    # below — so actual_high_pct was NEVER populated, starving the
-                    # gain regressor of the >=30 rows it needs and forcing the
-                    # hardcoded _GAIN_CURVE fallback. Normalize both merge keys to
-                    # the same "YYYY-MM-DD" string format before merging.
-                    merge_helper = winners_corrected[gain_cols].copy()
-                    merge_helper["detection_date"] = pd.to_datetime(
-                        merge_helper["detection_date"], errors="coerce"
-                    ).dt.strftime("%Y-%m-%d")
-
-                    # BUG FIX: previously picked ONE column (detection_date, if
-                    # present) for the entire frame, so base rows (no
-                    # detection_date) got NaT keys and silently never matched
-                    # winners_corrected — only T-1 rows ever received the RC2
-                    # corrected actual_high_pct. Build the key per-row instead,
-                    # falling back to event_date - 1 BDay (same alignment
-                    # convention used by the lookback filter / train_val_split).
-                    _merge_dates = pd.Series(pd.NaT, index=combined_df.index)
-                    if _has_detection_rc2:
-                        _merge_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-                    if _has_event_rc2:
-                        _merge_event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
-                        _merge_dates = _merge_dates.fillna(_merge_event_dates)
-
-                    _tmp_key_col = "__merge_date_key__"
-                    combined_df[_tmp_key_col] = _merge_dates.dt.strftime("%Y-%m-%d")
-
-                    combined_df = combined_df.merge(
-                        merge_helper,
-                        left_on=[symbol_col, _tmp_key_col],
-                        right_on=["symbol", "detection_date"],
-                        how="left",
-                        suffixes=("", "_winners"),
-                    ).drop(columns=["detection_date_winners", _tmp_key_col], errors="ignore")
-
-
-                    # Resolve column conflicts after merge
-                    for col in ["actual_high_pct", "change_pct"]:
-                        merged_col = f"{col}_winners"
-                        if merged_col in combined_df.columns:
-                            # Fill original NaN with corrected values
-                            if col in combined_df.columns:
-                                mask = combined_df[col].isna()
-                                combined_df.loc[mask, col] = combined_df.loc[mask, merged_col]
-                            else:
-                                combined_df[col] = combined_df[merged_col]
-                            combined_df = combined_df.drop(columns=[merged_col])
-
-                    n_with_gain = combined_df["actual_high_pct"].notna().sum()
-                    logger.info(
-                        f"RC2: {n_with_gain} rows now have corrected actual_high_pct "
-                        f"(prev_close denominator)"
-                    )
-    except Exception as e:
-        logger.warning(
-            f"RC2: Could not fetch/process gain data: {e} — gain regressor may be limited",
-            exc_info=True,
-        )
-
-    # ── RC3: Fetch ml_prediction_accuracy for label correction and gain regressor ──
-    #
-    # LEAKAGE FIX (RC3-label): The previous implementation backfilled
-    # actual_high_pct from ml_prediction_accuracy directly into combined_df
-    # BEFORE apply_intraday_high_labels() ran.  This conflated two distinct
-    # pipelines:
-    #
-    #   (A) LABEL-CORRECTION PIPELINE — post-close outcomes written to
-    #       ml_prediction_accuracy by the tracker after market close.
-    #       Legitimate use: upgrading label=0 → label=1 for rows where the
-    #       stock actually hit the intraday threshold.  The outcome is the
-    #       LABEL TARGET, not a feature.
-    #
-    #   (B) FEATURE PIPELINE — values that exist at prediction time (T-1
-    #       close data, prior-day stats, etc.).  actual_high_pct from
-    #       ml_prediction_accuracy is SAME-DAY outcome data; it does NOT
-    #       exist when the model runs pre-market.
-    #
-    # By writing accuracy-table actual_high_pct into combined_df.actual_high_pct
-    # before apply_intraday_high_labels(), the old code smuggled same-day
-    # outcome data into the feature column, then trained the gain regressor on
-    # it.  At inference time that column is absent, producing a silent but severe
-    # train/serve skew.
-    #
-    # FIX: We still fetch ml_prediction_accuracy (needed for the gain regressor
-    # via _accuracy_gain_map and for direct label correction below), but we NO
-    # LONGER write actual_high_pct back into combined_df.actual_high_pct.
-    # Instead, label correction is applied directly: rows whose (symbol, date)
-    # appear in the accuracy table with actual_high_pct >= threshold are
-    # upgraded to label=1 here, keeping the outcome data in the label column
-    # where it belongs and out of the feature matrix.
-    #
-    # ISSUE 2 FIX: _accuracy_gain_map is still built and passed to
-    # train_gain_regressor to eliminate its redundant DB fetch.
-    _accuracy_gain_map: dict = {}
-    logger.info("RC3: Fetching ml_prediction_accuracy for label correction and gain regressor...")
-    try:
-        _symbol_col = next(
-            (c for c in ["symbol", "ticker"] if c in combined_df.columns), None
-        )
-        _has_detection_rc3 = "detection_date" in combined_df.columns
-        _has_event_rc3     = "event_date" in combined_df.columns
-
-        if _symbol_col and (_has_detection_rc3 or _has_event_rc3):
-            # BUG FIX: previously picked ONE column (detection_date, if present)
-            # for the whole frame, so _min_date reflected only T-1 rows' dates
-            # (a ~90-day window) and silently ignored the much older event_date
-            # rows — narrowing the accuracy-table query and starving label
-            # correction / the gain map for base rows. Build per-row instead.
-            _all_dates = pd.Series(pd.NaT, index=combined_df.index)
-            if _has_detection_rc3:
-                _all_dates = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-            if _has_event_rc3:
-                _all_event_dates = pd.to_datetime(combined_df["event_date"], errors="coerce") - pd.tseries.offsets.BDay(1)
-                _all_dates = _all_dates.fillna(_all_event_dates)
-            _min_date = _all_dates.min()
-            _start_date = (
-                _min_date.date().isoformat() if pd.notna(_min_date) else None
-            )
-
-            # FIX2: also select actual_high_pct_source (see
-            # ml_track_comprehensive_accuracy.py) so the gain regressor can
-            # tell prev_close-based accuracy-table rows apart from the noisier
-            # same-day-price fallback instead of silently blending both bases
-            # into one target, which is what produced the ~60pp mean-gain
-            # divergence the FIX2 diagnostic below flags. Falls back to the
-            # old select() on deployments that haven't migrated the column yet.
-            try:
-                _acc_resp = (
-                    client.table("ml_prediction_accuracy")
-                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct, actual_high_pct_source")
-                    .not_.is_("actual_high_pct", "null")
-                    .gte("prediction_date", _start_date)
-                    .execute()
-                ) if _start_date else None
-            except Exception as _e_col:
-                logger.info(
-                    f"RC3: actual_high_pct_source column unavailable ({_e_col}); "
-                    "querying without it (denominator will be treated as unverified)."
-                )
-                _acc_resp = (
-                    client.table("ml_prediction_accuracy")
-                    .select("symbol, prediction_date, actual_gain_pct, actual_high_pct")
-                    .not_.is_("actual_high_pct", "null")
-                    .gte("prediction_date", _start_date)
-                    .execute()
-                ) if _start_date else None
-
-            if _acc_resp and _acc_resp.data:
-                # ── Build accuracy_gain_map for gain regressor (ISSUE 2 FIX) ──
-                for _r in _acc_resp.data:
-                    _accuracy_gain_map[(_r["symbol"], _r["prediction_date"])] = {
-                        "actual_gain_pct": _r.get("actual_gain_pct"),
-                        "actual_high_pct": _r.get("actual_high_pct"),
-                        "actual_high_pct_source": _r.get("actual_high_pct_source"),
-                    }
-                logger.info(
-                    f"RC3: Built accuracy_gain_map with {len(_accuracy_gain_map)} records "
-                    f"(reused by gain regressor — no redundant DB fetch)"
-                )
-
-                # ── Direct label correction (no feature-column contamination) ──
-                # Identify combined_df rows that the accuracy table says hit the
-                # intraday threshold.  Upgrade their label directly without writing
-                # actual_high_pct into the feature matrix.
-                _acc_df = pd.DataFrame(_acc_resp.data)
-                _acc_df["prediction_date"] = pd.to_datetime(
-                    _acc_df["prediction_date"], errors="coerce"
-                ).dt.date.astype(str)
-                _acc_df["actual_high_pct"] = pd.to_numeric(
-                    _acc_df["actual_high_pct"], errors="coerce"
-                )
-
-                # Only rows that genuinely cleared the threshold are label correctors
-                _acc_winners = _acc_df[
-                    _acc_df["actual_high_pct"] >= INTRADAY_WIN_THRESHOLD
-                ].set_index(["symbol", "prediction_date"])
-
-                if not _acc_winners.empty:
-                    _combined_dates = _all_dates.dt.date.astype(str)
-
-                    # Build a boolean mask: rows in combined_df whose (symbol, date)
-                    # appear as threshold-clearers in ml_prediction_accuracy.
-                    _keys = list(zip(
-                        combined_df[_symbol_col],
-                        _combined_dates,
-                    ))
-                    _is_acc_winner = np.array(
-                        [k in _acc_winners.index for k in _keys],
-                        dtype=bool,
-                    )
-
-                    # Only upgrade label=0 rows; never downgrade label=1.
-                    # Exclude base_csv rows (unreliable outcome pipeline).
-                    if "source" in combined_df.columns:
-                        _is_base_csv = combined_df["source"].str.contains(
-                            "base_csv", na=False
-                        ).values
-                    else:
-                        _is_base_csv = np.zeros(len(combined_df), dtype=bool)
-
-                    _upgrade_mask = (
-                        (combined_df["label"].values == 0) &
-                        _is_acc_winner &
-                        ~_is_base_csv
-                    )
-                    n_upgraded = int(_upgrade_mask.sum())
-
-                    if n_upgraded > 0:
-                        combined_df.loc[_upgrade_mask, "label"] = 1
-                        # Bump sample weight — high-signal corrective examples
-                        combined_df.loc[_upgrade_mask, "sample_weight"] = (
-                            combined_df.loc[_upgrade_mask, "sample_weight"] * 1.5
-                        )
-                        logger.info(
-                            f"RC3-label: Upgraded {n_upgraded} non-winner rows to label=1 "
-                            f"via ml_prediction_accuracy (actual_high_pct >= "
-                            f"{INTRADAY_WIN_THRESHOLD}%). "
-                            f"actual_high_pct NOT written to feature matrix (leakage fix)."
-                        )
-                    else:
-                        logger.info(
-                            "RC3-label: No label=0 rows matched accuracy-table threshold "
-                            "clearers — no upgrades applied."
-                        )
-                else:
-                    logger.warning(
-                        f"RC3-label: No accuracy records with actual_high_pct >= "
-                        f"{INTRADAY_WIN_THRESHOLD}% — non-winner relabelling will not fire."
-                    )
-            else:
-                logger.warning(
-                    "RC3: ml_prediction_accuracy returned no rows with actual_high_pct — "
-                    "non-winner relabelling and gain regressor map will be empty."
-                )
-        else:
-            logger.warning(
-                "RC3: Could not identify symbol/date columns in combined_df — "
-                "skipping accuracy-table label correction."
-            )
-    except Exception as _e:
-        logger.warning(f"RC3: Could not process ml_prediction_accuracy: {_e}")
-
-    # ── FIX 4: Relabel rows with strong intraday moves as winners ─────────────
-    combined_df = apply_intraday_high_labels(combined_df, threshold=INTRADAY_WIN_THRESHOLD)
-
-    # ── Filter-aware negative sampling (must run AFTER intraday relabelling) ──
-    # apply_intraday_high_labels() promotes some label=0 rows to label=1.
-    # Sampling before that step would select "hard negatives" that are then
-    # relabelled as winners, corrupting the label/ratio and causing those rows
-    # to appear as both a selected negative and a winner in the same training set.
-    combined_df = apply_filter_aware_negative_sampling(combined_df, logger)
-
-    # ── TRUE GAIN TARGET FIX: build the gain regressor's label from the ──────
-    # market_close/day_prior_close snapshot tables (+ ml_training_base.gain_pct
-    # for base rows) instead of ml_prediction_accuracy. See the docstrings on
-    # fetch_market_snapshot_gain_targets() / attach_true_gain_targets() above
-    # for why this replaces the old actual_high_pct-via-accuracy-table path.
-    logger.info("Fetching daily-outcome gain targets (daily_winners / daily_non_winners)...")
-    daily_outcome_df = fetch_daily_outcomes_gain_targets(client, winners_corrected_df=winners_corrected)
-    logger.info("Fetching market-snapshot gain targets (true_gain_pct, fallback)...")
-    market_gain_df = fetch_market_snapshot_gain_targets(client)
-    combined_df = attach_true_gain_targets(combined_df, market_gain_df, daily_outcome_df)
-
-    # ── Mistake learning step — DISABLED ─────────────────────────────────────
-    # Reason: with only ~18 mistakes in the corpus, the 3x/2x sample weights
-    # create a circular feedback loop. Valid setups that fail due to market
-    # noise are labelled as "bad patterns" and up-weighted, causing the model
-    # to suppress those setups on every subsequent retrain.
-    #
-    # Re-enable (and set MISTAKE_LEARNER_AVAILABLE = True at the top of this
-    # file) once there are enough mistakes for statistically meaningful signal
-    # (suggested threshold: ~200+ unique mistake samples).
-    #
-    # The original implementation is preserved below for reference:
-    #
-    # mistake_df = pd.DataFrame()
-    # if MISTAKE_LEARNER_AVAILABLE:
-    #     logger.info("\n" + "=" * 60)
-    #     logger.info("MISTAKE LEARNING STEP")
-    #     logger.info("=" * 60)
-    #     proto_features = [
-    #         c for c in combined_df.columns
-    #         if c not in NON_FEATURE_COLS and not c.startswith("Unnamed")
-    #     ]
-    #     logger.info("Loading multiday tables for mistake-sample enrichment...")
-    #     _mistake_winners_md, _mistake_non_winners_md = load_multiday_data(client)
-    #     mistake_df = build_mistake_training_samples(
-    #         lookback_days=90,
-    #         use_all_timepoints=True,
-    #         existing_features=proto_features,
-    #         winners_multiday=_mistake_winners_md,
-    #         non_winners_multiday=_mistake_non_winners_md,
-    #     )
-    #     if not mistake_df.empty:
-    #         mistake_df = enrich_mistakes_with_gains(mistake_df, client)
-    #         log_mistake_summary(mistake_df)
-    #         combined_df = pd.concat([combined_df, mistake_df],
-    #                                 ignore_index=True, sort=False)
-    #         logger.info(
-    #             f"Dataset after adding mistakes: {len(combined_df)} rows "
-    #             f"(+{len(mistake_df)} mistake samples)"
-    #         )
-    #     else:
-    #         logger.info("No mistake samples to add this run.")
-    logger.info("Mistake learning step skipped (corpus too small — see MISTAKE_LEARNER_AVAILABLE).")
-    mistake_df = pd.DataFrame()  # Placeholder; keeps downstream code compatible
-
-    # ── RC14: recency-weight rows before feature prep ─────────────────────
-    # Must run AFTER every other sample_weight contributor (T1_WEIGHT,
-    # BASE_CSV_WEIGHT, t1_data_source propensity reweighting) so recency
-    # decay multiplies the final combined weight rather than being
-    # overwritten by a later assignment.
-    combined_df = apply_recency_weights(combined_df, logger)
-
-    # ── Prepare features ──────────────────────────────────────────────────────
-    X, y, w = prepare_features(combined_df)
-    feature_names = list(X.columns)
-
-    # ── Persist symbol-demeaning baselines for live scoring ────────────────
-    # prepare_features() just demeaned HV_10/20/30 in X against each symbol's
-    # trailing (causal) history *within this training run*. Live scoring
-    # (explosion_predictor.py) sees one row at a time with no such history to
-    # compute a trailing mean from, so it needs a persisted "as of now" mean
-    # per symbol instead. Compute that from the same combined_df (raw values,
-    # untouched by prepare_features) and write it out here, once per retrain.
-    if "symbol" in combined_df.columns:
-        try:
-            _hv_baselines = compute_symbol_baselines(combined_df, combined_df["symbol"])
-            if _hv_baselines:
-                save_symbol_baselines(_hv_baselines, SYMBOL_DEMEAN_BASELINE_PATH)
-            else:
-                logger.info("[symbol-demean] no HV baseline columns found in combined_df — nothing saved")
-        except Exception as e:
-            logger.warning(f"[symbol-demean] failed to compute/save baselines (non-fatal): {e}")
-
-    # ── HYPERPARAMETER SEARCH ────────────────────────────────────────────────
-    # Runs BEFORE the CV legitimacy report below, so that report reflects
-    # whichever params this run actually uses (searched, if a usable result
-    # came back; hand-tuned XGBOOST_PARAMS otherwise). Scored against the
-    # same walk-forward folds as cv_walk_forward_evaluate() -- see
-    # search_hyperparameters()'s docstring.
-    logger.info("\n" + "=" * 60)
-    logger.info("HYPERPARAMETER SEARCH (pre-flight, scored on walk-forward CV folds)")
-    logger.info("=" * 60)
-    hparam_search_results = search_hyperparameters(X, y, w, combined_df)
-    # ACCEPTANCE-GATE FIX: only use the searched params when
-    # search_hyperparameters() actually marked them as a real improvement
-    # over the hand-tuned baseline (accepted=True). A non-skipped result
-    # whose best config didn't clear HPARAM_SEARCH_MIN_DELTA still comes
-    # back with skipped=False (it's a valid result, just not adopted), so
-    # this must check `accepted`, not just `skipped`, or the un-accepted —
-    # potentially over-regularised — config gets used anyway.
-    _searched_params = (
-        hparam_search_results.get("best_params")
-        if not hparam_search_results.get("skipped") and hparam_search_results.get("accepted")
-        else None
-    )
-
-    # ── CV WALK-FORWARD EVALUATION ───────────────────────────────────────────
-    # Runs BEFORE the single train_val_split() cut, over the same X/y/w/
-    # combined_df, reusing time_aware_splits() (the leak-guarded splitter
-    # feature_selection.py's RFECV/GA stages already depend on) to give the
-    # classifier itself a multi-fold walk-forward AUC estimate + a CV-averaged
-    # n_estimators recommendation, instead of relying solely on one train/val
-    # cut's point estimate. Scored with the searched hyperparameters (if any)
-    # so the reported CV numbers match what train_model() will actually use.
-    # See cv_walk_forward_evaluate()'s docstring.
-    logger.info("\n" + "=" * 60)
-    logger.info("CV WALK-FORWARD EVALUATION (pre-flight, before single train/val split)")
-    logger.info("=" * 60)
-    cv_results = cv_walk_forward_evaluate(X, y, w, combined_df, params_override=_searched_params)
-
-    # ── Scale ─────────────────────────────────────────────────────────────────
-    # ── FIX 1: Time-based train/val split (on RAW features, before scaling) ───────
-    # Split first so the scaler is fit on train rows only (no val leakage).
-    X_train_raw, X_val_raw, y_train, y_val, w_train, w_val, train_idx = train_val_split(
-        X, y, w, combined_df
-    )
-
-    # ── Scale ───────────────────────────────────────────────────────────────────────────
-    # LEAKAGE FIX: fit scaler on X_train_raw only, then transform each split
-    # separately.  Previously build_scaler() was called on the full X (all rows),
-    # so the scaler's mean_ / std_ were computed using val-set rows, making AUC
-    # metrics slightly optimistic and the scaler non-reproducible on train-only data.
-    logger.info("Fitting scaler on train split only (leakage fix)...")
-    scaler, X_train, _sparse_cols, _winsor_bounds = build_scaler(X_train_raw)      # fit + transform train
-    X_val                          = scale_with_fitted_scaler(scaler, X_val_raw,
-                                         sparse_threshold_cols=_sparse_cols,
-                                         winsor_bounds=_winsor_bounds)             # transform val only
-
-    # Reassemble a scaled DataFrame (train + val, original row order) kept for
-    # any downstream use that needs the surviving rows in order. Note: rows
-    # dropped by the purge/embargo gap in train_val_split are neither in
-    # X_train nor X_val, so X.index (the full original index) is a superset
-    # of the combined train+val index — reindexing to X.index directly would
-    # KeyError on the embargoed rows. Restore order using only the index
-    # values that actually survived the split instead.
-    X_combined      = pd.concat([X_train, X_val])
-    _surviving_index = [idx for idx in X.index if idx in X_combined.index]
-    X_scaled = X_combined.loc[_surviving_index]
-
-    # ── Train-set size guard ──────────────────────────────────────────────────
-    # The MIN_VAL_POSITIVES check (inside train_val_split) only guards the val
-    # set.  A sparse Supabase deployment can still produce a train split that is
-    # too small for XGBoost to generalise — e.g. if lookback_days=90 returns
-    # far fewer rows than expected due to data gaps or a new deployment.
-    train_pos  = int((y_train == 1).sum())
-    train_neg  = int((y_train == 0).sum())
-    train_rows = len(X_train)
-
-    if train_pos < MIN_TRAIN_POSITIVES:
-        logger.error(
-            f"ABORTING: only {train_pos} positive (winner) examples in the train split "
-            f"(need ≥ {MIN_TRAIN_POSITIVES}). "
-            "The Supabase tables are likely sparse — this may be a new deployment or "
-            "data gap. The model cannot learn a useful decision boundary from so few "
-            "positive examples. "
-            "Options: (1) accumulate more labelled T-1 data before retraining, "
-            "(2) lower MIN_TRAIN_POSITIVES if you accept a noisier model, "
-            "(3) verify that load_t1_data() and combine_datasets() returned the "
-            "expected rows (check logs above for row counts)."
-        )
-        sys.exit(1)
-
-    if train_rows < MIN_TRAIN_ROWS:
-        logger.error(
-            f"ABORTING: only {train_rows} total rows in the train split "
-            f"(pos={train_pos}, neg={train_neg}; need ≥ {MIN_TRAIN_ROWS} total). "
-            "A train set this small will overfit regardless of regularisation. "
-            "Accumulate more data or lower MIN_TRAIN_ROWS if running in a known "
-            "low-data environment."
-        )
-        sys.exit(1)
-
-    if train_pos < 100:
-        logger.warning(
-            f"  ⚠️  Train split has only {train_pos} positive examples "
-            f"({train_pos / max(1, train_rows):.1%} of {train_rows} rows). "
-            "The model may underfit on the positive class. "
-            "Consider accumulating more winner data before the next retrain."
-        )
-    else:
-        logger.info(
-            f"  ✅ Train split: {train_rows} rows "
-            f"(pos={train_pos}, neg={train_neg}, "
-            f"pos_rate={train_pos/train_rows:.1%}) — size looks adequate."
-        )
-
-    # ── RC6: Isotonic calibration from a VAL-set stratified holdout ──────────
-    # Previous attempts carved the cal set from the oldest training rows, which
-    # are dominated by base CSV rows with NaN t1_ features — a different data
-    # regime from inference.  That caused the calibrator to compress all
-    # probabilities into ~0.50–0.85 and was correctly disabled.
-    #
-    # Fix: carve the calibration set from the VAL set instead.  Val rows are
-    # recent T-1 data (same regime as inference: all t1_ features present).
-    # We reserve half the val set for calibration and use the remaining half
-    # for early-stopping AUC.  Both halves still come entirely from after the
-    # cutoff date, so there is no temporal leakage into training.
-    #
-    # IMPORTANT — method='isotonic' (not 'sigmoid'):
-    # Sigmoid (Platt scaling) anchors to the calibration set's positive base
-    # rate.  Because the val set is rebalanced to ~train_rate+2pp (~10–25%
-    # positive), sigmoid compresses all inference probabilities downward when
-    # the screened inference universe has a higher base rate.  This was the
-    # root cause of max probabilities being suppressed to ~0.68.
-    # Isotonic regression fits a rank-preserving step function without anchoring
-    # to any global base rate, so it is robust to this mismatch.
-    #
-    # Minimum requirements: ≥10 positives in each half after the split.
-    CAL_MIN_POS = 10
-
-    # CAL_SPLIT_FRACTION (2026-08-13, revised 2026-08-13b): fraction of the
-    # val set given to the calibration holdout, with the remainder going to
-    # early-stopping. Originally 50/50; first tried 60/40 in favor of
-    # calibration to fix flat isotonic plateaus (worked — the 0.5-0.7 gap
-    # closed), but 60/40 shrank the early-stopping set enough (1525→1220
-    # rows) that best_iteration dropped 79→38 and winner recall on the blind
-    # holdout fell 0.40→0.27 — early-stopping's AUC signal got noisier and
-    # triggered sooner at a worse point. Settling on 55/45 as a smaller step:
-    # still gives the calibrator meaningfully more than the original 50%,
-    # while giving back some of what early-stopping lost. Re-tune based on
-    # what the next run's best_iteration/recall/calibration-gap numbers show
-    # — this is a real trade-off between the two objectives, not a value
-    # with one obviously-correct setting.
-    CAL_SPLIT_FRACTION = 0.55
-
-    X_cal_fit, y_cal_fit = None, None
-    X_val_xgb, y_val_xgb = X_val, y_val
-
-    _val_pos_idx  = y_val[y_val == 1].index.tolist()
-    _val_neg_idx  = y_val[y_val == 0].index.tolist()
-
-    def _fractional_interleave_split(idx_list: list, cal_fraction: float) -> tuple[list, list]:
-        """Split idx_list into (cal_idx, stop_idx) at roughly cal_fraction,
-        selecting cal positions evenly spaced across the list so both halves
-        still span the full time window (same regime-mix goal as the
-        original interleave, generalised from a fixed 50/50 to any ratio)."""
-        n = len(idx_list)
-        n_cal = round(n * cal_fraction)
-        if n_cal <= 0:
-            return [], list(idx_list)
-        if n_cal >= n:
-            return list(idx_list), []
-        cal_positions = set(np.linspace(0, n - 1, n_cal).round().astype(int).tolist())
-        cal_idx  = [idx_list[i] for i in range(n) if i in cal_positions]
-        stop_idx = [idx_list[i] for i in range(n) if i not in cal_positions]
-        return cal_idx, stop_idx
-
-    _cal_pos_idx, _stop_pos_idx = _fractional_interleave_split(_val_pos_idx, CAL_SPLIT_FRACTION)
-    _cal_neg_idx, _stop_neg_idx = _fractional_interleave_split(_val_neg_idx, CAL_SPLIT_FRACTION)
-    _n_cal_pos = len(_cal_pos_idx)
-    _n_cal_neg = len(_cal_neg_idx)
-
-    if _n_cal_pos >= CAL_MIN_POS and _n_cal_neg >= CAL_MIN_POS:
-        _cal_idx  = _cal_pos_idx + _cal_neg_idx
-        _stop_idx = _stop_pos_idx + _stop_neg_idx
-
-        X_cal_fit    = X_val.loc[_cal_idx]
-        y_cal_fit    = y_val.loc[_cal_idx]
-        X_val_xgb    = X_val.loc[_stop_idx]
-        y_val_xgb    = y_val.loc[_stop_idx]
-
-        cal_pos = int((y_cal_fit == 1).sum())
-        cal_neg = int((y_cal_fit == 0).sum())
-        logger.info(
-            f"RC6: Calibration set carved from val (same T-1 regime as inference), "
-            f"{CAL_SPLIT_FRACTION:.0%}/{1-CAL_SPLIT_FRACTION:.0%} cal/early-stop split. "
-            f"Cal: {len(X_cal_fit)} rows ({cal_pos} pos / {cal_neg} neg, "
-            f"rate={cal_pos/max(1,len(X_cal_fit)):.1%}). "
-            f"Early-stop val: {len(X_val_xgb)} rows "
-            f"({int((y_val_xgb==1).sum())} pos / {int((y_val_xgb==0).sum())} neg)."
-        )
-    else:
-        logger.info(
-            f"RC6: Val set too small to split for calibration "
-            f"({_n_cal_pos} pos / {_n_cal_neg} neg in cal share, need ≥{CAL_MIN_POS} each). "
-            "Training without isotonic calibration."
-        )
-
-    X_train_xgb, y_train_xgb, w_train_xgb = X_train, y_train, w_train
-
-    # ── RC14: build train_dates aligned to X_train's index for window-ensembling ──
-    # Reuses the same detection_date/event_date unification rule as
-    # _cv_sort_date_and_symbols() / train_val_split() FIX 1 (kept independently
-    # duplicated for the same reason those two already are — see that
-    # function's docstring).
-    _train_dates_for_windows = None
-    if "detection_date" in combined_df.columns or "event_date" in combined_df.columns:
-        _sort_date_full = pd.Series(pd.NaT, index=combined_df.index)
-        if "detection_date" in combined_df.columns:
-            _sort_date_full = pd.to_datetime(combined_df["detection_date"], errors="coerce")
-        if "event_date" in combined_df.columns:
-            _event_parsed_full = pd.to_datetime(combined_df["event_date"], errors="coerce")
-            _sort_date_full = _sort_date_full.fillna(_event_parsed_full)
-        _train_dates_for_windows = _sort_date_full.reindex(X_train.index)
-
-    # ── Prior-correction anchor for isotonic calibration ────────────────────
-    # Measured trailing win rate of the screened universe (see
-    # estimate_screener_positive_rate()'s docstring above for why this
-    # replaces the old hardcoded SCREENER_POSITIVE_RATE constant).
-    _screener_positive_rate = estimate_screener_positive_rate(client)
-
-    # ── Train ─────────────────────────────────────────────────────────────────
-    model = train_model(X_train_xgb, y_train_xgb, w_train_xgb, X_val_xgb, y_val_xgb,
-                        X_cal=X_cal_fit, y_cal=y_cal_fit,
-                        X_val_full=X_val, y_val_full=y_val,
-                        n_estimators_ceiling=(
-                            cv_results.get("recommended_n_estimators")
-                            if not cv_results.get("skipped") else None
-                        ),
-                        hyperparams_override=_searched_params,
-                        screener_positive_rate=_screener_positive_rate,
-                        train_dates=_train_dates_for_windows)
-
-    # ── Feature importance ────────────────────────────────────────────────────
-    fi_df = compute_feature_importance(model, feature_names)
-
-    # ── RC1+RC2+RC3+RC6+RC7 FIX: Train gain regressor with corrected inputs ───────
-    # EVALUATION INTEGRITY FIX: Pass only X_train (classifier's train split) and
-    # combined_df.loc[train_idx] so the gain regressor builds its own internal val
-    # split exclusively from the classifier's training period.
-    #
-    # Passing X_scaled (all rows) here causes the regressor's internal time-based
-    # 80/20 split (inside train_gain_regressor, ~line 1895) to draw from the full
-    # dataset.  Because the classifier's val rows (the most recent ~VAL_WEEKS of
-    # data) are in that pool, the regressor's internal validation window overlaps
-    # the classifier's validation period.  This inflates the regressor's reported
-    # MAE/R² (it is evaluated on data it has effectively trained on) and means the
-    # combined system is optimising on partially future-seen data.
-    #
-    # The earlier rationalisation ("gain targets aren't classifier labels, so no
-    # leak") is incorrect: the gain regressor is trained on the same rows as the
-    # classifier, and its internal split draws from the same timeline.  Leakage
-    # occurs not through label identity but through temporal overlap.
-    #
-    # Using train rows only means the regressor's internal val split is drawn
-    # exclusively from the classifier's training period, giving a consistent and
-    # meaningful held-out evaluation with no future-data contamination.
-    #
-    # If excluding the most-recent ~VAL_WEEKS compresses the gain distribution too
-    # much, lower VAL_WEEKS (e.g. from 8 to 4) rather than reverting this fix.
-    logger.info("\n" + "=" * 60)
-    logger.info("GAIN REGRESSOR TRAINING (RC1+RC2+RC3+RC6+RC7 fixes applied; "
-                "true_gain_pct market-snapshot target takes priority — see attach_true_gain_targets)")
-    logger.info("=" * 60)
-    # LEAK-FREE FIX (re-reinstated, 2026-07): the earlier "NOTE" here reverted
-    # to passing the FULL (train+val) pool because train_idx-only data used
-    # to structurally contain ~0 gain-labeled rows (true_gain_pct only exists
-    # for recent T-1 rows, i.e. exactly the val window). That is no longer
-    # the whole picture: attach_true_gain_targets() now also backfills
-    # '_unified_gain_target' from ml_training_base.gain_pct, which spans the
-    # FULL historical range of the base CSV — so the train split has real,
-    # broadly time-distributed gain labels even after VAL_WEEKS is excluded.
-    #
-    # We pass train-only data by default. train_gain_regressor() itself
-    # checks whether that pool actually clears MIN_TRAIN_ONLY_GAIN_ROWS; if
-    # it doesn't (e.g. a sparse/early-stage deployment), it falls back to the
-    # full pool registered below (right before the call) via
-    # _full_combined_df/_full_X_scaled — but logs a loud warning and tags the
-    # resulting model as not leak-free (regressor._trained_leak_free = False)
-    # rather than silently reverting every run regardless of data volume.
-    # ── REGRESSOR-ONLY log_price FEATURE ──────────────────────────────────────
-    # The classifier must never see raw price level (that's the whole reason
-    # OHLCV columns are in NON_FEATURE_COLS — "expensive stocks explode more"
-    # is not a real signal). But the gain regressor's job is different: given
-    # that a move is happening, cheap/low-float stocks mechanically swing
-    # harder in % terms than expensive ones, so price level is legitimate
-    # signal for magnitude prediction specifically.
-    #
-    # log_price is derived in-memory only, from t1_close_Close (falling back
-    # to t1_open_Close) — both already populated for every row by the existing
-    # T-1 intraday pipeline. No DB schema change, no backfill, no new column
-    # persisted anywhere: this Series exists only for the duration of this
-    # training run and is never written back to combined_df or the DB.
-    # log1p (not raw price) is used to avoid the model memorising exact price
-    # points and to keep the feature on a smoother, split-friendly scale.
-    _price_source = combined_df.get("t1_close_Close")
-    if _price_source is None:
-        _price_source = pd.Series(np.nan, index=combined_df.index)
-    _price_fallback = combined_df.get("t1_open_Close")
-    if _price_fallback is not None:
-        _price_source = _price_source.fillna(_price_fallback)
-    _price_source = pd.to_numeric(_price_source, errors="coerce").clip(lower=0)
-    log_price = np.log1p(_price_source).reindex(X_scaled.index)
-    log_price = log_price.fillna(log_price.mean())  # match X_scaled's "no raw NaN into XGBoost" convention
-
-    # ── REGRESSOR-ONLY clf_proba FEATURE ──────────────────────────────────────
-    # Tie gain-magnitude predictions to how confident the classifier is that
-    # a move is happening at all. The classifier's calibrated probability is
-    # already a strong summary of "how explosive does this setup look" —
-    # feeding it to the regressor lets high-confidence strong-buy/buy rows
-    # pull toward higher predicted gains instead of the regressor treating a
-    # 51%-confidence row and a 99%-confidence row as equally likely to have
-    # any given magnitude of gain.
-    #
-    # `model` here is the fully trained + calibrated classifier from
-    # train_model() above, so this is the same probability the classifier
-    # itself reports for these rows — not a leaky re-derivation.
-    clf_proba = pd.Series(
-        model.predict_proba(X_scaled)[:, 1],
-        index=X_scaled.index,
-        name="clf_proba",
-    )
-
-    X_scaled_gain = X_scaled.assign(log_price=log_price, clf_proba=clf_proba)
-    logger.info(
-        f"Gain regressor feature matrix: {X_scaled_gain.shape[1]} features "
-        f"({X_scaled.shape[1]} shared with classifier + log_price + clf_proba)"
-    )
-
-    # LEAK-FREE FIX: register the full (train+val) pool as the fallback that
-    # train_gain_regressor() will use ONLY if the train-only pool doesn't
-    # clear MIN_TRAIN_ONLY_GAIN_ROWS. Registered as function attributes so
-    # the internal fallback-retry call (which recurses with the same
-    # function object) can reach it without changing every call signature
-    # up the stack.
-    train_gain_regressor._full_combined_df = combined_df
-    train_gain_regressor._full_X_scaled    = X_scaled_gain
-
-    # Train-only slice: same rows the classifier trained on (train_idx),
-    # matched between combined_df and the scaled feature matrix.
-    combined_df_train_only = combined_df.loc[train_idx]
-    X_scaled_gain_train_only = X_scaled_gain.reindex(train_idx)
-
-    gain_regressor = train_gain_regressor(
-        X_scaled=X_scaled_gain_train_only,          # LEAK-FREE FIX: train rows only (was: full X_scaled_gain)
-        combined_df=combined_df_train_only,         # LEAK-FREE FIX: train rows only (was: full combined_df)
-        feature_names=feature_names,
-        client=client,                              # RC1: fallback fetch if map not supplied
-        accuracy_gain_map=_accuracy_gain_map,       # ISSUE 2 FIX: reuse RC3 fetch, no redundant DB query
-    )
-
-    if gain_regressor is not None:
-        _leak_free = getattr(gain_regressor, "_trained_leak_free", None)
-        if _leak_free is True:
-            logger.info(
-                "  ✅ Gain regressor trained leak-free (train-split-only data; "
-                "no overlap with classifier val/cal rows)."
-            )
-        elif _leak_free is False:
-            logger.warning(
-                "  ⚠️  Gain regressor fell back to the full train+val pool "
-                "(train-only data was below MIN_TRAIN_ONLY_GAIN_ROWS). "
-                "Its reported val MAE/R² should be treated as optimistic."
-            )
-
-    # ── Evaluate classifier ───────────────────────────────────────────────────
-    # AUC is reported on X_val_xgb (the early-stopping half of the val set)
-    # rather than the full X_val.  The other half (X_cal_fit) was passed to
-    # CalibratedClassifierCV.fit(), so evaluating on it would be circular —
-    # the calibrated probability distribution has already seen those rows.
-    # X_val_xgb was held out from both training and calibration, making it a
-    # clean post-calibration holdout.  When calibration was skipped (val set
-    # too small), X_val_xgb == X_val so behaviour is unchanged.
-    from sklearn.metrics import roc_auc_score, classification_report
-
-    val_proba = model.predict_proba(X_val_xgb)[:, 1]
-    val_pred  = (val_proba >= 0.5).astype(int)
-
-    try:
-        auc = roc_auc_score(y_val_xgb, val_proba)
-        logger.info(f"Validation AUC-ROC: {auc:.4f} (evaluated on early-stop holdout, n={len(y_val_xgb)})")
-    except Exception:
-        auc = float("nan")
-        logger.warning("Validation AUC-ROC: nan (only one class in val set)")
-
-    logger.info("Classification report (val — early-stop holdout):")
-    for line in classification_report(y_val_xgb, val_pred).split("\n"):
-        if line.strip():
-            logger.info(f"  {line}")
-
-    # PRODUCTION-CONSISTENT METRIC (2026-08-13): the classification_report
-    # above uses a fixed raw_proba>=0.5 cutoff, but explosion_predictor.py
-    # never actually applies that cutoff in production — it falls back to
-    # percentile-based ranking (top 20% -> BUY-or-better) whenever raw
-    # probabilities look compressed (LOW-PROB COMPRESSION / NARROW BAND /
-    # etc. in _detect_bimodal), which is the common case for this model.
-    # A 0.5-cutoff recall number is therefore not a reliable signal of how
-    # well the deployed BUY/STRONG BUY picks actually perform — it can look
-    # terrible (or great) for reasons that never reach production. Report
-    # recall/precision at the same top-20%-by-score cut that
-    # RELATIVE_BUY_PCT uses, so this number tracks what's actually shipped.
-    _top20_recall_at_k = None
-    if len(y_val_xgb) > 0 and int(pd.Series(y_val_xgb).sum()) > 0:
-        _k = max(1, int(round(len(val_proba) * 0.20)))
-        _top_idx = np.argsort(-val_proba)[:_k]
-        _y_val_arr = np.asarray(y_val_xgb)
-        _n_pos_total = int(_y_val_arr.sum())
-        _n_pos_captured = int(_y_val_arr[_top_idx].sum())
-        _top20_recall_at_k = _n_pos_captured / _n_pos_total
-        _top20_precision_at_k = _n_pos_captured / _k
-        logger.info(
-            f"  Top-20%-by-score (production BUY-or-better cut, n={_k}): "
-            f"recall={_top20_recall_at_k:.3f} ({_n_pos_captured}/{_n_pos_total} positives captured), "
-            f"precision={_top20_precision_at_k:.3f} — trust this over the 0.5-cutoff "
-            "recall above for judging real-world BUY signal quality."
-        )
-
-    # Log probability distribution on val set (early-stop holdout only)
-    val_proba_series = pd.Series(val_proba)
-    bins = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
-    dist = pd.cut(val_proba_series, bins=bins).value_counts().sort_index()
-    logger.info("Val set probability distribution (early-stop holdout):")
-    for bucket, count in dist.items():
-        logger.info(f"  {str(bucket):<20} {count:>4}")
-
-    # ── Evaluate classifier on the truly blind calibration holdout ───────────
-    # X_val_xgb (above) was used by XGBoost's early_stopping_rounds to decide
-    # how many trees to build, so metrics on it are model-selection-influenced,
-    # not a blind evaluation — that's what produced the bimodal collapse
-    # investigated on 2026-07-22 (X_val_xgb collapsed to hard 0/0.9-1.0 while
-    # X_cal_fit, never touched during tree-building, stayed well-spread).
-    #
-    # X_cal_fit isn't perfectly blind either — it was used to fit the isotonic
-    # calibrator — so its calibrated *probability values* are still slightly
-    # optimistic. But XGBoost's tree structure and early-stopping point were
-    # never chosen using X_cal_fit, so its AUC/ranking behaviour is a much
-    # more honest estimate of generalization than X_val_xgb's, and is the
-    # number to trust if the two disagree.
-    cal_auc = None  # persisted to metadata below; None when no blind holdout was available
-    if X_cal_fit is not None and y_cal_fit is not None:
-        cal_proba_report = model.predict_proba(X_cal_fit)[:, 1]
-        cal_pred_report  = (cal_proba_report >= 0.5).astype(int)
-
-        try:
-            cal_auc = roc_auc_score(y_cal_fit, cal_proba_report)
-            logger.info(
-                f"Validation AUC-ROC: {cal_auc:.4f} "
-                f"(evaluated on blind calibration holdout, n={len(y_cal_fit)}) "
-                "— trust this over the early-stop-holdout AUC above if they diverge."
-            )
-        except Exception:
-            cal_auc = float("nan")
-            logger.warning("Calibration-holdout AUC-ROC: nan (only one class in set)")
-
-        logger.info("Classification report (val — blind calibration holdout):")
-        for line in classification_report(y_cal_fit, cal_pred_report).split("\n"):
-            if line.strip():
-                logger.info(f"  {line}")
-
-        # Same production-consistent top-20% metric as above, on the blind
-        # holdout — this is the number to actually trust for BUY signal
-        # quality since it was never used for early stopping.
-        if len(y_cal_fit) > 0 and int(pd.Series(y_cal_fit).sum()) > 0:
-            _k_cal = max(1, int(round(len(cal_proba_report) * 0.20)))
-            _top_idx_cal = np.argsort(-cal_proba_report)[:_k_cal]
-            _y_cal_arr = np.asarray(y_cal_fit)
-            _n_pos_total_cal = int(_y_cal_arr.sum())
-            _n_pos_captured_cal = int(_y_cal_arr[_top_idx_cal].sum())
-            _recall_cal = _n_pos_captured_cal / _n_pos_total_cal
-            _precision_cal = _n_pos_captured_cal / _k_cal
-            logger.info(
-                f"  Top-20%-by-score (production BUY-or-better cut, n={_k_cal}, "
-                f"blind holdout): recall={_recall_cal:.3f} "
-                f"({_n_pos_captured_cal}/{_n_pos_total_cal} positives captured), "
-                f"precision={_precision_cal:.3f} — this is the number to trust for "
-                "real-world BUY signal quality."
-            )
-
-        cal_proba_report_series = pd.Series(cal_proba_report)
-        cal_dist = pd.cut(cal_proba_report_series, bins=bins).value_counts().sort_index()
-        logger.info("Val set probability distribution (blind calibration holdout):")
-        for bucket, count in cal_dist.items():
-            logger.info(f"  {str(bucket):<20} {count:>4}")
-
-        cal_gap_count = int(((cal_proba_report_series > 0.15) & (cal_proba_report_series < 0.85)).sum())
-        if cal_gap_count < 5:
-            logger.warning(
-                f"  ⚠️  BIMODAL COLLAPSE detected on blind calibration holdout too: "
-                f"only {cal_gap_count} predictions in 0.15–0.85 range. "
-                "This set was never used for early stopping, so a collapse here points "
-                "at the base model / data (e.g. leakage, near-duplicate rows) rather "
-                "than early-stopping overfit."
-            )
-        else:
-            logger.info(
-                f"  ✅ {cal_gap_count} predictions in mid-range (0.15–0.85) on the blind "
-                "calibration holdout — distribution looks healthy."
-            )
-
-        if auc is not None and not (auc != auc) and abs(auc - cal_auc) > 0.03:
-            logger.warning(
-                f"  ⚠️  Early-stop-holdout AUC ({auc:.4f}) and blind calibration-holdout "
-                f"AUC ({cal_auc:.4f}) diverge by more than 0.03. This gap is itself a "
-                "diagnostic: it suggests early stopping is fitting X_val_xgb specifically "
-                "rather than a generalizable stopping point. Consider lowering "
-                "early_stopping_rounds further and/or increasing calibration-set size."
-            )
-    else:
-        logger.info(
-            "No blind calibration holdout available (val set too small to split) — "
-            "only the early-stop-holdout metrics above are available this run."
-        )
-
-    gap_count = int(((val_proba_series > 0.15) & (val_proba_series < 0.85)).sum())
-    if gap_count < 5:
-        logger.warning(
-            f"  ⚠️  BIMODAL COLLAPSE detected: only {gap_count} predictions in 0.15–0.85 range. "
-        )
-    else:
-        logger.info(f"  ✅ {gap_count} predictions in mid-range (0.15–0.85) — distribution looks healthy")
-
-    # ── Training stats for metadata ───────────────────────────────────────────
-    n_mistakes = len(mistake_df) if not mistake_df.empty else 0
-    n_t1_with_multiday = 0
-    if not t1_df.empty:
-        md_cols = [c for c in t1_df.columns if c.startswith(("t3_", "t5_", "t10_"))]
-        if md_cols:
-            n_t1_with_multiday = int(t1_df[md_cols].notna().any(axis=1).sum())
-
-    # ── Top-10 feature distribution snapshot (for PSI drift detection) ───────
-    # Store per-feature mean, std, and percentile buckets (deciles) computed on
-    # the *winsorized* (see build_scaler/_winsor_bounds above) training split
-    # for the top-10 most important features. explosion_predictor.py loads
-    # these at inference time and (a) logs a WARNING if PSI > 0.2 on any top
-    # feature, and (b) clips live values to [percentiles[0], percentiles[-1]]
-    # as a guard rail. Using X_train_raw directly here would re-introduce the
-    # exact contamination the winsorization above was added to prevent: a
-    # handful of outlier rows (e.g. sub-penny-close blowups) would make the
-    # stored percentiles — and therefore the live clip bounds — as wide as
-    # the outliers themselves, defeating the guard rail. Applying the same
-    # train-fit winsor bounds here keeps this snapshot consistent with what
-    # the scaler and model actually trained on.
-    X_train_for_stats = apply_winsor_bounds(X_train_raw, _winsor_bounds) if _winsor_bounds else X_train_raw
-    top10_features = fi_df.head(10)["feature"].tolist()
-    top10_training_stats: dict = {}
-    for feat in top10_features:
-        if feat not in X_train_for_stats.columns:
-            continue
-        col = X_train_for_stats[feat].dropna()
-        if len(col) < 10:
-            continue
-        # 10 equal-width buckets covering the observed training range, plus one
-        # open-ended bucket on each side (handled at inference time via clipping).
-        percentiles = [float(v) for v in np.percentile(col, np.linspace(0, 100, 11))]
-        top10_training_stats[feat] = {
-            "mean":        float(col.mean()),
-            "std":         float(col.std()),
-            "n":           int(len(col)),
-            "percentiles": percentiles,   # 11 values → 10 equal-frequency buckets
-        }
-    logger.info(
-        f"Stored training distribution stats for {len(top10_training_stats)} "
-        f"top-10 features (used for PSI drift detection at inference)."
-    )
-
-    training_stats = {
-        "n_total_samples":         len(combined_df),
-        "n_base_samples":          len(base_df),
-        "n_t1_samples":            len(t1_df) if not t1_df.empty else 0,
-        "n_t1_with_multiday":      n_t1_with_multiday,
-        "n_mistake_samples":       n_mistakes,
-        "n_positive":              int((y == 1).sum()),
-        "n_negative":              int((y == 0).sum()),
-        "positive_rate":           float((y == 1).mean()),
-        "val_auc_roc":             float(auc),
-        # NOTE: val_auc_roc / best_val_auc above are measured on X_val_xgb, the
-        # same set XGBoost's early_stopping_rounds used to choose best_iteration —
-        # that makes them a model-selection score, not a blind evaluation, and
-        # they run optimistic (can approach ~1.0 even when the model doesn't
-        # generalize). blind_cal_auc below is measured on X_cal_fit, a holdout
-        # that was never used for tree-building, and is the number to trust.
-        "blind_cal_auc": (
-            float(cal_auc) if cal_auc is not None and cal_auc == cal_auc else None
-        ),
-        # CV WALK-FORWARD FIX: multi-fold walk-forward estimate (see
-        # cv_walk_forward_evaluate()) to read alongside the single-cut
-        # val_auc_roc/blind_cal_auc point estimates above -- mean_auc/std_auc
-        # here is the number that should actually be quoted as "the model's
-        # AUC", with val_auc_roc/blind_cal_auc kept for early-stopping/
-        # calibration diagnostics.
-        "cv_walk_forward":         cv_results,
-        # HYPERPARAMETER SEARCH FIX: full search_hyperparameters() result --
-        # method used (optuna_tpe / random_search), best_params actually fed
-        # into train_model() above (see hyperparams_override), and how they
-        # compared to the hand-tuned XGBOOST_PARAMS baseline on the same
-        # folds cv_walk_forward is reporting on.
-        "hyperparameter_search":  hparam_search_results,
-        "base_sample_weight":      BASE_CSV_WEIGHT,
-        "t1_sample_weight":        T1_WEIGHT,
-        "intraday_win_threshold":  INTRADAY_WIN_THRESHOLD,
-        "screener_positive_rate_used": _screener_positive_rate,
-        "equal_weight_applied": (
-            len(t1_df) >= MIN_T1_ROWS_FOR_EQUAL_WEIGHT
-            if not t1_df.empty else False
-        ),
-        "gain_regressor_trained":  gain_regressor is not None,
-        "gain_regressor_leak_free": (
-            getattr(gain_regressor, "_trained_leak_free", None)
-            if gain_regressor is not None else None
-        ),
-        "gain_regressor_rc_fixes": ["RC1_broad_training", "RC2_prev_close",
-                                    "RC3_scaled_input", "RC6_mistake_enrichment", "RC7_log_transform_heavy_weights",
-                                    "RC8_data_driven_winner_weighting",
-                                    "RC9_confidence_scaled_weighting",
-                                    "RC10_combined_weight_cap",
-                                    "LEAK_FREE_train_split_only_with_fallback"],
+    if predictions_list:
+        count = supabase.write_predictions_upsert(predictions_list)
+        logger.info(f"✓ Wrote {count} predictions for trading session: {prediction_date}")
+
+    # ── STEP 9: SCREENING LOG ─────────────────────────────────────────────────
+    screening_log = {
+        'screening_date':               prediction_date,
+        'total_symbols_attempted':      args.max_results,
+        'symbols_fetched_successfully': len(enriched_stocks),
+        'symbols_after_all_filters':    len(features_df),
+        'total_predictions':            len(predictions_df),
+        'strong_buy_count':  len(predictions_df[predictions_df['signal'] == 'STRONG BUY']),
+        'buy_count':         len(predictions_df[predictions_df['signal'] == 'BUY']),
+        'hold_count':        len(predictions_df[predictions_df['signal'] == 'HOLD']),
+        'avoid_count':       len(predictions_df[predictions_df['signal'] == 'AVOID']),
+        'avg_probability':    float(predictions_df['explosion_probability'].mean()),
+        'max_probability':    float(predictions_df['explosion_probability'].max()),
+        'min_probability':    float(predictions_df['explosion_probability'].min()),
+        'model_version':      f"{model_prefix}_features_v9",
     }
+    supabase.write_screening_log(screening_log)
 
-    # ── Save ──────────────────────────────────────────────────────────────────
-    save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor,
-                 top10_training_stats=top10_training_stats, sparse_cols=_sparse_cols,
-                 winsor_bounds=_winsor_bounds)
+    csv_path = Path(f"ml_screening_results_{prediction_date}.csv")
+    top_predictions.to_csv(csv_path, index=False)
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("RETRAIN COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"  Total samples       : {training_stats['n_total_samples']}")
-    logger.info(f"  Base CSV samples    : {training_stats['n_base_samples']}")
-    logger.info(f"  T-1 samples         : {training_stats['n_t1_samples']}")
-    t1_total = training_stats['n_t1_samples']
-    t1_md    = training_stats['n_t1_with_multiday']
-    if t1_total > 0:
-        logger.info(
-            f"  T-1 w/ multiday     : {t1_md}/{t1_total} "
-            f"({t1_md/t1_total*100:.0f}% have t3/t5/t10 features)"
-        )
-    logger.info(f"  Mistake samples     : {training_stats['n_mistake_samples']}")
-    logger.info(f"  Positive rate       : {training_stats['positive_rate']:.1%}")
-
-    # Surface a summary-level advisory when the final positive rate is above the
-    # expected ceiling, even if it didn't trip the >25% threshold earlier.
-    # This is the number that lands in the retrain log and is easiest to monitor.
-    final_pos_rate = training_stats["positive_rate"]
-    if 0.20 < final_pos_rate <= 0.25:
-        logger.warning(
-            f"  ⚠️  Positive rate {final_pos_rate:.1%} is above the expected ~5-20% ceiling. "
-            "The model is training on a dataset where roughly 1 in 4 samples is a winner. "
-            "Possible causes: short LOOKBACK window over-representing a recent winning streak, "
-            "asymmetric deduplication dropping more negatives than positives, or label drift. "
-            "scale_pos_weight is computed from the training split class balance and will "
-            "partially compensate, but a structurally skewed dataset may still cause the "
-            "model to over-predict wins in a normal market. Review the pre/post-dedup "
-            "label counts logged above before deploying this model."
-        )
-    elif final_pos_rate > 0.25:
-        logger.warning(
-            f"  ⚠️  Positive rate {final_pos_rate:.1%} exceeds the 25% caution threshold. "
-            "This model may be over-fitted to recent market conditions. Investigate "
-            "before deploying — see dedup diagnostics logged earlier in this run."
-        )
-    logger.info(f"  Validation AUC      : {auc:.4f}  (early-stop holdout — optimistic, see below)")
-    _blind_cal_auc = training_stats.get("blind_cal_auc")
-    if _blind_cal_auc is not None:
-        logger.info(f"  Blind cal-holdout AUC: {_blind_cal_auc:.4f}  (trust this number)")
-    else:
-        logger.info("  Blind cal-holdout AUC: n/a (val set too small to carve a holdout this run)")
-    _best_iter = (model.calibrated_classifiers_[0].estimator.best_iteration
-                  if hasattr(model, "calibrated_classifiers_") else model.best_iteration)
-    logger.info(f"  Best iteration      : {_best_iter}")
-    logger.info(f"  Features            : {len(feature_names)}")
-    logger.info(f"  Gain regressor      : {'✓ trained (RC1+RC2+RC3+RC6+RC7 fixed)' if gain_regressor else '— skipped'}")
-    logger.info("")
-    logger.info("Files written:")
-    logger.info(f"  {MODEL_PATH}")
-    logger.info(f"  {SCALER_PATH}")
-    if gain_regressor is not None:
-        logger.info(f"  {GAIN_REGRESSOR_PATH}")
-    logger.info(f"  {METADATA_PATH}")
-    logger.info(f"  {FEATURE_IMPORTANCE_PATH}")
+    logger.info("\n" + "=" * 80)
+    logger.info("✓ PREDICTION COMPLETE")
+    logger.info("=" * 80)
+    logger.info(f"  Stocks screened:    {len(screened_df)}")
+    logger.info(f"  Stocks scored:      {len(predictions_df)}")
+    logger.info(f"  Predictions stored: {len(predictions_list)}")
+    logger.info(f"  Model prefix used:  {model_prefix}")
+    logger.info(f"  Hybrid model:       {hybrid}")
+    logger.info(f"  Prob std:           {predictions_df['explosion_probability'].std():.4f}")
+    logger.info(f"  Gain std:           {predictions_df['target_gain_pct'].std():.2f}%")
 
     return 0
 
