@@ -33,10 +33,27 @@ on:
           Space-separated exact column names to test (e.g.
           "t1_close_HV_10 t1_open_HV_10 t1_close_HV_20"). Leave blank to
           auto-scan every lag/side variant of HV_10/HV_20/HV_30 and
-          BBB_20_2.0_2.0.
+          BBB_20_2.0_2.0. Takes priority over model_features/all_features
+          below if set.
         required: false
         default: ''
         type: string
+      model_features:
+        description: >-
+          Test exactly the live model's current selected-feature set
+          (read from ml_models/model_metadata.json). Ignored if 'features'
+          above is set.
+        required: false
+        default: false
+        type: boolean
+      all_features:
+        description: >-
+          Exhaustively scan every column in the prepared feature matrix
+          (~300-400 columns, slow). Ignored if 'features' or
+          'model_features' above is set.
+        required: false
+        default: false
+        type: boolean
       min_symbol_rows:
         description: 'Drop symbols with fewer than this many train-only rows'
         required: false
@@ -76,9 +93,15 @@ jobs:
           LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '365' }}
         run: |
           FEATURES="${{ github.event.inputs.features }}"
+          MODEL_FEATURES="${{ github.event.inputs.model_features }}"
+          ALL_FEATURES="${{ github.event.inputs.all_features }}"
           MIN_ROWS="${{ github.event.inputs.min_symbol_rows || '2' }}"
           if [ -n "$FEATURES" ]; then
             python diagnose_symbol_fingerprint_leak.py --features $FEATURES --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
+          elif [ "$MODEL_FEATURES" = "true" ]; then
+            python diagnose_symbol_fingerprint_leak.py --model-features --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
+          elif [ "$ALL_FEATURES" = "true" ]; then
+            python diagnose_symbol_fingerprint_leak.py --all-features --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
           else
             python diagnose_symbol_fingerprint_leak.py --min-symbol-rows "$MIN_ROWS" | tee symbol_fingerprint_report.txt
           fi
