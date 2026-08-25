@@ -115,6 +115,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import roc_auc_score
 
 # _PriorCorrectedModel lives in a stable shared module so that joblib can
 # always resolve it by fully-qualified name regardless of which script is
@@ -3868,13 +3869,35 @@ def _fit_and_score_cv_folds(
             eval_set=[(Xc.iloc[test_pos], y_te)],
             verbose=False,
         )
-        fold_auc = float(fold_model.best_score)
         fold_iter = int(fold_model.best_iteration)
+
+        # FIX (metric mismatch): fold_model.best_score reflects whatever
+        # eval_metric was configured for early stopping — XGBOOST_PARAMS sets
+        # eval_metric="aucpr" (PR-AUC / average precision), NOT ROC-AUC.
+        # PR-AUC's no-skill baseline is the positive rate (e.g. ~0.136 at a
+        # 13.6% positive rate), not 0.5, so treating best_score as "AUC" and
+        # comparing it to a 0.5 threshold silently used the wrong baseline
+        # and made a model with real edge look worse than random. It also
+        # made this function's output incomparable to rfecv_time_aware()
+        # (src/ml_predictor/feature_selection.py), which scores its folds
+        # with sklearn's roc_auc_score directly.
+        #
+        # Compute true ROC-AUC here explicitly, from the fold's own held-out
+        # predict_proba, so this function's "auc" means the same thing
+        # rfecv_time_aware()'s does and both are safe to compare against 0.5
+        # and against each other. best_score (whatever metric it is) is kept
+        # separately as fold_pr_auc for reference/debugging, not used as the
+        # headline number.
+        fold_proba = fold_model.predict_proba(Xc.iloc[test_pos])[:, 1]
+        fold_auc = float(roc_auc_score(y_te, fold_proba))
+        fold_pr_auc = float(fold_model.best_score)
+
         fold_aucs.append(fold_auc)
         fold_best_iters.append(fold_iter)
         fold_rows.append({
             "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
             "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
+            "pr_auc": round(fold_pr_auc, 4),
             "best_iteration": fold_iter, "skipped": False,
         })
 
@@ -3916,9 +3939,17 @@ def cv_walk_forward_evaluate(
     XGBOOST_PARAMS by default, or `params_override` (e.g. the winner of
     search_hyperparameters()) when given — across n_splits rolling
     walk-forward folds and reports:
-      - fold_results: per-fold (n_train, n_test, n_test_pos, auc, best_iteration)
-      - mean_auc / std_auc: the CV estimate to read alongside (not instead
-        of) train_val_split()'s point estimate.
+      - fold_results: per-fold (n_train, n_test, n_test_pos, auc, pr_auc,
+        best_iteration). `auc` is a true sklearn roc_auc_score computed on
+        each fold's held-out predict_proba — directly comparable to 0.5 and
+        to rfecv_time_aware()'s fold scores. `pr_auc` is XGBoost's own
+        early-stopping best_score, which follows whatever eval_metric is
+        configured (XGBOOST_PARAMS uses "aucpr" — PR-AUC / average
+        precision). PR-AUC's no-skill baseline is the positive rate, not
+        0.5, so it is kept separately and must not be read against a 0.5
+        threshold or compared directly to `auc`.
+      - mean_auc / std_auc: the CV estimate (of the true ROC-AUC column) to
+        read alongside (not instead of) train_val_split()'s point estimate.
       - mean_best_iteration / recommended_n_estimators: the boosting-round
         hyperparameter, averaged across folds instead of trusted from one
         run's early stopping.
@@ -3961,6 +3992,7 @@ def cv_walk_forward_evaluate(
             logger.info(
                 f"[cv fold {i}] train={row['n_train']}  test={row['n_test']} "
                 f"(pos={row['n_test_pos']})  auc={row['auc']:.4f}  "
+                f"pr_auc={row.get('pr_auc', float('nan')):.4f}  "
                 f"best_iteration={row['best_iteration']}"
             )
 
