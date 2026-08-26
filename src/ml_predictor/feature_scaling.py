@@ -39,6 +39,70 @@ logger = logging.getLogger(__name__)
 _WINSOR_LOWER_PCT = 0.5   # per-column winsorization bounds, fit on train only
 _WINSOR_UPPER_PCT = 99.5
 
+# Heavy-tailed / volume-based columns get a signed log1p transform BEFORE
+# winsorization (see select_log_transform_cols() / apply_log_transform()
+# below). Matched by substring, case-insensitive, against the column name —
+# this is deliberately name-pattern-based rather than a fitted/statistical
+# decision so that column membership is 100% deterministic from the column
+# name alone and can never disagree between train and predict (unlike the
+# percentile-based winsor bounds, there's nothing here that needs to be
+# fit on X_train and persisted to be reproduced later).
+_LOG_TRANSFORM_NAME_TOKENS = ("obv", "vwap", "volume", "hv_")
+
+
+def select_log_transform_cols(columns) -> list:
+    """
+    Return the subset of `columns` that should get a signed log1p transform:
+    OBV / volume-based features (t1_open_OBV, t5_obv, Volume_MA*, ...), VWAP
+    (t1_close_VWAP, ...), and historical-volatility ratios (t3_hv_10,
+    t5_hv_20, ...). These are exactly the columns the CV-AUC review flagged
+    as heavy-tailed and only winsorized, not transformed: winsorizing alone
+    clips the worst outliers but leaves the right-skew intact (e.g. VWAP
+    winsor bounds spanning -56 to 1871, OBV spanning -186 to 3824), which
+    still lets a handful of extreme rows dominate split points for trees and
+    makes any linear/GLM consumer (e.g. the gain regressor, if ever swapped
+    to a linear model) unnecessarily sensitive to scale.
+
+    Matching is by case-insensitive substring against the column name, so it
+    applies uniformly across the t1_/t3_/t5_/t10_ prefixed variants and the
+    base (un-prefixed) multiday columns alike.
+    """
+    return [
+        col for col in columns
+        if any(token in col.lower() for token in _LOG_TRANSFORM_NAME_TOKENS)
+    ]
+
+
+def apply_log_transform(X: pd.DataFrame, cols) -> pd.DataFrame:
+    """
+    Apply a signed log1p transform to the given columns of X:
+        signed_log1p(x) = sign(x) * log1p(|x|)
+
+    Signed rather than plain log1p because these columns (OBV ratios, VWAP
+    %-distance-from-close, etc.) can legitimately be negative — plain log1p
+    would produce NaN for any negative value. signed_log1p compresses the
+    magnitude of both tails symmetrically while preserving sign and leaving
+    values near zero close to unchanged (it's the identity to first order
+    for |x| << 1), so downstream winsorization percentiles and the trained
+    model's notion of "this feature's scale" stay well-behaved instead of
+    being stretched across a wildly asymmetric raw range.
+
+    NaN is preserved. Columns not present in X, or not in `cols`, pass
+    through unmodified. Applying this twice is NOT idempotent (unlike
+    winsorization) — always call it exactly once, before winsorizing/scaling,
+    on both the train-fit path and the transform-only path, using the same
+    `cols` list (persisted via model_metadata.json — see build_scaler()).
+    """
+    if not cols:
+        return X
+    X = X.copy()
+    for col in cols:
+        if col not in X.columns:
+            continue
+        num = pd.to_numeric(X[col], errors="coerce")
+        X[col] = np.sign(num) * np.log1p(num.abs())
+    return X
+
 
 def compute_winsor_bounds(
     X_train: pd.DataFrame,
@@ -95,11 +159,28 @@ def apply_winsor_bounds(X: pd.DataFrame, bounds: dict) -> pd.DataFrame:
     return X
 
 
-def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, list, dict]:
+def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, list, dict, list]:
     """
     Fit scaler on train-split rows only. Returns scaler, scaled X_train, the
-    list of sparse column names determined from training-set coverage, and
-    the per-column winsorization bounds used before fitting.
+    list of sparse column names determined from training-set coverage, the
+    per-column winsorization bounds used before fitting, and the list of
+    columns that got the signed-log1p heavy-tail transform.
+
+    LOG-TRANSFORM FIX: heavy-tailed / volume-based columns (OBV, VWAP,
+    historical-volatility ratios — see select_log_transform_cols()) are
+    signed-log1p transformed BEFORE winsor bounds are computed or applied.
+    Winsorizing alone clips the worst outliers but leaves the underlying
+    right-skew intact (e.g. raw OBV/VWAP winsor bounds spanning hundreds to
+    thousands on one side and tens on the other), which still lets a
+    handful of extreme rows dominate tree split points and makes any
+    linear/GLM consumer more scale-sensitive than necessary. Doing this
+    ahead of winsorization means the percentile bounds themselves are
+    computed on the compressed, more symmetric distribution. The column
+    list is returned so the caller can apply the SAME transform (via
+    apply_log_transform()) to X_val / any other split — column membership
+    is name-pattern-based so it's already deterministic, but the list is
+    still threaded through and persisted (model_metadata.json) so training
+    and prediction can never disagree about which columns were transformed.
 
     WINSORIZATION FIX: X_train is winsorized (clipped to per-column [0.5th,
     99.5th] percentile bounds fit on X_train itself) BEFORE the scaler sees
@@ -131,9 +212,17 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
     """
     SPARSE_THRESHOLD = 0.5   # columns with < 50% coverage get NaN restored post-scale
 
-    winsor_bounds = compute_winsor_bounds(X_train)
+    log_transform_cols = select_log_transform_cols(X_train.columns)
+    X_train_log = apply_log_transform(X_train, log_transform_cols)
+    if log_transform_cols:
+        logger.info(
+            f"Signed-log1p transformed {len(log_transform_cols)} heavy-tailed "
+            f"column(s) before winsorizing/scaling: {log_transform_cols}"
+        )
+
+    winsor_bounds = compute_winsor_bounds(X_train_log)
     n_winsor_cols = len(winsor_bounds)
-    X_train_w = apply_winsor_bounds(X_train, winsor_bounds)
+    X_train_w = apply_winsor_bounds(X_train_log, winsor_bounds)
     if n_winsor_cols:
         n_cells_clipped = int(
             sum(
@@ -180,7 +269,7 @@ def build_scaler(X_train: pd.DataFrame) -> tuple[StandardScaler, pd.DataFrame, l
             f"Examples: {sparse_cols[:5]}"
         )
 
-    return scaler, X_scaled, sparse_cols, winsor_bounds
+    return scaler, X_scaled, sparse_cols, winsor_bounds, log_transform_cols
 
 
 def scale_with_fitted_scaler(
@@ -189,10 +278,22 @@ def scale_with_fitted_scaler(
     sparse_threshold_cols: list | None = None,
     sparse_threshold: float = 0.5,
     winsor_bounds: dict | None = None,
+    log_transform_cols: list | None = None,
 ) -> pd.DataFrame:
     """
     Transform X using an already-fitted scaler (e.g. to scale the val set or
     to reassemble a full scaled DataFrame for the gain regressor).
+
+    LOG-TRANSFORM FIX: pass the SAME log_transform_cols list returned by
+    build_scaler() so heavy-tailed columns (OBV/VWAP/historical-volatility —
+    see select_log_transform_cols()) get the identical signed-log1p
+    transform applied here, BEFORE winsorizing/scaling, that they got on the
+    training split. Column membership is name-pattern-based (deterministic
+    from the column name alone) so this list will already agree with
+    build_scaler()'s even if not explicitly passed through, but callers
+    should always thread it through explicitly (persisted in
+    model_metadata.json) rather than re-deriving it, for the same
+    train/predict-must-never-drift reason winsor_bounds is threaded through.
 
     WINSORIZATION FIX: pass the SAME winsor_bounds dict returned by
     build_scaler() (fit on X_train only) so X is clipped the same way before
@@ -214,7 +315,8 @@ def scale_with_fitted_scaler(
     hasn't been updated yet), coverage is re-computed from X as before and a
     DeprecationWarning is logged so callers know to pass the list.
     """
-    X_w = apply_winsor_bounds(X, winsor_bounds) if winsor_bounds else X
+    X_log = apply_log_transform(X, log_transform_cols) if log_transform_cols else X
+    X_w = apply_winsor_bounds(X_log, winsor_bounds) if winsor_bounds else X_log
 
     col_means = pd.Series(scaler.mean_, index=X.columns)
     X_filled  = X_w.fillna(col_means)
