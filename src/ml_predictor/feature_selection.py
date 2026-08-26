@@ -1489,7 +1489,10 @@ def _cli() -> int:
     # is identical to what train_model() actually sees.
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
     import ml_retrain_model as rt  # noqa: E402
-    from src.ml_predictor.feature_scaling import compute_winsor_bounds, apply_winsor_bounds  # noqa: E402
+    from src.ml_predictor.feature_scaling import (  # noqa: E402
+        compute_winsor_bounds, apply_winsor_bounds,
+        select_log_transform_cols, apply_log_transform,
+    )
 
     client = rt.get_supabase_client()
     lookback_days = args.lookback_days or None  # 0 → None → unbounded fetch
@@ -1562,6 +1565,20 @@ def _cli() -> int:
     # cluster selection and Stage 2/3/4's fold scoring use different bounds).
     # This mirrors prepare_features() itself, which is likewise computed once
     # on the full combined_df before any fold splitting happens.
+    # LOG-TRANSFORM CONSISTENCY FIX: production (build_scaler(), see
+    # feature_scaling.py) signed-log1p transforms heavy-tailed / volume-based
+    # columns (OBV, VWAP, historical-volatility ratios) BEFORE computing
+    # winsor bounds, since winsorizing alone leaves their right-skew intact.
+    # Applied here too, in the same order, so feature-selection scores
+    # features on the same distribution shape production actually trains on.
+    _log_transform_cols = select_log_transform_cols(X.columns)
+    X = apply_log_transform(X, _log_transform_cols)
+    if _log_transform_cols:
+        logger.info(
+            f"Signed-log1p transformed {len(_log_transform_cols)} heavy-tailed "
+            "column(s) before winsorizing (matches production retrain)."
+        )
+
     _winsor_bounds = compute_winsor_bounds(X)
     X = apply_winsor_bounds(X, _winsor_bounds)
     logger.info(
