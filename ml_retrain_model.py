@@ -4278,13 +4278,22 @@ def search_hyperparameters(
     def _score(params: dict) -> tuple:
         result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
         if result["n_used"] == 0:
-            return float("-inf"), float("nan"), 0
-        return float(np.mean(result["fold_aucs"])), float(np.std(result["fold_aucs"])), result["n_used"]
+            return float("-inf"), float("nan"), 0, []
+        return (
+            float(np.mean(result["fold_aucs"])),
+            float(np.std(result["fold_aucs"])),
+            result["n_used"],
+            result["fold_aucs"],
+        )
 
     # Baseline: current hand-tuned XGBOOST_PARAMS, scored on the exact same
     # folds, so the search result reads as "beat / didn't beat the hand-tuned
-    # defaults" instead of a number in a vacuum.
-    baseline_mean_auc, baseline_std_auc, baseline_n_used = _score(XGBOOST_PARAMS.copy())
+    # defaults" instead of a number in a vacuum. `baseline_fold_aucs` (the raw
+    # per-fold list, same fold order/identity every call since `splits` and
+    # `yv` never change) is kept around so the acceptance gate below can pair
+    # each fold against the same fold's searched-config score, instead of
+    # only having the unpaired mean/std.
+    baseline_mean_auc, baseline_std_auc, baseline_n_used, baseline_fold_aucs = _score(XGBOOST_PARAMS.copy())
     logger.info(
         f"search_hyperparameters: baseline (current hand-tuned XGBOOST_PARAMS) "
         f"CV AUC = {baseline_mean_auc:.4f} \u00b1 {baseline_std_auc:.4f} "
@@ -4292,7 +4301,7 @@ def search_hyperparameters(
     )
 
     trials_log = []
-    best_params, best_mean_auc, best_std_auc = None, float("-inf"), float("nan")
+    best_params, best_mean_auc, best_std_auc, best_fold_aucs = None, float("-inf"), float("nan"), None
     method = "unknown"
     n_trials_run = 0
 
@@ -4309,12 +4318,13 @@ def search_hyperparameters(
                 else:
                     sampled[name] = trial.suggest_float(name, low, high, log=log)
             params = _build_params(sampled)
-            mean_auc, std_auc, n_used = _score(params)
+            mean_auc, std_auc, n_used, fold_aucs = _score(params)
             trials_log.append({
                 "params": sampled,
                 "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
                 "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
                 "n_folds_used": n_used,
+                "fold_aucs": fold_aucs,
             })
             return mean_auc
 
@@ -4329,6 +4339,7 @@ def search_hyperparameters(
             best_mean_auc = float(study.best_value)
             _match = next((t for t in trials_log if t["params"] == study.best_params), None)
             best_std_auc = _match["std_auc"] if _match and _match["std_auc"] is not None else float("nan")
+            best_fold_aucs = _match["fold_aucs"] if _match else None
 
     except ImportError:
         logger.info(
@@ -4349,16 +4360,17 @@ def search_hyperparameters(
                 else:
                     sampled[name] = float(rng.uniform(low, high))
             params = _build_params(sampled)
-            mean_auc, std_auc, n_used = _score(params)
+            mean_auc, std_auc, n_used, fold_aucs = _score(params)
             n_trials_run += 1
             trials_log.append({
                 "params": sampled,
                 "mean_auc": round(mean_auc, 4) if mean_auc != float("-inf") else None,
                 "std_auc": round(std_auc, 4) if std_auc == std_auc else None,
                 "n_folds_used": n_used,
+                "fold_aucs": fold_aucs,
             })
             if mean_auc > best_mean_auc:
-                best_params, best_mean_auc, best_std_auc = params, mean_auc, std_auc
+                best_params, best_mean_auc, best_std_auc, best_fold_aucs = params, mean_auc, std_auc, fold_aucs
 
     if best_params is None or best_mean_auc == float("-inf"):
         logger.warning(
@@ -4410,13 +4422,48 @@ def search_hyperparameters(
     #
     # Fix: require delta to clear BOTH a small absolute floor
     # (HPARAM_SEARCH_MIN_DELTA, guards against near-zero deltas even when
-    # folds happen to be very stable) AND a multiple of the baseline fold
-    # noise (HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc, guards
-    # against "passing" a threshold that's tiny relative to how much these
-    # folds already disagree with each other). Otherwise fall back to the
-    # hand-tuned XGBOOST_PARAMS values (best_params effectively unused) and
-    # record why.
-    _noise_bar = HPARAM_SEARCH_NOISE_MULTIPLIER * baseline_std_auc if baseline_std_auc == baseline_std_auc else 0.0
+    # folds happen to be very stable) AND a multiple of the run's own noise
+    # floor (HPARAM_SEARCH_NOISE_MULTIPLIER * noise_std). Otherwise fall back
+    # to the hand-tuned XGBOOST_PARAMS values (best_params effectively
+    # unused) and record why.
+    #
+    # PAIRED-DELTA FIX: `noise_std` was originally `baseline_std_auc` — the
+    # *unpaired* std of the baseline's own fold AUCs. That mixes in
+    # fold-to-fold variance that has nothing to do with the hyperparameter
+    # change (different folds are different market regimes, giving a
+    # 0.75-0.85 swing on their own) and drowns out genuine, smaller
+    # improvements: a run with baseline_std_auc=0.0349 rejected a real
+    # +0.0096 CV AUC gain (mean 0.8038 vs baseline 0.7942) purely because
+    # unpaired fold variance set an implausibly high bar. What actually
+    # matters is how much the delta varies fold-by-fold, i.e. the *paired*
+    # difference (searched params - baseline params, same fold, same data)
+    # for every fold both were scored on — a much smaller, less noisy number
+    # since it cancels out the regime differences between folds.
+    #
+    # `best_fold_aucs` and `baseline_fold_aucs` come from the exact same
+    # `splits` list scored in the same order, and fold skipping is decided
+    # purely from each fold's train/test class counts (identical for every
+    # params dict, since only `params` changes between calls) — so the two
+    # lists line up fold-for-fold and a direct element-wise difference is a
+    # valid paired comparison, not an apples-to-oranges one.
+    _paired_std = None
+    _noise_bar_basis = "unpaired_baseline_std"
+    if (
+        best_fold_aucs and baseline_fold_aucs
+        and len(best_fold_aucs) == len(baseline_fold_aucs)
+        and len(best_fold_aucs) > 1
+    ):
+        _paired_diffs = np.asarray(best_fold_aucs, dtype=float) - np.asarray(baseline_fold_aucs, dtype=float)
+        _paired_std = float(np.std(_paired_diffs, ddof=1))
+        _noise_std = _paired_std
+        _noise_bar_basis = "paired_fold_diff_std"
+    else:
+        # Fall back to the old (unpaired) behaviour only if we don't have
+        # matching per-fold data to pair against (e.g. best trial's fold_aucs
+        # wasn't captured, or fold counts differ between baseline and best).
+        _noise_std = baseline_std_auc if baseline_std_auc == baseline_std_auc else 0.0
+
+    _noise_bar = HPARAM_SEARCH_NOISE_MULTIPLIER * _noise_std
     _required_delta = max(HPARAM_SEARCH_MIN_DELTA, _noise_bar)
     accepted = delta is not None and delta >= _required_delta
     if not accepted:
@@ -4425,13 +4472,22 @@ def search_hyperparameters(
             f"{('%.4f' % delta) if delta is not None else 'n/a'} AUC, which doesn't "
             f"clear the required bar of {_required_delta:.4f} "
             f"(= max(min_delta={HPARAM_SEARCH_MIN_DELTA}, "
-            f"{HPARAM_SEARCH_NOISE_MULTIPLIER}\u00d7baseline_std={baseline_std_auc:.4f})) "
+            f"{HPARAM_SEARCH_NOISE_MULTIPLIER}\u00d7{_noise_bar_basis}={_noise_std:.4f})) "
             "— not a real improvement over this noisy a CV estimate. Falling back to "
             "hand-tuned XGBOOST_PARAMS for this run instead of using the searched "
             "(possibly over-regularised) config."
         )
+    else:
+        logger.info(
+            f"  search_hyperparameters: accepted — delta {delta:.4f} clears required "
+            f"bar of {_required_delta:.4f} (basis={_noise_bar_basis}, "
+            f"noise_std={_noise_std:.4f})"
+        )
     top_trials = sorted(
-        (t for t in trials_log if t["mean_auc"] is not None),
+        (
+            {k: v for k, v in t.items() if k != "fold_aucs"}
+            for t in trials_log if t["mean_auc"] is not None
+        ),
         key=lambda t: t["mean_auc"], reverse=True,
     )[:10]
 
@@ -4445,6 +4501,9 @@ def search_hyperparameters(
         "best_params": {k: best_params[k] for k in searched_keys},
         "accepted": accepted,
         "min_delta_threshold": HPARAM_SEARCH_MIN_DELTA,
+        "noise_bar_basis": _noise_bar_basis,
+        "noise_std": round(_noise_std, 4),
+        "paired_fold_std": round(_paired_std, 4) if _paired_std is not None else None,
         "required_delta": round(_required_delta, 4),
         "best_mean_auc": round(best_mean_auc, 4),
         "best_std_auc": round(best_std_auc, 4) if best_std_auc == best_std_auc else None,
