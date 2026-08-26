@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -1495,7 +1496,55 @@ def _cli() -> int:
     base_df = rt.load_base_training_data(client, lookback_days=lookback_days)
     t1_df = rt.load_t1_data(client, lookback_days=lookback_days)
     combined_df = rt.combine_datasets(base_df, t1_df)
-    X, y, w = rt.prepare_features(combined_df)
+
+    # ── SELF-NARROWING-POOL FIX ─────────────────────────────────────────────
+    # prepare_features() honours the USE_SELECTED_FEATURES env var and, if
+    # set, restricts X to whatever this pipeline last wrote to
+    # selected_features.json (see that function's "OPTIONAL: restrict to a
+    # pre-computed feature subset" block). That flag exists for the *weekly
+    # retrain* to consume this pipeline's output — it must never be honoured
+    # by this pipeline's own run, or the candidate pool collapses to
+    # last run's picks and Stages 1-4 can only ever re-confirm or shrink
+    # that set, never discover a feature outside it. Concretely: if this env
+    # var is inherited from a shell/CI default (ml_weekly_retrain.yml sets it
+    # to 'true'), stage0_count silently drops from ~395 to whatever was
+    # previously selected, and the "4-stage reduction over ~395 features"
+    # this module's docstring promises quietly stops happening.
+    #
+    # Force it off for this call regardless of the ambient environment, then
+    # restore whatever was there before (defensive — nothing after this in
+    # _cli() currently reads it, but a future caller might).
+    _prev_use_selected = os.environ.pop("USE_SELECTED_FEATURES", None)
+    try:
+        X, y, w = rt.prepare_features(combined_df)
+    finally:
+        if _prev_use_selected is not None:
+            os.environ["USE_SELECTED_FEATURES"] = _prev_use_selected
+
+    # Hard-fail rather than silently searching a tiny pool: if something else
+    # upstream ever restricts X before this point, or prepare_features grows
+    # a new restriction path this override doesn't know about, catch it here
+    # instead of quietly writing a "4-stage search" result that only ever
+    # looked at a handful of features. ~395 raw t1_/t3_/t5_/t10_ columns is
+    # the expected order of magnitude; 100 is a generous floor that still
+    # catches the failure mode above without being brittle to legitimate
+    # schema drift.
+    MIN_EXPECTED_CANDIDATE_FEATURES = 100
+    if X.shape[1] < MIN_EXPECTED_CANDIDATE_FEATURES:
+        raise RuntimeError(
+            f"[feature-selection] candidate pool is only {X.shape[1]} columns "
+            f"(expected >= {MIN_EXPECTED_CANDIDATE_FEATURES}, typically ~395). "
+            "This almost always means USE_SELECTED_FEATURES was set in the "
+            "environment and prepare_features() restricted X to a previous "
+            "selected_features.json before this pipeline ever ran — which "
+            "makes Stages 1-4 re-confirm old picks instead of searching the "
+            "full feature set. Check for a lingering USE_SELECTED_FEATURES "
+            "env var (locally or in CI) and unset it before re-running."
+        )
+    logger.info(
+        f"[feature-selection] candidate pool: {X.shape[1]} raw features "
+        "(sanity check passed — not pre-restricted)."
+    )
 
     # WINSORIZATION CONSISTENCY FIX: the production retrain (ml_retrain_model.py
     # main()) winsorizes X to per-column [0.5th, 99.5th] percentile bounds
