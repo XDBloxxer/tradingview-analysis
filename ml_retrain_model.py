@@ -3255,6 +3255,7 @@ def prepare_features(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Seri
 from src.ml_predictor.feature_scaling import (          # noqa: E402
     compute_winsor_bounds,
     apply_winsor_bounds,
+    apply_log_transform,
     build_scaler,
     scale_with_fitted_scaler,
     normalise_t1_features,
@@ -6382,6 +6383,7 @@ def save_outputs(
     top10_training_stats: dict | None = None,
     sparse_cols: list | None = None,
     winsor_bounds: dict | None = None,
+    log_transform_cols: list | None = None,
 ) -> None:
     """Save model, scaler, gain regressor, feature importance, and metadata.
 
@@ -6398,6 +6400,14 @@ def save_outputs(
     (via feature_scaling.apply_winsor_bounds) to live features before
     scaling — otherwise a live outlier value that training would have
     clipped flows straight into the scaler unclipped at inference.
+
+    log_transform_cols: the list of heavy-tailed / volume-based columns
+    (OBV, VWAP, historical-volatility ratios) that build_scaler() applied a
+    signed-log1p transform to, BEFORE winsorizing, to fix the wildly
+    asymmetric raw scale of these features (e.g. VWAP winsor bounds -56..1871,
+    OBV -186..3824) that winsorization alone doesn't resolve. Persisted so
+    explosion_predictor.py applies the exact same transform, on the exact
+    same columns, before winsorizing/scaling live features.
     """
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -6439,6 +6449,7 @@ def save_outputs(
             {col: [lo, hi] for col, (lo, hi) in winsor_bounds.items()}
             if winsor_bounds else {}
         ),
+        "log_transform_cols":     list(log_transform_cols) if log_transform_cols else [],
         **training_stats,
     }
     if top10_training_stats:
@@ -7393,10 +7404,11 @@ def main() -> int:
     # so the scaler's mean_ / std_ were computed using val-set rows, making AUC
     # metrics slightly optimistic and the scaler non-reproducible on train-only data.
     logger.info("Fitting scaler on train split only (leakage fix)...")
-    scaler, X_train, _sparse_cols, _winsor_bounds = build_scaler(X_train_raw)      # fit + transform train
+    scaler, X_train, _sparse_cols, _winsor_bounds, _log_transform_cols = build_scaler(X_train_raw)  # fit + transform train
     X_val                          = scale_with_fitted_scaler(scaler, X_val_raw,
                                          sparse_threshold_cols=_sparse_cols,
-                                         winsor_bounds=_winsor_bounds)             # transform val only
+                                         winsor_bounds=_winsor_bounds,
+                                         log_transform_cols=_log_transform_cols)   # transform val only
 
     # Reassemble a scaled DataFrame (train + val, original row order) kept for
     # any downstream use that needs the surviving rows in order. Note: rows
@@ -7892,7 +7904,8 @@ def main() -> int:
     # the outliers themselves, defeating the guard rail. Applying the same
     # train-fit winsor bounds here keeps this snapshot consistent with what
     # the scaler and model actually trained on.
-    X_train_for_stats = apply_winsor_bounds(X_train_raw, _winsor_bounds) if _winsor_bounds else X_train_raw
+    X_train_for_stats = apply_log_transform(X_train_raw, _log_transform_cols) if _log_transform_cols else X_train_raw
+    X_train_for_stats = apply_winsor_bounds(X_train_for_stats, _winsor_bounds) if _winsor_bounds else X_train_for_stats
     top10_features = fi_df.head(10)["feature"].tolist()
     top10_training_stats: dict = {}
     for feat in top10_features:
@@ -7971,7 +7984,7 @@ def main() -> int:
     # ── Save ──────────────────────────────────────────────────────────────────
     save_outputs(model, scaler, fi_df, feature_names, training_stats, gain_regressor,
                  top10_training_stats=top10_training_stats, sparse_cols=_sparse_cols,
-                 winsor_bounds=_winsor_bounds)
+                 winsor_bounds=_winsor_bounds, log_transform_cols=_log_transform_cols)
 
     # ── Summary ───────────────────────────────────────────────────────────────
     logger.info("")
