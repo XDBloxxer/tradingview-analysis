@@ -116,6 +116,17 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TZ: 'America/New_York'
+          # Explicitly unset (not inherited/defaulted) so this run always
+          # searches the full ~395-feature pool. ml_weekly_retrain.yml
+          # defaults USE_SELECTED_FEATURES to 'true' for its own consumption
+          # of this pipeline's output; that flag must never be honoured by
+          # the pipeline that *produces* selected_features.json, or Stages
+          # 1-4 collapse to re-confirming last run's picks instead of
+          # searching from scratch. feature_selection.py's _cli() now also
+          # forces this off and hard-fails if the candidate pool looks
+          # pre-restricted, but clearing it here too means a misconfigured
+          # runner never gets far enough to hit that check.
+          USE_SELECTED_FEATURES: ''
         run: |
           CORR="${{ github.event.inputs.corr_threshold || '0.90' }}"
           BORUTA_ITER="${{ github.event.inputs.boruta_iterations || '100' }}"
