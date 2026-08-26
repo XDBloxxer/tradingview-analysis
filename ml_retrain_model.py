@@ -565,6 +565,30 @@ CV_N_SPLITS = int(os.environ.get("CV_N_SPLITS", "5"))
 CV_MIN_TRAIN_FRAC = float(os.environ.get("CV_MIN_TRAIN_FRAC", "0.4"))
 CV_EVALUATION_ENABLED = os.environ.get("CV_EVALUATION_ENABLED", "1").lower() in ("1", "true", "yes")
 
+# CV FOLD SEED-BAGGING FIX: _fit_and_score_cv_folds() previously fit exactly
+# ONE XGBClassifier per fold (fixed random_state=42), so every fold_auc in
+# cv_walk_forward_evaluate()'s std_auc (and every trial score inside
+# search_hyperparameters()) carried the SAME seed-dependent noise that
+# BAGGING_N_SEEDS/train_model() already exists to cancel for the production
+# model (see the "SEED-VARIANCE BAGGING" comment above). That's a genuine gap:
+# on ~15k rows / 13.6% positive rate the reported std_auc=0.0349 across folds
+# is measuring "which random subsample/colsample draw did this fold's single
+# fit make" as much as it's measuring real regime variance, which in turn
+# makes search_hyperparameters()'s accept/reject decisions noisier than they
+# need to be (it scores candidate params against these same single-seed
+# folds).
+#
+# Fix: fit CV_BAGGING_N_SEEDS XGBClassifier seeds per fold (differing only in
+# random_state, same recipe as BAGGING_N_SEEDS) and average their
+# predict_proba via BaggedXGBClassifier before scoring that fold's AUC. This
+# is deliberately a SMALLER ensemble than production's BAGGING_N_SEEDS=7 —
+# CV cost multiplies by (n_splits x n_seeds), and search_hyperparameters()
+# further multiplies that by n_trials, so 3 seeds (within the "3-5" cheap-
+# ensemble range) keeps a 40-trial x 5-fold search at 600 fits instead of
+# 1400. Set CV_BAGGING_N_SEEDS=1 to restore the old single-model-per-fold
+# behaviour.
+CV_BAGGING_N_SEEDS = int(os.environ.get("CV_BAGGING_N_SEEDS", "3"))
+
 # Train-set size guards — abort if the training split is too thin to generalise.
 # These fire when the Supabase tables are sparse (new deployment, data gaps, or
 # a lookback_days window that returned far less data than expected).
@@ -3905,14 +3929,27 @@ def _fit_and_score_cv_folds(
     splits: list,
     params: dict,
     random_state: int = 42,
+    n_bagged_seeds: int = CV_BAGGING_N_SEEDS,
 ) -> dict:
-    """Fit one XGBOOST_PARAMS-shaped `params` dict across every
-    (train_pos, test_pos) fold in `splits`, scoring each fold with its own
-    early-stopping AUC. Shared by cv_walk_forward_evaluate() (reports the
-    active params' CV performance) and search_hyperparameters() (scores
-    each trial's candidate params) so both use identical fold-fitting logic
-    — a hyperparameter search is only a fair comparison against the
-    legitimacy report if they share the exact same fitting code path.
+    """Fit `n_bagged_seeds` XGBOOST_PARAMS-shaped `params` models (differing
+    only in random_state) across every (train_pos, test_pos) fold in
+    `splits`, average their predict_proba via BaggedXGBClassifier, and score
+    each fold's AUC off that averaged probability. Shared by
+    cv_walk_forward_evaluate() (reports the active params' CV performance)
+    and search_hyperparameters() (scores each trial's candidate params) so
+    both use identical fold-fitting logic — a hyperparameter search is only
+    a fair comparison against the legitimacy report if they share the exact
+    same fitting code path.
+
+    CV FOLD SEED-BAGGING FIX: each fold previously fit exactly one seed, so
+    every fold_auc carried the same seed-dependent draw noise that
+    BAGGING_N_SEEDS/train_model() already exists to cancel for the
+    production model. Bagging a small number of seeds (CV_BAGGING_N_SEEDS,
+    default 3) per fold here applies that identical cancellation to the CV
+    estimate itself, so std_auc more accurately reflects fold-to-fold regime
+    variance rather than a mix of that plus single-model seed variance.
+    `random_state` is kept as the first seed (BAGGING_SEED_BASE-compatible
+    base) so n_bagged_seeds=1 reproduces the exact old single-model behaviour.
 
     Folds with a degenerate class split (all-one-class train or test) are
     skipped and excluded from the aggregates but still recorded.
@@ -3920,6 +3957,7 @@ def _fit_and_score_cv_folds(
     Returns {"fold_aucs", "fold_best_iters", "fold_rows", "n_used"}.
     """
     fold_rows, fold_aucs, fold_best_iters = [], [], []
+    n_bagged_seeds = max(1, int(n_bagged_seeds))
 
     for i, (train_pos, test_pos) in enumerate(splits):
         y_tr, y_te = yv[train_pos], yv[test_pos]
@@ -3936,19 +3974,29 @@ def _fit_and_score_cv_folds(
         fold_params = params.copy()
         raw_spw = n_tr_neg / n_tr_pos
         fold_params["scale_pos_weight"] = round(max(SPW_MIN, min(SPW_MAX, raw_spw)), 3)
-        # random_state may already be a key in `params` (XGBOOST_PARAMS carries
-        # one) — overwrite rather than also passing it as a separate kwarg
-        # below, which would otherwise raise "multiple values for keyword
-        # argument 'random_state'".
-        fold_params["random_state"] = random_state
         early_stopping = fold_params.pop("early_stopping_rounds", 30)
-        fold_model = XGBClassifier(**fold_params, early_stopping_rounds=early_stopping)
-        fold_model.fit(
-            Xc.iloc[train_pos], y_tr,
-            sample_weight=wv[train_pos],
-            eval_set=[(Xc.iloc[test_pos], y_te)],
-            verbose=False,
-        )
+        # `random_state` may already be a key in `params` (XGBOOST_PARAMS
+        # carries one) — it gets overwritten per seed below rather than also
+        # being passed as a separate kwarg, which would otherwise raise
+        # "multiple values for keyword argument 'random_state'".
+        fold_params.pop("random_state", None)
+
+        _seed_estimators = []
+        for _s in range(n_bagged_seeds):
+            _seed_params = {**fold_params, "random_state": random_state + _s}
+            _seed_model = XGBClassifier(**_seed_params, early_stopping_rounds=early_stopping)
+            _seed_model.fit(
+                Xc.iloc[train_pos], y_tr,
+                sample_weight=wv[train_pos],
+                eval_set=[(Xc.iloc[test_pos], y_te)],
+                verbose=False,
+            )
+            _seed_estimators.append(_seed_model)
+
+        # Single seed -> BaggedXGBClassifier is a transparent passthrough
+        # (n_seeds_=1), so this path is identical to the pre-bagging code
+        # whether n_bagged_seeds is 1 or more.
+        fold_model = BaggedXGBClassifier(_seed_estimators)
         fold_iter = int(fold_model.best_iteration)
 
         # FIX (metric mismatch): fold_model.best_score reflects whatever
@@ -3963,14 +4011,15 @@ def _fit_and_score_cv_folds(
         # with sklearn's roc_auc_score directly.
         #
         # Compute true ROC-AUC here explicitly, from the fold's own held-out
-        # predict_proba, so this function's "auc" means the same thing
-        # rfecv_time_aware()'s does and both are safe to compare against 0.5
-        # and against each other. best_score (whatever metric it is) is kept
+        # (seed-averaged) predict_proba, so this function's "auc" means the
+        # same thing rfecv_time_aware()'s does and both are safe to compare
+        # against 0.5 and against each other. best_score (whatever metric it
+        # is, averaged across seeds by BaggedXGBClassifier) is kept
         # separately as fold_pr_auc for reference/debugging, not used as the
         # headline number.
         fold_proba = fold_model.predict_proba(Xc.iloc[test_pos])[:, 1]
         fold_auc = float(roc_auc_score(y_te, fold_proba))
-        fold_pr_auc = float(fold_model.best_score)
+        fold_pr_auc = float(fold_model.best_score) if fold_model.best_score is not None else float("nan")
 
         fold_aucs.append(fold_auc)
         fold_best_iters.append(fold_iter)
@@ -3978,7 +4027,7 @@ def _fit_and_score_cv_folds(
             "fold": i, "n_train": int(len(train_pos)), "n_test": int(len(test_pos)),
             "n_test_pos": n_te_pos, "auc": round(fold_auc, 4),
             "pr_auc": round(fold_pr_auc, 4),
-            "best_iteration": fold_iter, "skipped": False,
+            "best_iteration": fold_iter, "n_seeds_bagged": n_bagged_seeds, "skipped": False,
         })
 
     return {
@@ -4058,7 +4107,8 @@ def cv_walk_forward_evaluate(
         f"embargo={EMBARGO_DAYS}d, symbol_purge_window="
         f"{EMBARGO_DAYS * SYMBOL_PURGE_WINDOW_MULTIPLIER:.0f}d "
         f"(mirrors train_val_split()'s FIX 4/5), "
-        f"params={'searched (search_hyperparameters)' if params_override is not None else 'hand-tuned XGBOOST_PARAMS'}."
+        f"params={'searched (search_hyperparameters)' if params_override is not None else 'hand-tuned XGBOOST_PARAMS'}, "
+        f"seed-bagged {CV_BAGGING_N_SEEDS} model(s)/fold."
     )
 
     result = _fit_and_score_cv_folds(Xc, yv, wv, splits, params, random_state=random_state)
@@ -4169,6 +4219,7 @@ def cv_walk_forward_evaluate(
         "n_folds_used": n_used,
         "embargo_days": EMBARGO_DAYS,
         "used_searched_params": params_override is not None,
+        "cv_bagging_n_seeds": CV_BAGGING_N_SEEDS,
         "fold_results": result["fold_rows"],
         "mean_auc": round(mean_auc, 4),
         "std_auc": round(std_auc, 4),
