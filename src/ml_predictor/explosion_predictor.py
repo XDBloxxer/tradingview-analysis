@@ -170,6 +170,7 @@ from src.ml_predictor.symbol_demeaning import (
 )
 from src.ml_predictor.feature_scaling import (
     apply_winsor_bounds,
+    apply_log_transform,
     scale_with_fitted_scaler,
     normalise_t1_features,
 )
@@ -552,6 +553,24 @@ class ExplosionPredictor:
                 "with the updated ml_retrain_model.py to populate this."
             )
 
+        # LOG-TRANSFORM CONSISTENCY FIX: build_scaler() in ml_retrain_model.py
+        # (via src.ml_predictor.feature_scaling) applies a signed-log1p
+        # transform to heavy-tailed / volume-based columns (OBV, VWAP,
+        # historical-volatility ratios) BEFORE winsorizing, since winsorizing
+        # alone leaves the underlying right-skew intact. Persisted here so
+        # _scale_features() applies the SAME transform to the SAME columns on
+        # live features before winsorizing/scaling — otherwise those columns
+        # would land on a different scale at inference than what the scaler
+        # (and the model) were actually fit on.
+        self._trained_log_transform_cols = list(self.metadata.get("log_transform_cols", []))
+        if not self._trained_log_transform_cols:
+            self.logger.warning(
+                "model_metadata.json has no 'log_transform_cols' (older model "
+                "or not yet retrained with the fix) — live features will skip "
+                "the heavy-tail log transform training used. Retrain with the "
+                "updated ml_retrain_model.py to populate this."
+            )
+
         if hasattr(self.scaler, "feature_names_in_"):
             self.feature_names = list(self.scaler.feature_names_in_)
         else:
@@ -931,12 +950,14 @@ class ExplosionPredictor:
             )
         sparse_cols = list(sparse_cols | _forced) or None
         winsor_bounds = getattr(self, "_trained_winsor_bounds", None) or None
+        log_transform_cols = getattr(self, "_trained_log_transform_cols", None) or None
 
         return scale_with_fitted_scaler(
             self.scaler,
             X,
             sparse_threshold_cols=sparse_cols,
             winsor_bounds=winsor_bounds,
+            log_transform_cols=log_transform_cols,
         )
 
     # -------------------------------------------------------------------------
