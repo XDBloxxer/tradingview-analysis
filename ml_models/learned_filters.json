@@ -7,7 +7,7 @@
   "min_relative_volume": 1.0,
   "min_volume_ratio": 1.0,
   "_derived_from_n_winners": 889,
-  "_derived_at": "2026-08-28T07:17:31.824907",
+  "_derived_at": "2026-08-29T02:59:46.898100",
   "_lookback_days": 90,
   "_note": "conservative defaults \u2014 not enough winner samples yet | max_price floored at 15.0 (FIX 6 \u2014 was ratcheting down via winner-detector feedback loop)",
   "_comment": "Tightened from defaults. max_price 50 and min_volume 500k target the small-cap explosive universe. min_relative_volume 2.0 requires stocks already showing above-normal activity. Model-driven thresholds (hv10, rsi) will be auto-populated by ml_track_comprehensive_accuracy.py after enough prediction history accumulates. min_market_cap/max_market_cap are null (no bound) by default \u2014 set them (e.g. max_market_cap: 2000000000 for small-cap only) to constrain the non-winners pool by market cap; applied consistently across the TradingView screener and yfinance fallback paths for both winners exclusion and non-winners detection."
