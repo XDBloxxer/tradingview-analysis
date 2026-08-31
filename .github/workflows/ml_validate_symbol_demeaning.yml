@@ -56,11 +56,6 @@ on:
         required: false
         default: false
         type: boolean
-  schedule:
-    # Re-validate weekly so a future retrain that changes the data mix
-    # (new symbols, more history) can't silently regress the fix without
-    # anyone noticing.
-    - cron: '0 13 * * 1'  # Mondays 13:00 UTC
 
 permissions:
   contents: read
