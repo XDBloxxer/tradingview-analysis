@@ -4,7 +4,7 @@ on:
   schedule:
     # Run at 7:00 AM UTC = 2:00 AM EST (1 hour before pre-market at 4 AM EST)
     # This gives predictions before pre-market opens
-    - cron: '5 6 * * 1-5'  # Mon-Fri at 6:00 AM UTC (1-2 AM ET, well before 4 AM ET pre-market)
+    - cron: '13 6 * * 1-5'  # Mon-Fri at 6:00 AM UTC (1-2 AM ET, well before 4 AM ET pre-market)
   
   workflow_dispatch:
     inputs:
