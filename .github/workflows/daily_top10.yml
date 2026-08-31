@@ -3,7 +3,7 @@ name: Daily Winners Tracker
 on:
   # Run daily at 4:30 PM EST (after market close at 4pm)
   schedule:
-    - cron: '50 20 * * 1-5'  # 21:30 UTC = 4:30 PM EST (Mon-Fri only)
+    - cron: '17 20 * * 1-5'  # 20:17 UTC = 4:17 PM EST (Mon-Fri only) -- offset from :00/:30 to avoid GitHub's round-minute scheduling congestion
 
   # Allow manual triggering
   workflow_dispatch:
@@ -20,10 +20,6 @@ on:
         description: 'Backfill: range end date (YYYY-MM-DD). Requires start_date.'
         required: false
         default: ''
-      chunk_days:
-        description: 'Backfill only: split start_date..end_date into separate queued runs of this many calendar days each (e.g. 7). Leave empty/0 to run the whole range as a single job.'
-        required: false
-        default: ''
       top_n:
         description: 'Number of top winners to track'
         required: false
@@ -33,127 +29,25 @@ on:
         required: false
         default: 'false'
         type: boolean
-      skip_queue:
-        description: 'Backfill only: run immediately in this job instead of going through the shared queue. Use for one-off/urgent backfills; leave off for routine/large backfills so they share the queue nicely with other runs.'
-        required: false
-        default: false
-        type: boolean
 
-# This job does NOT actually run the tracker anymore -- it just appends one
-# or more job descriptions to data/run_queue.jsonl (one per chunk, if
-# chunk_days was given for a backfill) and wakes up queue_runner.yml, which
-# is the only workflow that does real work and holds the shared
-# "tv-analysis-backfill" concurrency group. Deliberately no concurrency block
-# here: this job is a few seconds of git work, so any number of these can be
-# queued back-to-back (schedule, manual, winners, non-winners, all mixed)
-# without GitHub silently dropping earlier ones. See queue_runner.yml and
-# src/queue_worker.py for why this exists and how draining/chunking works.
+# Runs daily_winners_main.py directly -- no queue, no queue_runner.yml
+# involvement. Removed 2026-08-31: the queue system (data/run_queue.jsonl +
+# queue_runner.yml) was holding a runner busy for long, unpredictable
+# stretches, which was starving this repo's OTHER schedule-triggered
+# workflows of runner availability and delaying them by 10+ hours. Since
+# winners and non-winners write to different Supabase tables and different
+# local files (winner_selection_counts.json vs non_winner_selection_counts.json),
+# there was never actually a race between them that required serializing
+# through a shared queue -- each just needs to not race against a second
+# copy of ITSELF, which the concurrency group below handles.
 permissions:
   contents: write
-  actions: write
-
-# Our git steps (reset/pull/commit/push) never touch anything under
-# ml_models/ -- the only Git LFS-tracked path in this repo -- so skip
-# LFS smudging entirely. Without this, git-lfs's smudge filter runs on
-# every checkout/reset/pull regardless of the "lfs:" flag on
-# actions/checkout, and a pre-existing broken LFS pointer elsewhere in
-# the repo (ml_models/archive/*.pkl committed as a raw binary instead
-# of a pointer) makes "git reset --hard" leave the tree in a state
-# "git pull --rebase" then refuses to touch.
-env:
-  GIT_LFS_SKIP_SMUDGE: '1'
 
 jobs:
-  enqueue-winners:
-    if: github.event.inputs.skip_queue != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
-
-      - name: Append job(s) to shared run queue
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # ml_models/archive/best_model - Copy.pkl was committed as a raw
-          # binary instead of a real LFS pointer. The problem is that git
-          # doesn't scope its checks to what a job actually touches -- every
-          # "git reset --hard" / "git pull --rebase" reconciles the ENTIRE
-          # working tree against the target commit, so it always walks past
-          # this file even though this job never reads or writes anything
-          # under ml_models/. Overriding filter.lfs.* config is unreliable
-          # across git/git-lfs versions (it kept getting bypassed). The robust
-          # fix: use sparse-checkout to tell git to never materialize
-          # ml_models/ in the working tree for this job at all. If the file
-          # is never checked out, there's nothing to smudge/diff/complain
-          # about -- the problem structurally can't occur.
-          git sparse-checkout init --no-cone
-          printf '/*\n!/ml_models/\n' > .git/info/sparse-checkout
-          git sparse-checkout reapply
-
-          for i in 1 2 3 4 5; do
-            # Defensive: force the working tree to exactly match whatever is
-            # currently checked out before pulling. Without this, any
-            # pre-existing diff in a tracked file (e.g. a line-ending quirk
-            # in one of the selection-counts JSON files) makes git refuse to
-            # even start "pull --rebase" with "You have unstaged changes",
-            # before this script has touched anything itself.
-            git reset --hard HEAD
-            git clean -fd
-            git pull --rebase origin "${{ github.ref_name }}"
-
-            JOB_IDS=$(python src/queue_worker.py enqueue-range \
-              --job-type winners \
-              --date "${{ github.event.inputs.date }}" \
-              --start-date "${{ github.event.inputs.start_date }}" \
-              --end-date "${{ github.event.inputs.end_date }}" \
-              --chunk-days "${{ github.event.inputs.chunk_days }}" \
-              --top-n "${{ github.event.inputs.top_n || '15' }}" \
-              --allow-append "${{ github.event.inputs.allow_append || 'false' }}" \
-              --queued-by "winners:${{ github.run_id }}")
-
-            git add -f data/run_queue.jsonl
-            NUM_JOBS=$(echo "$JOB_IDS" | grep -c .)
-            git commit -m "chore: enqueue $NUM_JOBS winners job(s) [skip ci]"
-
-            if git push origin "HEAD:${{ github.ref_name }}"; then
-              echo "Enqueued:"
-              echo "$JOB_IDS"
-              break
-            fi
-
-            echo "Push attempt $i failed (likely a race with another enqueue), retrying..."
-            git reset --hard HEAD~1
-            sleep $((RANDOM % 5 + 2))
-          done
-
-      - name: Wake up the queue runner
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh workflow run queue_runner.yml --ref "${{ github.ref_name }}"
-
-  # Bypasses data/run_queue.jsonl and queue_runner.yml entirely and just runs
-  # daily_winners_main.py directly in this job. Uses its OWN concurrency
-  # group -- separate from queue_runner.yml's "tv-analysis-backfill" and from
-  # the non-winners direct-run's group -- so a winners direct-run and a
-  # non-winners direct-run (or a queue drain) can all proceed at the same
-  # time; they touch different Supabase tables and different local files
-  # (winner_selection_counts.json vs non_winner_selection_counts.json), so
-  # there's nothing to actually race on. This group only serializes repeat
-  # winners-direct triggers against each other, so you don't accidentally
-  # double-run the same backfill.
-  run-directly:
-    if: github.event.inputs.skip_queue == 'true'
+  run-winners-tracker:
     runs-on: ubuntu-latest
     concurrency:
-      group: tv-analysis-direct-winners
+      group: tv-analysis-winners
       cancel-in-progress: false
     steps:
       - name: Checkout code
@@ -175,7 +69,7 @@ jobs:
           mkdir -p data/cache
           mkdir -p logs
 
-      - name: Run winners tracker directly
+      - name: Run winners tracker
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -188,7 +82,7 @@ jobs:
           fi
           # Note: daily_winners_main.py has no --allow-append flag (only the
           # non-winners script does), so allow_append is intentionally not
-          # passed here -- matches how the queue path already behaves.
+          # passed here.
           python daily_winners_main.py "${ARGS[@]}"
 
       - name: Commit any local changes (e.g. selection-counts JSON)
@@ -196,16 +90,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Now that this job has its own concurrency group, it can genuinely
-          # run at the same moment as the non-winners direct-run and/or
-          # queue_runner.yml -- all three push to the same branch, so a
-          # single unconditional push here could lose the race. Same
-          # retry-with-jitter pattern as the enqueue workflows.
           for i in 1 2 3 4 5; do
             git add -A
             git diff --cached --quiet && NOTHING_TO_COMMIT=1 || NOTHING_TO_COMMIT=0
             if [ "$NOTHING_TO_COMMIT" = "0" ]; then
-              git commit -m "chore: winners direct run [skip ci]"
+              git commit -m "chore: winners run [skip ci]"
             fi
 
             git pull --rebase origin "${{ github.ref_name }}"
@@ -223,3 +112,11 @@ jobs:
             git reset --hard HEAD~1
             sleep $((RANDOM % 5 + 2))
           done
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: winners-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
