@@ -1,5 +1,5 @@
 {
-  "NCRA": 1,
+  "NCRA": 2,
   "SPRC": 1,
   "AMIX": 2,
   "LVWR": 1,
@@ -217,10 +217,10 @@
   "PCLA": 1,
   "ARBB": 1,
   "UXRP": 1,
-  "USDE": 3,
+  "USDE": 4,
   "CLPS": 1,
   "HOWL": 1,
-  "USDEW": 1,
+  "USDEW": 2,
   "KNRX": 1,
   "SDOT": 1,
   "EXYN": 3,
@@ -270,5 +270,15 @@
   "VNCE": 1,
   "AAME": 1,
   "ZCMD": 1,
-  "NOWL": 1
+  "NOWL": 1,
+  "AEHL": 1,
+  "GPRO": 1,
+  "YDDL": 1,
+  "RDHL": 1,
+  "TP": 1,
+  "SQFT": 1,
+  "COOT": 1,
+  "NEOV": 1,
+  "DPRO": 1,
+  "SY": 1
 }
