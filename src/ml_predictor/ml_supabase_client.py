@@ -223,6 +223,46 @@ class MLPredictionSupabaseClient:
             self.logger.error(f"Failed to write accuracy records: {e}", exc_info=True)
             raise
 
+    def write_records_upsert(
+        self,
+        table_name: str,
+        records: List[Dict[str, Any]],
+        on_conflict: str,
+    ) -> int:
+        """
+        Generic sanitized upsert for any table.
+
+        BUGFIX (2026-09): ml_track_comprehensive_accuracy.py used to call
+        self.client.table(...).upsert(...) directly for the
+        ml_accuracy_details and ml_missed_opportunities tables, bypassing
+        _sanitize_dict(). A single NaN/Infinity float anywhere in the batch
+        (e.g. predicted_probability for a row yfinance couldn't resolve)
+        makes postgrest-py's JSON encoder raise "Out of range float values
+        are not JSON compliant" for the *entire* upsert — so all rows in
+        the batch silently fail to write, not just the offending one. This
+        is why downstream tables could show nulls/gaps almost everywhere
+        even though only one symbol's data was actually bad.
+
+        Every non-prediction-table write should go through this method
+        (or otherwise call _sanitize_dict itself) instead of hitting
+        self.client.table(...) directly.
+        """
+        if not records:
+            return 0
+        try:
+            sanitized = [self._sanitize_dict(rec) for rec in records]
+            response = (
+                self.client.table(table_name)
+                .upsert(sanitized, on_conflict=on_conflict)
+                .execute()
+            )
+            count = len(response.data) if response.data else 0
+            self.logger.info(f"✓ Wrote {count} record(s) to {table_name}")
+            return count
+        except Exception as e:
+            self.logger.error(f"Failed to write records to {table_name}: {e}", exc_info=True)
+            raise
+
     def get_historical_prediction_accuracy(
         self,
         days_back: int = 30,
