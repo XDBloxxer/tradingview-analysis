@@ -40,6 +40,34 @@ FIXES vs previous version:
      Fix: predicted_positive is now True only when signal ∈ {BUY, STRONG BUY},
      which matches exactly what the published recommendation said.
 
+  6. (NEW 2026-09) ml_accuracy_details / ml_missed_opportunities writes
+     bypassed the NaN/Infinity sanitizer that write_accuracy_records uses,
+     calling self.client.table(...).upsert(...) directly. A single NaN or
+     Infinity float anywhere in the batch (e.g. one symbol yfinance
+     couldn't resolve) made postgrest's JSON encoder reject the WHOLE
+     batch upsert with "Out of range float values are not JSON compliant"
+     — so all rows for the run silently failed to write, not just the bad
+     one. Fixed by routing every write through the new sanitized
+     write_records_upsert() helper on MLPredictionSupabaseClient.
+
+  7. (NEW 2026-09) Added pre-market tracking. The yfinance actual-gain
+     fetch previously only pulled interval="1d" regular-session bars,
+     which cannot reflect pre-market moves (Yahoo's daily OHLC is
+     regular-session only, 09:30-16:00 ET). Added a second intraday
+     (5m, prepost=True) fetch that isolates the 04:00-09:30 ET window
+     and computes actual_premarket_high_pct / actual_premarket_low_pct
+     relative to the same prev_close used for the regular-session figures,
+     so premarket spikes that reverse before the open are captured.
+
+  8. (NEW 2026-09) Backfill hardening: --date already existed for
+     re-running a specific past date, but a partial/failed prior run
+     (e.g. hit by bug #6) could leave ml_accuracy_details/
+     ml_missed_opportunities empty for that date. Since every table
+     write now upserts on the natural key (symbol, prediction_date) /
+     (symbol, detection_date), simply re-running with --date on the same
+     date now fully repairs prior partial writes instead of skipping them.
+     Also added --backfill-yesterday as a convenience shortcut.
+
 IMPROVEMENTS (carried from previous version):
 1. Finds most recent prediction date automatically
 2. Validates data exists before fetching
@@ -52,13 +80,19 @@ import argparse
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from pathlib import Path
 import sys
 import pandas as pd
 import numpy as np
 import yaml
 from typing import Optional
+
+try:
+    from zoneinfo import ZoneInfo
+    _ET = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover - stdlib zoneinfo should exist on py3.9+
+    _ET = None
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -140,7 +174,74 @@ def setup_logging(level: str = "INFO"):
 # yfinance actual-gain fetcher
 # ---------------------------------------------------------------------------
 
-def _fetch_actual_gain_for_symbol(symbol: str, prediction_date: str) -> dict:
+def _fetch_premarket_extremes(symbol: str, prediction_date: str, prev_close: Optional[float]) -> dict:
+    """
+    FIX 7: regular-session daily bars (interval="1d") cannot reflect
+    pre-market activity — Yahoo's daily OHLC only covers the 09:30-16:00 ET
+    regular session regardless of the `prepost` flag. To capture pre-market
+    moves we need a separate intraday (5m) fetch with prepost=True, then
+    isolate bars whose Eastern-time timestamp falls in the 04:00-09:30 ET
+    pre-market window on the prediction date.
+
+    Returns {} (empty extras) on any failure — this is best-effort
+    enrichment and must never break the regular-session accuracy numbers.
+    """
+    empty = {
+        "actual_premarket_high_pct": None,
+        "actual_premarket_low_pct":  None,
+        "actual_premarket_volume":   None,
+    }
+    if _ET is None or prev_close is None or prev_close == 0:
+        return empty
+    try:
+        import yfinance as yf
+
+        target = datetime.strptime(prediction_date, "%Y-%m-%d").date()
+        # yfinance only serves ~30 days of intraday history at 5m resolution,
+        # so a wide window costs nothing extra and keeps this robust for
+        # near-term backfills; older dates will simply return no data.
+        start = (target - timedelta(days=1)).isoformat()
+        end   = (target + timedelta(days=1)).isoformat()
+
+        ticker   = yf.Ticker(symbol)
+        intraday = ticker.history(
+            start=start, end=end, interval="5m", prepost=True, auto_adjust=True
+        )
+        if intraday.empty:
+            return empty
+
+        idx = intraday.index
+        if idx.tz is None:
+            idx = idx.tz_localize("UTC")
+        idx_et = idx.tz_convert(_ET)
+
+        et_dates = idx_et.date
+        et_times = idx_et.time
+        premarket_mask = (et_dates == target) & (et_times >= dt_time(4, 0)) & (et_times < dt_time(9, 30))
+
+        pm = intraday.loc[premarket_mask]
+        if pm.empty:
+            return empty
+
+        pm_high   = float(pm["High"].max())
+        pm_low    = float(pm["Low"].min())
+        pm_volume = int(pm["Volume"].sum()) if "Volume" in pm.columns else None
+
+        return {
+            "actual_premarket_high_pct": round((pm_high - prev_close) / prev_close * 100, 4),
+            "actual_premarket_low_pct":  round((pm_low  - prev_close) / prev_close * 100, 4),
+            "actual_premarket_volume":   pm_volume,
+        }
+    except Exception as e:
+        logging.getLogger(__name__).debug(
+            f"premarket fetch failed for {symbol} on {prediction_date}: {e}"
+        )
+        return empty
+
+
+def _fetch_actual_gain_for_symbol(
+    symbol: str, prediction_date: str, include_premarket: bool = True
+) -> dict:
     try:
         import yfinance as yf
 
@@ -175,7 +276,7 @@ def _fetch_actual_gain_for_symbol(symbol: str, prediction_date: str) -> dict:
         day_open   = float(today_bar["Open"])
         day_volume = int(today_bar["Volume"])
 
-        return {
+        result = {
             "symbol":          symbol,
             "actual_gain_pct": round((close    - prev_close) / prev_close * 100, 4),
             "actual_high_pct": round((day_high - prev_close) / prev_close * 100, 4),
@@ -184,7 +285,15 @@ def _fetch_actual_gain_for_symbol(symbol: str, prediction_date: str) -> dict:
             "actual_high":     day_high,
             "actual_low":      day_low,
             "actual_volume":   day_volume,
+            "actual_premarket_high_pct": None,
+            "actual_premarket_low_pct":  None,
+            "actual_premarket_volume":   None,
         }
+
+        if include_premarket:
+            result.update(_fetch_premarket_extremes(symbol, prediction_date, prev_close))
+
+        return result
 
     except Exception as e:
         logging.getLogger(__name__).debug(
@@ -198,16 +307,19 @@ def fetch_actual_gains_for_all_symbols(
     prediction_date: str,
     logger: logging.Logger,
     max_workers: int = YFINANCE_MAX_WORKERS,
+    include_premarket: bool = True,
 ) -> dict:
     logger.info(
         f"Fetching actual gain data from yfinance for {len(symbols)} symbols "
-        f"on {prediction_date} (max_workers={max_workers})..."
+        f"on {prediction_date} (max_workers={max_workers}, premarket={include_premarket})..."
     )
 
     results: dict = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_sym = {
-            executor.submit(_fetch_actual_gain_for_symbol, sym, prediction_date): sym
+            executor.submit(
+                _fetch_actual_gain_for_symbol, sym, prediction_date, include_premarket
+            ): sym
             for sym in symbols
         }
         for future in as_completed(future_to_sym):
@@ -219,7 +331,10 @@ def fetch_actual_gains_for_all_symbols(
                 results[sym] = {"symbol": sym}
 
     found = sum(1 for r in results.values() if r.get("actual_gain_pct") is not None)
+    pm_found = sum(1 for r in results.values() if r.get("actual_premarket_high_pct") is not None)
     logger.info(f"✓ yfinance fetch complete: {found}/{len(symbols)} symbols returned gain data")
+    if include_premarket:
+        logger.info(f"✓ premarket fetch complete: {pm_found}/{len(symbols)} symbols returned premarket data")
     return results
 
 
@@ -857,6 +972,17 @@ class ComprehensiveAccuracyTracker:
                 "prediction_correct":     prediction_correct,
                 "gain_error_pct":         gain_error,
                 "gain_error_ratio":       gain_error_ratio,
+                # FIX 7: pre-market extremes, relative to the same prev_close
+                # basis as actual_high_pct. None if yfinance had no intraday
+                # data for this symbol/date (common for older backfills,
+                # since 5m bars are only retained for ~30 days).
+                # Requires actual_premarket_high_pct / actual_premarket_low_pct
+                # / actual_premarket_volume columns on ml_prediction_accuracy —
+                # add via migration before relying on them downstream (same
+                # caveat as actual_high_pct_source above).
+                "actual_premarket_high_pct": yf_data.get("actual_premarket_high_pct"),
+                "actual_premarket_low_pct":  yf_data.get("actual_premarket_low_pct"),
+                "actual_premarket_volume":   yf_data.get("actual_premarket_volume"),
                 "actual_recorded_at":     datetime.now().isoformat(),
             })
 
@@ -869,6 +995,8 @@ class ComprehensiveAccuracyTracker:
                 "became_winner":         became_winner,
                 "actual_gain_pct":       actual_gain,
                 "actual_high_pct":       actual_high_pct,
+                "actual_premarket_high_pct": yf_data.get("actual_premarket_high_pct"),
+                "actual_premarket_low_pct":  yf_data.get("actual_premarket_low_pct"),
                 "actual_volume":         actual_volume,
                 "failure_reason":        None,
             })
@@ -942,14 +1070,21 @@ class ComprehensiveAccuracyTracker:
                         "(no yfinance data) — value will be near 0%"
                     )
 
+            # Volume can be NaN for some rows — int(NaN) raises ValueError,
+            # which previously could abort analysis for the whole date.
+            raw_volume = winner_data.get("volume")
+            actual_volume = int(raw_volume) if pd.notna(raw_volume) else None
+
             missed_records.append({
                 "symbol":                   symbol,
                 "detection_date":           check_date,
                 "exchange":                 winner_data.get("exchange", "UNKNOWN"),
                 "actual_gain_pct":          float(winner_data["change_pct"]),
                 "actual_high_pct":          actual_high_pct,
+                "actual_premarket_high_pct": yf_data.get("actual_premarket_high_pct"),
+                "actual_premarket_low_pct":  yf_data.get("actual_premarket_low_pct"),
                 "actual_price":             actual_price,
-                "actual_volume":            int(winner_data["volume"]),
+                "actual_volume":            actual_volume,
                 "was_screened":             False,
                 "screening_failure_reason": self._determine_screening_failure(winner_data),
                 "predicted_probability":    None,
@@ -986,18 +1121,24 @@ class ComprehensiveAccuracyTracker:
         if details_records:
             self.logger.info(f"Writing {len(details_records)} detail records...")
             try:
-                self.client.table("ml_accuracy_details").upsert(
-                    details_records, on_conflict="symbol,prediction_date"
-                ).execute()
+                # FIX 6: was self.client.table(...).upsert(...) directly, which
+                # sends raw numpy/NaN values and fails the WHOLE batch (all
+                # rows, not just the bad one) with "Out of range float values
+                # are not JSON compliant" the moment any single row has a
+                # NaN/Infinity. write_records_upsert() sanitizes every row
+                # first, same as the main accuracy table.
+                self.supabase.write_records_upsert(
+                    "ml_accuracy_details", details_records, on_conflict="symbol,prediction_date"
+                )
             except Exception as e:
                 self.logger.error(f"Failed to write details: {e}")
 
         if missed_records:
             self.logger.info(f"Writing {len(missed_records)} missed opportunity records...")
             try:
-                self.client.table("ml_missed_opportunities").upsert(
-                    missed_records, on_conflict="symbol,detection_date"
-                ).execute()
+                self.supabase.write_records_upsert(
+                    "ml_missed_opportunities", missed_records, on_conflict="symbol,detection_date"
+                )
             except Exception as e:
                 self.logger.error(f"Failed to write missed opportunities: {e}")
 
@@ -1012,6 +1153,17 @@ def main():
     )
     parser.add_argument("--config",  default="config.yaml")
     parser.add_argument("--date",    type=str, help="Date to check (YYYY-MM-DD)")
+    parser.add_argument(
+        "--backfill-yesterday", action="store_true",
+        help=(
+            "Convenience shortcut for --date <yesterday, local date>. Useful "
+            "for repairing a run that failed partway (e.g. wrote accuracy "
+            "records but not details/missed) — re-running with the same "
+            "date upserts on (symbol, prediction_date)/(symbol, detection_date), "
+            "so it fully overwrites/repairs the prior partial data rather "
+            "than duplicating or skipping it."
+        ),
+    )
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument(
         "--filters-only", action="store_true",
@@ -1021,8 +1173,22 @@ def main():
         "--yfinance-workers", type=int, default=YFINANCE_MAX_WORKERS,
         help=f"Parallel workers for yfinance fetches (default: {YFINANCE_MAX_WORKERS})",
     )
+    parser.add_argument(
+        "--no-premarket", action="store_true",
+        help=(
+            "Skip the extra pre-market (5m, prepost=True) yfinance fetch. "
+            "Pre-market fetching doubles yfinance calls per symbol; disable "
+            "if you hit rate limits and only need regular-session accuracy."
+        ),
+    )
 
     args = parser.parse_args()
+
+    if args.date and args.backfill_yesterday:
+        parser.error("--date and --backfill-yesterday are mutually exclusive")
+
+    if args.backfill_yesterday:
+        args.date = (datetime.now().date() - timedelta(days=1)).isoformat()
 
     config    = load_config(args.config)
     log_level = "DEBUG" if args.verbose else "INFO"
@@ -1042,7 +1208,8 @@ def main():
 
     if args.date:
         check_date = args.date
-        logger.info(f"Using manually specified date: {check_date}")
+        source = "--backfill-yesterday" if args.backfill_yesterday else "manually specified"
+        logger.info(f"Using {source} date: {check_date}")
     else:
         check_date = get_most_recent_prediction_date(tracker)
         if not check_date:
@@ -1067,6 +1234,7 @@ def main():
             prediction_date=check_date,
             logger=logger,
             max_workers=args.yfinance_workers,
+            include_premarket=not args.no_premarket,
         )
     else:
         logger.warning("No predicted symbols found — skipping yfinance fetch.")
@@ -1088,8 +1256,12 @@ def main():
     logger.info("\n" + "=" * 80)
     logger.info("✓ COMPREHENSIVE ANALYSIS COMPLETE")
     logger.info("=" * 80)
+    premarket_populated = sum(
+        1 for r in accuracy_records if r.get("actual_premarket_high_pct") is not None
+    )
     logger.info(f"  Accuracy records written      : {len(accuracy_records)}")
     logger.info(f"  actual_gain_pct populated     : {gain_populated}/{len(accuracy_records)}")
+    logger.info(f"  actual_premarket_high_pct pop.: {premarket_populated}/{len(accuracy_records)}")
     logger.info(f"  Detail records written        : {len(details_records)}")
     logger.info(f"  Missed records written        : {len(missed_records)}")
     logger.info(f"\n  Learned filters updated       : {LEARNED_FILTERS_PATH}")
