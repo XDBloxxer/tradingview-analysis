@@ -649,7 +649,7 @@ class SmartScreener:
 # FIX 12: Accurate entry price from the last available 1-minute candle
 # ---------------------------------------------------------------------------
 
-def fetch_accurate_entry_price(symbol: str, logger=None) -> float | None:
+def fetch_accurate_entry_price(symbol: str, logger=None) -> dict:
     """
     Fetch the true current/entry price for `symbol` from the most recent
     available 1-minute candle.
@@ -667,36 +667,47 @@ def fetch_accurate_entry_price(symbol: str, logger=None) -> float | None:
          yfinance has backfilled anything for the new session), widen the
          window and fall back to the most recent 1m bar available at all.
 
-    Returns None if no price data can be fetched, so callers can fall back
-    to the TradingView screener close instead of dropping the stock.
+    Returns {"price": float|None, "source": str, "bar_time": str|None}.
+    `price` is None if no price data can be fetched at all, so callers can
+    fall back to the TradingView screener close instead of dropping the
+    stock. `source`/`bar_time` are written through to Supabase so it's
+    auditable which basis each prediction's current_price actually used
+    (e.g. distinguishing a genuine pre-market tick from a stale TV close).
     """
     try:
         import yfinance as yf
     except ImportError:
-        return None
+        return {"price": None, "source": "yfinance_unavailable", "bar_time": None}
 
     try:
         ticker = yf.Ticker(symbol)
 
-        hist = ticker.history(period="1d", interval="1m", prepost=True)
+        hist   = ticker.history(period="1d", interval="1m", prepost=True)
+        source = "yfinance_1m_prepost_today"
         if hist.empty:
             # Nothing for today yet — widen the window and just take
             # whatever the last available 1-minute bar is.
-            hist = ticker.history(period="5d", interval="1m", prepost=True)
+            hist   = ticker.history(period="5d", interval="1m", prepost=True)
+            source = "yfinance_1m_prepost_widened"
 
         if hist.empty or "Close" not in hist.columns:
-            return None
+            return {"price": None, "source": "no_data", "bar_time": None}
 
         closes = hist["Close"].dropna()
         if closes.empty:
-            return None
+            return {"price": None, "source": "no_data", "bar_time": None}
 
-        return float(closes.iloc[-1])
+        last_ts = closes.index[-1]
+        return {
+            "price":    float(closes.iloc[-1]),
+            "source":   source,
+            "bar_time": last_ts.isoformat() if hasattr(last_ts, "isoformat") else str(last_ts),
+        }
 
     except Exception as e:
         if logger:
             logger.debug(f"fetch_accurate_entry_price({symbol}) failed: {e}")
-        return None
+        return {"price": None, "source": "fetch_failed", "bar_time": None}
 
 
 # ---------------------------------------------------------------------------
@@ -2089,37 +2100,63 @@ def main():
     logger.info("=" * 80)
 
     from concurrent.futures import ThreadPoolExecutor as _PriceTPE, as_completed as _price_as_completed
+    import time as _time, random as _random
 
     price_workers = max(1, min(args.t1_workers, len(enriched_stocks)))
     price_map     = {}
 
+    def _fetch_price_with_jitter(sym):
+        # Small stagger mirrors the T-1 fetch loop below (FIX: unstaggered
+        # bursts to yfinance/Yahoo are more likely to get rate-limited,
+        # which would silently degrade refresh coverage and leave more
+        # stocks on the stale TV screener close).
+        _time.sleep(_random.uniform(0.05, 0.2))
+        return sym, fetch_accurate_entry_price(sym, logger)
+
     with _PriceTPE(max_workers=price_workers) as executor:
         futures = {
-            executor.submit(fetch_accurate_entry_price, s["symbol"], logger): s["symbol"]
+            executor.submit(_fetch_price_with_jitter, s["symbol"]): s["symbol"]
             for s in enriched_stocks
         }
         for future in _price_as_completed(futures):
             sym = futures[future]
             try:
-                price_map[sym] = future.result()
+                _, result = future.result()
+                price_map[sym] = result
             except Exception as e:
                 logger.debug(f"Entry price fetch failed for {sym}: {e}")
-                price_map[sym] = None
+                price_map[sym] = {"price": None, "source": "fetch_failed", "bar_time": None}
 
     refreshed = 0
     for stock in enriched_stocks:
-        new_price = price_map.get(stock["symbol"])
-        if new_price:
-            stock["current_price"] = new_price
+        result = price_map.get(sym := stock["symbol"], {"price": None, "source": "no_data", "bar_time": None})
+        if result.get("price"):
+            stock["current_price"] = result["price"]
+            stock["price_source"]  = result["source"]
+            stock["price_bar_time"] = result.get("bar_time")
             refreshed += 1
-        # else: keep the TV screener close already written by
-        # build_features_from_tv_data() as a fallback.
+        else:
+            # Keep the TV screener close already written by
+            # build_features_from_tv_data() as a fallback, but tag it so
+            # Supabase records show WHICH basis was actually used instead
+            # of looking identical to a genuine live refresh.
+            stock["price_source"] = "tv_screener_close_fallback"
+            stock["price_bar_time"] = None
 
+    refresh_rate = refreshed / len(enriched_stocks) if enriched_stocks else 0
     logger.info(
         f"✓ Refreshed entry price for {refreshed}/{len(enriched_stocks)} stocks "
-        f"from live 1-minute bars ({len(enriched_stocks) - refreshed} kept the "
-        f"TV screener close as fallback)"
+        f"({refresh_rate*100:.1f}%) from live 1-minute bars "
+        f"({len(enriched_stocks) - refreshed} kept the TV screener close as fallback)"
     )
+    if enriched_stocks and refresh_rate < 0.5:
+        logger.warning(
+            f"⚠️ Only {refresh_rate*100:.1f}% of stocks got a live price refresh — "
+            "this usually means yfinance rate-limited the run. Most current_price "
+            "values for this run are the (potentially stale) TV screener close, "
+            "not a genuine pre/after-market tick. Consider lowering --t1-workers "
+            "or re-running."
+        )
 
     # ── STEP 3: T-1 INTRADAY INDICATOR ENRICHMENT ────────────────────────────
     if not args.no_t1:
@@ -2289,6 +2326,19 @@ def main():
         traceback.print_exc()
         return 1
 
+    # FIX: predict_with_targets() rebuilds its result DataFrame from scratch
+    # (explosion_probability/raw_model_score/prediction/signal + symbol/
+    # exchange only — see explosion_predictor._predict_internal) and does
+    # NOT carry through arbitrary extra columns from features_df. Without
+    # this merge, price_source/price_bar_time (set during the STEP 2.5
+    # price refresh above) would silently be lost and every stored
+    # prediction would fall back to price_source='unknown', defeating the
+    # whole point of tagging where current_price came from.
+    if "price_source" in features_df.columns and "symbol" in predictions_df.columns:
+        price_meta = features_df[["symbol", "price_source", "price_bar_time"]].drop_duplicates("symbol")
+        predictions_df = predictions_df.merge(price_meta, on="symbol", how="left")
+        predictions_df["price_source"] = predictions_df["price_source"].fillna("unknown")
+
     prob_std = predictions_df['explosion_probability'].std()
     if prob_std < 0.001 and len(predictions_df) > 5:
         logger.error(
@@ -2417,6 +2467,13 @@ def main():
             'target_price':          float(row.get('target_price', 0)),
             'target_price_low':      float(row.get('target_price_low', 0)),
             'target_price_high':     float(row.get('target_price_high', 0)),
+            # FIX: records WHICH basis current_price actually came from
+            # (genuine live pre/after-market tick vs. stale TV screener
+            # fallback) so this is auditable from Supabase instead of every
+            # current_price looking equally "fresh". Requires a
+            # price_source/price_bar_time column — see migration file.
+            'price_source':          row.get('price_source', 'unknown'),
+            'price_bar_time':        row.get('price_bar_time'),
             'gain_source':           row.get('gain_source', 'model'),
             'model_version':         f"{model_prefix}_v9",
         }
