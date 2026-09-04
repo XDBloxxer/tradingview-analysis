@@ -51,6 +51,14 @@ class MLPredictionSupabaseClient:
         "current_price", "target_price", "target_price_low", "target_price_high",
         "rsi", "macd", "adx", "volume_ratio", "hv_20", "bb_width",
         "model_version", "screening_universe",
+        # FIX: audit trail for current_price — which basis was actually used
+        # (genuine live pre/after-market yfinance tick vs. stale TV screener
+        # close fallback) and the timestamp of the bar it came from. Requires
+        # matching columns on ml_explosion_predictions — see migration file;
+        # until that migration runs these two keys will be silently dropped
+        # by the allowlist filter below (a warning is logged when that
+        # happens, same as any other not-yet-migrated key).
+        "price_source", "price_bar_time",
     })
 
     def write_predictions_upsert(self, predictions: list) -> int:
