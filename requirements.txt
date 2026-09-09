@@ -5,6 +5,10 @@ numpy>=1.24.0
 pytz>=2023.3
 ta>=0.11.0
 tradingview_ta>=3.3.0
+# ⚠️ RISK: no ref pinned, so this always installs whatever's on the default
+# branch at install time -- same class of bug as the yfinance one, just with
+# no version number to even notice has changed. Pin to a commit or tag:
+#   git+https://github.com/xgboosted/pandas-ta-classic.git@<commit-sha>
 git+https://github.com/xgboosted/pandas-ta-classic.git
 
 # Google Sheets integration
@@ -39,6 +43,15 @@ supabase>=1.26.01
 lxml>=6.0.0
 
 # ML dependencies
+# ⚠️ RISK: best_model.pkl / gain_regressor.pkl / scaler.pkl are joblib-pickled
+# by a specific xgboost/scikit-learn version (see explosion_predictor.py,
+# model_trainer.py). An unbounded >= here means a future CI run can silently
+# install a newer major version and load the SAME pkl files under different
+# internals -- pickle version mismatches on these two libraries are a classic
+# source of either a hard load error, or worse, a model that loads without
+# error but scores differently. Recommend pinning both to whatever versions
+# best_model.pkl was actually trained/saved with (check `pip freeze` from a
+# training run, or re-save the model after upgrading deliberately).
 xgboost>=2.0.0
 scikit-learn>=1.3.0
 joblib>=1.3.0
@@ -49,7 +62,15 @@ optuna>=3.6.0  # optional: ml_retrain_model.py's search_hyperparameters() uses
                # if it's absent -- not a hard requirement.
 
 # Stock data fetching
-yfinance>=0.2.40
+# PINNED (was >=0.2.40): an unbounded floor let CI silently upgrade to the
+# 1.x rewrite (1.7.0 as of 2026-09-09), which changed request/retry behavior
+# enough to blow the T-1 enrichment step from ~4 min to 60+ min and starve
+# large numbers of stocks of t1_/t3_/t5_/t10_ features. 0.2.66 is the last
+# release before the 1.0 rewrite (Dec 2025) and is what this pipeline's
+# fetch logic (FIX 7-11) was actually built and tuned against.
+# Bump deliberately and re-test the full screen-and-predict run before
+# moving off this pin.
+yfinance==0.2.66
 html5lib>=1.1
 beautifulsoup4>=4.12.0
 
