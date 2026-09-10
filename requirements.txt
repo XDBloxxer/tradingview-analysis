@@ -70,7 +70,7 @@ optuna>=3.6.0  # optional: ml_retrain_model.py's search_hyperparameters() uses
 # fetch logic (FIX 7-11) was actually built and tuned against.
 # Bump deliberately and re-test the full screen-and-predict run before
 # moving off this pin.
-yfinance==0.2.66
+yfinance==1.6.0
 html5lib>=1.1
 beautifulsoup4>=4.12.0
 
