@@ -1648,11 +1648,27 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
     result = {}
     yesterday = None
 
+    # CLAUDE INSTRUMENTATION (2026-09-10): both yfinance and curl_cffi have
+    # now been pinned to known-good versions and a run still took ~5x longer
+    # than the ~4-min baseline with zero HTTP errors / zero rate-limit hits,
+    # so the network layer is exonerated. This timing wrap isolates fetch
+    # (I/O) time from indicator-computation (CPU) time per symbol so the
+    # next run's log tells us definitively which one is actually slow,
+    # instead of inferring it from timestamp gaps after the fact. Remove
+    # once the bottleneck is confirmed and fixed.
+    import time as _instr_time
+    _t_fetch_intraday = 0.0
+    _t_compute_intraday = 0.0
+    _t_fetch_daily_and_compute = 0.0
+    _t_total_start = _instr_time.perf_counter()
+
     # ── Phase 1: T-1 5-min intraday fetch (independent — failure here no ──
     # longer blocks Phase 2 below) ──────────────────────────────────────────
     try:
         ticker      = yf.Ticker(symbol)
+        _t0 = _instr_time.perf_counter()
         df_intraday = ticker.history(period="5d", interval="5m")
+        _t_fetch_intraday = _instr_time.perf_counter() - _t0
 
         if df_intraday.empty or len(df_intraday) < 50:
             logger.warning(
@@ -1681,6 +1697,8 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
                 else:
                     day_bars.columns = [c.lower() for c in day_bars.columns]
 
+                    _t0 = _instr_time.perf_counter()
+
                     # ── Close-of-day indicators (full session) ──────────────
                     close_indicators = _compute_indicators(
                         day_bars["close"], day_bars["high"], day_bars["low"],
@@ -1703,6 +1721,7 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
                             "copying close indicators as open fallback"
                         )
                         open_indicators = dict(close_indicators)
+                    _t_compute_intraday = _instr_time.perf_counter() - _t0
 
                     if _t1_map_available:
                         # ── Rename and write t1_close_* ──────────────────────
@@ -1748,7 +1767,17 @@ def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = Fal
             yesterday if yesterday is not None else _most_recent_completed_trading_day(logger),
             dt_time(0, 0),
         )
+        _t0 = _instr_time.perf_counter()
         _fetch_real_multiday_features(symbol, detection_date_for_multiday, result, logger)
+        _t_fetch_daily_and_compute = _instr_time.perf_counter() - _t0
+
+    _t_total = _instr_time.perf_counter() - _t_total_start
+    logger.info(
+        f"TIMING {symbol}: total={_t_total:.2f}s | "
+        f"intraday_fetch={_t_fetch_intraday:.2f}s | "
+        f"intraday_compute={_t_compute_intraday:.2f}s | "
+        f"daily_fetch+compute={_t_fetch_daily_and_compute:.2f}s"
+    )
 
     t1_close_count = sum(1 for k in result if k.startswith("t1_close_"))
     t1_open_count  = sum(1 for k in result if k.startswith("t1_open_"))
