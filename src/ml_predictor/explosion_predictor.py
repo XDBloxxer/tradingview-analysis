@@ -1085,6 +1085,50 @@ class ExplosionPredictor:
                     "noise-level rank differences."
                 )
 
+        # CLAUDE FIX (2026-09-10): tied-cluster guard.
+        # ROOT CAUSE: RC7's method='max' fix was designed for the case where a
+        # SMALL tied group sits at the top of an otherwise well-differentiated
+        # distribution (e.g. 25/44 stocks genuinely saturating together). It
+        # assumed ties are rare. When upstream data fetching fails for a large
+        # fraction of the batch (e.g. missing t1_/t3_/t5_/t10_ features from a
+        # broken/rate-limited data source), those stocks all route to the same
+        # XGBoost missing-value leaf and land on an EXACT identical probability
+        # — and method='max' then promotes that entire tied mass to
+        # percentile=1.0, i.e. STRONG BUY, regardless of how large the tied
+        # group is. A real run hit this directly: 497/995 stocks (49.9%) tied
+        # at 68.89–68.91% probability, nearly all with zero daily-bar features
+        # present, all classified STRONG BUY. The population-level score_std
+        # guard above doesn't catch this because std stays "healthy" — driven
+        # by the gap between the tied cluster and the AVOID-bucket stocks, not
+        # by any real differentiation within the tied cluster itself.
+        #
+        # FIX: if any single probability value (rounded to avoid float noise)
+        # accounts for more than TIE_CLUSTER_MAX_FRACTION of the batch among
+        # stocks currently at STRONG BUY/BUY, that's a signature of a data
+        # problem, not consensus — downgrade that tied group to HOLD (not
+        # AVOID, since we genuinely don't know) and log it loudly so it's
+        # investigated rather than shipped as a confident buy signal.
+        TIE_CLUSTER_MAX_FRACTION = 0.15  # a real top-decile shouldn't be >15% duplicate-valued
+
+        elevated_mask = signals.isin(["STRONG BUY", "BUY"])
+        if elevated_mask.any():
+            rounded = probabilities[elevated_mask].round(4)
+            value_counts = rounded.value_counts()
+            top_value, top_count = value_counts.index[0], int(value_counts.iloc[0])
+            if top_count > TIE_CLUSTER_MAX_FRACTION * n:
+                tied_index = rounded[rounded == top_value].index
+                downgraded_counts = signals.loc[tied_index].value_counts().to_dict()
+                signals.loc[tied_index] = "HOLD"
+                self.logger.warning(
+                    f"Tied-cluster guard: {top_count}/{n} stocks ({top_count / n:.1%}) share an "
+                    f"identical probability of {top_value:.4f} — this exceeds "
+                    f"{TIE_CLUSTER_MAX_FRACTION:.0%} of the batch and almost certainly reflects "
+                    "stocks that fell through to the same missing-value model leaf (e.g. failed "
+                    "t1_/t3_/t5_/t10_ feature fetches), not genuine signal agreement. Downgraded "
+                    f"{downgraded_counts} to HOLD rather than ship them as STRONG BUY/BUY. "
+                    "Check the upstream data-fetch logs for this run."
+                )
+
         strong_buy_n = (signals == "STRONG BUY").sum()
         buy_n        = (signals == "BUY").sum()
         hold_n       = (signals == "HOLD").sum()
