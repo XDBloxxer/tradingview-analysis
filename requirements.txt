@@ -70,7 +70,18 @@ optuna>=3.6.0  # optional: ml_retrain_model.py's search_hyperparameters() uses
 # fetch logic (FIX 7-11) was actually built and tuned against.
 # Bump deliberately and re-test the full screen-and-predict run before
 # moving off this pin.
-yfinance==1.6.0
+# yfinance==0.2.66's HTTP transport. Confirmed via yfinance's own release
+# notes (1.5.2, Jul 2026: "Fix yfinance breaking with curl_cffi>=0.16") that
+# curl_cffi>=0.16 breaks yfinance versions before that fix landed -- and
+# 0.2.66 (Sept 2025) predates it by ~10 months, so it never got the patch.
+# curl_cffi has no explicit pin anywhere in this file, so pip was free to
+# resolve it to whatever's newest (0.16.3 as of 2026-09-10) even with
+# yfinance itself pinned -- this is almost certainly the actual root cause
+# of the "started happening out of nowhere with zero code changes" timeouts
+# and missing-feature/tied-signal issue, since neither the repo nor yfinance
+# needed to change for this to silently start breaking.
+curl_cffi>=0.7,<0.16
+yfinance==0.2.66
 html5lib>=1.1
 beautifulsoup4>=4.12.0
 
