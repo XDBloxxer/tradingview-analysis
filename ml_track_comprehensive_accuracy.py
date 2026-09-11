@@ -124,14 +124,32 @@ INTRADAY_WIN_THRESHOLD = 15.0
 
 # FIX 1: Keys are now lowercase to match what load_feature_importance() produces
 # after stripping the t3_/t5_/t10_ prefix from lowercase model feature names.
+#
+# 2026-09-11 INCIDENT FIX: hv_10/hv_20 used to live here, which meant their
+# filters were only ever derived if the live model happened to still be
+# using that feature that week. When a retrain's feature-selection stage
+# dropped hv_20 from feature_importance.csv, min_hv20/max_hv20 silently
+# vanished from learned_filters.json, the screener let ~20x more stocks
+# through, and the model (which had never seen that population) collapsed
+# onto a single tied probability for half the batch. Volatility-regime
+# bounds describe what kind of stock this strategy works on, not what the
+# model reads as input, so they've been moved to ALWAYS_ON_REGIME_FEATURES
+# below and are computed unconditionally, independent of feature selection.
 SCREENER_FEATURE_MAP = {
-    "hv_10":        ("min_hv10",        "max_hv10"),
-    "hv_20":        ("min_hv20",        "max_hv20"),
     "volume_ratio": ("min_volume_ratio", None),
     "rsi_14":       ("min_rsi",         "max_rsi"),
     "rsi_7":        ("min_rsi7",        "max_rsi7"),
     "atr_14":       ("min_atr14",       None),
     "adx_14":       ("min_adx",         None),
+}
+
+# Volatility-regime filters: computed every run from the winner/non-winner
+# distributions regardless of whether hv_10/20/30 currently appear in
+# feature_importance.csv. See note above SCREENER_FEATURE_MAP.
+ALWAYS_ON_REGIME_FEATURES = {
+    "hv_10": ("min_hv10", "max_hv10"),
+    "hv_20": ("min_hv20", "max_hv20"),
+    "hv_30": ("min_hv30", "max_hv30"),
 }
 
 # FIX 3: Hard caps prevent any single filter from excluding the bulk of the market.
@@ -153,8 +171,25 @@ HARD_CAPS = {
     "min_relative_volume": 1.0,
     "max_min_hv10":        30.0,
     "max_min_hv20":        30.0,
+    "max_min_hv30":        30.0,
     "max_min_volume_ratio": 3.0,
 }
+
+# Keys that must always be present in learned_filters.json once they've
+# appeared once. Used by apply_continuity_guard() to catch a run that would
+# otherwise silently drop or wildly jump one of these — the exact failure
+# mode from the 2026-09-11 incident.
+ALWAYS_REQUIRED_FILTER_KEYS = [
+    "min_price", "max_price", "min_volume",
+    "min_relative_volume", "min_volume_ratio",
+    "min_hv10", "max_hv10",
+    "min_hv20", "max_hv20",
+    "min_hv30", "max_hv30",
+]
+
+# If a filter value would move by more than this fraction in a single run,
+# blend it with the previous value instead of hard-replacing it.
+MAX_FILTER_RELATIVE_CHANGE = 0.5
 
 
 def load_config(config_path: str) -> dict:
@@ -599,6 +634,54 @@ def compute_model_driven_filters(
                 f"min_volume filter: {filters['min_volume']:,}"
             )
 
+    # ── Volatility-regime filters (ALWAYS computed) ─────────────────────────
+    # Deliberately NOT gated on top_features_set and NOT subject to the
+    # discriminativeness check below — these exist to keep the screener in
+    # the volatility regime this strategy's winners actually come from,
+    # independent of whatever the current model happens to use as input.
+    # If a column is genuinely unusable this run (missing / too few samples),
+    # we skip writing it here rather than guess, and let apply_continuity_guard()
+    # carry forward the previous value further down the pipeline — the key
+    # itself is never simply left absent.
+    for hv_base, (min_key, max_key) in ALWAYS_ON_REGIME_FEATURES.items():
+        col = find_col(winner_df, hv_base)
+        if col is None:
+            logger.warning(
+                f"  {hv_base}: no column found in winner snapshot this run — "
+                f"{min_key}/{max_key} will fall back to the previous value"
+            )
+            continue
+
+        w_vals = pd.to_numeric(winner_df[col], errors="coerce").dropna()
+        if len(w_vals) < MIN_SAMPLES_FOR_FILTER:
+            logger.warning(
+                f"  {hv_base}: only {len(w_vals)} samples (need {MIN_SAMPLES_FOR_FILTER}) — "
+                f"{min_key}/{max_key} will fall back to the previous value"
+            )
+            continue
+
+        p10_w = float(w_vals.quantile(LOWER_PCT / 100))
+        p90_w = float(w_vals.quantile(UPPER_PCT / 100))
+        min_val = round(p10_w, 4)
+
+        cap = HARD_CAPS.get(f"max_min_{hv_base.replace('_', '')}")
+        if cap is not None and min_val > cap:
+            logger.info(
+                f"  {hv_base}: raw p10={min_val:.2f} exceeds cap {cap} "
+                f"→ clamping {min_key} to {cap}"
+            )
+            min_val = cap
+
+        filters[min_key] = min_val
+        if p90_w > p10_w:
+            filters[max_key] = round(p90_w, 4)
+
+        logger.info(
+            f"  {hv_base} (always-on regime filter): winner 10th-90th = "
+            f"{p10_w:.2f}-{p90_w:.2f} → {min_key}={filters.get(min_key)}, "
+            f"{max_key}={filters.get(max_key)}"
+        )
+
     # ── Screener-relevant features ────────────────────────────────────────────
     for base_feat, (min_key, max_key) in SCREENER_FEATURE_MAP.items():
         if base_feat not in top_features_set:
@@ -710,11 +793,72 @@ def _conservative_defaults() -> dict:
     }
 
 
+def apply_continuity_guard(
+    new_filters: dict,
+    previous_filters: dict,
+    logger: logging.Logger,
+) -> dict:
+    """
+    Protects learned_filters.json against two failure modes seen in
+    production (2026-09-11 incident): a key silently disappearing between
+    runs, and a key jumping to a wildly different value in one run because
+    that day's winner sample was unusual or a required feature was
+    temporarily missing from the model.
+
+    - Missing key this run, present last run  -> carry the previous value
+      forward and warn loudly.
+    - Present in both, but moved by more than MAX_FILTER_RELATIVE_CHANGE
+      -> blend 70% old / 30% new instead of a hard jump, and warn.
+
+    This only applies to ALWAYS_REQUIRED_FILTER_KEYS — keys that, once they
+    exist, must always exist and should not swing wildly run to run.
+    """
+    guarded = dict(new_filters)
+
+    for key in ALWAYS_REQUIRED_FILTER_KEYS:
+        old_val = previous_filters.get(key)
+        new_val = guarded.get(key)
+
+        if new_val is None:
+            if old_val is not None:
+                logger.warning(
+                    f"  CONTINUITY GUARD: '{key}' is missing from this run's "
+                    f"freshly computed filters — carrying forward the previous "
+                    f"value ({old_val}) instead of dropping it"
+                )
+                guarded[key] = old_val
+            continue
+
+        if old_val is None or old_val == 0:
+            continue  # nothing to compare against yet
+
+        rel_change = abs(new_val - old_val) / abs(old_val)
+        if rel_change > MAX_FILTER_RELATIVE_CHANGE:
+            blended = round(0.7 * old_val + 0.3 * new_val, 4)
+            logger.warning(
+                f"  CONTINUITY GUARD: '{key}' moved {rel_change:.0%} in one run "
+                f"({old_val} → {new_val}) — smoothing to {blended} instead of "
+                f"applying the full jump immediately"
+            )
+            guarded[key] = blended
+
+    return guarded
+
+
 def learn_and_write_filters(client, logger: logging.Logger) -> dict:
     logger.info("")
     logger.info("=" * 60)
     logger.info("MODEL-DRIVEN FILTER LEARNING")
     logger.info("=" * 60)
+
+    previous_filters = {}
+    if LEARNED_FILTERS_PATH.exists():
+        try:
+            with open(LEARNED_FILTERS_PATH) as f:
+                previous_filters = json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not read previous learned_filters.json: {e}")
+            previous_filters = {}
 
     top_features = load_feature_importance(FEATURE_IMPORTANCE_PATH, top_n=40)
     if top_features:
@@ -724,6 +868,10 @@ def learn_and_write_filters(client, logger: logging.Logger) -> dict:
     else:
         logger.warning("No feature importance file — using conservative defaults")
         filters = _conservative_defaults()
+        filters = apply_continuity_guard(filters, previous_filters, logger)
+        for k, v in previous_filters.items():
+            if k.startswith("_") and k not in filters:
+                filters[k] = v
         _write_filters(filters, logger)
         return filters
 
@@ -734,15 +882,13 @@ def learn_and_write_filters(client, logger: logging.Logger) -> dict:
                 f"{len(non_winner_df)} non-winners...")
     filters = compute_model_driven_filters(winner_df, non_winner_df, top_features, logger)
 
-    if LEARNED_FILTERS_PATH.exists():
-        try:
-            with open(LEARNED_FILTERS_PATH) as f:
-                existing = json.load(f)
-            for k, v in existing.items():
-                if k.startswith("_") and k not in filters:
-                    filters[k] = v
-        except Exception:
-            pass
+    logger.info("")
+    logger.info("Applying continuity guard against previous learned_filters.json...")
+    filters = apply_continuity_guard(filters, previous_filters, logger)
+
+    for k, v in previous_filters.items():
+        if k.startswith("_") and k not in filters:
+            filters[k] = v
 
     _write_filters(filters, logger)
     return filters
