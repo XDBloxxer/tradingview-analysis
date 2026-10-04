@@ -1,9 +1,9 @@
 feature,importance
-t3_atr_7,0.145817
-t1_open_OBV,0.141636
-t3_kcle_20_2,0.137505
-t3_ema_50,0.127994
-t1_close_VWAP,0.124794
-t1_open_ATR_14_Slope,0.118058
-t3_hv_30,0.10753
-t1_close_DCL_20_20,0.096666
+t3_ema_50,0.160465
+t10_obv,0.155396
+t3_kcle_20_2,0.147758
+t3_atr_7,0.137686
+t3_hv_10,0.119437
+t1_close_DMP_14,0.104599
+t1_close_ATR_14,0.090148
+t1_open_Gap_Pct,0.084511
