@@ -1,9 +1,9 @@
 feature,importance
-t3_ema_50,0.1748
-t3_kcle_20_2,0.163573
-t10_obv,0.144293
-t3_atr_7,0.112701
-t1_close_DMP_14,0.110464
-t1_close_ATR_14,0.102666
-t1_open_Gap_Pct,0.098745
-t3_hv_10,0.092759
+t3_ema_50,0.181071
+t3_kcle_20_2,0.173
+t10_obv,0.127456
+t1_open_Gap_Pct,0.118941
+t3_atr_7,0.108928
+t3_hv_10,0.100954
+t1_close_DMP_14,0.098784
+t1_close_ATR_14,0.090865
