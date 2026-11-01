@@ -1,19 +1,18 @@
 {
-  "stage0_count": 14,
-  "stage1_corr_count": 14,
-  "stage2_boruta_count": 14,
-  "stage3_rfecv_count": 14,
-  "stage4_ga_count": 8,
-  "final_count": 8,
+  "stage0_count": 17,
+  "stage1_corr_count": 17,
+  "stage2_boruta_count": 17,
+  "stage3_rfecv_count": 12,
+  "stage4_ga_count": 7,
+  "final_count": 7,
   "final_features": [
-    "t1_open_Gap_Pct",
+    "t1_open_ATR_14_Slope",
     "t3_hv_10",
-    "t3_ema_50",
-    "t3_atr_7",
     "t1_close_DMP_14",
     "t3_kcle_20_2",
+    "t5_kcue_20_2",
     "t1_close_ATR_14",
-    "t10_obv"
+    "t1_close_VWAP"
   ],
   "corr_threshold": 0.9,
   "boruta_iterations": 100,
