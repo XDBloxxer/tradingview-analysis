@@ -25,6 +25,9 @@ except ImportError:
     )
 
 from .rate_limiter import RateLimiter
+from .market_calendar import (
+    is_live_window, last_completed_session, now_et,
+)
 
 
 class DailyWinnersDetector:
@@ -140,7 +143,12 @@ class DailyWinnersDetector:
         if target_date is None:
             return True
         target = target_date.date() if isinstance(target_date, datetime) else target_date
-        return target == datetime.now().date()
+        # Timezone-correct: the live endpoints (TradingView gainers, yfinance
+        # day_gainers) describe the last completed NYSE session until
+        # pre-market (04:00 ET) rolls them over. Comparing against the
+        # runner's UTC date (old behaviour) was wrong for any run that
+        # started after 00:00 UTC.
+        return is_live_window(target, now_et())
 
     # How many symbols to pack into a single yf.download() batch call when
     # prefetching daily bars for a scan (see _batch_prefetch_daily_bars).
@@ -278,10 +286,14 @@ class DailyWinnersDetector:
     
     def detect_top_winners(self, top_n: int = 15, target_date: datetime = None) -> List[Dict[str, Any]]:
         if target_date is None:
-            target_date = datetime.now()
+            target_date = datetime.combine(last_completed_session(), datetime.min.time())
         
         target_date_str = target_date.date().isoformat()
         
+        self.logger.info(
+            f"Target session {target_date_str} | now ET={now_et():%Y-%m-%d %H:%M} | "
+            f"live endpoints usable={self._is_live(target_date)}"
+        )
         self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
         
         # Fetch MORE than we need initially to account for validation rejections
@@ -961,105 +973,113 @@ class DailyWinnersDetector:
             # the date-pinned helper instead.
             return self._verify_freshness_for_date(candidates, target_date)
 
-        symbols = [c['symbol'] for c in candidates]
-        
+        return self._verify_freshness_live(candidates, target_date, batch_size)
+
+    def _verify_freshness_live(
+        self,
+        candidates: List[Dict[str, Any]],
+        target_date: datetime,
+        batch_size: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Live-run validation, pinned to the target session date.
+
+        Old behaviour looked at the LAST row of a period='5d' download and
+        accepted anything <=5 days old, so (a) it validated nothing useful,
+        and (b) a trailing NaN row (yfinance emits one for a not-yet-complete
+        session) or a rate-limited/empty batch made candidates vanish,
+        producing "All candidates failed freshness validation".
+
+        Now each candidate ends in one of three states:
+          * CONFIRMED  - yfinance has a non-NaN bar for exactly target_date -> keep
+                         (OHLC filled from it if missing).
+          * STALE      - yfinance responded with bars but none for target_date
+                         (genuinely stale/halted/delisted)               -> reject
+          * UNVERIFIED - yfinance failed / returned nothing for the batch or
+                         symbol (rate limit, outage)                      -> keep
+                         TradingView's data, with a warning. A data-provider
+                         hiccup must not wipe out the whole day's winners.
+        """
+        target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
+        start = target_date_obj - timedelta(days=10)
+        end = target_date_obj + timedelta(days=1)
+        valid: List[Dict[str, Any]] = []
+        n_confirmed = n_stale = n_unverified = 0
+
         self.logger.info("=" * 80)
-        self.logger.info(f"🔍 FRESHNESS VALIDATION DEBUG - Target date: {target_date_obj}")
+        self.logger.info(f"🔍 FRESHNESS VALIDATION (date-pinned) - session {target_date_obj}")
         self.logger.info("=" * 80)
-        
-        for i in range(0, len(symbols), batch_size):
-            batch_symbols    = symbols[i:i + batch_size]
-            batch_candidates = candidates[i:i + batch_size]
-            
-            self.logger.info(f"📦 Batch {i//batch_size + 1}: Checking {len(batch_symbols)} symbols")
-            
+
+        for i in range(0, len(candidates), batch_size):
+            batch = candidates[i:i + batch_size]
+            symbols = [c['symbol'] for c in batch]
+            data = None
             try:
                 data = self.rate_limiter.call_with_backoff(
                     yf.download,
-                    batch_symbols,
-                    period='5d',
+                    symbols,
+                    start=start.isoformat(),
+                    end=end.isoformat(),
                     interval='1d',
                     group_by='ticker',
                     progress=False,
                     threads=True,
                     auto_adjust=True,
-                    label=f"freshness batch {i//batch_size + 1}",
+                    label=f"freshness batch {i // batch_size + 1}",
                 )
-                
-                if data.empty:
-                    self.logger.warning(f"⚠️ No data returned for batch {i//batch_size + 1}")
-                    continue
-                
-                for symbol, candidate in zip(batch_symbols, batch_candidates):
-                    self.logger.info(f"\n{'='*60}")
-                    self.logger.info(f"🔍 Checking: {symbol}")
-                    
-                    try:
-                        if len(batch_symbols) == 1:
-                            symbol_data = data
-                        else:
-                            if symbol not in data.columns.get_level_values(0):
-                                self.logger.warning(f"  ❌ {symbol}: Not in response data")
-                                continue
-                            symbol_data = data[symbol]
-                        
-                        if symbol_data.empty:
-                            self.logger.warning(f"  ❌ {symbol}: Empty data frame")
-                            continue
-                        
-                        available_dates = symbol_data.index.date
-                        self.logger.info(f"  📅 Available dates: {[str(d) for d in available_dates]}")
-                        
-                        last_date   = symbol_data.index[-1].date()
-                        last_close  = symbol_data['Close'].iloc[-1]
-                        last_volume = symbol_data['Volume'].iloc[-1]
-                        
-                        self.logger.info(f"  📊 Last trading day: {last_date}")
-                        self.logger.info(f"  💰 Last close: {'NaN' if pd.isna(last_close) else f'${last_close:.2f}'}")
-                        self.logger.info(f"  📈 Last volume: {'NaN' if pd.isna(last_volume) else f'{last_volume:,}'}")
-                        
-                        days_diff = (target_date_obj - last_date).days
-                        self.logger.info(f"  ⏱️  Age: {days_diff} days old")
-                        
-                        if days_diff > 5:
-                            self.logger.warning(f"  ❌ REJECTED: Data is {days_diff} days old (limit: 5)")
-                            continue
-                        if pd.isna(last_close) or pd.isna(last_volume):
-                            self.logger.warning(f"  ❌ REJECTED: NaN close or volume")
-                            continue
-                        if last_volume < self.min_volume:
-                            self.logger.warning(f"  ❌ REJECTED: volume {last_volume:,} < {self.min_volume:,}")
-                            continue
-                        
-                        # ── Opportunistically fill OHLC from this validation fetch ──
-                        row = symbol_data.iloc[-1]
-                        for field, col in (('high', 'High'), ('low', 'Low'),
-                                           ('open', 'Open'), ('close', 'Close')):
-                            if candidate.get(field) is None and not pd.isna(row.get(col, float('nan'))):
-                                candidate[field] = float(row[col])
-                        
-                        self.logger.info(f"  ✅✅ {symbol} PASSED ALL VALIDATION CHECKS")
-                        valid_candidates.append(candidate)
-                        
-                    except Exception as e:
-                        self.logger.error(f"  ❌ {symbol}: Error: {e}", exc_info=True)
-                        continue
-                
-                if i + batch_size < len(symbols):
-                    time.sleep(0.5)
-                
             except Exception as e:
-                self.logger.error(f"❌ Batch {i//batch_size + 1} error: {e}", exc_info=True)
-                continue
-        
-        self.logger.info("\n" + "=" * 80)
-        self.logger.info(f"📊 VALIDATION SUMMARY: "
-                         f"total={len(candidates)}, "
-                         f"passed={len(valid_candidates)}, "
-                         f"rejected={len(candidates)-len(valid_candidates)}")
-        self.logger.info("=" * 80 + "\n")
-        
-        return valid_candidates
+                self.logger.warning(f"  ⚠️ freshness batch {i // batch_size + 1} download failed: {e}")
+
+            for cand in batch:
+                sym = cand['symbol']
+                frame = None
+                try:
+                    if data is not None and not data.empty:
+                        if isinstance(data.columns, pd.MultiIndex):
+                            if sym in data.columns.get_level_values(0):
+                                frame = data[sym]
+                        else:
+                            frame = data  # single-symbol download
+                        if frame is not None:
+                            frame = frame.dropna(subset=['Close'])
+                except Exception:
+                    frame = None
+
+                if frame is None or frame.empty:
+                    n_unverified += 1
+                    self.logger.warning(f"  ⚠️ {sym}: no yfinance bars — UNVERIFIED, keeping TradingView data")
+                    valid.append(cand)
+                    continue
+
+                match = frame[frame.index.date == target_date_obj]
+                if match.empty:
+                    n_stale += 1
+                    self.logger.warning(
+                        f"  ❌ {sym}: STALE — latest bar {frame.index[-1].date()} != {target_date_obj}"
+                    )
+                    continue
+
+                row = match.iloc[-1]
+                vol = row.get('Volume')
+                if pd.notna(vol) and vol < self.min_volume:
+                    self.logger.warning(f"  ❌ {sym}: volume {int(vol):,} < {self.min_volume:,}")
+                    continue
+
+                for field, col in (('high', 'High'), ('low', 'Low'),
+                                   ('open', 'Open'), ('close', 'Close')):
+                    if cand.get(field) is None and pd.notna(row.get(col)):
+                        cand[field] = float(row[col])
+                n_confirmed += 1
+                valid.append(cand)
+
+            if i + batch_size < len(candidates):
+                time.sleep(0.5)
+
+        self.logger.info(
+            f"📊 VALIDATION SUMMARY: total={len(candidates)}, confirmed={n_confirmed}, "
+            f"unverified-kept={n_unverified}, stale-rejected={n_stale}"
+        )
+        return valid
 
     def _verify_freshness_for_date(
         self,
