@@ -404,25 +404,34 @@ def _is_trading_day(d) -> bool:
 
 def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
     """
-    Determine the prediction date for the current run.
+    Determine the session this run is predicting for.
 
-    Logic:
-      1. Query daily_winners for the latest detection_date (last day winners
-         were actually tracked).
-      2. Advance one calendar day at a time past that date, skipping weekends
-         AND US market holidays, until we reach the next valid trading day.
-      3. Clamp to today: if the script is running on a valid trading day and
-         the calculated next day is still in the future, return today instead.
-         This handles the case where the winners tracker hasn't been updated
-         yet for the most recent session (e.g. a holiday pushed detection_date
-         one day behind).
+    FIX 12: derived from the America/New_York wall clock ONLY.
 
-    Fallback: if the table is empty or the query fails, use today (or the
-    most recent past trading day) so the workflow never hard-crashes.
+    The previous version (FIX 10) took the latest daily_winners.detection_date
+    and added one trading day. That made the predictor inherit every winners
+    problem: a winners run that was stamped with the wrong date pushed
+    predictions to the wrong (even future) session, and a winners run that
+    failed for a day left last_date + 1 pointing at a session that had already
+    happened (the clamp only handled the future case), so predictions were
+    written for a past date.
+
+    Rule: the session being predicted is today (ET) if today is a trading day
+    and the 16:00 ET close hasn't happened yet, else the next trading day.
+    A run delayed by hours (e.g. 8am Estonia = 1am ET) is still "today ET".
+
+    daily_winners is consulted for logging only, so a gap in winners data is
+    visible but can no longer corrupt the prediction date.
     """
+    from src.market_calendar import upcoming_session, last_completed_session, now_et
+
     logger = logging.getLogger(__name__)
-    est = pytz.timezone('America/New_York')
-    today = datetime.now(est).date()
+    prediction_day = upcoming_session()
+    expected_last_winners = last_completed_session()
+    logger.info(
+        f"Prediction date from ET clock: now ET={now_et():%Y-%m-%d %H:%M} "
+        f"-> session {prediction_day} (last completed session {expected_last_winners})"
+    )
 
     try:
         response = (
@@ -433,42 +442,22 @@ def get_next_trading_day(supabase: "MLPredictionSupabaseClient") -> str:
             .execute()
         )
         if response.data:
-            last_date_str = response.data[0]["detection_date"]
-            last_date = datetime.strptime(last_date_str, "%Y-%m-%d").date()
-
-            # Advance past last_date, skipping weekends + holidays
-            prediction_day = last_date + timedelta(days=1)
-            while not _is_trading_day(prediction_day):
-                prediction_day += timedelta(days=1)
-
-            # Clamp: only kicks in for a genuine backfill lag (e.g. a holiday
-            # or an outage left daily_winners more than one trading day behind
-            # today). A gap of exactly one day is the normal, expected case
-            # (yesterday's winners -> predicting today's session) and must
-            # NOT be clamped, or the script will perpetually predict for the
-            # day that already closed instead of the upcoming session.
-            if (prediction_day - today).days > 1 and _is_trading_day(today):
-                logger.info(
-                    f"Prediction date derived from daily_winners: "
-                    f"last={last_date}  →  next trading day={prediction_day} "
-                    f"(clamped to today={today})"
+            last_winners = datetime.strptime(response.data[0]["detection_date"], "%Y-%m-%d").date()
+            if last_winners < expected_last_winners:
+                logger.warning(
+                    f"daily_winners is behind: latest detection_date={last_winners}, "
+                    f"expected {expected_last_winners}. Predicting for {prediction_day} anyway; "
+                    f"re-run the winners tracker for the missing session(s)."
                 )
-                return today.isoformat()
-
-            logger.info(
-                f"Prediction date derived from daily_winners: "
-                f"last={last_date}  →  next trading day={prediction_day}"
-            )
-            return prediction_day.isoformat()
+            elif last_winners > expected_last_winners:
+                logger.warning(
+                    f"daily_winners has detection_date={last_winners} AFTER the last completed "
+                    f"session {expected_last_winners} — a winners run was likely mis-dated."
+                )
     except Exception as e:
-        logger.warning(f"Could not fetch most recent winners date: {e}")
+        logger.warning(f"Could not check winners freshness (non-fatal): {e}")
 
-    # ── Fallback: use today if it's a trading day, else most recent past day ─
-    logger.warning("Falling back to time-based prediction date.")
-    fallback = today
-    while not _is_trading_day(fallback):
-        fallback -= timedelta(days=1)
-    return fallback.isoformat()
+    return prediction_day.isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -1600,10 +1589,8 @@ def _most_recent_completed_trading_day(logger):
     independent yfinance call) still has a detection_date to anchor on
     instead of being skipped along with the intraday fetch.
     """
-    d = datetime.now().date() - timedelta(days=1)
-    while not _is_trading_day(d):
-        d -= timedelta(days=1)
-    return d
+    from src.market_calendar import last_completed_session
+    return last_completed_session()
 
 
 def fetch_t1_data_for_symbol(symbol: str, logger, fill_flat_prefixes: bool = False) -> dict:
