@@ -11,7 +11,9 @@ import sys
 from pathlib import Path
 from datetime import datetime, timedelta
 
-from pandas.tseries.holiday import USFederalHolidayCalendar
+from src.market_calendar import (
+    is_trading_day as _nyse_is_trading_day, last_completed_session, now_et,
+)
 
 from src.daily_winners_detector import DailyWinnersDetector
 from src.intraday_data_collector import IntradayDataCollector
@@ -21,11 +23,8 @@ from src.utils import setup_logging, load_config
 
 
 def is_trading_day(d) -> bool:
-    """Return True if d is a NYSE trading day (not a weekend or US federal holiday)."""
-    if d.weekday() >= 5:  # Saturday=5, Sunday=6
-        return False
-    holidays = USFederalHolidayCalendar().holidays(start=str(d), end=str(d))
-    return len(holidays) == 0
+    """True if d is a NYSE trading day (weekends, NYSE holidays incl. Good Friday)."""
+    return _nyse_is_trading_day(d)
 
 
 def trading_days_between(start_date, end_date):
@@ -277,7 +276,13 @@ def main():
             logger.error(f"Invalid date format: {args.date}. Use YYYY-MM-DD")
             return 1
     else:
-        target_date = datetime.now()
+        # Resolve the session from the America/New_York clock, NOT the runner's
+        # UTC clock: a run delayed past midnight UTC (e.g. 08:00 Estonia =
+        # 01:00 ET) must still process the session that just closed.
+        session = last_completed_session()
+        target_date = datetime.combine(session, datetime.min.time())
+        logger.info(f"No --date given: resolved session {session} "
+                    f"(now ET {now_et():%Y-%m-%d %H:%M})")
 
     return run_for_date(target_date, args, config, logger)
 
