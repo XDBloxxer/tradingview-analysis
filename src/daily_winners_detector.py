@@ -297,7 +297,12 @@ class DailyWinnersDetector:
         self.logger.info(f"Fetching top {top_n} day gainers from TradingView MarketMovers...")
         
         # Fetch MORE than we need initially to account for validation rejections
-        initial_fetch_size = top_n * 2
+        # The TradingView fetch is sized by top_n (it pulls up to 500 raw rows and
+        # filters them). We only supplement when the live screener could not even
+        # supply top_n candidates; previously we demanded 2x top_n, so a perfectly
+        # good 18-candidate TradingView result was padded with 12 random
+        # universe-scan symbols that then failed validation.
+        initial_fetch_size = top_n
         
         candidates = self._fetch_from_tradingview(target_date, initial_fetch_size)
         
@@ -712,10 +717,19 @@ class DailyWinnersDetector:
             self.logger.info("Fetching from yfinance screener...")
             
             try:
-                from yfinance import Screener
-                
-                screener = Screener()
-                gainers_data = screener.get_screeners(['day_gainers'], count=limit * 2)
+                quotes = None
+                # yfinance >= 0.2.5x: yf.screen('day_gainers'); the old
+                # `from yfinance import Screener` no longer exists (it raised
+                # ImportError on every run and silently sent us to the universe scan).
+                try:
+                    res = yf.screen('day_gainers', count=min(250, max(limit * 2, 50)))
+                    quotes = (res or {}).get('quotes', [])
+                except Exception as e1:
+                    self.logger.warning(f"yf.screen failed ({e1}); trying legacy Screener")
+                    from yfinance import Screener
+                    legacy = Screener().get_screeners(['day_gainers'], count=limit * 2)
+                    quotes = (legacy or {}).get('day_gainers', {}).get('quotes', [])
+                gainers_data = {'day_gainers': {'quotes': quotes}} if quotes else None
                 
                 if not gainers_data or 'day_gainers' not in gainers_data:
                     return self._fetch_from_liquid_stocks(target_date, limit, exclude_symbols)
@@ -1001,7 +1015,11 @@ class DailyWinnersDetector:
                          hiccup must not wipe out the whole day's winners.
         """
         target_date_obj = target_date.date() if isinstance(target_date, datetime) else target_date
-        start = target_date_obj - timedelta(days=10)
+        # Single-day window (same shape as _backfill_ohlc, which works in prod).
+        # The old 10-day window straddled the Nov 1 DST change; with yfinance
+        # 0.2.66 + pandas 3 the multi-ticker frame then lost the newest rows,
+        # making every symbol look 'stale'.
+        start = target_date_obj
         end = target_date_obj + timedelta(days=1)
         valid: List[Dict[str, Any]] = []
         n_confirmed = n_stale = n_unverified = 0
@@ -1045,18 +1063,18 @@ class DailyWinnersDetector:
                 except Exception:
                     frame = None
 
-                if frame is None or frame.empty:
-                    n_unverified += 1
-                    self.logger.warning(f"  ⚠️ {sym}: no yfinance bars — UNVERIFIED, keeping TradingView data")
-                    valid.append(cand)
-                    continue
-
-                match = frame[frame.index.date == target_date_obj]
-                if match.empty:
-                    n_stale += 1
-                    self.logger.warning(
-                        f"  ❌ {sym}: STALE — latest bar {frame.index[-1].date()} != {target_date_obj}"
-                    )
+                match = frame[frame.index.date == target_date_obj] if frame is not None and not frame.empty else None
+                if match is None or match.empty:
+                    if cand.get('source') == 'tradingview':
+                        # TradingView's live gainers list IS the source of truth for
+                        # the session; a missing yfinance bar is a data-provider gap,
+                        # not evidence the winner is stale.
+                        n_unverified += 1
+                        self.logger.warning(f"  ⚠️ {sym}: no yfinance bar for {target_date_obj} — UNVERIFIED, keeping TradingView data")
+                        valid.append(cand)
+                    else:
+                        n_stale += 1
+                        self.logger.warning(f"  ❌ {sym} [{cand.get('source')}]: no confirmed bar for {target_date_obj} — rejected")
                     continue
 
                 row = match.iloc[-1]
