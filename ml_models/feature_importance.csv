@@ -1,8 +1,8 @@
 feature,importance
-t1_close_ATR_14,0.361715
-t5_kcue_20_2,0.164453
-t3_kcle_20_2,0.137463
-t1_close_VWAP,0.100488
-t3_hv_10,0.085021
-t1_close_DMP_14,0.077832
-t1_open_ATR_14_Slope,0.073027
+t1_close_ATR_14,0.40717
+t5_kcue_20_2,0.167523
+t3_kcle_20_2,0.119771
+t1_close_VWAP,0.092273
+t1_close_DMP_14,0.07717
+t3_hv_10,0.071081
+t1_open_ATR_14_Slope,0.065012
